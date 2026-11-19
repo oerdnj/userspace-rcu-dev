@@ -889,10 +889,15 @@ post_traversal:
 	 * ft_node_external() also matches: that is a mid-key dead-end, NOT a
 	 * proper-prefix leaf -- fall through to going_up, which backtracks to
 	 * the nearest lesser key.
+	 *
+	 * Scoped traversal: a leaf above the scope prefix (level < prefix_len)
+	 * is outside the scope.  The scope guard before descend_children
+	 * answers NOT_FOUND for it.
 	 */
 	if (limit == FT_LOOKUP_LIMIT_NONE &&
 			(mode == FT_LOOKUP_LE || mode == FT_LOOKUP_LT) &&
 			node_flag && ft_node_external(node_flag) &&
+			level >= (ssize_t) iter->prefix_len &&
 			level < key_depth - 1) {
 		int j;
 
@@ -1407,6 +1412,35 @@ going_up:
 	 * @node_flag; only the fall-through path can carry NULL.
 	 */
 	if (!node_flag) {
+		iter->node = NULL;
+		iter->cache_valid = true;
+		iter_debug_path_update(iter);
+		iter->path_len = iter->prefix_len + 1;
+		iter->status = CDS_FT_STATUS_NOT_FOUND;
+		goto end;
+	}
+
+	/*
+	 * Scope guard: the descent stopped on an external leaf at or above
+	 * the scope prefix.  The going-up loop is bounded at prefix_len, so
+	 * it did not run.  descend_children below would return this leaf.
+	 *
+	 * - level < prefix_len: the leaf's key is shorter than the scope
+	 *   prefix.  It is outside the scope.
+	 * - level == prefix_len: the leaf's key is the scope prefix.  It is
+	 *   the only key in the scope.  LIMIT_FIRST and LIMIT_LAST return it
+	 *   below.  For a relational lookup, the arms above already returned
+	 *   it when it satisfies the inequality.
+	 *
+	 * In the other cases no key in the scope matches: report NOT_FOUND.
+	 * A sibling found by the going-up loop is deeper than prefix_len, so
+	 * it never reaches this guard.
+	 */
+	if (!(use_keycopy && ft_node_skip_compressed(node_flag)) &&
+			ft_node_external(node_flag) &&
+			(level < (ssize_t) iter->prefix_len ||
+			 (level == (ssize_t) iter->prefix_len &&
+			  limit == FT_LOOKUP_LIMIT_NONE))) {
 		iter->node = NULL;
 		iter->cache_valid = true;
 		iter_debug_path_update(iter);

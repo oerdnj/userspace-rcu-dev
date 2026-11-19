@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (406 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (407 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (355 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (356 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -9115,6 +9115,147 @@ static int test_iteration_prefix_scoped(void)
 		return -1;
 	}
 	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Check a scoped walk when a key ends at or above the scope prefix.
+ *
+ * The trie holds "ap", "aq" and "b".  Scope "ap" must yield "ap" once.
+ * Scope "apt" holds no key, so first and last must return NOT_FOUND.
+ * The key "ap" is a prefix of "apt", but it is outside that scope.
+ * The relational lookups of scoped_rel[] follow the same two scopes.
+ */
+struct scoped_rel_case {
+	char op;		/* 'l' <, 'L' <=, 'G' >=, 'g' > */
+	const char *key;
+	size_t prefix_len;
+	const char *expect;	/* NULL: NOT_FOUND */
+};
+
+static const struct scoped_rel_case scoped_rel[] = {
+	/* Scope "ap": the leaf "ap" is the only key in the scope. */
+	{ 'l', "ap", 2, NULL },
+	{ 'L', "ap", 2, "ap" },
+	{ 'G', "ap", 2, "ap" },
+	{ 'g', "ap", 2, NULL },
+	{ 'l', "apz", 2, "ap" },
+	{ 'L', "apz", 2, "ap" },
+	{ 'G', "apz", 2, NULL },
+	{ 'g', "apz", 2, NULL },
+	/* Scope "apt": the leaf "ap" is above the scope. */
+	{ 'l', "apt", 3, NULL },
+	{ 'L', "apt", 3, NULL },
+	{ 'G', "apt", 3, NULL },
+	{ 'g', "apt", 3, NULL },
+	{ 'L', "aptz", 3, NULL },
+	{ 'G', "aptz", 3, NULL },
+};
+
+static int test_iteration_prefix_scoped_key_at_scope(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
+	struct cds_ft_iter *iter;
+	const char *words[] = { "ap", "aq", "b" };
+	enum cds_ft_status s_first, s_last;
+	unsigned int i, count = 0;
+	int ret = 0;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	for (i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+		struct ft_test_node *n = node_alloc(0);
+
+		rcu_read_lock();
+		cds_ft_insert(ft, (const uint8_t *)words[i],
+			      strlen(words[i]), &n->node);
+		rcu_read_unlock();
+	}
+
+	/* Scope "ap".  Stop after 8 keys: a broken walk never ends. */
+	cds_ft_iter_set_key(iter, (const uint8_t *)"ap", 2);
+	cds_ft_iter_set_prefix_len(iter, 2);
+	rcu_read_lock();
+	cds_ft_for_each_rcu(ft, iter) {
+		if (++count == 8)
+			break;
+	}
+	rcu_read_unlock();
+	if (count != 1) {
+		fprintf(stderr, "scope 'ap': %u keys%s, expected 1\n", count,
+			count == 8 ? " (walk stopped by the test)" : "");
+		ret = -1;
+	}
+
+	/* Scope "apt". */
+	cds_ft_iter_set_key(iter, (const uint8_t *)"apt", 3);
+	cds_ft_iter_set_prefix_len(iter, 3);
+	rcu_read_lock();
+	s_first = cds_ft_lookup_first(ft, iter);
+	rcu_read_unlock();
+	cds_ft_iter_set_key(iter, (const uint8_t *)"apt", 3);
+	cds_ft_iter_set_prefix_len(iter, 3);
+	rcu_read_lock();
+	s_last = cds_ft_lookup_last(ft, iter);
+	rcu_read_unlock();
+	if (s_first != CDS_FT_STATUS_NOT_FOUND) {
+		fprintf(stderr, "scope 'apt': lookup_first returns %s, expected NOT_FOUND\n",
+			cds_ft_status_to_string(s_first));
+		ret = -1;
+	}
+	if (s_last != CDS_FT_STATUS_NOT_FOUND) {
+		fprintf(stderr, "scope 'apt': lookup_last returns %s, expected NOT_FOUND\n",
+			cds_ft_status_to_string(s_last));
+		ret = -1;
+	}
+
+	/* Relational lookups from a key at, below and above the leaf "ap". */
+	for (i = 0; i < sizeof(scoped_rel) / sizeof(scoped_rel[0]); i++) {
+		const struct scoped_rel_case *c = &scoped_rel[i];
+		enum cds_ft_status s;
+		uint8_t key[8];
+		size_t key_len = 0;
+
+		cds_ft_iter_set_key(iter, (const uint8_t *)c->key, strlen(c->key));
+		cds_ft_iter_set_prefix_len(iter, c->prefix_len);
+		rcu_read_lock();
+		switch (c->op) {
+		case 'l':
+			s = cds_ft_lookup_lt(ft, iter);
+			break;
+		case 'L':
+			s = cds_ft_lookup_le(ft, iter);
+			break;
+		case 'G':
+			s = cds_ft_lookup_ge(ft, iter);
+			break;
+		default:
+			s = cds_ft_lookup_gt(ft, iter);
+			break;
+		}
+		if (s == CDS_FT_STATUS_OK)
+			(void) cds_ft_iter_get_key(iter, key, sizeof(key), &key_len);
+		rcu_read_unlock();
+		if (c->expect ? (s != CDS_FT_STATUS_OK ||
+				key_len != strlen(c->expect) ||
+				memcmp(key, c->expect, key_len)) :
+				s != CDS_FT_STATUS_NOT_FOUND) {
+			fprintf(stderr, "scoped op '%c' key '%s' prefix_len %zu: %s '%.*s', expected %s\n",
+				c->op, c->key, c->prefix_len,
+				cds_ft_status_to_string(s),
+				s == CDS_FT_STATUS_OK ? (int) key_len : 0, key,
+				c->expect ? c->expect : "NOT_FOUND");
+			ret = -1;
+		}
+	}
+
+	cds_ft_iter_destroy(iter);
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	return ret;
 }
 
 /*
@@ -40847,6 +40988,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_iteration_prefix_key);
 	RUN_TEST(test_iteration_reverse_order);
 	RUN_TEST(test_iteration_prefix_scoped);
+	RUN_TEST(test_iteration_prefix_scoped_key_at_scope);
 	RUN_TEST(test_iteration_for_each_entry);
 	RUN_TEST(test_iter_copy);
 	RUN_TEST(test_iter_reset);
