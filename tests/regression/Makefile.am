@@ -16,6 +16,7 @@ noinst_PROGRAMS = \
 	test_urcu_fork_cxx.tap \
 	test_urcu_ft \
 	test_urcu_ft_inv \
+	test_urcu_ft_inv_memb \
 	rcutorture_urcu_membarrier \
 	rcutorture_urcu_membarrier_cxx \
 	rcutorture_urcu_mb \
@@ -48,6 +49,10 @@ test_urcu_ft_LDADD = $(URCU_QSBR_LIB) $(URCU_CDS_LIB)
 test_urcu_ft_inv_SOURCES = test_urcu_ft_inv.c
 test_urcu_ft_inv_CFLAGS = -DRCU_QSBR $(AM_CFLAGS)
 test_urcu_ft_inv_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(URCU_CDS_LIB) $(TAP_LIB)
+
+test_urcu_ft_inv_memb_SOURCES = test_urcu_ft_inv.c
+test_urcu_ft_inv_memb_CFLAGS = -DRCU_MEMB $(AM_CFLAGS)
+test_urcu_ft_inv_memb_LDADD = $(URCU_LIB) $(URCU_COMMON_LIB) $(URCU_CDS_LIB) $(TAP_LIB)
 
 rcutorture_urcu_membarrier_SOURCES = urcutorture.c
 rcutorture_urcu_membarrier_CFLAGS = -DRCU_MEMBARRIER $(AM_CFLAGS)
@@ -86,6 +91,7 @@ urcutorture.c: ../common/api.h
 dist_check_SCRIPTS = \
 	test_urcu_ft.tap \
 	test_urcu_ft_inv.tap \
+	test_urcu_ft_inv_memb.tap \
 	test_rcutorture_urcu_bp_perf_global.tap \
 	test_rcutorture_urcu_bp_perf_global_cxx.tap \
 	test_rcutorture_urcu_bp_perf_percpu.tap \
@@ -194,6 +200,7 @@ REGTEST_TESTS = \
 	test_urcu_fork_cxx.tap \
 	test_urcu_ft.tap \
 	test_urcu_ft_inv.tap \
+	test_urcu_ft_inv_memb.tap \
 	test_rcutorture_urcu_bp_perf_global.tap \
 	test_rcutorture_urcu_bp_perf_global_cxx.tap \
 	test_rcutorture_urcu_bp_perf_percpu.tap \

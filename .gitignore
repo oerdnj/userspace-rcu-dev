@@ -67,6 +67,7 @@ tests/regression/test_urcu_fork_cxx.tap
 tests/regression/test_urcu_fork.tap
 tests/regression/test_urcu_ft
 tests/regression/test_urcu_ft_inv
+tests/regression/test_urcu_ft_inv_memb
 
 tests/benchmark/test_barrier
 tests/benchmark/test_rwlock_timing

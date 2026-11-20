@@ -36,7 +36,16 @@
 #endif
 
 #include <urcu/compiler.h>
+#ifdef RCU_MEMB
+/*
+ * The urcu-memb build: a read-side section is real there.  So it catches a
+ * section held where QSBR cannot tell, e.g. around a bulk op that waits for
+ * a grace period.  urcu-memb defines the QSBR-only calls as no-ops.
+ */
+#include <urcu.h>		/* Must precede fractal-trie.h */
+#else
 #include <urcu-qsbr.h>		/* Must precede fractal-trie.h */
+#endif
 #include <urcu/fractal-trie.h>
 #include <urcu-call-rcu.h>
 
