@@ -2164,31 +2164,14 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		sdrun.rlast = ms_s_last;
 	}
 	/*
-	 * Pre-reserve the src-side ordered-list commit txn before the (still
-	 * fallible) src unlink.  The src side's commit is whichever of two
-	 * fires: the root-src root+endpoint swap, or the rare unfused non-root
-	 * run-unlink.  It is un-abortable once the structural unlink is
-	 * public, so it commits through this pre-reserved txn
-	 * (ft_ord_cell_flip_into).  Sized to the larger bound (4-edge
-	 * run-unlink >= 3-edge root swap).  OOM here aborts the
-	 * still-invisible build (both tries pristine).  The lone-edge list-off
-	 * paths (ft_root_edge_flip) need no txn, so reserve only when ms_ord.
-	 *
-	 * ☠ WHY THE SRC SIDE IS TRANSACTED AT ALL, given cds_ft_merge_at and
-	 * cds_ft_graft both REJECT a non-exclusive src (BUSY_ERROR), and an
-	 * exclusive trie has no concurrent reader or writer to be atomic against:
-	 *
-	 * because that rejection is `src_ft != dst_ft` -- SAME-TRIE is excluded
-	 * from it on purpose.  cds_ft_rekey_{graft,merge} reach this worker
-	 * through ft_merge_at_inner(ft, ..., ft, ...) with @rekey set, so on that
-	 * path @src_ft IS @dst_ft: the LIVE, SHARED, concurrently-read trie.  Its
-	 * "src side" is therefore exactly as contended as its dst side, and every
-	 * edge here needs the same atomicity a cross-trie merge's src does not.
-	 *
-	 * So "the src is always exclusive now, drop the src-side txn" is a sound
-	 * reading of the entry gates and a WRONG conclusion about this body.  The
-	 * exclusivity that would justify it belongs to the CROSS-TRIE callers
-	 * only; this code is shared with the one caller that has none.
+	 * Pre-reserve the root src's root + endpoint swap txn before the
+	 * (still fallible) src unlink.  The swap is un-abortable once the
+	 * structural unlink is public, so it commits through this
+	 * pre-reserved txn.  OOM here aborts the still-invisible build (both
+	 * tries pristine).  A non-root src needs none: its unlink folds the
+	 * run's removal from src's list into its own commit (see the assert
+	 * after it).  The lone-edge list-off paths (ft_root_edge_flip) need no
+	 * txn either.
 	 */
 	struct ft_flip_txn *src_side_txn = NULL;
 
@@ -2196,8 +2179,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * Size the src-side commit txn per shape.  A root src fuses the gs
 	 * free-list freeze into its root swap / lone root flip (atomic detach,
 	 * doc §4.B): + gs.cap_free tombstone edges (cnt.nf_src + 8, the exact
-	 * upper bound ft_glue_defer_free asserts against).  A non-root src
-	 * commits its run-unlink through a plain FT_ORD_CELL_RUN_UNLINK txn; its
+	 * upper bound ft_glue_defer_free asserts against).  A non-root src's
 	 * gs freeze stays standalone, applied below AFTER
 	 * ft_merge_unlink_src_subtree's (still fallible) unlink so a rolled-back
 	 * merge never freezes-then-strands (full non-root fusion -- into
@@ -2207,10 +2189,9 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * final here.  (gd is stamped in ft_glue_apply_deferred for the dst
 	 * forward publish.)
 	 */
-	if (ms_ord) {
-		src_side_txn = ft_flip_txn_create_bounded(src_ft, root_src ?
-			FT_ROOT_LIST_SWAP_MAX_EDGES + (unsigned int) gs.cap_free :
-			FT_ORD_CELL_RUN_UNLINK_MAX_EDGES);
+	if (ms_ord && root_src) {
+		src_side_txn = ft_flip_txn_create_bounded(src_ft,
+			FT_ROOT_LIST_SWAP_MAX_EDGES + (unsigned int) gs.cap_free);
 		if (!src_side_txn) {
 			free(ms_src_pool);
 			free(ms_src_caps);
@@ -2449,25 +2430,15 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * gs fused into its root swap / flip above.
 	 */
 	/*
-	 * The last fallible step has committed.  Now remove src's merged
-	 * subtree (S) run from src's ordered list.  Its cells disperse to dst
-	 * (survivors) or are freed (collisions).
-	 *
-	 * This is deferred to here so that an OOM in the src unlink above
-	 * leaves src's list untouched on rollback.  It is done before the
-	 * drain so that sync drains src ord-readers of the run too.
-	 *
-	 * Skipped for a root src (fused into the root swap above), and for a
-	 * non-root src whose unlink already fused the run (sdrun.armed).
+	 * The run of src's merged subtree (S) is out of src's ordered list
+	 * now.  A root src removed it in its root swap above.  A non-root src
+	 * removed it in the unlink's own commit: ft_detach_node arms @sdrun on
+	 * every success.  The one exception replaces a compressed trie ROOT,
+	 * which never exists at rest (root-is-internal invariant, ft-helpers.h).
+	 * Every root path consumed @src_side_txn.
 	 */
-	if (ms_ord && !root_src && !sdrun.armed) {
-		ft_ord_cell_run_unlink(src_ft, src_side_txn, ms_s_first,
-			ms_s_last);
-		src_side_txn = NULL;	/* consumed */
-	}
-	/* Reserved but unused: a non-root run whose unlink already fused it. */
-	if (src_side_txn)
-		ft_flip_txn_destroy(src_side_txn);
+	assert(!ms_ord || root_src || sdrun.armed);
+	assert(!src_side_txn);
 	/*
 	 * NO SRC DRAIN.  This worker is now CROSS-TRIE ONLY: the same-trie
 	 * rekey moved to ft-rekey.h.  The gates of ft_merge_at_inner leave
@@ -2836,7 +2807,6 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	 * Mirrors cds_ft_graft's post-swap store retry.
 	 */
 	bool already_unlinked = false;
-	struct ft_flip_txn *run_unlink_txn = NULL;
 	struct ft_flip_txn *run_splice_txn = NULL;
 
 	*handled = false;
@@ -3081,21 +3051,14 @@ retry_merge:
 	if (!already_unlinked) {
 		if (ms_ord) {
 			/*
-			 * Pre-reserve the standalone run-unlink + run-splice txns (the
-			 * rare unfused shapes touch src's / dst's list AFTER the
-			 * structural flip is public, un-abortable).  OOM here aborts the
+			 * Pre-reserve the standalone run-splice txn (a rare
+			 * unfused shape touches dst's list AFTER the structural
+			 * flip is public, un-abortable).  OOM here aborts the
 			 * still-invisible build (both tries pristine).
 			 */
-			run_unlink_txn = ft_flip_txn_create_bounded(src_ft,
-				FT_ORD_CELL_RUN_UNLINK_MAX_EDGES);
 			run_splice_txn = ft_flip_txn_create_bounded(dst_ft,
 				FT_ORD_CELL_RUN_SPLICE_MAX_EDGES);
-			if (!run_unlink_txn || !run_splice_txn) {
-				if (run_unlink_txn)
-					ft_flip_txn_destroy(run_unlink_txn);
-				if (run_splice_txn)
-					ft_flip_txn_destroy(run_splice_txn);
-				run_unlink_txn = run_splice_txn = NULL;
+			if (!run_splice_txn) {
 				cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 				ft_glue_abort(dst_ft, &glue);
 				ft_flip_txn_destroy(glue.txn);
@@ -3112,11 +3075,9 @@ retry_merge:
 		 */
 		if (ft_merge_unlink_src_subtree(src_ft, okey_src, src_key_len,
 				cnt_src, srunp, /*retire_glue=*/ NULL) < 0) {
-			if (run_unlink_txn)
-				ft_flip_txn_destroy(run_unlink_txn);
 			if (run_splice_txn)
 				ft_flip_txn_destroy(run_splice_txn);
-			run_unlink_txn = run_splice_txn = NULL;
+			run_splice_txn = NULL;
 			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 			ft_glue_abort(dst_ft, &glue);
 			ft_flip_txn_destroy(glue.txn);
@@ -3127,21 +3088,12 @@ retry_merge:
 		already_unlinked = true;	/* POINT OF NO RETURN: @payload owned */
 
 		/*
-		 * Remove the source run from src's ordered list.  The cells
-		 * keep their internal links for the dst splice.  Do it BEFORE
-		 * the drain, so sync drains src ord-readers of the run too.
-		 * The structural unlink FUSED this into its flip
-		 * (@srun.armed); the standalone remains a fallback.
+		 * The structural unlink removed the source run from src's
+		 * ordered list in its own commit.  The cells keep their
+		 * internal links for the dst splice.  See
+		 * ft_merge_spine_copy's assert for why @srun is always armed.
 		 */
-		if (ms_ord && !srun.armed) {
-			ft_ord_cell_run_unlink(src_ft, run_unlink_txn, s_first,
-				s_last);
-			run_unlink_txn = NULL;	/* consumed */
-		}
-		if (run_unlink_txn) {
-			ft_flip_txn_destroy(run_unlink_txn);
-			run_unlink_txn = NULL;
-		}
+		assert(!ms_ord || srun.armed);
 
 		/* No src drain: cross-trie only, src is exclusive.  See
 		 * ft_merge_spine_copy's assert for the full reasoning. */

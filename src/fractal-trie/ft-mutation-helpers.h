@@ -14538,8 +14538,7 @@ void ft_trace_miswire_check(struct cds_ft *ft,
  * Promotion (ft_unchain_node) and replace (cds_ft_replace) need NO list op:
  * the cell stays put and only cell->node is retargeted.  Bulk ops (merge /
  * graft / graft_swap / detach) maintain the list through:
- *   - the run helpers below (run_detach / run_splice / run_replace /
- *     run_unlink);
+ *   - the run helpers below (run_detach / run_splice / run_replace);
  *   - the merge interleave.
  */
 
@@ -22136,56 +22135,6 @@ enum urcu_txn_status ft_ord_cell_flip_rec_replace(struct cds_ft *ft,
 		return pst;
 	}
 }
-
-/*
- * Remove the contiguous run [@first_head .. @last_head] from @ft's ordered
- * list WITHOUT re-homing it.  This is the cds_ft_merge source side, where
- * the run's cells disperse: survivors are spliced into dst and collided
- * heads are freed.  Relink the two boundary edges (atomic for @ft's live
- * readers).  The run cells keep their stale links: the caller no longer
- * references them as a run.  Whole-list removal leaves @ft's sentinel
- * pointing at itself (empty).
- */
-/* Max edges a run-unlink commits: the two boundary back-edges. */
-#define FT_ORD_CELL_RUN_UNLINK_MAX_EDGES	2
-
-#ifdef FEATURE_FT_MERGE	/* only the merge calls it */
-static
-void ft_ord_cell_run_unlink(struct cds_ft *ft, struct ft_flip_txn *txn,
-		struct cds_ft_node *first_head, struct cds_ft_node *last_head)
-{
-	struct ft_ord_cell *first =
-		ft_ord_cell_ptr(rcu_dereference(first_head->prev));
-	struct ft_ord_cell *last =
-		ft_ord_cell_ptr(rcu_dereference(last_head->prev));
-	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&first->lnode.prev);
-	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&last->lnode.next);
-	struct ft_ord_cell_edge edges[FT_ORD_CELL_RUN_UNLINK_MAX_EDGES] = { 0 };
-	unsigned int n = 0;
-
-	(void) ft;
-	/*
-	 * Sentinel topology: @pred / @succ resolve to @ft's sentinel when the
-	 * run sits at @ft's head / tail.  The whole-list case leaves the
-	 * sentinel self-pointing, which means empty.  No separate endpoint
-	 * edge.
-	 */
-	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
-	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
-	edges[n].owner_cell = pred;
-	edges[n].old_target = first;
-	edges[n].new_target = succ;
-	n++;
-	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
-	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
-	edges[n].owner_cell = succ;
-	edges[n].old_target = last;
-	edges[n].new_target = pred;
-	n++;
-	/* Bulk op, not yet MW-hardened: ABORT unreachable under its exclusion. */
-	(void) ft_ord_cell_flip_into(ft, txn, edges, n);
-}
-#endif /* FEATURE_FT_MERGE */
 
 /*
  * Set @child's parent back-pointer to a raw flag @value (a flip-proxy)

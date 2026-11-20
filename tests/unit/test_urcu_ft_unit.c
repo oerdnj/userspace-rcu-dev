@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (408 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (409 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (357 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (358 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -11640,6 +11640,148 @@ out:
 	cds_ft_destroy(dst);
 	cds_ft_group_destroy(group);
 	return ret;
+}
+
+/*
+ * Merge a source subtree whose removal leaves its parent with no child but
+ * with a prefix key.  The source unlink then promotes that key's external
+ * chain.  The promote must still remove the moved run from the source's
+ * ordered list in its own commit: both merge paths assert that it did.
+ *
+ * Shape 0 merges into a dst that already holds a key under "ab" (the spine
+ * copy).  Shape 1 merges into a dst with nothing under "ab" (the
+ * sub-position graft).  The source keeps "a" and "c".
+ */
+static int merge_src_prefix_promote(int shape)
+{
+	static const char *const src_keys[] = { "a", "abx", "aby", "c" };
+	static const char *const dst_keys[2][2] = {
+		{ "abz", "q" },
+		{ "q", NULL },
+	};
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *dst = NULL, *src = NULL;
+	struct cds_ft_iter *iter = NULL;
+	struct ft_test_node *sn[4], *dn[2] = { NULL, NULL };
+	unsigned long want_dst;
+	const char *walk[8];
+	unsigned int i, nwalk;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
+	cds_ft_group_attr_set_ordered_list(attr, true);
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &dst) < 0 ||
+	    cds_ft_create(group, NULL, &src) < 0 ||
+	    cds_ft_iter_create(dst, &iter) < 0)
+		abort();
+
+	rcu_read_lock();
+	for (i = 0; i < 4; i++) {
+		sn[i] = node_alloc(i);
+		if (cds_ft_insert(src, (const uint8_t *) src_keys[i],
+				strlen(src_keys[i]), &sn[i]->node) < 0) {
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	for (i = 0; i < 2 && dst_keys[shape][i]; i++) {
+		dn[i] = node_alloc(10 + i);
+		if (cds_ft_insert(dst, (const uint8_t *) dst_keys[shape][i],
+				strlen(dst_keys[shape][i]), &dn[i]->node) < 0) {
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	rcu_read_unlock();
+	cds_ft_make_exclusive(src);	/* cross-trie src must be exclusive */
+	if (shape == 0)
+		s = cds_ft_merge(dst, (const uint8_t *) "ab", 2, src);
+	else
+		s = cds_ft_merge_at(dst, (const uint8_t *) "ab", 2, src,
+				(const uint8_t *) "ab", 2);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_src_prefix_promote[%d]: merge: %s\n",
+			shape, cds_ft_status_to_string(s));
+		goto out;
+	}
+
+	if (shape == 0) {
+		walk[0] = "abx"; walk[1] = "aby"; walk[2] = "abz"; walk[3] = "q";
+		nwalk = 4;
+	} else {
+		walk[0] = "abx"; walk[1] = "aby"; walk[2] = "q";
+		nwalk = 3;
+	}
+	want_dst = nwalk;
+
+	rcu_read_lock();
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK ||
+	    cds_ft_verify(src, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_src_prefix_promote[%d]: verify failed\n",
+			shape);
+		rcu_read_unlock();
+		goto out;
+	}
+	if (cds_ft_count_keys(dst) != want_dst || cds_ft_count_keys(src) != 2) {
+		fprintf(stderr, "merge_src_prefix_promote[%d]: counts dst %lu "
+			"src %lu, want %lu and 2\n", shape, cds_ft_count_keys(dst),
+			cds_ft_count_keys(src), want_dst);
+		rcu_read_unlock();
+		goto out;
+	}
+	/* The ordered walk over dst must yield exactly @walk, in key order. */
+	s = cds_ft_lookup_first(dst, iter);
+	for (i = 0; i < nwalk; i++) {
+		uint8_t rk[16];
+		size_t rl;
+
+		if (s != CDS_FT_STATUS_OK ||
+		    cds_ft_iter_get_key(iter, rk, sizeof rk, &rl) !=
+				CDS_FT_STATUS_OK ||
+		    rl != strlen(walk[i]) || memcmp(rk, walk[i], rl)) {
+			fprintf(stderr, "merge_src_prefix_promote[%d]: dst walk "
+				"step %u, want \"%s\"\n", shape, i, walk[i]);
+			rcu_read_unlock();
+			goto out;
+		}
+		s = cds_ft_next(dst, iter);
+	}
+	if (s == CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_src_prefix_promote[%d]: dst walk has "
+			"extra keys\n", shape);
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	if (iter)
+		cds_ft_iter_destroy(iter);
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_merge_src_prefix_promote(void)
+{
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_src_prefix_promote: skipped, merge "
+			"compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	return merge_src_prefix_promote(0) |
+		merge_src_prefix_promote(1);
 }
 
 static int test_merge_rerooted_glue_ordered_key_shorter(void)
@@ -41130,6 +41272,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rerooted_glue_ordered_key_shorter);
 	RUN_TEST(test_merge_rerooted_glue_ordered_exclusive_dst);
 	RUN_TEST(test_merge_at_empty_dst_root_listoff);
+	RUN_TEST(test_merge_src_prefix_promote);
 	RUN_TEST(test_merge_subpos_branch_reserve);
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_atnode);
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_branch);
