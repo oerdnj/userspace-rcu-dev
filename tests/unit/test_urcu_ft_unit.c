@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (409 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (410 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (358 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (359 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -6214,6 +6214,83 @@ fail_nolock:
 	cds_ft_iter_destroy(iter);
 	drain_and_destroy(ft, group);
 	return -1;
+}
+
+/*
+ * cds_ft_lookup_nth on variable-length keys that END inside a single-child
+ * run ("Kabcdefghijkst" ends in the run "st" under the branch after
+ * "Kabcdefghijk"; "Z1" ends in the run "1" under 'Z').  Every rank, from
+ * either end, must rebuild the whole key, with and without order
+ * statistics: the two take different descents.
+ */
+static int lookup_nth_varlen_run_end(bool rank)
+{
+	static const char *const keys[] = {	/* in key order */
+		"Kabcdefghijkmnopq1", "Kabcdefghijkmnopq2", "Kabcdefghijkr",
+		"Kabcdefghijkst", "Z1",
+	};
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter;
+	unsigned int i;
+	int ret = 0;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
+	if (rank && cds_ft_group_attr_set_rank_stats(attr, true) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0 ||
+	    cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+
+	rcu_read_lock();
+	for (i = 0; i < 5; i++)
+		if (cds_ft_insert(ft, (const uint8_t *) keys[i],
+				strlen(keys[i]), &node_alloc(i)->node) < 0)
+			abort();
+	for (i = 0; i < 5; i++) {
+		uint8_t rk[32];
+		size_t rl = 0;
+
+		if (cds_ft_lookup_nth(ft, iter, i) != CDS_FT_STATUS_OK ||
+		    cds_ft_iter_get_key(iter, rk, sizeof(rk), &rl) !=
+				CDS_FT_STATUS_OK ||
+		    rl != strlen(keys[i]) || memcmp(rk, keys[i], rl)) {
+			fprintf(stderr, "lookup_nth_varlen_run_end[%s]: nth(%u) "
+				"returned %.*s (len %zu), want %s\n",
+				rank ? "rank" : "plain", i, (int) rl, rk, rl,
+				keys[i]);
+			ret = -1;
+		}
+		/* The same key from the other end. */
+		if (cds_ft_lookup_nth_last(ft, iter, 4 - i) != CDS_FT_STATUS_OK ||
+		    cds_ft_iter_get_key(iter, rk, sizeof(rk), &rl) !=
+				CDS_FT_STATUS_OK ||
+		    rl != strlen(keys[i]) || memcmp(rk, keys[i], rl)) {
+			fprintf(stderr, "lookup_nth_varlen_run_end[%s]: "
+				"nth_last(%u) returned %.*s (len %zu), want %s\n",
+				rank ? "rank" : "plain", 4 - i, (int) rl, rk, rl,
+				keys[i]);
+			ret = -1;
+		}
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_lookup_nth_varlen_run_end(void)
+{
+	return lookup_nth_varlen_run_end(false) | lookup_nth_varlen_run_end(true);
 }
 
 /*
@@ -41181,6 +41258,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_lookup_nth_last);
 	RUN_TEST(test_lookup_nth_duplicates);
 	RUN_TEST(test_lookup_nth_varlen);
+	RUN_TEST(test_lookup_nth_varlen_run_end);
 
 	/* Iterator skip tests */
 	diag("Iterator skip tests");

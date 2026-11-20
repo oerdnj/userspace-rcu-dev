@@ -212,8 +212,13 @@ enum ft_descent_action ft_lookup_nth_compressed(
 	node_flag = ft_cn_child_dereference_acquire_prefetch(cn);
 	assert(node_flag != NULL);	/* compressed node always has a live child (by construction) */
 	if (ft_node_external(node_flag)) {
+		/*
+		 * The caller's loop exits on BREAK, so it skips the level++
+		 * that lands a descended child at its depth.  Take that step
+		 * here, so the leaf's key length counts the run's last byte.
+		 */
 		*node_flag_p = node_flag;
-		*level_p = level;
+		*level_p = level + 1;
 		return FT_DESCENT_BREAK;
 	}
 	*node_flag_p = node_flag;
@@ -464,8 +469,9 @@ enum ft_descent_action ft_lookup_nth_last_compressed(
 		node_flag = ft_cn_child_dereference_acquire_prefetch(cn);
 		assert(node_flag != NULL);	/* compressed node always has a live child */
 		if (ft_node_external(node_flag)) {
+			/* As in ft_lookup_nth_compressed: the loop skips level++. */
 			*node_flag_p = node_flag;
-			*level_p = level;
+			*level_p = level + 1;
 			return FT_DESCENT_BREAK;
 		}
 		*node_flag_p = node_flag;
