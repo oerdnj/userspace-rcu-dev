@@ -103,7 +103,9 @@ It provides these wait-free read-side operations:
   - rank and skip queries;
   - ordered (key-sorted) forward and reverse traversal.
 
-Updates are serialized by a caller-provided mutex. Unique and
+By default the library coordinates concurrent updates itself, with
+fine-grained per-node locks. A group may instead select one
+trie-wide writer lock, or serialize its writers itself. Unique and
 duplicate keys are supported. It provides bulk sub-trie operations:
 graft, graft-swap, detach and merge. They move or combine whole key
 ranges between tries of a group. Each one is atomic with respect to

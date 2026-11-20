@@ -5336,7 +5336,7 @@ Status 2026-11-19:
 - An EXCLUSIVE trie and a `CDS_FT_WRITER_EXTERNAL_SYNC` trie skip
   `bulk_lock` (`ft_bulk_lock_enter`).
 - The comments of `cds_ft_detach` and `cds_ft_merge` in the public header
-  still say "☐ The drain-seam gap applies". They were not changed.
+  said "☐ The drain-seam gap applies". They now describe the second lock.
 - The FT-SLOT-3 statements were not re-checked against the code.
 
 #### M1.10 ☠ Do not call the bulk ops "unconverted"
@@ -5368,7 +5368,8 @@ Status 2026-11-19:
 - The first is fixed. The `cds_ft_merge` comment no longer says "NOT
   concurrency-safe". Its FINE paragraph says "identical to cds_ft_merge_at".
   The body is still the one line above (`ft-merge.h`, `cds_ft_merge`).
-- The second is still present in the `cds_ft_merge_at` comment.
+- The second is fixed too. The `cds_ft_merge_at` comment now says the source
+  must be EXCLUSIVE.
 
 #### M1.12 ☐ Four mutators the enumeration first missed
 
@@ -5390,8 +5391,9 @@ writer-strategy block:
 
 Status 2026-11-19:
 
-- The rekey functions still have no writer-strategy paragraph in the
-  header. The entry arms the gate with `ft_move_gate_enter`. That is
+- The rekey functions now have a writer-strategy paragraph in the
+  header: they are bulk ops. The entry arms the gate with
+  `ft_move_gate_enter`. That is
   `ft_bulk_gate_enter(ft, FT_BULK_COHERENT)`. See `ft-rekey.h` and
   `fractal-trie-internal.h`.
 - "`_step` takes NO scope" is no longer true. `cds_ft_compact_step` enters

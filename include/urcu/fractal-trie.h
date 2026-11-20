@@ -683,13 +683,13 @@ void cds_ft_node_init(struct cds_ft_node *node)
  *
  * Allocations are 8-byte aligned and zero-initialised.
  *
- * NUMA: each range is placed with CDS_FT_NUMA_DEFAULT, deferring to the
- * process NUMA policy.  Under a process interleave policy (e.g. numactl
- * --interleave) the range is interleaved in 2 MiB chunks (MPOL_BIND per
- * chunk); under LOCAL/PREFERRED/BIND the kernel honors that at fault
- * time; with no process policy, pages fall back to first-touch.  Prefer
- * setting a process NUMA policy over first-touching from one thread,
- * which would pin the whole arena to a single node.
+ * NUMA: each range is placed with CDS_FT_NUMA_DEFAULT.  With no process
+ * policy, the range is interleaved across the allowed nodes: each 2 MiB
+ * chunk is bound (MPOL_BIND) to one node.  A process interleave policy
+ * (e.g. numactl --interleave) gets the same 2 MiB interleave.  A process
+ * BIND, PREFERRED or LOCAL policy is left to the kernel at fault time.
+ * CDS_FT_NUMA_INTERLEAVE=0 in the environment skips all of this, so pages
+ * land on the node that first touches them.
  *
  * Thread-safety: cds_ft_external_arena_alloc is internally
  * synchronised by a per-arena mutex, so multiple writer threads may
@@ -1646,12 +1646,11 @@ enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
  * Returns CDS_FT_STATUS_OK on success (node inserted, no prior node
  * existed). Returns CDS_FT_STATUS_DUPLICATE_FOUND on success when a
  * prior duplicate chain was replaced (*@result_node is the old head).
- * Returns CDS_FT_STATUS_BUSY_ERROR if the publish lost an
- * expected-value CAS or a guarded node was frozen: nothing was
- * published and the call may be retried.
- * Returns a negative cds_ft_status on error.  On error, @node has
- * not been published and is left reusable for a subsequent insert
- * attempt.
+ * A commit lost to a peer is retried inside the call.  It is never
+ * returned.
+ * Returns CDS_FT_STATUS_INVALID_ARGUMENT_ERROR or
+ * CDS_FT_STATUS_MEMORY_ERROR on error.  On error, @node has not been
+ * published and is left reusable for a subsequent insert attempt.
  *
  * Update concurrency depends on the group's writer strategy
  * (cds_ft_group_attr_set_writer_strategy):
@@ -1672,8 +1671,9 @@ enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
  *   the expected-old check and ABORTS the attempt.  It is not marked into a
  *   tombstone.
  *
- *   An attempt that loses publishes nothing and is re-derived; a caller that
- *   reaches a retired chain is answered -ESTALE rather than served.
+ *   An attempt that loses publishes nothing and is re-derived.  A later
+ *   cds_ft_remove of a node in the displaced chain returns
+ *   CDS_FT_STATUS_NOT_FOUND.
  *
  *   ☐ The caller must still ensure mutual exclusion against
  *   cds_ft_compact_step and cds_ft_recompute_stats.  Concurrent compaction
@@ -1952,8 +1952,8 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  * - > 0: Explicit key length.
  * - 0: Graft at the root (NIL prefix).
  * @src_ft: Source Fractal Trie. Must be in the same group as @dst_ft.
- *          Under fine-grained writer locking (CDS_FT_WRITER_LOCK_FINE)
- *          @src_ft must be EXCLUSIVE (cds_ft_make_exclusive): it has no
+ *          Under every writer strategy, @src_ft must be EXCLUSIVE
+ *          (cds_ft_make_exclusive): it has no
  *          concurrent readers or writers. A live concurrent source is
  *          rejected with CDS_FT_STATUS_BUSY_ERROR (see below). On
  *          success, @src_ft becomes empty. The caller retains ownership
@@ -1973,9 +1973,9 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  * variable-length key groups. Non-root graft (@key_len > 0)
  * requires a variable-length key group (CDS_FT_LEN_VARIABLE).
  *
- * Source-exclusivity requirement (fine-grained locking).  A cross-trie
- * graft consumes @src_ft's whole content.  Under CDS_FT_WRITER_LOCK_FINE
- * it holds only @dst_ft's writer lock.  An exclusive @src_ft is private,
+ * Source-exclusivity requirement.  It holds under every writer strategy.
+ * A cross-trie graft consumes @src_ft's whole content.  It holds only
+ * @dst_ft's writer lock.  An exclusive @src_ft is private,
  * so no second lock is taken and there is no cross-trie deadlock.  A LIVE
  * (concurrent, non-exclusive) @src_ft would require a second lock with no
  * lock order.  It is therefore rejected with CDS_FT_STATUS_BUSY_ERROR
@@ -1990,7 +1990,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  *
  * Returns CDS_FT_STATUS_OK on success (@src_ft left empty).
  * Returns CDS_FT_STATUS_BUSY_ERROR if @src_ft is a live concurrent trie
- * under fine-grained writer locking (make it exclusive first).
+ * (make it exclusive first).
  * Returns CDS_FT_STATUS_POPULATED_ERROR if the graft point is already
  * populated (destination has content at or below @key).
  * Returns CDS_FT_STATUS_OVERFLOW_ERROR if the grafted keys would
@@ -2008,8 +2008,11 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  *   handles both with ONE mechanism: the FT-WIDE WRITER LOCK.
  *
  *   A bulk op first publishes the BULK-IN-PROGRESS state and waits a grace
- *   period, which drains the point mutations already in flight (each runs
- *   inside the caller's RCU read-side bracket, so one GP retires them).
+ *   period, which drains the point mutations already in flight.  Each
+ *   point op holds a read-side section of its own while it samples the
+ *   bulk state, so one grace period retires them.  The caller of a point
+ *   op holds none.  Do not call a bulk op from inside a read-side
+ *   section.
  *   While that state is live, every writer entering a writer scope takes
  *   the FT-wide lock instead of skipping it.  Point ops FLIP OUT of fine
  *   locking for the duration.  This is the `ft->lock_fine &&
@@ -2048,8 +2051,8 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
  * - > 0: Explicit key length.
  * - 0: Graft at the root (NIL prefix).
  * @swap_ft: Fractal Trie to exchange content with. Must be in the same
- *           group as @dst_ft. Under fine-grained writer locking
- *           (CDS_FT_WRITER_LOCK_FINE) @swap_ft must be EXCLUSIVE
+ *           group as @dst_ft. Under every writer strategy, @swap_ft
+ *           must be EXCLUSIVE
  *           (cds_ft_make_exclusive): it has no concurrent readers or
  *           writers. A live concurrent @swap_ft is rejected with
  *           CDS_FT_STATUS_BUSY_ERROR (see below). On entry, its content is
@@ -2076,9 +2079,9 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
  * including for the drain above. Re-establish the desired mode with
  * cds_ft_make_exclusive() / cds_ft_make_shared() if it matters.
  *
- * Source-exclusivity requirement (fine-grained locking).  @swap_ft is the
- * consumed source of the exchange.  Like the source of cds_ft_graft, it
- * must be EXCLUSIVE under CDS_FT_WRITER_LOCK_FINE.  The op then holds only
+ * Source-exclusivity requirement.  @swap_ft is the consumed source of the
+ * exchange.  Like the source of cds_ft_graft, it must be EXCLUSIVE under
+ * every writer strategy.  The op then holds only
  * @dst_ft's writer lock, with no cross-trie deadlock.  A LIVE (concurrent,
  * non-exclusive) @swap_ft is rejected with CDS_FT_STATUS_BUSY_ERROR before
  * anything is modified.  Make it exclusive first with
@@ -2094,7 +2097,7 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
  *
  * Returns CDS_FT_STATUS_OK on success.
  * Returns CDS_FT_STATUS_BUSY_ERROR if @swap_ft is a live concurrent trie
- * under fine-grained writer locking (make it exclusive first).
+ * (make it exclusive first).
  * Returns CDS_FT_STATUS_OVERFLOW_ERROR if the grafted keys would
  * exceed the group's maximum key length.
  * Returns CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if the tries are not
@@ -2110,8 +2113,11 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
  *   handles both with ONE mechanism: the FT-WIDE WRITER LOCK.
  *
  *   A bulk op first publishes the BULK-IN-PROGRESS state and waits a grace
- *   period, which drains the point mutations already in flight (each runs
- *   inside the caller's RCU read-side bracket, so one GP retires them).
+ *   period, which drains the point mutations already in flight.  Each
+ *   point op holds a read-side section of its own while it samples the
+ *   bulk state, so one grace period retires them.  The caller of a point
+ *   op holds none.  Do not call a bulk op from inside a read-side
+ *   section.
  *   While that state is live, every writer entering a writer scope takes
  *   the FT-wide lock instead of skipping it.  Point ops FLIP OUT of fine
  *   locking for the duration.  This is the `ft->lock_fine &&
@@ -2180,9 +2186,10 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
  *   ops queue on one word.  The DETACHED trie is handed back EXCLUSIVE by
  *   construction, so it has no concurrent writer to coordinate with.
  *
- *   ☐ The drain-seam gap applies: this op drops writer_lock across mid-body
- *   grace periods, so the hold is not continuous.  See enum
- *   cds_ft_writer_strategy.
+ *   This op waits for grace periods inside its body (drain seams).  A
+ *   point op on @ft may run at a seam, between two of its commits.  Bulk
+ *   ops on @ft serialize on a second lock, held across those seams.  See
+ *   enum cds_ft_writer_strategy.
  *
  *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
  *   lock per trie, so any mix of update operations may be called
@@ -2200,8 +2207,8 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
  * @key_len: Length of @key in bytes.  Use 0 to merge every key in
  *           @src_ft into @dst_ft (whole-trie merge).
  * @src_ft: Source Fractal Trie.  Must belong to the same group as
- *          @dst_ft and must not equal @dst_ft.  Under the default
- *          CDS_FT_WRITER_LOCK_FINE it must be EXCLUSIVE
+ *          @dst_ft and must not equal @dst_ft.  Under every writer
+ *          strategy it must be EXCLUSIVE
  *          (cds_ft_make_exclusive), exactly as for cds_ft_merge_at and
  *          cds_ft_graft.  A live concurrent source would need a second
  *          trie's writer lock with no lock order.  It is rejected with
@@ -2239,6 +2246,10 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
  * - @dst_ft == @src_ft;
  * - the tries are not in the same group;
  * - @key_len exceeds the group's maximum key length.
+ * Returns CDS_FT_STATUS_BUSY_ERROR in these cases, with both tries
+ * unchanged, and the caller may retry:
+ * - @src_ft is not exclusive;
+ * - a peer holds the destination root during a root-level attach.
  * Returns a negative cds_ft_status on memory allocation failure.  Both
  * tries are then left individually valid AND no moved entry is stranded.
  * The merge is built invisibly.  The source is emptied only once the
@@ -2256,7 +2267,9 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
  *   its point ops onto the FT-wide writer lock for the window.  Bulk peers
  *   queue on that same lock.  @src_ft must be EXCLUSIVE, as there.
  *
- *   ☐ The drain-seam gap applies.  See enum cds_ft_writer_strategy.
+ *   A point op on @dst_ft may run at a drain seam, between two commits of
+ *   this op.  Bulk ops serialize on a second lock, held across those
+ *   seams.  See enum cds_ft_writer_strategy.
  *
  *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
  *   lock per trie, so any mix of update operations may be called
@@ -2274,8 +2287,10 @@ enum cds_ft_status cds_ft_merge(struct cds_ft *dst_ft,
  * @dst_key_len: Length of @dst_key in bytes.
  * @src_ft: Source Fractal Trie.  Must belong to the same group as
  *          @dst_ft and must NOT equal @dst_ft -- a same-trie move is a
- *          REKEY (see cds_ft_rekey_graft / cds_ft_rekey_merge).  May be
- *          in either exclusive or concurrent mode.
+ *          REKEY (see cds_ft_rekey_graft / cds_ft_rekey_merge).  Must be
+ *          EXCLUSIVE (cds_ft_make_exclusive), under every writer
+ *          strategy.  A live source is rejected with
+ *          CDS_FT_STATUS_BUSY_ERROR.
  * @src_key: Source-side prefix selecting which @src_ft sub-trie to
  *           move.  May be NULL if @src_key_len is 0.
  * @src_key_len: Length of @src_key in bytes.
@@ -2322,8 +2337,11 @@ enum cds_ft_status cds_ft_merge(struct cds_ft *dst_ft,
  *   handles both with ONE mechanism: the FT-WIDE WRITER LOCK.
  *
  *   A bulk op first publishes the BULK-IN-PROGRESS state and waits a grace
- *   period, which drains the point mutations already in flight (each runs
- *   inside the caller's RCU read-side bracket, so one GP retires them).
+ *   period, which drains the point mutations already in flight.  Each
+ *   point op holds a read-side section of its own while it samples the
+ *   bulk state, so one grace period retires them.  The caller of a point
+ *   op holds none.  Do not call a bulk op from inside a read-side
+ *   section.
  *   While that state is live, every writer entering a writer scope takes
  *   the FT-wide lock instead of skipping it.  Point ops FLIP OUT of fine
  *   locking for the duration.  This is the `ft->lock_fine &&
@@ -2398,7 +2416,16 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
  * or CDS_FT_STATUS_INVALID_ARGUMENT_ERROR (NULL @ft, a key length exceeding the
  * group maximum, a fixed-length group, overlapping keys, or a speculative trie),
  * CDS_FT_STATUS_OVERFLOW_ERROR (a moved key would exceed the group maximum
- * length).
+ * length), or CDS_FT_STATUS_NOT_SUPPORTED (the group did not opt in with
+ * cds_ft_group_attr_set_rekey(), or an uncovered shape, see above).
+ *
+ * Update concurrency: this is a bulk op, like cds_ft_graft.  Under
+ * CDS_FT_WRITER_LOCK_FINE or _COARSE the caller needs no mutex of its own.
+ * The op waits for a grace period, so do not call it from inside a
+ * read-side section.  While it runs, point ops on @ft queue on the
+ * trie-wide writer lock, and readers take the slower coherent lookup path.
+ * Under CDS_FT_WRITER_EXTERNAL_SYNC the caller's writer exclusion must be
+ * held.
  */
 enum cds_ft_status cds_ft_rekey_graft(struct cds_ft *ft,
 		const uint8_t *dst_key, size_t dst_key_len,
@@ -2429,6 +2456,8 @@ enum cds_ft_status cds_ft_rekey_graft(struct cds_ft *ft,
  * stays compiled in on such a build.  Query cds_ft_merge_enabled() to tell
  * the two configurations apart.  Do not infer it from a NOT_SUPPORTED:
  * either entry can also return that for an uncovered SHAPE.
+ *
+ * Update concurrency: the same as cds_ft_rekey_graft.
  */
 enum cds_ft_status cds_ft_rekey_merge(struct cds_ft *ft,
 		const uint8_t *dst_key, size_t dst_key_len,
@@ -3075,8 +3104,9 @@ enum cds_ft_status cds_ft_group_attr_set_ordered_list(
  *    price of in-trie moves under an exclusion the library does not own.
  *
  * A move also requires an EAGER trie: it re-parents leaves without rewriting an
- * application-stored speculative key, so a speculative trie refuses the move
- * with CDS_FT_STATUS_INVALID_ARGUMENT_ERROR regardless of this flag.
+ * application-stored speculative key.  On a group that opted in, a
+ * speculative trie refuses the move with CDS_FT_STATUS_INVALID_ARGUMENT_ERROR.
+ * Without the opt-in, NOT_SUPPORTED comes first.
  *
  * Returns CDS_FT_STATUS_OK, or CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @attr is
  * NULL.
@@ -3201,15 +3231,15 @@ enum cds_ft_status cds_ft_group_attr_set_optimize(
  * CDS_FT_WRITER_LOCK_FINE (the DEFAULT): writers coordinate through
  *   fine-grained per-node lock-sets.  Writers on disjoint subtrees proceed in
  *   parallel.  Only structural collisions serialize.  There is no FT-wide
- *   writer mutex.  Note this is the mode under which a CROSS-TRIE graft /
- *   graft_swap / merge_at requires an EXCLUSIVE source (see those functions):
- *   being the default, that requirement applies unless a group opts out to
- *   COARSE.  A trie that also maintains order statistics is coerced to
+ *   writer mutex.  A trie that also maintains order statistics is coerced to
  *   CDS_FT_WRITER_LOCK_COARSE.  Every count-changing writer updates the shared
  *   root, so there are no disjoint writers for fine locking to parallelize.
  *
  * CDS_FT_WRITER_EXTERNAL_SYNC: the application serializes its own writers.
  *   See the enumerator below.
+ *
+ * Under every strategy, a cross-trie graft, graft_swap, merge or merge_at
+ * needs an EXCLUSIVE source (see those functions).
  *
  * Bulk operations on a CDS_FT_WRITER_LOCK_FINE trie (the mode flip).  The
  * bulk operations are:
@@ -4162,10 +4192,11 @@ enum cds_ft_compact_status {
  * graft-based population fragmentation cost a trie over time.
  *
  * One-shot convenience wrapper around cds_ft_compact_begin/step/end.  The
- * caller must exclude concurrent writers on @ft for the whole call (the same
- * mutual-exclusion contract as the other mutators). Concurrent RCU readers are
- * permitted throughout.  Other tries sharing the group keep mutating: the
- * group stays online.
+ * caller must exclude the point writers of @ft and cds_ft_recompute_stats
+ * for the whole call.  Bulk ops need no caller exclusion: on a
+ * CDS_FT_WRITER_LOCK_FINE trie the call queues behind a live bulk op.
+ * Concurrent RCU readers are permitted throughout.  Other tries sharing the
+ * group keep mutating: the group stays online.
  *
  * Returns CDS_FT_COMPACT_DONE once the trie is fully compacted.  Returns
  * CDS_FT_COMPACT_OOM if it stopped early under memory pressure.  An
@@ -4190,21 +4221,25 @@ enum cds_ft_compact_status cds_ft_compact(struct cds_ft *ft);
  * Resumable compaction (cds_ft_compact_begin / _step / _end).
  *
  * Lets a long compaction be interleaved with concurrent mutations of the
- * SAME trie.  The caller drives it.  It holds its writer mutex only around
- * each cds_ft_compact_step and releases it between steps.  Other writers
- * then get a window, and so do the grace periods that drain reclaimed
- * ranges.  Each step tolerates the structure changing between steps (a
- * writer may mutate the trie while the lock is dropped).
+ * SAME trie.  The caller drives it.  It excludes the other writers of @ft
+ * only around each cds_ft_compact_step, and releases that exclusion between
+ * steps.  The library provides no such lock under CDS_FT_WRITER_LOCK_FINE:
+ * use an application mutex that the point writers of @ft also take.  Bulk
+ * ops need no such exclusion.  Other writers then get a window between
+ * steps, and so do the grace periods that drain reclaimed ranges.  Each
+ * step tolerates the structure changing between steps (a writer may mutate
+ * the trie while the lock is dropped).
  *
  *   struct cds_ft_compact_state *st = cds_ft_compact_begin(ft);
  *   enum cds_ft_compact_status s;
  *   do {
- *           writer_lock();
+ *           app_writer_lock();
  *           s = cds_ft_compact_step(st, batch);
- *           writer_unlock();
+ *           app_writer_unlock();
  *           if (s == CDS_FT_COMPACT_OOM) {
  *                   ... free memory, then loop to resume from the same key ...
  *           }
+ *           // On CDS_FT_COMPACT_BUSY, loop to resume from the same key.
  *   } while (s != CDS_FT_COMPACT_DONE);
  *   cds_ft_compact_end(st);
  */
@@ -4226,7 +4261,9 @@ struct cds_ft_compact_state *cds_ft_compact_begin(struct cds_ft *ft);
  * @st: State from cds_ft_compact_begin.
  * @batch: Maximum nodes to relocate this step (0 selects a default).
  *
- * The caller must hold its writer exclusion for @ft across this call.  On a
+ * The caller must exclude the other writers of @ft (the point ops and
+ * cds_ft_recompute_stats) across this call.  Bulk ops need no caller
+ * exclusion.  On a
  * CDS_FT_WRITER_LOCK_FINE trie the step also takes part in the bulk-op mode
  * flip on its own, like a point op.  While a bulk op (detach, graft,
  * graft_swap, merge, rekey) is live on @ft, the step queues on the trie-wide
@@ -4238,9 +4275,10 @@ struct cds_ft_compact_state *cds_ft_compact_begin(struct cds_ft *ft);
  *                         failure.
  *   CDS_FT_COMPACT_BUSY - stopped early: a relocation lost a lock-set to a
  *                         peer.
- * The trie is valid at every step boundary. On CDS_FT_COMPACT_OOM the bound
- * cursor is left at the interrupted key.  After freeing memory the caller
- * may call this again to RESUME.  The step then re-attempts that key
+ * The trie is valid at every step boundary. On CDS_FT_COMPACT_OOM or
+ * CDS_FT_COMPACT_BUSY the bound cursor is left at the interrupted key.
+ * After an OOM, free memory first.  Then call this again to RESUME.  On
+ * BUSY there is nothing to free.  The step then re-attempts that key
  * inclusively and loses no key.  (An un-relocated node of any key pins its
  * whole old arena range against reclaim.)
  */
