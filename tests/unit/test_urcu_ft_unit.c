@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (407 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (408 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (356 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (357 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -11545,6 +11545,100 @@ static int test_merge_rerooted_glue_ordered_exclusive_dst(void)
 	}
 	for (shape = 0; shape < 3; shape++)
 		ret |= merge_rerooted_glue_ordered(shape, true);
+	return ret;
+}
+
+/*
+ * Merge a sub-position source into an EMPTY destination root, with the
+ * ordered list off.  This is the only shape that reaches the list-off root
+ * swap of cds_ft_merge_at (the appear_txn commit).  dst_key_len 0 with
+ * src_key_len 1 needs a variable-length group.  Each moved key "x" || S
+ * becomes S in dst.
+ */
+static int test_merge_at_empty_dst_root_listoff(void)
+{
+	static const char *const moved[] = { "ab", "ac", "b" };
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *dst = NULL, *src = NULL;
+	struct cds_ft_iter *iter = NULL;
+	struct ft_test_node *n[4];
+	enum cds_ft_status s;
+	unsigned int i;
+	int ret = -1;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_at_empty_dst_root_listoff: skipped, merge "
+			"compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
+	cds_ft_group_attr_set_ordered_list(attr, false);
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &dst) < 0 ||
+	    cds_ft_create(group, NULL, &src) < 0 ||
+	    cds_ft_iter_create(dst, &iter) < 0)
+		abort();
+
+	for (i = 0; i < 4; i++)
+		n[i] = node_alloc(i);
+	rcu_read_lock();
+	if (cds_ft_insert(src, (const uint8_t *) "xab", 3, &n[0]->node) < 0 ||
+	    cds_ft_insert(src, (const uint8_t *) "xac", 3, &n[1]->node) < 0 ||
+	    cds_ft_insert(src, (const uint8_t *) "xb", 2, &n[2]->node) < 0 ||
+	    cds_ft_insert(src, (const uint8_t *) "y", 1, &n[3]->node) < 0) {
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+	cds_ft_make_exclusive(src);	/* cross-trie src must be exclusive */
+	s = cds_ft_merge_at(dst, NULL, 0, src, (const uint8_t *) "x", 1);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_at_empty_dst_root_listoff: merge: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+
+	rcu_read_lock();
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK ||
+	    cds_ft_verify(src, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_at_empty_dst_root_listoff: verify failed\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	if (cds_ft_count_keys(dst) != 3 || cds_ft_count_keys(src) != 1) {
+		fprintf(stderr, "merge_at_empty_dst_root_listoff: counts dst %lu "
+			"src %lu, want 3 and 1\n", cds_ft_count_keys(dst),
+			cds_ft_count_keys(src));
+		rcu_read_unlock();
+		goto out;
+	}
+	for (i = 0; i < 3; i++) {
+		cds_ft_iter_set_key(iter, (const uint8_t *) moved[i],
+			strlen(moved[i]));
+		cds_ft_lookup(dst, iter);
+		if (cds_ft_iter_node(iter) != &n[i]->node) {
+			fprintf(stderr, "merge_at_empty_dst_root_listoff: dst "
+				"lookup \"%s\" missed\n", moved[i]);
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	if (iter)
+		cds_ft_iter_destroy(iter);
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
 	return ret;
 }
 
@@ -41035,6 +41129,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rerooted_glue_ordered_compressed);
 	RUN_TEST(test_merge_rerooted_glue_ordered_key_shorter);
 	RUN_TEST(test_merge_rerooted_glue_ordered_exclusive_dst);
+	RUN_TEST(test_merge_at_empty_dst_root_listoff);
 	RUN_TEST(test_merge_subpos_branch_reserve);
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_atnode);
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_branch);

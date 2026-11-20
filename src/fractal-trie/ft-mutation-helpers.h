@@ -15804,10 +15804,15 @@ void ft_root_list_swap_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 * @txn is the caller-PRE-RESERVED bounded txn: every Class-G root swap
 	 * reserves in its fallible prefix.  It is committed infallibly here.
 	 * The un-abortable post-drain root swap reaches an allocation-free
-	 * commit.
+	 * commit.  A failed commit means the premise is false, as for the
+	 * take above.
 	 */
-	/* Bulk op, not yet MW-hardened: ABORT unreachable under its exclusion. */
-	(void) ft_ord_cell_flip_into(ft, txn, edges, n);
+	if (ft_ord_cell_flip_into(ft, txn, edges, n) != URCU_TXN_STATUS_OK) {
+		fprintf(stderr, "FT ROOT LIST SWAP: commit failed on an "
+			"unfailable publish (ft %p)\n", (void *) ft);
+		fflush(stderr);
+		abort();
+	}
 }
 
 /*

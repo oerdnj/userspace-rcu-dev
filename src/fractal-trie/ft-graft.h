@@ -3594,7 +3594,8 @@ retry_attach:
 					(void *) ft_node_flag(fresh_node, 0));
 				ft_flip_txn_record_tombstone(src_retire_txn,
 					cds_ft_item_to_metadata(ft_node_ptr(old_src_root)));
-				ft_flip_txn_commit(src_ft, src_retire_txn);
+				ft_flip_txn_commit_unfailable(src_ft,
+					src_retire_txn);
 			} else {
 				ft_root_edge_flip(src_ft, &src_ft->root,
 					old_src_root, ft_node_flag(fresh_node, 0));

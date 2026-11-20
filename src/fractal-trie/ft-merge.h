@@ -3927,7 +3927,7 @@ merge_spine_retry:
 				dst_root_snap);
 			ft_flip_txn_record_tombstone_locked(appear_txn,
 				dst_rmeta, dst_root_snap);
-			ft_flip_txn_commit(dst_ft, appear_txn);
+			ft_flip_txn_commit_unfailable(dst_ft, appear_txn);
 		}
 		FT_TP(root_publish, (const void *) dst_ft,
 			(const void *) dst_ft->root);
