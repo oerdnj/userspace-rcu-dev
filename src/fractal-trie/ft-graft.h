@@ -4595,13 +4595,19 @@ retry_swap:
 			 * applies the key map itself.  On a non-identity
 			 * group, the already-remapped @key would be remapped
 			 * twice: wrong graft point, wrong splice position.
+			 *
+			 * Close the attempt first: it holds a read-side section.
+			 * cds_ft_graft's nested gate may wait for a peer gate's
+			 * grace period (a rekey's move gate), and that grace
+			 * period would wait for this section.  The delegate uses
+			 * no node this descent captured.
 			 */
-			enum cds_ft_status s = cds_ft_graft(dst_ft, _key, _key_len,
-					swap_ft);
+			enum cds_ft_status s;
 
-			FT_TP(graft_swap_exit, (int) s);
 			ft_txn_attempt_end(&optxn, gs_open);
 			gs_open = false;
+			s = cds_ft_graft(dst_ft, _key, _key_len, swap_ft);
+			FT_TP(graft_swap_exit, (int) s);
 			return s;
 		}
 

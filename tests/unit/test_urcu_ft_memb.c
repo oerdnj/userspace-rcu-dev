@@ -25,10 +25,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "tap.h"
 
-#define NR_TESTS	10
+#define NR_TESTS	12
 
 #define KEY_LEN		8
 /*
@@ -655,6 +656,121 @@ out:
 	return ret;
 }
 
+/*
+ * A cds_ft_graft_swap at an empty key delegates to cds_ft_graft.  A rekey on
+ * the same trie runs beside it, so its move gate can own a grace period while
+ * the graft's nested gate waits for that grace period.  The delegate must hold
+ * no read-side section then, or each thread waits for the other.
+ */
+#define NR_SWAPS		2000
+#define NR_REKEY_PINGPONG	2000
+#define HANG_TIMEOUT_S		60
+
+static struct cds_ft *swap_dst;
+static int swap_done, rekey_done;
+static unsigned long rekey_moves;
+
+static void *rekey_thread(void *arg)
+{
+	static const uint8_t a[] = { 2 }, b[] = { 3 };
+	unsigned int i;
+	long ret = 0;
+
+	(void) arg;
+	rcu_register_thread();
+	for (i = 0; i < NR_REKEY_PINGPONG && !uatomic_read(&swap_done); i++) {
+		const uint8_t *from = (i & 1) ? b : a, *to = (i & 1) ? a : b;
+		enum cds_ft_status s = cds_ft_rekey_graft(swap_dst, to, 1,
+				from, 1);
+
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "rekey %u: %s\n", i,
+				cds_ft_status_to_string(s));
+			ret = -1;
+			break;
+		}
+		uatomic_inc(&rekey_moves);
+	}
+	rcu_unregister_thread();
+	uatomic_set(&rekey_done, 1);
+	return (void *) ret;
+}
+
+static void *hang_watchdog(void *arg)
+{
+	unsigned int s;
+
+	(void) arg;
+	for (s = 0; s < HANG_TIMEOUT_S * 10; s++) {
+		if (uatomic_read(&swap_done) && uatomic_read(&rekey_done))
+			return NULL;
+		usleep(100000);
+	}
+	fprintf(stderr, "graft_swap delegate vs rekey: no progress in %d s\n",
+		HANG_TIMEOUT_S);
+	printf("not ok - graft_swap: a delegate beside a rekey hangs\n");
+	fflush(stdout);
+	_exit(2);	/* no core file */
+}
+
+static int test_graft_swap_delegate_vs_rekey(enum cds_ft_writer_strategy strategy,
+		const char *name)
+{
+	struct cds_ft_group *group;
+	pthread_t rk, wd;
+	unsigned int i;
+	void *rk_ret;
+	int ret = 0;
+
+	swap_dst = create_rekey_ft(strategy, &group);
+	uatomic_set(&swap_done, 0);
+	uatomic_set(&rekey_done, 0);
+	uatomic_set(&rekey_moves, 0);
+	for (i = 0; i < 16; i++) {
+		uint8_t k[2] = { 2, (uint8_t) i };
+
+		if (insert_one(swap_dst, k, sizeof(k), i) < 0)
+			abort();
+	}
+	if (pthread_create(&wd, NULL, hang_watchdog, NULL) ||
+			pthread_create(&rk, NULL, rekey_thread, NULL))
+		abort();
+	for (i = 0; i < NR_SWAPS; i++) {
+		uint8_t key[3] = { 5, (uint8_t) i, (uint8_t) (i >> 8) };
+		uint8_t sk[1] = { 0 };
+		struct cds_ft *swap;
+		enum cds_ft_status s;
+
+		if (cds_ft_create(group, NULL, &swap) < 0)
+			abort();
+		if (insert_one(swap, sk, sizeof(sk), 100000 + i) < 0)
+			abort();
+		cds_ft_make_exclusive(swap);
+		s = cds_ft_graft_swap(swap_dst, key, sizeof(key), swap);
+		cds_ft_destroy(swap);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "%s: graft_swap %u: %s\n", name, i,
+				cds_ft_status_to_string(s));
+			ret = -1;
+			break;
+		}
+	}
+	uatomic_set(&swap_done, 1);
+	if (pthread_join(rk, &rk_ret) || pthread_join(wd, NULL))
+		abort();
+	if (rk_ret)
+		ret = -1;
+	diag("%s: %u swaps beside %lu rekeys", name, i,
+		uatomic_read(&rekey_moves));
+	if (!uatomic_read(&rekey_moves))
+		ret = -1;	/* the rekey never ran beside the swaps */
+	if (cds_ft_verify(swap_dst, stderr) != CDS_FT_STATUS_OK)
+		ret = -1;
+	if (drain_and_destroy(swap_dst, group) < 0)
+		ret = -1;
+	return ret;
+}
+
 int main(void)
 {
 	if (create_all_cpu_call_rcu_data(0))
@@ -692,6 +808,12 @@ int main(void)
 	ok(test_graft_walk_gp_progress(CDS_FT_WRITER_LOCK_COARSE,
 			"graft_repair_coarse") == 0,
 		"graft: grace periods complete during the hint repair walk (COARSE)");
+	ok(test_graft_swap_delegate_vs_rekey(CDS_FT_WRITER_LOCK_FINE,
+			"swap_vs_rekey_fine") == 0,
+		"graft_swap: a delegate beside a rekey completes (FINE)");
+	ok(test_graft_swap_delegate_vs_rekey(CDS_FT_WRITER_LOCK_COARSE,
+			"swap_vs_rekey_coarse") == 0,
+		"graft_swap: a delegate beside a rekey completes (COARSE)");
 
 	rcu_unregister_thread();
 	return exit_status();
