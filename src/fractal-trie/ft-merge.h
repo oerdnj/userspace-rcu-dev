@@ -1668,8 +1668,6 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 {
 	struct ft_glue gd, gs;
 	struct ft_merge_ctx ctx = { .dst_ft = dst_ft, .gd = &gd, .gs = &gs };
-	/* Set from the step-4 commit; read by ft_glue_clear_fenced below. */
-	bool fenced_committed = false;
 	struct ft_merge_counts cnt = { 0, 0, 0, 0, 0 };
 	bool root_src = (src_key_len == 0);
 	bool ks_dst = (off_dst > 0);
@@ -2409,7 +2407,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			gs.txn = src_side_txn;
 			gs.fuse_free_list = true;
 			ft_glue_tombstone_free_list(&gs);
-			ft_flip_txn_commit(src_ft, src_side_txn);
+			ft_flip_txn_commit_unfailable(src_ft, src_side_txn);
 			src_side_txn = NULL;	/* consumed */
 		} else {
 			/*
@@ -2698,58 +2696,31 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 *    (descend then up-walk) only progresses old->merged.  And the
 	 *    ordered-list front advances in the same instant the merged
 	 *    minimum becomes reachable.
+	 *
+	 *    The src is unlinked by now, so this commit cannot fail safely.
+	 *    A failure would lose the src keys and free live dst nodes.  The
+	 *    locks, the records and the edge scratch were all taken before
+	 *    the unlink, and the bulk gate excludes every dst peer writer.
 	 */
-	{
-		enum urcu_txn_status mst = ft_flip_txn_commit(dst_ft, txn);
-
-		/*
-		 * Carried out of this block for ft_glue_clear_fenced below.
-		 * The fenced retires' fate is the OP's own knowledge, and that
-		 * sweep must not re-derive it from the state words.
-		 */
-		fenced_committed = (mst == URCU_TXN_STATUS_OK);
-
-		/*
-		 * The flip did not happen, so no fenced retire took effect and
-		 * this op owns none of those frees.  Renounce them before the
-		 * step-7 reclaim.  The dominant reason a fenced terminal aborts
-		 * is a PEER retiring the node under our fence: the retire
-		 * primitives do not honour LOCK.  That peer owns the reclaim.
-		 * Freeing here would be a double free on top of an already-lost
-		 * merge.
-		 *
-		 * The merge itself still cannot recover, because the src is
-		 * unlinked by now.  This is the pre-existing
-		 * abort-after-point-of-no-return exposure.  The unlocked
-		 * pub_parent publish shares it.  But the merge must not
-		 * corrupt the arena on the way out.
-		 */
-		if (mst != URCU_TXN_STATUS_OK)
-			ft_glue_fenced_renounce_free(&gd);
-	}
+	ft_flip_txn_commit_unfailable(dst_ft, txn);
 
 	/*
 	 * 5. Drop the dup-chain holder locks: the appends are installed, so peers
 	 *    may mutate those chains again.  Do it BEFORE the step-7 reclaim
 	 *    below.  Most holders are dst overlap-spine nodes this merge
 	 *    retires, and the fence has to come off while the node is still
-	 *    there to clear.  (The fence survives the commit either way.  The
-	 *    free-list retire records a plain {LOCK|s -> LOCK|s|TOMBSTONE}
-	 *    upgrade, and an aborted commit leaves {LOCK|s}.  The one holder
-	 *    that IS the publish target was handed to @txn above and is
-	 *    already released by its flip.)
+	 *    there to clear.  (The fence survives the commit: the free-list
+	 *    retire records a plain {LOCK|s -> LOCK|s|TOMBSTONE} upgrade.  The
+	 *    one holder that IS the publish target was handed to @txn above
+	 *    and is already released by its flip.)
 	 */
 	ft_glue_release_splice_holders(&gd);
 	/*
 	 *    Same for the overlap-spine plan-locks.  A COMMITTED fenced retire
 	 *    consumed each fence into TOMBSTONE, so the sweep releases nothing.
-	 *    An ABORTED commit left {LOCK|s}.  That must come off, or every
-	 *    later peer publish into that node fails forever.  The sweep does
-	 *    not ask the state word which case it is: @fenced_committed tells
-	 *    it.  Before the step-7 reclaim, while the nodes are still
-	 *    addressable.
+	 *    Before the step-7 reclaim, while the nodes are still addressable.
 	 */
-	ft_glue_clear_fenced(&gd, fenced_committed);
+	ft_glue_clear_fenced(&gd, /*committed=*/ true);
 
 	/*
 	 * 6. The dst net key-count delta (merged_keys - cnt_dst) is FOLDED into

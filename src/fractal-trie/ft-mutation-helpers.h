@@ -10284,6 +10284,27 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 }
 
 /*
+ * Commit a txn that has no way left to fail safely: a bulk op's commit past
+ * its point of no return.  The op took every lock and reserved every record
+ * before that point, and it excludes every peer writer.  If the commit fails
+ * anyway, that premise is false.  Going on would lose keys or free live
+ * nodes.  So report it and abort, as ft_flip_txn_lock_root_unfailable does.
+ */
+static inline
+void ft_flip_txn_commit_unfailable(struct cds_ft *ft, struct ft_flip_txn *t)
+{
+	enum urcu_txn_status st = ft_flip_txn_commit(ft, t);
+
+	if (caa_unlikely(st != URCU_TXN_STATUS_OK)) {
+		fprintf(stderr, "FT UNFAILABLE COMMIT FAILED: status %d producer "
+			"%p -- the bulk op's premise is false\n", (int) st,
+			__builtin_return_address(0));
+		fflush(stderr);
+		abort();
+	}
+}
+
+/*
  * A SAME-VALUE record ({v -> v}) is a validate.  Onto a slot this txn already
  * records with pending value @v, it adds nothing: it would validate the txn's
  * own pending write.  The MW front end fuses it away.  The SW engine's blind
@@ -25672,31 +25693,6 @@ bool ft_glue_fence_holds_node(const struct ft_glue *g,
 			return true;
 	}
 	return false;
-}
-
-/*
- * Renounce the free of every fenced overlap node.  Call this when the commit
- * did NOT report OK.
- *
- * A fenced retire's LIVE->TOMBSTONE transition is atomic with the flip.  So
- * if the flip did not happen, this op performed no retire and owns no free.
- * Something else may own it.  The dominant reason a fenced terminal aborts
- * is that a PEER retired the node under our fence: the retire primitives do
- * not honour LOCK.  That peer owns the reclaim.  Freeing here would be a
- * double free.
- *
- * This is separate from ft_glue_clear_fenced, which releases the FENCE.
- * This function releases the claim on the MEMORY.  Both run on the aborting
- * path.
- */
-static
-void ft_glue_fenced_renounce_free(struct ft_glue *g)
-{
-	int i;
-
-	for (i = 0; i < g->nr_free; i++)
-		if (g->free_list[i].fenced)
-			g->free_list[i].retired = false;
 }
 
 /*
