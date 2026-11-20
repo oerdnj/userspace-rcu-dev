@@ -20,47 +20,54 @@
  * REKEY-COHERENT POINT LOOKUPS: TWO FORWARD DESCENTS.
  * ===========================================================================
  *
- * FIRST, the MODE GATE (struct cds_ft::move_active): with no move in flight the
- * coherent entry points tail-call the ordinary specialization, and the whole
- * mechanism costs one load of a quiet word -- sound because a mover publishes the
- * gate and waits a grace period BEFORE touching the structure, so a reader that
- * samples "inactive" cannot have a move mutate under it inside its own critical
- * section.
+ * FIRST, the MODE GATE (struct cds_ft::move_active).  With no move in flight
+ * the coherent entry points tail-call the ordinary specialization.  The whole
+ * mechanism then costs one load of a quiet word.  This is sound because a
+ * mover publishes the gate and waits a grace period BEFORE touching the
+ * structure.  So a reader that samples "inactive" cannot have a move mutate
+ * under it inside its own critical section.
  *
- * Otherwise: descend TWICE and accept only if both descents agree on the result
- * AND on the visited-node witness (struct ft_visit_witness).  Sound because a
- * single descent can witness a view torn across a move only by STRADDLING its
- * commit, and two SEQUENTIAL descents cannot both straddle the same commit -- the
- * antisymmetry the earlier up-walk construction got from descend-vs-up-walk comes
- * here from pass1-before-pass2.  This is the design's uniform choice, the same
- * primitive the relational path and the rekey writer use.
+ * Otherwise: descend TWICE.  Accept only if both descents agree on the result
+ * AND on the visited-node witness (struct ft_visit_witness).  This is sound
+ * for two reasons:
  *
- * WHY THIS REPLACED THE UP-WALK KEY WITNESS (which compared the found leaf's
- * structurally rematerialized key against the descended key):
+ *  - a single descent can witness a view torn across a move only by
+ *    STRADDLING its commit;
+ *  - two SEQUENTIAL descents cannot both straddle the same commit.
  *
- *  - it was HIT-ONLY.  A MISS has no leaf to walk up from, so a move that tore
- *    the descent into a dead end produced a FALSE MISS with nothing to check.
- *    Two descents cover hit and miss uniformly: the PATH is the witness, not the
- *    result.
- *  - it needed the ORDERED-LIST CELL as its up-walk source, which is why
- *    coherence was gated on ->ordered_list.  Nothing about an in-trie move needs
- *    the cell, so that requirement is now gone: coherence is available on every
- *    EAGER trie, list or no list.
- *  - it read the METADATA cache line the forward descent does not need.
+ * The earlier up-walk construction got this antisymmetry from
+ * descend-vs-up-walk.  Here it comes from pass1-before-pass2.  This is the
+ * design's uniform choice: the relational path and the rekey writer use the
+ * same primitive.
  *
- * Must run under the caller's RCU read lock, like any traversal, and both
- * descents must be in the one critical section (the compared addresses are only
- * meaningful, and the pointers only valid, within it).
+ * WHY THIS REPLACED THE UP-WALK KEY WITNESS.  That witness compared the found
+ * leaf's structurally rematerialized key against the descended key.
+ *
+ *  - It was HIT-ONLY.  A MISS has no leaf to walk up from.  So a move that
+ *    tore the descent into a dead end produced a FALSE MISS with nothing to
+ *    check.  Two descents cover hit and miss uniformly: the PATH is the
+ *    witness, not the result.
+ *  - It needed the ORDERED-LIST CELL as its up-walk source.  That is why
+ *    coherence was gated on ->ordered_list.  Nothing about an in-trie move
+ *    needs the cell, so that requirement is now gone.  Coherence is available
+ *    on every EAGER trie, list or no list.
+ *  - It read the METADATA cache line, which the forward descent does not
+ *    need.
+ *
+ * Must run under the caller's RCU read lock, like any traversal.  Both
+ * descents must be in the one critical section.  Only within it are the
+ * compared addresses meaningful and the pointers valid.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
 extern long cds_ft_fault_rekey_countdown;
 #endif
 
 /*
- * Test-only: force ONE coherence check to report a MISS, exactly as a concurrent
- * in-trie rekey that restructured the reader's path would.  Shared by the point
- * two-descent and the relational two-pass so a single knob
- * (cds_ft_fault_rekey_countdown) arms whichever check runs next.  Self-clearing,
+ * Test-only: force ONE coherence check to report a MISS.  A concurrent in-trie
+ * rekey that restructured the reader's path would report exactly the same.
+ * The point two-descent and the relational two-pass share this helper.  So a
+ * single knob (cds_ft_fault_rekey_countdown) arms whichever check runs next.
+ * Self-clearing,
  * so it cannot livelock the retry loop it exists to exercise.  Compiles to a
  * constant false without FEATURE_FT_FAULT_INJECT.
  */
@@ -80,12 +87,12 @@ bool ft_rekey_fault_miss(void)
 }
 
 /*
- * The two descents.  @iter is populated by the SECOND (accepted) descent, so the
+ * The two descents.  The SECOND (accepted) descent populates @iter.  So the
  * caller's iterator ends up exactly as a single successful descent would leave
  * it.  Retries on disagreement: an incoherent view cannot be repaired, only
- * re-taken, which makes a reader LOCK-FREE (not wait-free) for as long as moves
- * keep restructuring the path it is reading -- inside a move window, and only
- * there.
+ * re-taken.  This makes a reader LOCK-FREE (not wait-free) for as long as
+ * moves keep restructuring the path it is reading.  That happens inside a
+ * move window, and only there.
  */
 static
 enum cds_ft_status ft_lookup_two_descents(struct cds_ft *ft,
@@ -122,11 +129,12 @@ enum cds_ft_status ft_lookup_two_descents(struct cds_ft *ft,
 }
 
 /*
- * REKEY-coherent exact lookup specializations, installed on ft->lookup_key_fn in
- * place of ft_lookup_precise_{sc,nosc} when ft->rekey_coherence.  Fast mode
- * tail-calls the ordinary specialization, so with no move in flight this costs
- * the gate load and nothing else; otherwise the two descents above.  Not in the
- * hot .text cluster; real symbols (fn-ptr targets), so not inlined.
+ * REKEY-coherent exact lookup specializations.  They are installed on
+ * ft->lookup_key_fn in place of ft_lookup_precise_{sc,nosc} when
+ * ft->rekey_coherence.  Fast mode tail-calls the ordinary specialization.  So
+ * with no move in flight this costs the gate load and nothing else.
+ * Otherwise they run the two descents above.  Not in the hot .text cluster.
+ * They are real symbols (fn-ptr targets), so not inlined.
  */
 static
 enum cds_ft_status ft_lookup_precise_coherent_sc(struct cds_ft *ft,
@@ -162,8 +170,8 @@ enum cds_ft_status ft_lookup_precise_coherent_nosc(struct cds_ft *ft,
 
 #ifdef FEATURE_FT_KEY_MAP
 /*
- * Non-identity key_map REKEY-coherent exact lookup: remap once, then the two
- * descents (which take ordinal bytes, like every internal descent).
+ * Non-identity key_map REKEY-coherent exact lookup.  Remap once, then run the
+ * two descents.  They take ordinal bytes, like every internal descent.
  */
 static
 enum cds_ft_status ft_lookup_key_coherent_nonidentity(struct cds_ft *ft,
@@ -204,9 +212,9 @@ enum cds_ft_status cds_ft_eager_lookup_key(struct cds_ft *ft,
  * lookup key.  If it does not match, the key is not in the trie.
  *
  * This is faster than cds_ft_eager_lookup_key for workloads with long
- * compressed paths (e.g. reverse DNS, file paths) because it
- * eliminates per-node key comparisons, doing a single verification
- * at the end instead.
+ * compressed paths (e.g. reverse DNS, file paths).  It eliminates
+ * per-node key comparisons and does a single verification at the end
+ * instead.
  */
 FT_LOOKUP_DISPATCH("lookup_candidate_key")
 enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
@@ -219,12 +227,12 @@ enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
 
 /*
  * Specialized iter-form lookup inners.  iter is always non-NULL on
- * this path (path tracking is the whole point of the iter API), so
+ * this path: path tracking is the whole point of the iter API.  So
  * each inner bakes that into the wrapper call along with the
  * (descend_cand, skip_compressed) pair.  iter already holds
- * ordinals-mapped key bytes (see cds_ft_iter_set_key: non-identity
- * key_map remapping happens at iter-set time, not at lookup time),
- * so there is no non-identity branch on this path.
+ * ordinals-mapped key bytes, so there is no non-identity branch on
+ * this path.  See cds_ft_iter_set_key: non-identity key_map remapping
+ * happens at iter-set time, not at lookup time.
  */
 static FT_LOOKUP_FAST_PATH("lookup")
 enum cds_ft_status ft_lookup_iter_precise_sc(struct cds_ft *ft,
@@ -257,12 +265,12 @@ enum cds_ft_status ft_lookup_iter_precise_nosc(struct cds_ft *ft,
 /*
  * REKEY-coherent iterator EXACT lookup (installed on ft->lookup_iter_fn when
  * ft->rekey_coherence): the iter-form sibling of ft_lookup_precise_coherent_*.
- * The search key is SNAPSHOTTED first: the descent's epilogue
+ * The search key is SNAPSHOTTED first.  The descent's epilogue
  * (iter_auto_invalidate_cache, UNCACHED mode) may materialize the FOUND leaf's
- * key into iter_key(iter), so the second descent would otherwise run with the
- * wrong key.  The exact iter descent always top-descends from the root (no
- * cross-call cache path, unlike the inequality descent), so re-calling it is a
- * clean fresh descent.
+ * key into iter_key(iter).  Without the snapshot, the second descent would
+ * run with the wrong key.  The exact iter descent always top-descends from
+ * the root: it has no cross-call cache path, unlike the inequality descent.
+ * So re-calling it is a clean fresh descent.
  */
 static
 enum cds_ft_status ft_lookup_iter_precise_coherent_sc(struct cds_ft *ft,
