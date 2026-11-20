@@ -4576,3 +4576,478 @@ Each step is bisectable, each gated by §3's protocol; nothing below the C
 line starts before the C measurement exists, because C is what prices D–F.
 ☑ That gate is now SATISFIED — C is done and priced D–F — so the ordering
 constraint it expressed has been discharged rather than merely deferred.
+
+## Moved from the public header (2026-11-19)
+
+The text below came from comments in `include/urcu/fractal-trie.h`. It is
+transition history and design notes, not API documentation, so it was moved
+here and the header keeps only the current rule.
+
+Each subsection names the header comment it came from. The facts, figures
+and names are those of the header text. A line that starts with "Status
+2026-11-19:" says what the code does today, where the moved text is no
+longer true. File names are relative to `src/fractal-trie/` unless they
+start with `include/` or `tests/`.
+
+### M1. `enum cds_ft_writer_strategy`: the transition log
+
+The header comment had a block titled "☐ TODO -- THE FINE-LOCKING
+TRANSITION IS INCOMPLETE, BUT EVERY POINT OPERATION IS NOW CONVERTED". All
+of it is below, in the order of the header.
+
+#### M1.1 What is converted and what remains
+
+The fine-locking transition is incomplete, but every POINT operation is now
+converted. The converted operations are:
+
+- `cds_ft_insert`;
+- `cds_ft_remove`;
+- `cds_ft_replace`;
+- `cds_ft_insert_unique`;
+- `cds_ft_remove_all`;
+- `cds_ft_insert_replace`, since the whole-chain freeze went into its
+  commit.
+
+Their notes say they may run concurrently with each other "including on the
+same key".
+
+The BULK ops are NOT in the waiting set at all: graft, graft_swap, merge_at,
+merge, detach and the rekeys. See M1.8 (the mode flip).
+
+What remains: `cds_ft_compact_step` and `cds_ft_recompute_stats`, which
+carry no writer-strategy paragraph at all. By plan, concurrent compaction is
+the last step of the transition, after rekey.
+
+Status 2026-11-19: `cds_ft_compact_step` now has a FINE paragraph in the
+header. Its code enters `CDS_FT_SCOPED_WRITER(ft)` on each step
+(`ft-compact.h`, `cds_ft_compact_step`, "THE MODE FLIP, PER STEP"). The
+header still asks the caller to hold its writer exclusion across the call.
+`cds_ft_recompute_stats` still has no writer-strategy paragraph. Its header
+comment asks for the caller's mutual exclusion with other writers.
+
+#### M1.2 ☠ "Every point op is converted" is not "the transition is done"
+
+The per-op notes are the wrong place to look for the difference. A converted
+op is one whose CALLERS may run it concurrently. The transition also owes
+the WORD-KIND conversions:
+
+- the duplicate list to SW under the nearest ancestor lock;
+- the SKIP_X dual;
+- `metadata.parent_word` / `parent_slot_offset`.
+
+Those are tracked in the word-kind table in `fractal-trie-internal.h`, not
+in the public header.
+
+#### M1.3 ★ The order is part of the plan
+
+The order is not an accident of what got done first:
+
+1. point ops;
+2. bulk;
+3. rekey;
+4. concurrent compaction, as the final step.
+
+Until then `cds_ft_compact` / `cds_ft_compact_step` require the caller's
+exclusion and are NOT in the validated set. This lets a conversion land
+while a compaction producer of the same word is still MW. The two never run
+concurrently, so they cannot disagree on a word's kind.
+
+⇒ Do NOT hold a conversion back on account of a compaction-only producer.
+Do NOT read "compaction still CASes it MW" as a blocker.
+
+#### M1.4 ☠ Read those sentences as a TODO, not as a contract
+
+They describe work not yet done, not a property anyone wants. No design
+reason prevents the rest from coordinating through the same per-node
+lock-sets as insert and remove. A caller-side mutex around them defeats the
+point of the default strategy. This was documented once, at the enum,
+because per-op notes with identical wording read like deliberate decisions.
+
+#### M1.5 ★ They are not all one defect shape
+
+The note used to assume that they were, and that was a trap.
+
+- Most unconverted ops derive something with NOTHING HELD and then trust it.
+  The converted sibling goes on to ACQUIRE the owning node and RE-VALIDATE.
+- `cds_ft_remove_all` was different. It already acquired and re-validated
+  everything it derived. What it lacked was PROGRESS. Its body ran exactly
+  once. So every correct abort, which had published nothing, was handed to
+  the caller as BUSY_ERROR.
+- Under a same-key peer, 91% of its calls failed that way (measured 25634
+  BUSY vs 2473 OK). It lost no node and corrupted nothing.
+
+⇒ Ask what an op is missing before applying the recipe. Three of the four
+needed exclusion; the fourth needed a loop.
+
+#### M1.6 ☑ The four conversions
+
+**`cds_ft_replace` was the first of the four converted.** It is the worked
+example to copy, with one lesson that generalises. Its conversion is smaller
+than remove's. How much re-validation an op owes after its acquire is a
+question about the op, not a template to apply:
+
+- remove re-validates its ROUTING ("★ RE-VALIDATE THE CALLER'S ROUTING",
+  `ft-remove.h`). Its three arms are three DIFFERENT structural transforms,
+  so a stale decision publishes an ILLEGAL SHAPE.
+- replace has ONE transform in every arm. It is recorded with the target
+  node as the EXPECTED-OLD, so a stale slot ABORTS. The expected-old IS the
+  routing validation. The lock adds EXCLUSION.
+- The lock also adds the one thing a value-CAS cannot see: a stale slot
+  ADDRESS inside the retired copy of a COW'd holder. The body of that copy
+  still holds the expected old node, so the CAS would succeed into a dead
+  node. The lock catches it because `ft_dlm_lock` refuses a TOMBSTONE.
+- NEITHER re-validates from the root. Both checks are a back-pointer hop.
+
+**☠ A hold cancels the §4.B guard on the same word.** The conversion has to
+know about this trap.
+
+- The expectation of `ft_flip_txn_guard_parent` masks `FT_STATE_LOCK` out.
+- So it can never match on a word the op itself locked, and 100% of commits
+  abort.
+- Measured: 49966 of 49974, attributed to the VALIDATE class by
+  `-DFT_WINNER_DBG`.
+- `ft_flip_txn_lock_or_guard_parent_at` already encodes the skip on its
+  `@held.shared` path. A hand-rolled acquire must spell it itself.
+
+**☑ `cds_ft_insert_replace` answered that question with a yes.** It is the
+one op that needed MORE than the acquire+revalidate recipe.
+
+- It replaces the whole duplicate chain.
+- The composed version froze only the HEAD. That left 21.7% of
+  displacements with unmarked LIVE members.
+- A concurrent `cds_ft_insert` appends onto one of them and the key is LOST,
+  with nothing in the trie to say so.
+- The cure is one commit that freezes the whole chain, with the length as a
+  BOUND: the last member is recorded against the derived NULL.
+- A concurrently appended duplicate then tears the expected-old and aborts,
+  instead of being marked into a tombstone.
+
+⇒ "Ask what an op is missing" (M1.5) applies a fourth time. Three needed
+exclusion, one needed a loop, and this one needed its marks folded into the
+COMMIT.
+
+The `cds_ft_insert_replace` comment in the header carried the same figure:
+"Freezing only the head left 21.7% of displacements with unmarked live
+members. A concurrent cds_ft_insert could then append onto them and lose the
+key." The header now states the rule without the figure.
+
+**☑ `cds_ft_remove_all` was converted by adding its retry loop.** Three
+premises died with its exclusion. Each was a comment asserting something the
+conversion falsifies:
+
+- an "-EAGAIN from here is the whole CALL failing" in the orphan acquire;
+- an assert that detach cannot return -ENOENT "because it has been found by
+  a mutex-protected traversal within this function" (no mutex exists there
+  under FINE);
+- a discarded unsplice status justified by "ABORT unreachable under its
+  current exclusion".
+
+A FOURTH was only reachable at EXPONENTIAL spacing. The op derives its
+holder from the chain head's BACK POINTER. It then re-derives it TOP-DOWN by
+the key, for the lock-set depths. Under a peer the two can disagree. That
+used to be impossible. It now bails retriably instead of asserting.
+
+#### M1.7 The cross-trie / bulk ops: the source side is settled
+
+The destination's story is NOT the per-node conversion an earlier version of
+the note claimed.
+
+Settled:
+
+- `cds_ft_graft` and `cds_ft_graft_swap` require an EXCLUSIVE source under
+  FINE;
+- `cds_ft_merge_at` likewise (its code returns BUSY for a concurrent
+  source);
+- `cds_ft_detach` hands back a trie exclusive by construction.
+
+An exclusive trie has no concurrent writer to coordinate with, so nothing is
+owed there.
+
+☠ Their FINE paragraphs used to promise the opposite of the design, and were
+corrected. They said bulk ops "may run concurrently on the same destination"
+and handed point exclusion to the caller. Neither is the goal, and neither
+is what the code does.
+
+#### M1.8 ☑ Bulk-vs-point exclusion: the mode flip is the design
+
+Bulk-vs-point exclusion is not the caller's, nor is it owed. A bulk op
+publishes the gate and waits a GP. From then on a FINE point op FLIPS MODE:
+it takes the FT-wide writer lock instead of skipping it. This is the test in
+`ft_writer_lock_scope_enter` (G5.25):
+
+    ft->lock_fine && !(FT_BULK_WIDE_LOCK && ft_bulk_active(ft))
+
+So bulk and point writers arbitrate on one word. The FT-wide lock protects
+the bulk-op mode transition, which is also the reader dual-descent
+transition. That mode flip IS the target design for bulk-vs-point, not a
+placeholder for per-node work.
+
+⇒ The bulk ops' own paragraphs now say so. The POINT ops' notes still do not
+mention bulk ops at all. That is the remaining under-description.
+
+★ The FT-wide lock is the mechanism, not an over-hold awaiting relaxation.
+The goal is one word for both questions. BULK-vs-BULK is the FT-wide writer
+lock. BULK-vs-POINT is the same lock, reached by flipping the point ops onto
+it. The bulk-in-progress state is the flip, not a second mechanism:
+
+1. publish it;
+2. wait a grace period, so that the point mutations already in flight
+   drain;
+3. from then on every writer scope takes the lock.
+
+Bulk peers queue on it for the same reason point ops do.
+
+⇒ An exclusion argument for a bulk op MAY rest on the FT-wide lock; that is
+what it is for. It may NOT rest on the lock being held CONTINUOUSLY across
+the whole body, because it is not. See M1.9.
+
+Status 2026-11-19: "BULK-vs-BULK is the FT-wide writer lock" is no longer
+the whole mechanism. Bulk ops now serialize on a second lock, `bulk_lock`
+(`fractal-trie-internal.h`, `struct cds_ft` and `ft_bulk_lock_enter`). The
+test in `ft_writer_lock_scope_enter` is unchanged.
+
+#### M1.9 ☐ The drain-seam gap
+
+There is one gap against that goal, and it is in the bulk op's OWN code.
+
+- `ft_writer_lock_gp_wait` UNCONDITIONALLY drops `writer_lock` at seven live
+  sites inside the bulk bodies (`ft-detach.h:219/511/575`,
+  `ft-graft.h:2960/4011`, `ft-rekey.h:4510/5035`).
+- So the hold is NOT end-to-end, and a peer bulk op can enter at a drain
+  seam.
+- Read that as a HOLE IN THE MECHANISM to close, not as a reason to pick a
+  different one.
+
+The drop is the COARSE discipline. There, point ops wait at the ONLINE scope
+entry, so holding across a GP would wedge them. On a FINE trie every waiter
+on this lock is another BULK op, and bulk entries forbid a read-section
+caller. So the GP may be taken while HOLDING the lock, with the waiters
+parked OFFLINE. The two paths must not share one acquisition helper by
+accident.
+
+Until then, two things cover the seam:
+
+- the REFCOUNTED gate (overlapping windows compose, with no per-node bit for
+  a peer's clear to erase);
+- each op's own acquire/validate machinery.
+
+This is a backstop, not the design. ☞ G5.3/G5.4/G5.25 in this document.
+
+⇒ So the open question is narrow and named. It is the SEAM, not the choice
+of mechanism. What separates two bulk ops that meet inside a drain seam,
+where the lock is momentarily not held? FT-SLOT-3 is the live instance.
+"every caller here is a BULK op ... so the two arbitrate on one word"
+answers bulk-vs-point. Two bulk ops that both park SW on one live parent
+word have nothing stated to separate them across a seam. Known issues get
+stabilised first; this is later.
+
+⇒ The rule that follows is for anyone adding exclusion arguments here.
+
+- You MAY rest one on the FT-wide lock: that is the design. But state WHICH
+  SIDE of a drain seam it needs.
+- An argument that needs the lock held CONTINUOUSLY across a GP is not true
+  today. One that needs it held per-edit is.
+- Where neither holds, state it on the per-node lock-set or on the gate
+  flip.
+
+FT-SLOT-3 is an EXISTING instance, flagged as such.
+`ft_glue_record_back_edge` passes `@child_held` TRUE unconditionally. So it
+parks SW on a live node's parent word that the op does not hold. This is
+sound only because every caller is a bulk op: "☠ SO IT IS A DEPENDENCY, NOT
+AN INVARIANT". It is debt against the relaxation, NOT a missing destination
+conversion. It is debt on the BULK-vs-BULK side as much as on the point
+side.
+
+Status 2026-11-19:
+
+- The call sites of `ft_writer_lock_gp_wait` inside the bulk bodies are now
+  nine: `ft-detach.h:219/513/577`, `ft-graft.h:2339/3180/3804/4876`,
+  `ft-rekey.h:9651/10199`. The function still drops `writer_lock` whenever
+  the thread holds it.
+- The gap between two bulk ops is closed by a second lock. `struct cds_ft`
+  has a `bulk_lock` ("BULK-vs-BULK, AND IT IS A SECOND LOCK ON PURPOSE",
+  `fractal-trie-internal.h`). `ft_bulk_gate_enter` takes it after the gate's
+  grace period, through `ft_bulk_lock_enter`. It is held across the drain
+  seams. Only bulk ops wait on it, and they park OFFLINE.
+- An EXCLUSIVE trie and a `CDS_FT_WRITER_EXTERNAL_SYNC` trie skip
+  `bulk_lock` (`ft_bulk_lock_enter`).
+- The comments of `cds_ft_detach` and `cds_ft_merge` in the public header
+  still say "☐ The drain-seam gap applies". They were not changed.
+- The FT-SLOT-3 statements were not re-checked against the code.
+
+#### M1.10 ☠ Do not call the bulk ops "unconverted"
+
+Do not call the bulk ops "UNCONVERTED FOR FINE DESTINATION LOCKING", as an
+earlier version of the note did. Their bulk-vs-point story is finished by
+design. The unconverted list is the POINT ops above, plus compact /
+compact_step / recompute_stats. Those three are caller-excluded by their own
+contracts. And do not cite merge_at as a destination-conversion template:
+there is nothing there to copy that graft and detach do not already do.
+
+Status 2026-11-19: "The unconverted list is the POINT ops above"
+contradicts M1.1, which says every point operation is converted. The
+per-function comments in the header agree with M1.1.
+
+#### M1.11 ☐ Two header bugs found while enumerating
+
+The note said both were still present:
+
+- `cds_ft_merge` says "NOT concurrency-safe" yet its body is one line:
+  `return cds_ft_merge_at(dst_ft, key, key_len, src_ft, key, key_len);`.
+  Both notes cannot be right; the code says merge_at's is.
+- `cds_ft_merge_at` says "@src_ft ... May be in either exclusive or
+  concurrent mode" in one paragraph and "The SOURCE must be EXCLUSIVE" in
+  the next, while the code refuses a concurrent source with BUSY.
+
+Status 2026-11-19:
+
+- The first is fixed. The `cds_ft_merge` comment no longer says "NOT
+  concurrency-safe". Its FINE paragraph says "identical to cds_ft_merge_at".
+  The body is still the one line above (`ft-merge.h`, `cds_ft_merge`).
+- The second is still present in the `cds_ft_merge_at` comment.
+
+#### M1.12 ☐ Four mutators the enumeration first missed
+
+A reminder that the list is the declarations, not the ones with a
+writer-strategy block:
+
+- `cds_ft_rekey_graft` / `cds_ft_rekey_merge` have NO writer-strategy
+  paragraph at all. This is against the section's own promise that "each
+  operation below states the caller's mutual-exclusion requirement". In
+  code they arm the COHERENT bulk gate and then take a writer scope, so
+  G5.25 excludes them exactly as it does the other bulk ops. A DOCUMENTATION
+  gap, not a code gap.
+- `cds_ft_compact` and `cds_ft_compact_step` say the caller must exclude,
+  and mean it: the one-shot takes a writer scope, `_step` takes NO scope and
+  NO bulk gate. Its per-relocation -EAGAIN -> `CDS_FT_COMPACT_BUSY` plumbing
+  is already there for the conversion, unused.
+- `cds_ft_recompute_stats` likewise, and the rekey path calls it internally
+  inside its own bulk window.
+
+Status 2026-11-19:
+
+- The rekey functions still have no writer-strategy paragraph in the
+  header. The entry arms the gate with `ft_move_gate_enter`, which is
+  `ft_bulk_gate_enter(ft, FT_BULK_COHERENT)` (`ft-rekey.h`,
+  `fractal-trie-internal.h`).
+- "`_step` takes NO scope" is no longer true. `cds_ft_compact_step` enters
+  `CDS_FT_SCOPED_WRITER(ft)` inside each step's read-side section
+  (`ft-compact.h`). It returns `CDS_FT_COMPACT_BUSY` when a relocation bails
+  with -EAGAIN, so that plumbing is used.
+- `cds_ft_recompute_stats` takes `CDS_FT_SCOPED_WRITER(ft)` and calls
+  `ft_recompute_max_used_key_len` (`ft-lifecycle.h`). The rekey path now
+  calls `ft_recompute_max_used_key_len` directly (`ft-rekey.h`).
+
+#### M1.13 ☑ Exempt, not unconverted: order statistics
+
+A group that maintains order statistics is coerced to
+`CDS_FT_WRITER_LOCK_COARSE`, so the FINE question does not arise for any op
+on it.
+
+#### M1.14 ⇒ The recipe, and how to test it
+
+The recipe exists in-tree. The point remove was converted exactly this way:
+
+1. derive the holder;
+2. acquire it;
+3. RE-VALIDATE that it still names what the plan read;
+4. bail RETRIABLY when it does not.
+
+See `ft_chain_head_holder`'s re-validation and its callers. Reuse that
+rather than inventing a new rule.
+
+☞ And test it in-contract. A concurrency row for an unconverted op belongs
+on the FINE arm. It is expected RED until the conversion lands. Writing it
+COARSE-only would bless the gap as the contract. COARSE stays the
+adjudicator for a shape that IS converted (the same-key rows of
+`tests/regression/test_urcu_ft_inv.c`).
+
+### M2. "IN-TRIE REKEY COHERENCE is automatic" (after `cds_ft_attr_set_speculative_keys`)
+
+This was a standalone comment block before `cds_ft_make_exclusive`. Its
+text:
+
+IN-TRIE REKEY COHERENCE is automatic; there is no attribute for it.
+
+A rekey (`cds_ft_rekey_graft` / `cds_ft_rekey_merge`) moves a live subtree
+from one key prefix to another WITHIN one trie. So a reader whose traversal
+races the move could otherwise be torn onto a position the key no longer
+occupies. Every trie that can host such a move verifies its reads against a
+concurrent move. A trie can host a move when its group does not use
+speculative stored keys. The reason is that the library cannot rewrite an
+application-stored key when a leaf's key changes.
+
+The cost is confined to the move itself.
+
+- A mover first publishes a per-trie "a move is in flight" mode and waits
+  one grace period. So every reader has observed the mode before any
+  structure changes.
+- Readers check that mode once per traversal.
+- With no move in flight, that check is a single load of a word nobody
+  writes, and the read runs exactly as it always did.
+- While a move IS in flight, readers on this trie verify each traversal and
+  repeat it if the move restructured their path. So reads on that trie are
+  lock-free rather than wait-free for the duration of the move, and
+  unaffected otherwise.
+
+A burst of concurrent moves pays about ONE grace period between them, not
+one each. A rekey therefore BLOCKS and must not be called from an RCU
+read-side critical section (see the rekey functions' own documentation).
+
+Status 2026-11-19:
+
+- "Automatic; there is no attribute for it" is no longer true.
+  `cds_ft_group_attr_set_rekey` exists and defaults to false
+  (`ft-lifecycle.h`). Without the opt-in, the rekey entry returns
+  `CDS_FT_STATUS_NOT_SUPPORTED` before it touches the trie (`ft-rekey.h`,
+  the `!ft->group->rekey_set` test). There is still no per-trie attribute.
+- Under `CDS_FT_WRITER_EXTERNAL_SYNC`, the opt-in turns on
+  `rekey_always_coherent`. Readers then run the coherent path always, and
+  the move takes no gate grace period (comment of
+  `cds_ft_group_attr_set_rekey` in `ft-lifecycle.h`).
+- "Readers on this trie verify each traversal" is reported not to hold for
+  the partial, longest-match and candidate lookups (review note
+  readers-point.md A2). This was not re-checked here.
+- The one-grace-period-per-burst claim is still stated by the code
+  (`ft_bulk_gate_enter`, `fractal-trie-internal.h`).
+
+### M3. History sentences from function comments
+
+#### M3.1 `cds_ft_remove_all`: BUSY_ERROR
+
+The header said: "CDS_FT_STATUS_BUSY_ERROR is NO LONGER RETURNED. A lock
+lost to a concurrent writer is absorbed by this op's own retry loop. The
+loop ages the conflict, so a contended caller escalates into the trie's FIFO
+writer lane instead of spinning. Callers that tested for BUSY_ERROR may keep
+doing so, because the value is still declared. That branch is dead."
+
+The history is in M1.5 and M1.6: before the retry loop, every abort was
+returned as BUSY_ERROR. The header now says that the function never returns
+`CDS_FT_STATUS_BUSY_ERROR`. This matches the code: `cds_ft_remove_all`
+loops while `_cds_ft_remove_all_locked` sets `need_retry` (`ft-remove.h`).
+
+#### M3.2 `cds_ft_insert_replace`: the 21.7% figure
+
+See the end of the `cds_ft_insert_replace` item in M1.6.
+
+#### M3.3 `cds_ft_max_used_key_len`: no recompute before a bulk operation
+
+The header said, about a bulk operation with an EXCLUSIVE source: "the
+operation recomputes the source's value before answering. So a caller no
+longer needs cds_ft_recompute_stats() for that."
+
+The sentence implies the history: a caller once had to call
+`cds_ft_recompute_stats()` on the source first, so that a stale estimate
+did not refuse it with `CDS_FT_STATUS_OVERFLOW_ERROR`. The header now says
+only that the caller does not need to call it first. The recompute of the
+source is in `ft-graft.h` (the call to
+`ft_recompute_max_used_key_len(src_ft)`).
+
+#### M3.4 `cds_ft_group_attr_set_writer_strategy`: the optimistic engine
+
+The paragraph on the coercion of FINE with order statistics ended with:
+"(The optimistic engine this sentence also weighed no longer exists.)"
+
+The sentence it refers to gives the two reasons for the coercion. The note
+records that this sentence once also covered an optimistic engine, and that
+the engine is gone. The header now gives the two reasons only.

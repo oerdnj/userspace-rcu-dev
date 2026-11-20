@@ -16,25 +16,36 @@
  * the header; with those, use cds_ft_group_create_flavor() (explicit
  * flavor argument) instead of cds_ft_group_create().
  *
- * A concurrent, RCU-protected ordered trie mapping variable or
- * fixed-length byte keys to user-defined nodes. Keys are opaque
- * byte sequences with no reserved or sentinel values; unlike
- * tries that rely on NUL or other terminal characters, any byte
- * value may appear at any position in a key. Keys are ordered
- * most-significant-byte first: the byte at offset 0 is most
- * significant and the last byte least significant -- i.e.
- * lexicographically by byte sequence, the big-endian form of
- * an integer key. This is the order used by ordered iteration
- * and the range queries (<=, >=, <, >). Lookups and traversals
- * are wait-free under the RCU read-side lock and can proceed
- * concurrently with mutations. The internal structure is
- * acyclic by construction: no sequence of concurrent updates can
- * introduce a cycle, ensuring that all lookups and traversals
- * complete in bounded time. Supports exact lookup, partial
- * (prefix) match, ordered iteration, duplicate key chains, and
- * range queries (<=, >=, <, >). A longest-match lookup reports
- * the deepest trie position matching a prefix of the input key,
- * even if that position has no external node.
+ * A concurrent, RCU-protected ordered trie. It maps variable-length
+ * or fixed-length byte keys to user-defined nodes.
+ *
+ * Keys are opaque byte sequences. No byte value is reserved or used
+ * as a sentinel: any byte value may appear at any position in a key.
+ * This differs from tries that rely on NUL or other terminal
+ * characters.
+ *
+ * Keys are ordered most-significant-byte first: the byte at offset 0
+ * is the most significant and the last byte is the least significant.
+ * This is the lexicographic order of the byte sequences. It is also
+ * the big-endian form of an integer key. Ordered iteration and the
+ * range queries (<=, >=, <, >) use this order.
+ *
+ * Lookups and traversals are wait-free under the RCU read-side lock.
+ * They can proceed concurrently with mutations. The internal structure
+ * is acyclic by construction: no sequence of concurrent updates can
+ * introduce a cycle. So all lookups and traversals complete in bounded
+ * time.
+ *
+ * The trie supports:
+ *
+ * - exact lookup;
+ * - partial (prefix) match;
+ * - ordered iteration;
+ * - duplicate key chains;
+ * - range queries (<=, >=, <, >).
+ *
+ * A longest-match lookup reports the deepest trie position matching a
+ * prefix of the input key, even if that position has no external node.
  *
  * Performance characteristics:
  *
@@ -53,27 +64,31 @@
  *
  * Internal nodes are reclaimed via RCU (call_rcu), so readers never
  * access freed memory even for the trie's own internal structure.
- * Internal nodes adapt to the key population automatically; memory
- * efficiency is comparable to adaptive radix tree schemes with no
+ * Internal nodes adapt to the key population automatically. Memory
+ * efficiency is comparable to adaptive radix tree schemes, with no
  * user tuning or configuration.
  *
- * Resident memory (RSS) overstates the actual *cache-hot* working set:
- * Fractal Trie can keep a denser cache-hot set than other trie
- * implementations even though its RSS is higher.
+ * Resident memory (RSS) overstates the actual *cache-hot* working set.
+ * The RSS of a Fractal Trie is higher than that of other trie
+ * implementations, but its cache-hot set can be denser.
  *
  * Graft, graft-swap, detach, and merge:
  *
- * The graft, graft-swap, detach, and merge operations move (or,
- * for merge, combine) entire sub-tries between trie instances
- * within the same group. The write-side cost is more than a single
- * pointer store (so "O(1)" below means independent of subtree size,
- * not literally one store). Each of these ops also unlinks content
- * from a source trie (graft-swap from the destination too), so --
- * when concurrent readers are possible -- it may issue a
- * synchronize_rcu to drain readers of the unlinked content before its
- * nodes are reclaimed. What concurrent readers see, however, is
- * published atomically: a reader observes either the complete prior
- * state or the complete result, never a partial state.
+ * These operations move entire sub-tries between trie instances within
+ * the same group. Merge combines the sub-tries instead of moving them.
+ *
+ * "O(1)" below means independent of the subtree size. It does not mean
+ * one store: the write-side cost is more than a single pointer store.
+ *
+ * Each of these operations also unlinks content from a source trie.
+ * Graft-swap unlinks content from the destination too. So when
+ * concurrent readers are possible, the operation may issue a
+ * synchronize_rcu. This drains the readers of the unlinked content
+ * before its nodes are reclaimed.
+ *
+ * What concurrent readers see is still published atomically. A reader
+ * observes either the complete prior state or the complete result,
+ * never a partial state.
  *
  * - Graft (cds_ft_graft) attaches the content of a source trie
  *   at a key position in a destination trie. The destination
@@ -90,34 +105,36 @@
  *   empty intermediate state.
  *
  * - Detach (cds_ft_detach) removes the sub-structure rooted at
- *   a key position and returns it as a new, independent trie
- *   instance whose key lengths are relative to the detach
- *   point.
+ *   a key position. It returns it as a new, independent trie
+ *   instance. The key lengths of that instance are relative to the
+ *   detach point.
  *
  * - Merge-at (cds_ft_merge_at) combines a source sub-trie into a
- *   destination while re-keying it: the content under a source
- *   prefix is unioned into the destination under a possibly
- *   different prefix, each moved key keeping whatever suffix
- *   follows the prefix. Unlike graft, the destination may already
- *   hold entries under that prefix -- the two sub-tries are unioned
- *   and same-key duplicate chains are concatenated. It expresses
- *   re-keying patterns (archive moves, tier promotion, partition
- *   rename) that a detach + graft pair cannot on a fixed-length
- *   group, where the source and destination prefixes must be of
- *   equal length so the moved keys keep the fixed length.
+ *   destination and re-keys it. The content under a source prefix is
+ *   unioned into the destination under a possibly different prefix.
+ *   Each moved key keeps whatever suffix follows the prefix. Unlike
+ *   graft, the destination may already hold entries under that
+ *   prefix: the two sub-tries are unioned and same-key duplicate
+ *   chains are concatenated.
  *
- * - Merge (cds_ft_merge) is the same-prefix case of merge-at: a
+ *   Merge-at expresses re-keying patterns such as archive moves, tier
+ *   promotion and partition rename. A detach + graft pair cannot
+ *   express them on a fixed-length group. There, the source and
+ *   destination prefixes must be of equal length, so that the moved
+ *   keys keep the fixed length.
+ *
+ * - Merge (cds_ft_merge) is the same-prefix case of merge-at. A
  *   single key is both the source selector and the destination
- *   attach point, so nothing is re-keyed; a zero-length key merges
+ *   attach point, so nothing is re-keyed. A zero-length key merges
  *   two whole tries at the root.
  *
  * - Rekey (cds_ft_rekey_graft / cds_ft_rekey_merge) moves a subtree
- *   to a new key WITHIN one trie -- the same-trie analog of graft and
- *   merge-at (graft requires an empty destination; merge unions into an
- *   occupied one). The source and destination keys must be disjoint, and
- *   the trie must be EAGER (not speculative). Same-trie moves are their
- *   own entry points because they are made coherent for concurrent
- *   readers; cds_ft_merge_at is cross-trie only.
+ *   to a new key WITHIN one trie. It is the same-trie analog of graft
+ *   and merge-at. Graft requires an empty destination. Merge unions
+ *   into an occupied one. The source and destination keys must be
+ *   disjoint, and the trie must be EAGER (not speculative). Same-trie
+ *   moves are their own entry points because they are made coherent
+ *   for concurrent readers. cds_ft_merge_at is cross-trie only.
  *
  * Root-level operations (key_len 0) work with both fixed-length
  * and variable-length key groups. Non-root operations (key_len
@@ -128,16 +145,26 @@
  * expressed, and the call returns
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR.
  *
- * Together, these operations serve as the transplant, exchange,
- * and split primitives for bulk operations. A typical bulk-load
- * pattern populates a staging trie offline -- with no RCU or
- * locking overhead -- and then grafts it into the live trie in
- * a single O(1) step, keeping the writer critical section
- * minimal regardless of the number of nodes being moved. A
- * complementary bulk-removal pattern detaches (or graft-swaps)
- * a sub-trie in O(1), waits for a single grace period, and
- * then drains the detached trie locally, reducing the cost
- * from one grace period per node to one grace period total.
+ * Together, these operations serve as the transplant, exchange and
+ * split primitives for bulk operations.
+ *
+ * A typical bulk-load pattern has two steps:
+ *
+ *   1. Populate a staging trie offline, with no RCU or locking
+ *      overhead.
+ *   2. Graft it into the live trie in a single O(1) step.
+ *
+ * This keeps the writer critical section minimal, regardless of the
+ * number of nodes being moved.
+ *
+ * A complementary bulk-removal pattern has three steps:
+ *
+ *   1. Detach (or graft-swap) a sub-trie in O(1).
+ *   2. Wait for a single grace period.
+ *   3. Drain the detached trie locally.
+ *
+ * This reduces the cost from one grace period per node to one grace
+ * period in total.
  *
  * Reader contract:
  *
@@ -155,15 +182,16 @@
  *   Exclusive mode:
  *     - the caller guarantees mutual exclusion against any
  *       concurrent access on this trie.  Exclusive-mode mutations
- *       skip RCU synchronisation primitives (synchronize_rcu,
- *       call_rcu) on the assumption that there are no concurrent
- *       readers, so holding the RCU read-side lock on its own
+ *       assume that there are no concurrent readers.  They skip
+ *       the RCU synchronisation primitives (synchronize_rcu,
+ *       call_rcu).  So holding the RCU read-side lock on its own
  *       does not protect against use-after-free in this mode.
  *
  * The library never calls rcu_read_lock() on a READER's behalf.
  * (Point updates differ: see "Mutation API" below.)
+ *
  * If FEATURE_FT_EXCL_VALIDATE is compiled in, the library
- * *validates* the discipline above and aborts on violation -- it
+ * *validates* the discipline above and aborts on violation.  It
  * does not enforce the discipline.  Compliance is the caller's
  * responsibility.  The validator catches:
  *
@@ -175,43 +203,45 @@
  *     RCU read-side lock are permitted to overlap with a single
  *     writer.
  *
- * Detection in concurrent mode is point-in-time: a reader that
- * holds neither the RCU read-side lock nor an external mutex but
- * does not overlap with any writer in this run is not detected.
+ * Detection in concurrent mode is point-in-time.  Consider a reader
+ * that holds neither the RCU read-side lock nor an external mutex.
+ * It is not detected if it overlaps with no writer in this run.
  *
  * Per-function comments below that say "the RCU read-side lock
- * must be held" describe the concurrent-mode case; in exclusive
+ * must be held" describe the concurrent-mode case.  In exclusive
  * mode the caller's mutual exclusion replaces that requirement.
  *
  * Iterator Lifecycle and RCU Locking:
  *
- * The `cds_ft_iter` object can operate in two cache modes, selected via
- * cds_ft_iter_set_cache_mode():
+ * The `cds_ft_iter` object can operate in two cache modes.  Select the
+ * mode with cds_ft_iter_set_cache_mode().
  *
  * CDS_FT_ITER_CACHED (default):
  *
  * The iterator reuses its current position (the result node) to
- * accelerate subsequent sequential operations like cds_ft_next(),
- * cds_ft_prev(), or cds_ft_remove_all() (cds_ft_remove() and
- * cds_ft_replace() take the target node explicitly; see their note
- * below.)
+ * accelerate subsequent sequential operations.  Examples are
+ * cds_ft_next(), cds_ft_prev() and cds_ft_remove_all().  cds_ft_remove() and
+ * cds_ft_replace() take the target node explicitly: see their note
+ * below.
  *
- * Because the position is an RCU-protected pointer, the RCU read-side
+ * The position is an RCU-protected pointer.  So the RCU read-side
  * lock must be held CONTINUOUSLY between the operation that populates
  * the iterator (e.g., cds_ft_lookup) and the operation that reuses it.
  * If the RCU read-side lock is dropped, the cached position may
  * reference memory reclaimed after a grace period.
  *
  * If you need to drop the RCU read-side lock between operations, call
- * cds_ft_iter_bind_key() WHILE STILL HOLDING the lock, before dropping it:
+ * cds_ft_iter_bind_key() WHILE STILL HOLDING the lock.
  * cds_ft_iter_bind_key() snapshots the iterator's current key into its
  * own storage and clears the cached position.  The next position-reusing
  * operation (e.g., cds_ft_remove_all) then falls back to a safe, fresh
- * top-down traversal by that key.  Snapshotting (rather than merely
- * clearing the node pointer) matters because in a speculative group
- * configured with a leaf-key offset the cached key is held as a live
- * REFERENCE into the result node, valid only while the read-side lock
- * is held; bind copies it out before that node can be reclaimed.
+ * top-down traversal by that key.
+ *
+ * Clearing the node pointer alone would not be enough: the snapshot
+ * matters.  In a speculative group configured with a leaf-key offset,
+ * the cached key is held as a live REFERENCE into the result node.
+ * That reference is valid only while the read-side lock is held.  Bind
+ * copies the key out before that node can be reclaimed.
  *
  * Example A (Continuous lock -- fast):
  * rcu_read_lock();
@@ -220,11 +250,11 @@
  * rcu_read_unlock();
  *
  * Example B (Dropped lock -- snapshot the key, re-derive from it):
- * Bind the key while STILL HOLDING the lock; after the unlock the cached
- * position is gone but the key is retained, so a position-reusing operation
- * re-descends by it.  cds_ft_remove_all takes no node argument and, with the
- * cached position cleared, derives everything from the key under the writer
- * mutex alone:
+ * Bind the key while STILL HOLDING the lock.  After the unlock the cached
+ * position is gone but the key is retained, so a position-reusing
+ * operation re-descends by it.  cds_ft_remove_all takes no node argument.
+ * With the cached position cleared, it derives everything from the key,
+ * under the writer mutex alone:
  *
  * rcu_read_lock();
  * cds_ft_lookup(ft, iter);
@@ -236,27 +266,29 @@
  * unlock(&writer_mutex);
  *
  * cds_ft_remove() and cds_ft_replace() take the target node explicitly
- * (@node / @old_node -- normally cds_ft_iter_node(iter), the iterator's
- * current position) and dereference it directly via @node->prev, with no
- * re-descent.  The RCU read-side lock must therefore be held CONTINUOUSLY
- * from when that node was obtained until the call, so the node has not
- * been reclaimed.  After a dropped lock the node is stale: re-look it up
- * (under the lock) and pass the fresh node -- bind resets the iterator's
- * cached position but cannot refresh a node you already hold.
+ * (@node / @old_node).  This is normally cds_ft_iter_node(iter), the
+ * iterator's current position.  They dereference it directly via
+ * @node->prev, with no re-descent.  The RCU read-side lock must
+ * therefore be held CONTINUOUSLY from when that node was obtained until
+ * the call, so the node has not been reclaimed.
  *
- * Note: CDS_FT_ITER_UNCACHED iterators do not require this -- the cached
- * position is discarded (and any referenced key snapshotted) automatically
- * after each operation.
+ * After a dropped lock the node is stale.  Look it up again under the
+ * lock and pass the fresh node.  Bind resets the iterator's cached
+ * position but cannot refresh a node you already hold.
+ *
+ * Note: CDS_FT_ITER_UNCACHED iterators do not require this.  After each
+ * operation, the cached position is discarded automatically and any
+ * referenced key is snapshotted.
  *
  * Debug validation (URCU_FRACTAL_TRIE_DEBUG_PATH):
  *
  * Building with URCU_FRACTAL_TRIE_DEBUG_PATH defined enables run-time
  * detection of stale cached positions.  Each position records an RCU
- * grace-period snapshot when populated and checks it on reuse; if a
- * full grace period has elapsed since the position was populated the
- * cached pointer may reference freed memory, so the program aborts
- * with a diagnostic.  Since struct cds_ft_iter is opaque, this option
- * does not affect the application ABI -- only the library needs to be
+ * grace-period snapshot when populated and checks it on reuse.  If a
+ * full grace period has elapsed since the position was populated, the
+ * cached pointer may reference freed memory.  The program then aborts
+ * with a diagnostic.  struct cds_ft_iter is opaque, so this option
+ * does not affect the application ABI: only the library needs to be
  * rebuilt.
  *
  * CDS_FT_ITER_UNCACHED:
@@ -265,11 +297,11 @@
  * returns. Every subsequent operation performs a fresh top-down
  * traversal from the root for the current key. The RCU read-side lock
  * only needs to be held during each individual operation and while
- * accessing the returned node -- it may be dropped between operations.
+ * accessing the returned node. It may be dropped between operations.
  *
- * This mode is suited for iteration patterns where the caller needs
- * to drop the RCU read-side lock between steps (e.g. to perform
- * blocking work or acquire other locks).
+ * This mode suits iteration patterns where the caller needs to drop
+ * the RCU read-side lock between steps.  Examples are performing
+ * blocking work and acquiring other locks.
  *
  * Example C (Uncached mode, per-step locking with refcount):
  * cds_ft_iter_set_cache_mode(iter, CDS_FT_ITER_UNCACHED);
@@ -378,57 +410,65 @@ enum cds_ft_lookup_optimization {
 enum cds_ft_numa_policy {
 	/*
 	 * CDS_FT_NUMA_DEFAULT: honor an explicit per-process NUMA policy, but
-	 * interleave the library's arenas when none is set.  Concretely:
+	 * interleave the library's arenas when none is set.  The three cases:
 	 *
-	 *   - process set MPOL_BIND / PREFERRED / LOCAL (numactl --membind /
-	 *     --preferred / --localalloc, set_mempolicy, numa_set_*): the
-	 *     library applies no mbind() of its own; the kernel honors that
-	 *     policy.  An explicit application intent is never overridden.
+	 *   - The process set MPOL_BIND / PREFERRED / LOCAL.  This is done
+	 *     with numactl --membind / --preferred / --localalloc, with
+	 *     set_mempolicy or with numa_set_*.  The library applies no
+	 *     mbind() of its own and the kernel honors that policy.  An
+	 *     explicit application intent is never overridden.
 	 *   - process set MPOL_INTERLEAVE (numactl --interleave): upgraded to
 	 *     the library's THP-friendly 2 MiB-granular interleave.
 	 *   - no process policy set (would be first-touch): the library
 	 *     interleaves its own arenas across the allowed nodes itself
 	 *     (equivalent to CDS_FT_NUMA_INTERLEAVE).
 	 *
-	 * That last case is why this is NOT plain first-touch: a Fractal Trie
-	 * is a shared, read-mostly, random-access structure, so first-touch
-	 * piles it onto the builder's node -- one memory controller bottlenecks
-	 * every other node's readers, and Linux auto-NUMA-balancing thrashes
-	 * the unbound pages (PTE-scan + TLB-shootdown storms).  Interleaving the
-	 * library's OWN arenas (it never touches application memory) avoids that
-	 * by default while still deferring to any policy the application stated.
+	 * That last case is why this is NOT plain first-touch.  A Fractal
+	 * Trie is a shared, read-mostly, random-access structure.  First-touch
+	 * piles it onto the builder's node, with two effects:
 	 *
-	 * This is the default value of a freshly-created group attr.  To force a
-	 * placement regardless of process policy use INTERLEAVE or LOCAL; the env
-	 * var CDS_FT_NUMA_INTERLEAVE=0 globally disables the library's mbind().
+	 *   - one memory controller bottlenecks every other node's readers;
+	 *   - Linux auto-NUMA-balancing thrashes the unbound pages (PTE-scan
+	 *     + TLB-shootdown storms).
+	 *
+	 * Interleaving the library's OWN arenas avoids that by default.  The
+	 * library never touches application memory.  It still defers to any
+	 * policy the application stated.
+	 *
+	 * This is the default value of a freshly-created group attr.  To force
+	 * a placement regardless of process policy, use INTERLEAVE or LOCAL.
+	 * The env var CDS_FT_NUMA_INTERLEAVE=0 globally disables the library's
+	 * mbind().
 	 */
 	CDS_FT_NUMA_DEFAULT = 0,
 
 	/*
 	 * CDS_FT_NUMA_INTERLEAVE: round-robin the trie's memory
 	 * across the calling thread's allowed NUMA nodes in 2 MiB
-	 * chunks.  Best for workloads
-	 * with concurrent readers distributed across NUMA nodes: every
-	 * reader sees the same balanced cross-node access pattern, so
-	 * the worst-case cross-NUMA cost is bounded by (NR_NODES - 1) /
-	 * NR_NODES of accesses.  Enables transparent hugepage collapse
-	 * by keeping each 2 MiB chunk on a single node.
+	 * chunks.
+	 *
+	 * Best for workloads with concurrent readers distributed across
+	 * NUMA nodes.  Every reader sees the same balanced cross-node
+	 * access pattern.  So the worst-case cross-NUMA cost is bounded
+	 * by (NR_NODES - 1) / NR_NODES of accesses.  Each 2 MiB chunk
+	 * stays on a single node, which enables transparent hugepage
+	 * collapse.
 	 */
 	CDS_FT_NUMA_INTERLEAVE,
 
 	/*
-	 * CDS_FT_NUMA_LOCAL: explicit first-touch placement -- pages
+	 * CDS_FT_NUMA_LOCAL: explicit first-touch placement.  Pages
 	 * land on whichever NUMA node first faults them (typically the
-	 * writer thread).  Mechanically the library skips its own mbind();
-	 * the distinction from DEFAULT is that LOCAL forces first-touch even
-	 * when no process policy is set, whereas DEFAULT interleaves in that
-	 * case.  Use LOCAL when you specifically want the trie on the faulting
-	 * thread's node.
+	 * writer thread).  Mechanically the library skips its own mbind().
+	 * The distinction from DEFAULT: LOCAL forces first-touch even when
+	 * no process policy is set, whereas DEFAULT interleaves in that
+	 * case.  Use LOCAL when you specifically want the trie on the
+	 * faulting thread's node.
 	 *
 	 * Best for single-threaded workloads and for tries accessed
-	 * exclusively by threads on the writer's node.  Multi-node-
-	 * distributed readers pay full cross-NUMA latency for every
-	 * access since all pages live on one node.
+	 * exclusively by threads on the writer's node.  Readers
+	 * distributed over several nodes pay full cross-NUMA latency for
+	 * every access, since all pages live on one node.
 	 */
 	CDS_FT_NUMA_LOCAL,
 };
@@ -447,7 +487,7 @@ enum cds_ft_iter_cache_mode {
 	 *   re-descending from the root.
 	 *   The RCU read-side lock must be held CONTINUOUSLY between the
 	 *   operation that populates the iterator and any operation that
-	 *   reuses its position; otherwise the position may reference
+	 *   reuses its position.  Otherwise the position may reference
 	 *   memory reclaimed after a grace period.
 	 */
 	CDS_FT_ITER_CACHED = 0,
@@ -459,7 +499,7 @@ enum cds_ft_iter_cache_mode {
 	 *   fresh top-down traversal from the root for the current key.
 	 *   The RCU read-side lock must be held only during each
 	 *   individual operation and while accessing the returned
-	 *   node -- it may be dropped between operations.
+	 *   node.  It may be dropped between operations.
 	 *
 	 *   This mode is suitable for iteration patterns where the
 	 *   caller needs to drop the RCU read-side lock between steps
@@ -501,34 +541,44 @@ enum cds_ft_iter_cache_mode {
  *
  * Note that removal from a Fractal Trie does _not_ reset node->next,
  * because it can still be accessed by concurrent RCU readers. After
- * removal of a node, the user needs to re-initialize the node after
- * a grace period (e.g. via call_rcu() or synchronize_rcu()) before
- * being allowed to re-insert it.
+ * removing a node, the user must wait for a grace period (e.g. via
+ * call_rcu() or synchronize_rcu()) and then re-initialize the node.
+ * Only then may the node be re-inserted.
  *
  * This structure is required to be naturally aligned.
  */
 /*
  * ☞ BOTH WORDS ARE TRANSACTED SLOTS.  src/fractal-trie/fractal-trie-internal.h
  * carries THE TRANSACTED-SLOT REGISTER, which is authoritative for owner and
- * record kind; the summary for these two:
+ * record kind.  The summary for these two words:
  *
- * @next -- the duplicate-chain forward link.  EXCLUDED by the chain HOLDER's
- * node lock (the head's immediate parent), or that holder's ANCHOR under a
- * coarse spacing; a bulk run-append is excluded by the FT-wide writer lock
- * instead.  Recorded MW everywhere today, and that MW is currently
- * LOAD-BEARING: the sole-entry freeze's derived expected-old is the only
- * thing that turns an UNHELD derivation into an abort rather than a lost key.
+ * @next -- the duplicate-chain forward link.  It is EXCLUDED by one of:
+ *
+ *   - the chain HOLDER's node lock (the holder is the head's immediate
+ *     parent);
+ *   - that holder's ANCHOR, under a coarse spacing;
+ *   - the FT-wide writer lock instead, for a bulk run-append.
+ *
+ * Recorded MW everywhere today, and that MW is currently LOAD-BEARING.
+ * The sole-entry freeze derives an expected-old.  It is the only thing
+ * that turns an UNHELD derivation into an abort rather than a lost key.
  * Bit 0 is the engine tag, bit 1 the removal MARK.
  * ☠ A MARKED @next IS TERMINAL, and the append does not check it.
  *
- * @prev -- OVERLOADED, and the role decides the encoding: on a chain MEMBER it
- * names the predecessor NODE (headness is ft_node_external(prev), which is why
- * this is not a kernel-style pprev); on the HEAD it names the ordered-list
- * cell (tagged bit 0) when the list is on, else the flagged parent word with
- * its prefix-head bit.  Owner is the holder either way.  Recorded with the
- * FLIP-PROXY tag (0xF), never the bit-0 hlist tag, because the resting value
- * can itself carry bit 0.
- * ☠ Reading it: a head's prev may carry a PARKED PROXY, and stripping bit 0
+ * @prev -- OVERLOADED: the role decides the encoding.
+ *
+ *   - On a chain MEMBER it names the predecessor NODE.  Headness is
+ *     ft_node_external(prev), which is why this is not a kernel-style
+ *     pprev.
+ *   - On the HEAD, when the list is on, it names the ordered-list cell
+ *     (tagged bit 0).
+ *   - On the HEAD, when the list is off, it names the flagged parent
+ *     word with its prefix-head bit.
+ *
+ * Owner is the holder either way.  Recorded with the FLIP-PROXY tag (0xF),
+ * never the bit-0 hlist tag, because the resting value can itself carry
+ * bit 0.
+ * ☠ Reading it: a head's prev may carry a PARKED PROXY.  Stripping bit 0
  * alone then yields a misaligned descriptor address.  Resolve through
  * ft_dereference_prev_resolved unless you hold the holder or the bulk gate.
  */
@@ -539,17 +589,21 @@ struct cds_ft_node {
 
 /*
  * Library-internal: bit 1 of cds_ft_node.next is a removal tombstone.  The
- * mutation side sets it when the node leaves the trie (so a position-based
- * remove can detect an already-removed node in O(1) without re-descending),
- * and every chain traversal masks it off.  Bit 0 is reserved for the
- * transactional engine's in-band proxy tag, so that the duplicate chain can be
- * committed as a concurrent transaction (a mid-commit "next" carries the proxy
- * on bit 0; the accessor below resolves it once the chain rides the engine).
- * cds_ft_node is naturally (pointer) aligned, so both low bits are always free.
+ * mutation side sets it when the node leaves the trie.  A position-based
+ * remove can then detect an already-removed node in O(1), without
+ * re-descending.  Every chain traversal masks it off.
  *
- * Applications must therefore not read cds_ft_node.next directly: walk
+ * Bit 0 is reserved for the transactional engine's in-band proxy tag, so
+ * that the duplicate chain can be committed as a concurrent transaction.
+ * A mid-commit "next" carries the proxy on bit 0.  The accessor below
+ * resolves it once the chain rides the engine.
+ *
+ * cds_ft_node is naturally (pointer) aligned, so both low bits are always
+ * free.
+ *
+ * Applications must therefore not read cds_ft_node.next directly.  Walk
  * duplicate chains via cds_ft_node_next_rcu() (which masks the bit), or
- * the cds_ft_for_each_duplicate*() macros built on it, and treat a
+ * via the cds_ft_for_each_duplicate*() macros built on it.  Treat a
  * removed node as opaque until re-initialized with cds_ft_node_init().
  */
 #define CDS_FT_NODE_REMOVED_FLAG	2UL
@@ -558,17 +612,24 @@ struct cds_ft_node {
  * Library-internal: bit 0 of cds_ft_node.next is the transactional engine's
  * in-band proxy tag (equal to URCU_TXN_TAG; asserted in the library).  A
  * duplicate-chain successor read observes it only while a concurrent bulk
- * commit (e.g. a merge appending a src run at this chain's tail) is in flight.
+ * commit is in flight.  An example of such a commit is a merge appending a
+ * src run at this chain's tail.
  */
 #define CDS_FT_NODE_TXN_PROXY_TAG	1UL
 
 /*
- * Library-internal back-end for cds_ft_node_next_rcu()'s proxy path: resolve a
- * raw successor value that carries the engine proxy tag (an in-flight commit)
- * to the committed successor, then strip the removal tombstone.  Deliberately
- * NOT inlined -- a duplicate-chain walk is not a fast path, and out-of-lining it
- * keeps the transactional engine (and its headers) opaque to API users; reach
- * it only through cds_ft_node_next_rcu().
+ * Library-internal back-end for the proxy path of cds_ft_node_next_rcu().
+ * @raw is a raw successor value that carries the engine proxy tag (an
+ * in-flight commit).  Resolve it to the committed successor, then strip the
+ * removal tombstone.
+ *
+ * Deliberately NOT inlined, for two reasons:
+ *
+ *   - a duplicate-chain walk is not a fast path;
+ *   - keeping it out of line keeps the transactional engine (and its
+ *     headers) opaque to API users.
+ *
+ * Reach it only through cds_ft_node_next_rcu().
  */
 extern struct cds_ft_node *cds_ft_node_next_resolve(void *raw);
 
@@ -603,16 +664,17 @@ void cds_ft_node_init(struct cds_ft_node *node)
 }
 
 /*
- * External-node arena with end-of-zone over-read safety, suitable for
- * embedding application leaf structures (those containing a struct
- * cds_ft_node) when the caller needs a trailing readable pad past
- * stored keys for SIMD-friendly comparison.
+ * External-node arena with end-of-zone over-read safety.  It suits
+ * application leaf structures (those containing a struct cds_ft_node)
+ * when the caller needs a trailing readable pad past stored keys for
+ * SIMD-friendly comparison.
  *
- * Pattern: app embeds struct cds_ft_node in its own leaf struct,
- * allocates each leaf from this arena via cds_ft_external_arena_alloc,
- * and inserts into the trie.  Every allocation is guaranteed at least
- * 32 bytes of safely-over-readable padding past its last byte, so the
- * library's SIMD leaf compare never faults reading past a stored key.
+ * Pattern: the application embeds struct cds_ft_node in its own leaf
+ * struct.  It allocates each leaf from this arena via
+ * cds_ft_external_arena_alloc and inserts it into the trie.  Every
+ * allocation is guaranteed at least 32 bytes of padding past its last
+ * byte that are safe to over-read.  So the library's SIMD leaf compare
+ * never faults reading past a stored key.
  *
  * Lifetime: all-or-nothing.  cds_ft_external_arena_destroy frees
  * every allocation served by the arena.  The caller is responsible
@@ -646,9 +708,9 @@ struct cds_ft_external_arena_attr;
  *   first touch, so a small / sparse trie pays a ~2 MiB RSS floor per range.
  *
  * CDS_FT_OPTIMIZE_RSS: advise 4 KiB pages (MADV_NOHUGEPAGE).  No hugepage
- *   floor -- a small or sparse trie faults only the pages it touches -- at the
- *   cost of more DTLB pressure once the working set is large.  Choose this for
- *   workloads with many small tries / arenas.
+ *   floor: a small or sparse trie faults only the pages it touches.  The
+ *   cost is more DTLB pressure once the working set is large.  Choose this
+ *   for workloads with many small tries / arenas.
  */
 enum cds_ft_optimize {
 	CDS_FT_OPTIMIZE_THROUGHPUT = 0,
@@ -701,13 +763,13 @@ struct cds_ft_external_arena *cds_ft_external_arena_create(
  * cds_ft_external_arena_alloc - Allocate from @arena.
  * @arena: Arena returned by cds_ft_external_arena_create.
  * @size:  Number of bytes the caller needs.  Rounded up internally
- *         to the next power of two (the slot's "size class");
- *         requests below 16 bytes are bumped to 16 bytes, requests
+ *         to the next power of two (the slot's "size class").
+ *         Requests below 16 bytes are bumped to 16 bytes.  Requests
  *         above 4 MiB are rejected with NULL.
  *
- * Returns a pointer aligned to its size class with the slot
- * zero-initialised, or NULL if the size class is out of range or
- * a backing-range allocation fails.
+ * Returns a pointer aligned to its size class, with the slot
+ * zero-initialised.  Returns NULL if the size class is out of range
+ * or a backing-range allocation fails.
  */
 void *cds_ft_external_arena_alloc(struct cds_ft_external_arena *arena,
 		size_t size);
@@ -721,7 +783,7 @@ void *cds_ft_external_arena_alloc(struct cds_ft_external_arena *arena,
  * reuse by subsequent allocations.
  *
  * Caller must ensure no RCU reader still references @ptr (e.g.
- * via synchronize_rcu after removal from any published trie) -- the
+ * via synchronize_rcu after removal from any published trie).  The
  * arena does not defer reclamation.
  */
 void cds_ft_external_arena_free(struct cds_ft_external_arena *arena,
@@ -763,9 +825,9 @@ void cds_ft_external_arena_destroy(struct cds_ft_external_arena *arena);
  *
  * The fastest lookup: the returned node is a CANDIDATE that may not be
  * an exact match.  The caller MUST compare the returned node's key
- * against the lookup key to confirm; if the keys do not match, the
+ * against the lookup key to confirm.  If the keys do not match, the
  * lookup key is not in the trie.  cds_ft_speculative_lookup_key wraps
- * this with the validating compare and is the recommended entry point
+ * this with the validating compare.  It is the recommended entry point
  * for callers that want an exact match.
  *
  * Returns CDS_FT_STATUS_OK on success (candidate found),
@@ -927,15 +989,21 @@ enum cds_ft_status cds_ft_lookup_longest_match_key(struct cds_ft *ft,
  *
  * These functions use a cds_ft_iter to hold input key, output key,
  * result node, status, and cached position. Set the input key
- * with cds_ft_iter_set_key() before calling. The @ft argument must be
- * the trie the iterator was created for (cds_ft_iter_create): the
- * descent uses @ft while the key handling uses the iterator's bound
- * trie, so passing a different trie mixes their key mappings and
- * produces undefined results. On return, the iterator
- * holds the result key (cds_ft_iter_get_key()), result node
- * (cds_ft_iter_node()), status (cds_ft_iter_status()), and cached
- * position. The status is also returned by the function for
- * convenience.
+ * with cds_ft_iter_set_key() before calling.
+ *
+ * The @ft argument must be the trie the iterator was created for
+ * (cds_ft_iter_create). The descent uses @ft while the key handling
+ * uses the iterator's bound trie. So passing a different trie mixes
+ * their key mappings and produces undefined results.
+ *
+ * On return, the iterator holds:
+ *
+ * - the result key (cds_ft_iter_get_key());
+ * - the result node (cds_ft_iter_node());
+ * - the status (cds_ft_iter_status());
+ * - the cached position.
+ *
+ * The function also returns the status, for convenience.
  *
  * Scope: a scoped iterator (cds_ft_iter_set_prefix_len()) confines
  * cds_ft_next() / _prev() / _first() / _last() and the range lookups to
@@ -988,12 +1056,12 @@ enum cds_ft_status cds_ft_lookup_partial(struct cds_ft *ft,
  *        matching sub-key length. This is the deepest position in
  *        the trie that matches a prefix of the input key, including
  *        internal nodes with no external nodes attached. The result
- *        node (cds_ft_iter_node()) is set to the first node of a
- *        duplicate chain if the longest match has an external node
- *        (status is CDS_FT_STATUS_OK), or NULL if the longest match
- *        ends at an internal node (status is
- *        CDS_FT_STATUS_INTERNAL_MATCH). The cached position is
- *        populated.
+ *        node (cds_ft_iter_node()) is set as follows:
+ *        - the longest match has an external node: the first node
+ *          of a duplicate chain (status is CDS_FT_STATUS_OK);
+ *        - the longest match ends at an internal node: NULL
+ *          (status is CDS_FT_STATUS_INTERNAL_MATCH).
+ *        The cached position is populated.
  *
  * Returns CDS_FT_STATUS_OK if the longest match has an external node.
  * Returns CDS_FT_STATUS_INTERNAL_MATCH if the longest match ends at
@@ -1147,11 +1215,13 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  *
  * An RCU read-side lock must be held when the macro invokes trie
  * operations (cds_ft_lookup_first, cds_ft_next) and while accessing
- * the returned node. For CDS_FT_ITER_CACHED iterators, this
- * means the RCU read-side critical section must span the entire
- * loop, since the cached position can reference memory reclaimed
- * after a grace period. For
- * CDS_FT_ITER_UNCACHED iterators, the lock may be dropped and
+ * the returned node.
+ *
+ * For CDS_FT_ITER_CACHED iterators, the RCU read-side critical
+ * section must therefore span the entire loop. The cached position
+ * can otherwise reference memory reclaimed after a grace period.
+ *
+ * For CDS_FT_ITER_UNCACHED iterators, the lock may be dropped and
  * reacquired within the loop body, because the cached position is
  * discarded after each operation:
  *
@@ -1213,25 +1283,32 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  * @cap: Capacity of @buf (a larger batch amortizes the call boundary further;
  *       32-64 is plenty).
  *
- * Batched in-order traversal built on the iterator-free cds_ft_cell_next_batch():
- * it refills @buf one library call per @cap cells and iterates it INLINE, so the
- * ordered cell-list walk pays the call boundary once per batch instead of once
- * per cell.  There is NO iterator object in scope, so none of the
- * stale-position hazards of an iterator apply.  From @cell, recover the
- * head node with cds_ft_cell_node(@cell, off) (off =
- * cds_ft_cell_node_offset(), cached once outside the loop) and the key
- * with cds_ft_cell_get_key(ft, @cell, ...).
+ * Batched in-order traversal built on the iterator-free
+ * cds_ft_cell_next_batch().  It refills @buf with one library call per
+ * @cap cells and iterates it INLINE.  So the ordered cell-list walk pays
+ * the call boundary once per batch instead of once per cell.  There is NO
+ * iterator object in scope, so none of the stale-position hazards of an
+ * iterator apply.
  *
- * ORDERED-LIST ONLY: stepping in key order needs the cell list, so on a list-off
- * trie (cds_ft_group_attr_set_ordered_list(attr, false)) this loop iterates
- * NOTHING (cds_ft_cell_next_batch returns CDS_FT_STATUS_NOT_SUPPORTED, which the
- * macro cannot surface).  Code that may run on either kind of trie must branch
- * on cds_ft_group_ordered_list(group) and use cds_ft_for_each_rcu() when it is false.
+ * From @cell, recover:
+ *
+ *   - the head node with cds_ft_cell_node(@cell, off).  Here off is
+ *     cds_ft_cell_node_offset(), cached once outside the loop;
+ *   - the key with cds_ft_cell_get_key(ft, @cell, ...).
+ *
+ * ORDERED-LIST ONLY: stepping in key order needs the cell list.  On a
+ * list-off trie (cds_ft_group_attr_set_ordered_list(attr, false)) this
+ * loop iterates NOTHING.  cds_ft_cell_next_batch then returns
+ * CDS_FT_STATUS_NOT_SUPPORTED, which the macro cannot surface.  Code that
+ * may run on either kind of trie must branch on
+ * cds_ft_group_ordered_list(group).  When it is false, use
+ * cds_ft_for_each_rcu().
+ *
  * Same RCU read-lock requirement as cds_ft_for_each_rcu().
  *
- * Despite the batching, this expands to a SINGLE flat loop: `break` and
- * `continue` in the body behave exactly as in a plain for loop (`break`
- * terminates the whole traversal, not just the current batch).
+ * Despite the batching, this expands to a SINGLE flat loop.  `break` and
+ * `continue` in the body behave exactly as in a plain for loop: `break`
+ * terminates the whole traversal, not just the current batch.
  *
  *   const struct cds_ft_cell *cell, *batch[64];
  *   size_t off = cds_ft_cell_node_offset();
@@ -1258,10 +1335,12 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
 
 /*
  * cds_ft_for_each_reverse_batched_rcu - Reverse in-order traversal, batched.
- * The descending-key-order counterpart of cds_ft_for_each_batched_rcu(): visits
- * every cell from the largest key down, batching via cds_ft_cell_prev_batch().
- * Same arguments, RCU rules, and ORDERED-LIST-ONLY contract (list-off iterates
- * nothing; branch on cds_ft_group_ordered_list() and use cds_ft_for_each_reverse_rcu()).
+ * The descending-key-order counterpart of cds_ft_for_each_batched_rcu().
+ * Visit every cell from the largest key down, batching via
+ * cds_ft_cell_prev_batch().  The arguments, the RCU rules and the
+ * ORDERED-LIST-ONLY contract are the same: a list-off trie iterates
+ * nothing.  Branch on cds_ft_group_ordered_list() and use
+ * cds_ft_for_each_reverse_rcu() on a list-off trie.
  */
 #define cds_ft_for_each_reverse_batched_rcu(ft, cell, buf, cap)			\
 	for (struct { const struct cds_ft_cell *cur; size_t n, i; int started; } \
@@ -1348,20 +1427,18 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  *               }
  *       }
  *
- *     The outer loop positions the iterator at each distinct key;
- *     extracting the containing struct there would be redundant
- *     since the inner loop re-derives it starting from the same
- *     chain head.
+ *     The outer loop positions the iterator at each distinct key.
+ *     Extracting the containing struct there would be redundant:
+ *     the inner loop re-derives it, starting from the same chain
+ *     head.
  */
 
 /*
  * cds_ft_for_each_duplicate_rcu - Iterate through duplicates.
  * @pos: struct cds_ft_node *, start of duplicate list and loop cursor.
  *
- * Iterate through duplicates returned by cds_ft_lookup*()
+ * Iterate through duplicates returned by cds_ft_lookup*().
  * This must be done while rcu_read_lock() is held.
- * Receives a struct cds_ft_node * as parameter, which is used as start
- * of duplicate list and loop cursor.
  * _NOT_ safe against node removal within iteration.
  */
 #define cds_ft_for_each_duplicate_rcu(pos)				\
@@ -1426,23 +1503,29 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
 /*
  * Mutation API
  *
- * "Atomically" in this section is with respect to concurrent RCU readers:
- * a reader observes either the complete prior state or the complete result,
+ * "Atomically" in this section is with respect to concurrent RCU readers.
+ * A reader observes either the complete prior state or the complete result,
  * never a partial one.  It does NOT make an operation atomic against other
- * concurrent updates; each operation below states the caller's
+ * concurrent updates.  Each operation below states the caller's
  * mutual-exclusion requirement.
  *
- * RCU read side, point updates (cds_ft_insert, cds_ft_insert_unique,
- * cds_ft_insert_replace, cds_ft_replace, cds_ft_remove, cds_ft_remove_all):
- * each one takes read-side critical sections of the trie's flavor
- * internally around its accesses to the shared structure; the caller need
- * not hold one, and a section the caller does hold simply nests.  The
- * exceptions are the caller-owned references: cds_ft_remove and
- * cds_ft_replace dereference the node passed in, and a CDS_FT_ITER_CACHED
- * iterator carries a node from a previous lookup, so the caller must have
- * held the read-side lock continuously since obtaining it (see each
- * function).  Bulk operations (graft, graft_swap, detach, merge, rekey) wait
- * for grace periods and must NOT be called inside a read-side critical
+ * RCU read side, point updates.  The point updates are cds_ft_insert,
+ * cds_ft_insert_unique, cds_ft_insert_replace, cds_ft_replace,
+ * cds_ft_remove and cds_ft_remove_all.  Each one takes read-side critical
+ * sections of the trie's flavor internally, around its accesses to the
+ * shared structure.  The caller need not hold one, and a section the
+ * caller does hold simply nests.
+ *
+ * The exceptions are the caller-owned references:
+ *
+ *   - cds_ft_remove and cds_ft_replace dereference the node passed in;
+ *   - a CDS_FT_ITER_CACHED iterator carries a node from a previous lookup.
+ *
+ * So the caller must have held the read-side lock continuously since
+ * obtaining that node (see each function).
+ *
+ * Bulk operations (graft, graft_swap, detach, merge, rekey) wait for
+ * grace periods.  They must NOT be called inside a read-side critical
  * section.
  */
 
@@ -1469,8 +1552,8 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  *   cds_ft_remove and cds_ft_remove_all on the same trie, including on the same
  *   key.
  *   ☐ Mutual exclusion against cds_ft_compact_step and cds_ft_recompute_stats
- *   is still the caller's responsibility: concurrent compaction is the LAST
- *   step of the transition, by plan -- see "THE FINE-LOCKING TRANSITION IS
+ *   is still the caller's responsibility.  Concurrent compaction is the LAST
+ *   step of the transition, by plan.  See "THE FINE-LOCKING TRANSITION IS
  *   INCOMPLETE" at enum cds_ft_writer_strategy.
  *
  *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
@@ -1500,10 +1583,12 @@ enum cds_ft_status cds_ft_insert(struct cds_ft *ft,
  * @node has not been published and is left reusable for a subsequent
  * insert attempt.
  *
- * Pointers to existing nodes returned by this function are only safe to
- * dereference as long as the writer mutual exclusion is held, or if the
- * caller wraps the operation in their own RCU read-side critical
- * section.
+ * A pointer to an existing node returned by this function is safe to
+ * dereference only in one of two cases:
+ *
+ *   - the writer mutual exclusion is still held;
+ *   - the caller wraps the operation in its own RCU read-side critical
+ *     section.
  *
  * Update concurrency depends on the group's writer strategy
  * (cds_ft_group_attr_set_writer_strategy):
@@ -1513,8 +1598,8 @@ enum cds_ft_status cds_ft_insert(struct cds_ft *ft,
  *   cds_ft_remove and cds_ft_remove_all on the same trie, including on the same
  *   key.
  *   ☐ Mutual exclusion against cds_ft_compact_step and cds_ft_recompute_stats
- *   is still the caller's responsibility: concurrent compaction is the LAST
- *   step of the transition, by plan -- see "THE FINE-LOCKING TRANSITION IS
+ *   is still the caller's responsibility.  Concurrent compaction is the LAST
+ *   step of the transition, by plan.  See "THE FINE-LOCKING TRANSITION IS
  *   INCOMPLETE" at enum cds_ft_writer_strategy.
  *
  *   ☞ The op takes the duplicate chain's HOLDER lock and derives its routing
@@ -1574,20 +1659,26 @@ enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
  *   CDS_FT_WRITER_LOCK_FINE (the default): may run concurrently with
  *   cds_ft_insert, cds_ft_insert_unique, cds_ft_insert_replace, cds_ft_replace,
  *   cds_ft_remove and cds_ft_remove_all on the same trie, including on the same
- *   key.  The
- *   op ACQUIRES the chain holder before it derives what it displaces, and the
- *   commit FREEZES THE WHOLE displaced chain -- not just its head, which left
- *   21.7% of displacements with unmarked live members that a concurrent
- *   cds_ft_insert could then append onto, losing the key.  The freeze length is
- *   a BOUND, not a hint: the last member is recorded against the derived NULL,
- *   so a duplicate appended concurrently tears the expected-old and ABORTS the
- *   attempt instead of being marked into a tombstone.  An attempt that loses
- *   publishes nothing and is re-derived; a caller that reaches a retired chain
- *   is answered -ESTALE rather than served.
- *   ☐ Mutual exclusion against cds_ft_compact_step and cds_ft_recompute_stats
- *   is still the caller's responsibility: concurrent compaction is the LAST
- *   step of the transition, by plan -- see "THE FINE-LOCKING TRANSITION IS
- *   INCOMPLETE" at enum cds_ft_writer_strategy.
+ *   key.
+ *
+ *   The op acquires the chain holder before it derives what it displaces.
+ *   The commit freezes the WHOLE displaced chain, not only its head.
+ *   Freezing only the head would leave live members unmarked.  A
+ *   concurrent cds_ft_insert could then append onto one of them and lose
+ *   the key.
+ *
+ *   The freeze length is a BOUND, not a hint.  The last member is recorded
+ *   against the derived NULL.  So a duplicate appended concurrently fails
+ *   the expected-old check and ABORTS the attempt.  It is not marked into a
+ *   tombstone.
+ *
+ *   An attempt that loses publishes nothing and is re-derived; a caller that
+ *   reaches a retired chain is answered -ESTALE rather than served.
+ *
+ *   ☐ The caller must still ensure mutual exclusion against
+ *   cds_ft_compact_step and cds_ft_recompute_stats.  Concurrent compaction
+ *   is the LAST step of the transition, by plan.  See "THE FINE-LOCKING
+ *   TRANSITION IS INCOMPLETE" at enum cds_ft_writer_strategy.
  *
  *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
  *   lock, so any mix of update operations may be called concurrently.
@@ -1604,14 +1695,14 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
  *        that returned @old_node).  Used only for its key, to locate
  *        @old_node's slot.
  * @old_node: Node to replace (normally cds_ft_iter_node(iter)), currently
- *            present in the trie.  Dereferenced directly via
- *            @old_node->prev, so it must be live: hold the RCU read-side
- *            lock continuously from when @old_node was obtained until this
- *            call (concurrent mode; in exclusive mode the caller's mutual
- *            exclusion replaces that).  After a dropped lock, re-look up
- *            @old_node first -- cds_ft_iter_bind_key() snapshots the
- *            iterator's key to resume across the dropped lock, but
- *            cannot refresh a node you already hold.
+ *            present in the trie.  It is dereferenced directly via
+ *            @old_node->prev, so it must be live.  In concurrent mode,
+ *            hold the RCU read-side lock continuously from when @old_node
+ *            was obtained until this call.  In exclusive mode, the
+ *            caller's mutual exclusion replaces that.  After a dropped
+ *            lock, look up @old_node again first.  cds_ft_iter_bind_key()
+ *            snapshots the iterator's key to resume across the dropped
+ *            lock.  It cannot refresh a node you already hold.
  * @new_node: Node to insert in place of @old_node. Must be
  *            initialized with cds_ft_node_init() before this call.
  *
@@ -1624,8 +1715,8 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
  * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
  * @old_node is not found at the iterator position, or a negative
  * cds_ft_status on error.  A publish that loses an expected-value CAS
- * is absorbed internally (the call re-derives and re-attempts), so it
- * is never reported as success without @new_node installed.
+ * is absorbed internally: the call re-derives and re-attempts.  So
+ * success is never reported without @new_node installed.
  *
  * Update concurrency depends on the group's writer strategy
  * (cds_ft_group_attr_set_writer_strategy):
@@ -1633,14 +1724,17 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
  *   CDS_FT_WRITER_LOCK_FINE (the default): may run concurrently with
  *   cds_ft_insert, cds_ft_insert_unique, cds_ft_insert_replace, cds_ft_replace,
  *   cds_ft_remove and cds_ft_remove_all on the same trie, including on the same
- *   key.  The
- *   chain holder is acquired before the routing is derived, and @expected_old
- *   IS the routing re-validation (a stale slot aborts the commit); an attempt
- *   that loses either publishes nothing and is re-derived.
- *   ☐ Mutual exclusion against cds_ft_compact_step and cds_ft_recompute_stats
- *   is still the caller's responsibility: concurrent compaction is the LAST
- *   step of the transition, by plan -- see "THE FINE-LOCKING TRANSITION IS
- *   INCOMPLETE" at enum cds_ft_writer_strategy.
+ *   key.
+ *
+ *   The chain holder is acquired before the routing is derived.
+ *   @expected_old IS the routing re-validation: a stale slot aborts the
+ *   commit.  An attempt that loses either one publishes nothing and is
+ *   re-derived.
+ *
+ *   ☐ The caller must still ensure mutual exclusion against
+ *   cds_ft_compact_step and cds_ft_recompute_stats.  Concurrent compaction
+ *   is the LAST step of the transition, by plan.  See "THE FINE-LOCKING
+ *   TRANSITION IS INCOMPLETE" at enum cds_ft_writer_strategy.
  *
  *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
  *   lock, so any mix of update operations may be called concurrently.
@@ -1656,13 +1750,13 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
  * @iter: Identifies the key at which @node sits (set by the lookup that
  *        returned @node).  Used only for its key, to locate @node's
  *        slot.
- * @node: Node to remove (normally cds_ft_iter_node(iter)).  Dereferenced
- *        directly via @node->prev, so it must be live: hold the RCU
- *        read-side lock continuously from when @node was obtained until
- *        this call (concurrent mode; in exclusive mode the caller's
- *        mutual exclusion replaces that).  After a dropped lock, re-look
- *        up @node first -- cds_ft_iter_bind_key() snapshots the
- *        iterator's key to resume across the dropped lock, but cannot
+ * @node: Node to remove (normally cds_ft_iter_node(iter)).  It is
+ *        dereferenced directly via @node->prev, so it must be live.  In
+ *        concurrent mode, hold the RCU read-side lock continuously from
+ *        when @node was obtained until this call.  In exclusive mode, the
+ *        caller's mutual exclusion replaces that.  After a dropped lock,
+ *        look up @node again first.  cds_ft_iter_bind_key() snapshots the
+ *        iterator's key to resume across the dropped lock.  It cannot
  *        refresh a node you already hold.
  *
  * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
@@ -1677,10 +1771,11 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
  *   cds_ft_insert, cds_ft_insert_unique, cds_ft_insert_replace, cds_ft_replace,
  *   cds_ft_remove and cds_ft_remove_all on the same trie, including on the same
  *   key.
- *   ☐ Mutual exclusion against cds_ft_compact_step and cds_ft_recompute_stats
- *   is still the caller's responsibility: concurrent compaction is the LAST
- *   step of the transition, by plan -- see "THE FINE-LOCKING TRANSITION IS
- *   INCOMPLETE" at enum cds_ft_writer_strategy.
+ *
+ *   ☐ The caller must still ensure mutual exclusion against
+ *   cds_ft_compact_step and cds_ft_recompute_stats.  Concurrent compaction
+ *   is the LAST step of the transition, by plan.  See "THE FINE-LOCKING
+ *   TRANSITION IS INCOMPLETE" at enum cds_ft_writer_strategy.
  *
  *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
  *   lock, so any mix of update operations may be called concurrently.
@@ -1695,55 +1790,60 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
  * @iter: Iterator position identifying the key.
  *        If the iterator holds a valid cached position from a prior
  *        lookup, remove_all reuses it to avoid a full traversal.
- *        WARNING (CDS_FT_ITER_CACHED only): If you intend to drop the
- *        RCU read-side lock between the positioning lookup and this
- *        call, you must call cds_ft_iter_bind_key() WHILE STILL HOLDING
- *        that lock to snapshot the key and clear the cached position;
- *        remove_all then re-descends by the key.  CDS_FT_ITER_UNCACHED
- *        iterators handle this automatically.
+ *        WARNING (CDS_FT_ITER_CACHED only): You may want to drop the RCU
+ *        read-side lock between the positioning lookup and this call.
+ *        Then call cds_ft_iter_bind_key() WHILE STILL HOLDING that lock.
+ *        It snapshots the key and clears the cached position.  remove_all
+ *        then re-descends by the key.  CDS_FT_ITER_UNCACHED iterators
+ *        handle this automatically.
  * @result_node: Node output. Set to the head of the removed duplicate
  *               chain on success, or NULL if no node is found or on
  *               error.
  *
  * Removes the key and all associated duplicate nodes from the trie.
- * On success, *@result_node points to the head of the removed chain;
- * the caller can traverse it with cds_ft_for_each_duplicate_rcu()
- * under rcu_read_lock, or reclaim all nodes after a grace period.
- * A grace period must be observed (e.g., synchronize_rcu, call_rcu)
- * after success before reclaiming memory of any nodes in the chain.
+ * On success, *@result_node points to the head of the removed chain.
+ * The caller can traverse it with cds_ft_for_each_duplicate_rcu()
+ * under rcu_read_lock.  A grace period must be observed (e.g.,
+ * synchronize_rcu, call_rcu) after success before reclaiming memory
+ * of any nodes in the chain.
  *
  * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
  * no node is found at the iterator position, or a negative
- * cds_ft_status on error.  CDS_FT_STATUS_MEMORY_ERROR reports an
- * allocation failure while restructuring the trie around the removed
- * key; it leaves the key NOT removed (the chain is still reachable;
- * *@result_node is NULL) and may be retried once the caller has freed
- * memory.  An allocation
- * failure while pruning an already-emptied internal holder is NOT an
- * error: the key's removal is published before the holder is pruned, so
- * the removal has already succeeded (CDS_FT_STATUS_OK).  Completing the
- * prune is deferred to a later mutation through that slot.
+ * cds_ft_status on error.
  *
- * CDS_FT_STATUS_BUSY_ERROR is NO LONGER RETURNED: a lock lost to a
- * concurrent writer is absorbed by this op's own retry loop, which ages
- * the conflict so a contended caller escalates into the trie's FIFO
- * writer lane instead of spinning.  Callers that tested for it may keep
- * doing so -- the value is still declared -- but the branch is dead.
+ * CDS_FT_STATUS_MEMORY_ERROR reports an allocation failure while
+ * restructuring the trie around the removed key.  The key is then NOT
+ * removed: the chain is still reachable and *@result_node is NULL.
+ * The call may be retried once the caller has freed memory.
+ *
+ * An allocation failure while pruning an already-emptied internal
+ * holder is NOT an error.  The key's removal is published before the
+ * holder is pruned, so the removal has already succeeded
+ * (CDS_FT_STATUS_OK).  Completing the prune is deferred to a later
+ * mutation through that slot.
+ *
+ * This function never returns CDS_FT_STATUS_BUSY_ERROR.  A lock lost to
+ * a concurrent writer is absorbed by this op's own retry loop.  The loop
+ * ages the conflict, so a contended caller escalates into the trie's
+ * FIFO writer lane instead of spinning.
  *
  * Update concurrency depends on the group's writer strategy
  * (cds_ft_group_attr_set_writer_strategy):
  *
  *   CDS_FT_WRITER_LOCK_FINE (the default): may run concurrently with
  *   cds_ft_insert, cds_ft_insert_unique, cds_ft_insert_replace, cds_ft_replace,
- *   cds_ft_remove and cds_ft_remove_all, INCLUDING ON THE SAME KEY.  The chain head is derived
- *   with nothing held, then re-validated: the leaf shape under
- *   ft_detach_node's lock-set (as the point remove), the prefix shape under
- *   the holder's lock with the clear's expected-old as the check.  An attempt
- *   that loses either publishes nothing and is re-derived.
- *   ☐ Mutual exclusion against cds_ft_compact_step and cds_ft_recompute_stats
- *   is still the caller's responsibility: concurrent compaction is the LAST
- *   step of the transition, by plan -- see "THE FINE-LOCKING TRANSITION IS
- *   INCOMPLETE" at enum cds_ft_writer_strategy.
+ *   cds_ft_remove and cds_ft_remove_all, INCLUDING ON THE SAME KEY.
+ *
+ *   The chain head is derived with nothing held, then re-validated:
+ *   - the leaf shape under ft_detach_node's lock-set, as the point remove;
+ *   - the prefix shape under the holder's lock, with the clear's
+ *     expected-old as the check.
+ *   An attempt that loses either one publishes nothing and is re-derived.
+ *
+ *   ☐ The caller must still ensure mutual exclusion against
+ *   cds_ft_compact_step and cds_ft_recompute_stats.  Concurrent compaction
+ *   is the LAST step of the transition, by plan.  See "THE FINE-LOCKING
+ *   TRANSITION IS INCOMPLETE" at enum cds_ft_writer_strategy.
  *
  *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
  *   lock, so any mix of update operations may be called concurrently.
@@ -1767,8 +1867,8 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  *
  * Root-level operations (key_len 0) work with both fixed-length and
  * variable-length key groups. Non-root operations (key_len > 0)
- * require a variable-length key group (CDS_FT_LEN_VARIABLE), because
- * a fixed-length group rejects any key whose length differs from the
+ * require a variable-length key group (CDS_FT_LEN_VARIABLE). A
+ * fixed-length group rejects any key whose length differs from the
  * group's fixed length.
  *
  * Efficient bulk-load pattern:
@@ -1778,12 +1878,13 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  * trie has no concurrent readers or writers during population, no RCU
  * read-side lock and no mutual exclusion are needed for the inserts.
  * Concurrent RCU readers see either the pre-graft state or the
- * post-graft state, never a partial view -- so the duration of writer
- * mutual exclusion on the main trie is short and bounded (independent
- * of the number of nodes being grafted, modulo the O(depth) descent and
- * key-count propagation). This pattern is well suited for batch loading,
- * sharding, and periodic bulk updates where minimizing the writer
- * critical section on the live trie is important.
+ * post-graft state, never a partial view. So the writer mutual
+ * exclusion on the main trie is held for a short, bounded time. That
+ * time does not depend on the number of nodes being grafted, except
+ * for the O(depth) descent and the key-count propagation. This pattern
+ * is well suited for batch loading, sharding, and periodic bulk updates
+ * where minimizing the writer critical section on the live trie is
+ * important.
  *
  *   // Phase 1: populate offline, no locking needed.
  *   cds_ft_create(group, NULL, &staging);
@@ -1807,25 +1908,24 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  * Both source and destination tries must belong to the same group.
  * Update concurrency is documented per operation below and depends on
  * the group's writer strategy (cds_ft_group_attr_set_writer_strategy).
- * Do NOT call these operations from within
- * an RCU read-side critical section: they can block internally on
- * synchronize_rcu() to drain readers, which deadlocks (or never
- * completes) inside a read-side critical section. No RCU read-side lock
- * is required. The source trie must not be the same object as the
- * destination trie.
+ * Do NOT call these operations from within an RCU read-side critical
+ * section. They can block internally on synchronize_rcu() to drain
+ * readers. Inside a read-side critical section, that deadlocks or
+ * never completes. No RCU read-side lock is required. The source trie
+ * must not be the same object as the destination trie.
  *
  * Efficient bulk-removal pattern:
  *
  * Detach (or graft_swap) removes an entire sub-trie from the live
- * trie in a single O(1) operation and drains it before returning:
- * the operation performs one internal grace period, after which no
+ * trie in a single O(1) operation and drains it before returning.
+ * The operation performs one internal grace period. After it, no
  * concurrent reader can still hold a reference to any node in the
- * detached sub-trie. The returned trie is therefore purely local --
- * the caller can iterate it and free all external nodes directly,
- * with no further synchronize_rcu and no grace period per individual
- * node. This reduces the cost of removing N nodes from N grace
- * periods (or N call_rcu callbacks) to the single grace period the
- * operation already performed, followed by a local iteration.
+ * detached sub-trie. The returned trie is therefore purely local.
+ * The caller can iterate it and free all external nodes directly. It
+ * needs no further synchronize_rcu and no grace period per node.
+ * Removing N nodes then costs the single grace period the operation
+ * already performed, followed by a local iteration. It no longer costs
+ * N grace periods (or N call_rcu callbacks).
  *
  *   // Phase 1: detach from the live trie, O(1) under lock.
  *   lock(&writer_mutex);
@@ -1853,9 +1953,9 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  * - 0: Graft at the root (NIL prefix).
  * @src_ft: Source Fractal Trie. Must be in the same group as @dst_ft.
  *          Under fine-grained writer locking (CDS_FT_WRITER_LOCK_FINE)
- *          @src_ft must be EXCLUSIVE (cds_ft_make_exclusive), i.e. have
- *          no concurrent readers or writers -- a live concurrent source
- *          is rejected with CDS_FT_STATUS_BUSY_ERROR (see below). On
+ *          @src_ft must be EXCLUSIVE (cds_ft_make_exclusive): it has no
+ *          concurrent readers or writers. A live concurrent source is
+ *          rejected with CDS_FT_STATUS_BUSY_ERROR (see below). On
  *          success, @src_ft becomes empty. The caller retains ownership
  *          of the (now empty) @src_ft object.
  *
@@ -1875,16 +1975,18 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  *
  * Source-exclusivity requirement (fine-grained locking).  A cross-trie
  * graft consumes @src_ft's whole content.  Under CDS_FT_WRITER_LOCK_FINE
- * it holds only @dst_ft's writer lock -- an exclusive @src_ft is private,
+ * it holds only @dst_ft's writer lock.  An exclusive @src_ft is private,
  * so no second lock is taken and there is no cross-trie deadlock.  A LIVE
  * (concurrent, non-exclusive) @src_ft would require a second lock with no
- * lock order and is therefore rejected with CDS_FT_STATUS_BUSY_ERROR
- * BEFORE anything is modified; make it exclusive first with
- * cds_ft_make_exclusive() (the "offline staging trie" pattern above
- * already builds @src_ft privately).  @dst_ft may be a live concurrent
- * trie.  On ANY failure -- BUSY, POPULATED, OVERFLOW or a memory error --
- * @src_ft is left UNCHANGED (the graft is assembled invisibly and only
- * commits once it cannot fail), so no content is ever stranded.
+ * lock order.  It is therefore rejected with CDS_FT_STATUS_BUSY_ERROR
+ * BEFORE anything is modified.  Make it exclusive first with
+ * cds_ft_make_exclusive().  The "offline staging trie" pattern above
+ * already builds @src_ft privately.  @dst_ft may be a live concurrent
+ * trie.
+ *
+ * On ANY failure, @src_ft is left UNCHANGED: the graft is assembled
+ * invisibly and only commits once it cannot fail.  So no content is ever
+ * stranded.  This holds for BUSY, POPULATED, OVERFLOW and a memory error.
  *
  * Returns CDS_FT_STATUS_OK on success (@src_ft left empty).
  * Returns CDS_FT_STATUS_BUSY_ERROR if @src_ft is a live concurrent trie
@@ -1901,31 +2003,34 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  * (cds_ft_group_attr_set_writer_strategy):
  *
  *   CDS_FT_WRITER_LOCK_FINE (the default): the DESTINATION may be a live
- *   trie carrying concurrent writers, and NO caller-side mutex is needed --
+ *   trie carrying concurrent writers.  NO caller-side mutex is needed,
  *   against bulk peers OR against the point-update operations.  The library
- *   carries both, with ONE mechanism: the FT-WIDE WRITER LOCK.
+ *   handles both with ONE mechanism: the FT-WIDE WRITER LOCK.
  *
  *   A bulk op first publishes the BULK-IN-PROGRESS state and waits a grace
  *   period, which drains the point mutations already in flight (each runs
  *   inside the caller's RCU read-side bracket, so one GP retires them).
- *   While that state is live every writer entering a writer scope takes the
- *   FT-wide lock instead of skipping it -- point ops FLIP OUT of fine
- *   locking for the duration (ft_writer_lock_scope_enter's `ft->lock_fine &&
- *   !(FT_BULK_WIDE_LOCK && ft_bulk_active(ft))` test), and bulk peers queue
- *   on the same word.  So cross-trie attaches on one destination SERIALIZE
- *   rather than interleave; they do not run concurrently, they take turns.
+ *   While that state is live, every writer entering a writer scope takes
+ *   the FT-wide lock instead of skipping it.  Point ops FLIP OUT of fine
+ *   locking for the duration.  This is the `ft->lock_fine &&
+ *   !(FT_BULK_WIDE_LOCK && ft_bulk_active(ft))` test in
+ *   ft_writer_lock_scope_enter.  Bulk peers queue on the same word.  So
+ *   cross-trie attaches on one destination SERIALIZE: they take turns and
+ *   do not run concurrently.
  *
- *   The SOURCE must still be EXCLUSIVE, which is what removes the need to
- *   exclude writers on it.
+ *   The SOURCE must still be EXCLUSIVE.  This removes the need to exclude
+ *   writers on it.
  *
  *   A ROOT-LEVEL attach into an EMPTY destination (key_len 0 /
- *   dst_key_len 0) arbitrates against the bulk peers waiting their turn on
- *   the destination's root: a peer that populates the destination first wins,
- *   and this call then reports POPULATED_ERROR (cds_ft_graft) or falls
- *   through to the ordinary merge into a populated destination
- *   (cds_ft_merge_at).  A peer holding the root mid-attach yields
- *   CDS_FT_STATUS_BUSY_ERROR; the caller may retry.  In every outcome the
- *   losing side keeps its keys -- neither op's content is discarded.
+ *   dst_key_len 0) competes with the bulk peers waiting their turn on the
+ *   destination's root.  A peer that populates the destination first wins.
+ *   This call then does one of two things:
+ *   - cds_ft_graft reports POPULATED_ERROR;
+ *   - cds_ft_merge_at falls through to the ordinary merge into a populated
+ *     destination.
+ *   If a peer holds the root mid-attach, this call returns
+ *   CDS_FT_STATUS_BUSY_ERROR and the caller may retry.  In every outcome
+ *   the losing side keeps its keys: neither op's content is discarded.
  *
  *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
  *   lock per trie, so any mix of update operations may be called
@@ -1945,8 +2050,8 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
  * @swap_ft: Fractal Trie to exchange content with. Must be in the same
  *           group as @dst_ft. Under fine-grained writer locking
  *           (CDS_FT_WRITER_LOCK_FINE) @swap_ft must be EXCLUSIVE
- *           (cds_ft_make_exclusive), i.e. have no concurrent readers or
- *           writers -- a live concurrent @swap_ft is rejected with
+ *           (cds_ft_make_exclusive): it has no concurrent readers or
+ *           writers. A live concurrent @swap_ft is rejected with
  *           CDS_FT_STATUS_BUSY_ERROR (see below). On entry, its content is
  *           grafted into @dst_ft at @key. On success, it receives the
  *           content that was previously at @key in @dst_ft, or is empty if
@@ -1961,24 +2066,24 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
  * placed into @swap_ft. The caller can check cds_ft_empty(@swap_ft)
  * to determine whether there was pre-existing content. If @swap_ft
  * is non-empty, the "Efficient bulk-removal pattern" described above
- * applies: after a single grace period, the caller can drain
- * @swap_ft locally without per-node grace periods.
+ * applies. After a single grace period, the caller can drain @swap_ft
+ * locally without per-node grace periods.
  *
- * On success @swap_ft also inherits @dst_ft's access discipline: its
- * exclusive/concurrent mode is set to match @dst_ft (so an exclusive
- * @swap_ft may end up concurrent again if @dst_ft is a live trie).  This
- * changes the RCU rules the caller must follow on @swap_ft afterward
- * (including the drain above), so re-establish the desired mode with
+ * On success @swap_ft also inherits @dst_ft's access discipline. Its
+ * exclusive/concurrent mode is set to match @dst_ft. So an exclusive
+ * @swap_ft may end up concurrent again if @dst_ft is a live trie. This
+ * changes the RCU rules the caller must follow on @swap_ft afterward,
+ * including for the drain above. Re-establish the desired mode with
  * cds_ft_make_exclusive() / cds_ft_make_shared() if it matters.
  *
  * Source-exclusivity requirement (fine-grained locking).  @swap_ft is the
- * consumed source of the exchange, so like cds_ft_graft it must be
- * EXCLUSIVE under CDS_FT_WRITER_LOCK_FINE: the op then holds only
+ * consumed source of the exchange.  Like the source of cds_ft_graft, it
+ * must be EXCLUSIVE under CDS_FT_WRITER_LOCK_FINE.  The op then holds only
  * @dst_ft's writer lock, with no cross-trie deadlock.  A LIVE (concurrent,
  * non-exclusive) @swap_ft is rejected with CDS_FT_STATUS_BUSY_ERROR before
- * anything is modified; make it exclusive first with cds_ft_make_exclusive().
- * @dst_ft may be a live concurrent trie.  On any failure -- BUSY, OVERFLOW
- * or a memory error -- both tries are left UNCHANGED.
+ * anything is modified.  Make it exclusive first with
+ * cds_ft_make_exclusive().  @dst_ft may be a live concurrent trie.  On any
+ * failure (BUSY, OVERFLOW or a memory error) both tries are left UNCHANGED.
  *
  * The operation validates that @key_len plus the maximum used key
  * length of @swap_ft does not exceed the group's maximum key length.
@@ -2000,22 +2105,23 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
  * (cds_ft_group_attr_set_writer_strategy):
  *
  *   CDS_FT_WRITER_LOCK_FINE (the default): the DESTINATION may be a live
- *   trie carrying concurrent writers, and NO caller-side mutex is needed --
+ *   trie carrying concurrent writers.  NO caller-side mutex is needed,
  *   against bulk peers OR against the point-update operations.  The library
- *   carries both, with ONE mechanism: the FT-WIDE WRITER LOCK.
+ *   handles both with ONE mechanism: the FT-WIDE WRITER LOCK.
  *
  *   A bulk op first publishes the BULK-IN-PROGRESS state and waits a grace
  *   period, which drains the point mutations already in flight (each runs
  *   inside the caller's RCU read-side bracket, so one GP retires them).
- *   While that state is live every writer entering a writer scope takes the
- *   FT-wide lock instead of skipping it -- point ops FLIP OUT of fine
- *   locking for the duration (ft_writer_lock_scope_enter's `ft->lock_fine &&
- *   !(FT_BULK_WIDE_LOCK && ft_bulk_active(ft))` test), and bulk peers queue
- *   on the same word.  So cross-trie attaches on one destination SERIALIZE
- *   rather than interleave; they do not run concurrently, they take turns.
+ *   While that state is live, every writer entering a writer scope takes
+ *   the FT-wide lock instead of skipping it.  Point ops FLIP OUT of fine
+ *   locking for the duration.  This is the `ft->lock_fine &&
+ *   !(FT_BULK_WIDE_LOCK && ft_bulk_active(ft))` test in
+ *   ft_writer_lock_scope_enter.  Bulk peers queue on the same word.  So
+ *   cross-trie attaches on one destination SERIALIZE: they take turns and
+ *   do not run concurrently.
  *
- *   The SOURCE must still be EXCLUSIVE, which is what removes the need to
- *   exclude writers on it.
+ *   The SOURCE must still be EXCLUSIVE.  This removes the need to exclude
+ *   writers on it.
  *
  *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
  *   lock per trie, so any mix of update operations may be called
@@ -2038,10 +2144,10 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
  *
  * Removes the sub-structure rooted at @key as a single operation
  * visible to concurrent RCU readers and returns it as a new trie
- * instance. The new trie supports all normal operations (lookup,
- * iteration, further detach, graft, destroy). The key lengths
- * within the detached trie are relative to the detach point
- * (i.e., the @key prefix is stripped).
+ * instance. The new trie supports all normal operations: lookup,
+ * iteration, further detach, graft and destroy. The key lengths
+ * within the detached trie are relative to the detach point:
+ * the @key prefix is stripped.
  *
  * See "Efficient bulk-removal pattern" above for how to drain and
  * free the detached sub-trie with a single grace period.
@@ -2052,8 +2158,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
  *
  * The returned trie is in exclusive mode: no RCU reader can be
  * inside it at return.  A subsequent graft of the detached trie
- * therefore needs no grace-period drain of its own, coalescing
- * detach+graft into a single grace period.  Callers that publish
+ * therefore needs no grace-period drain of its own.  So detach+graft
+ * costs a single grace period.  Callers that publish
  * the detached trie to concurrent readers must call
  * cds_ft_make_shared() first.
  *
@@ -2066,13 +2172,14 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
  * (cds_ft_group_attr_set_writer_strategy):
  *
  *   CDS_FT_WRITER_LOCK_FINE (the default): no caller-side mutex is needed
- *   on @ft.  The whole body runs inside the BULK GATE (see cds_ft_graft):
- *   the op publishes the bulk-in-progress state and waits a grace period to
- *   drain the point mutations already in flight, and for the duration every
- *   writer scope on @ft -- point ops included -- takes the FT-wide writer
- *   lock instead of skipping it, so bulk peers and point ops queue on one
- *   word.  The DETACHED trie is handed back EXCLUSIVE by construction, so it
- *   has no concurrent writer to coordinate with either.
+ *   on @ft.  The whole body runs inside the BULK GATE (see cds_ft_graft).
+ *   The op publishes the bulk-in-progress state.  It then waits a grace
+ *   period to drain the point mutations already in flight.  For the
+ *   duration, every writer scope on @ft takes the FT-wide writer lock
+ *   instead of skipping it, point ops included.  So bulk peers and point
+ *   ops queue on one word.  The DETACHED trie is handed back EXCLUSIVE by
+ *   construction, so it has no concurrent writer to coordinate with.
+ *
  *   ☐ The drain-seam gap applies: this op drops writer_lock across mid-body
  *   grace periods, so the hold is not continuous.  See enum
  *   cds_ft_writer_strategy.
@@ -2096,11 +2203,12 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
  *          @dst_ft and must not equal @dst_ft.  Under the default
  *          CDS_FT_WRITER_LOCK_FINE it must be EXCLUSIVE
  *          (cds_ft_make_exclusive), exactly as for cds_ft_merge_at and
- *          cds_ft_graft -- a live concurrent source would need a second
- *          trie's writer lock with no lock order, and is rejected with
+ *          cds_ft_graft.  A live concurrent source would need a second
+ *          trie's writer lock with no lock order.  It is rejected with
  *          CDS_FT_STATUS_BUSY_ERROR.  Detach the region first if the source
- *          must stay live to its readers: cds_ft_detach returns the detached
- *          trie exclusive, so detach-then-merge is the supported idiom.
+ *          must stay live to its readers.  cds_ft_detach returns the
+ *          detached trie exclusive, so detach-then-merge is the supported
+ *          idiom.
  *
  * Moves @src_ft's content under prefix @key into @dst_ft at the
  * same prefix, preserving original key bytes.  @src_ft keys that
@@ -2114,11 +2222,11 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
  * Atomicity: the entire merge is published to concurrent RCU
  * readers of @dst_ft as a single atomic transition.  A reader
  * sees either the complete pre-merge @dst_ft or the complete
- * post-merge @dst_ft -- never a partially-applied merge, and
- * never a half-spliced duplicate chain at any key.  Same-key
+ * post-merge @dst_ft.  It never sees a partially-applied merge or
+ * a half-spliced duplicate chain at any key.  Same-key
  * duplicate chains under @key are concatenated.  On an ordered-list
  * group the moved keys' ordered-list links are spliced as part of
- * the same atomic commit, so ordered iteration over @dst_ft observes
+ * the same atomic commit.  So ordered iteration over @dst_ft observes
  * the merge atomically too.
  *
  * @src_ft's moved nodes are reclaimed under the usual RCU discipline;
@@ -2126,26 +2234,28 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
  *
  * Returns CDS_FT_STATUS_OK on success (including the no-op case
  * where @src_ft has no content under @key).
- * Returns CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if either trie
- * pointer is NULL, if @dst_ft == @src_ft, if the tries are not in
- * the same group, or if @key_len exceeds the group's maximum key
- * length.
- * Returns a negative cds_ft_status on memory allocation failure, with both
- * tries left individually valid AND no moved entry stranded.  The merge is
- * built invisibly and the source is emptied only once the destination
- * placement is fully secured (every node drawn from a pre-filled reserve, the
- * single publish slot pre-allocated), so the source unlink is the last
- * fallible step and any allocation shortfall rolls the whole operation back
- * cleanly: the merge never leaks.
+ * Returns CDS_FT_STATUS_INVALID_ARGUMENT_ERROR in these cases:
+ * - either trie pointer is NULL;
+ * - @dst_ft == @src_ft;
+ * - the tries are not in the same group;
+ * - @key_len exceeds the group's maximum key length.
+ * Returns a negative cds_ft_status on memory allocation failure.  Both
+ * tries are then left individually valid AND no moved entry is stranded.
+ * The merge is built invisibly.  The source is emptied only once the
+ * destination placement is fully secured.  By then every node is drawn
+ * from a pre-filled reserve, and the single publish slot is pre-allocated.
+ * So the source unlink is the last fallible step.  Any allocation shortfall
+ * rolls the whole operation back cleanly: the merge never leaks.
  *
  * Update concurrency depends on the group's writer strategy
  * (cds_ft_group_attr_set_writer_strategy):
  *
- *   CDS_FT_WRITER_LOCK_FINE (the default): identical to cds_ft_merge_at,
- *   which this is a one-line wrapper over (same key on both sides) -- no
- *   caller-side mutex is needed on @dst_ft, the bulk gate flips its point
- *   ops onto the FT-wide writer lock for the window, and bulk peers queue on
- *   that same lock.  @src_ft must be EXCLUSIVE, as there.
+ *   CDS_FT_WRITER_LOCK_FINE (the default): identical to cds_ft_merge_at.
+ *   This function is a one-line wrapper over it, with the same key on both
+ *   sides.  No caller-side mutex is needed on @dst_ft.  The bulk gate flips
+ *   its point ops onto the FT-wide writer lock for the window.  Bulk peers
+ *   queue on that same lock.  @src_ft must be EXCLUSIVE, as there.
+ *
  *   ☐ The drain-seam gap applies.  See enum cds_ft_writer_strategy.
  *
  *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
@@ -2181,53 +2291,60 @@ enum cds_ft_status cds_ft_merge(struct cds_ft *dst_ft,
  * partition rename) that cannot be expressed via the public
  * cds_ft_detach + cds_ft_graft pair on fixed-length groups.
  *
- * @src_ft must differ from @dst_ft (cross-trie only): the operation has the
- * same whole-operation-atomic contract as cds_ft_merge, with @src_key
- * selecting the source subtree to move and @dst_key serving as both the
- * destination attach point and the prefix that replaces @src_key on each
- * moved key.  To move a subtree to a new key WITHIN one trie, use the
- * dedicated rekey entry points cds_ft_rekey_graft (empty destination) /
- * cds_ft_rekey_merge (union into an occupied destination); a same-trie
- * cds_ft_merge_at is rejected with CDS_FT_STATUS_INVALID_ARGUMENT_ERROR.
+ * The operation is cross-trie only: @src_ft must differ from @dst_ft.  It
+ * has the same whole-operation-atomic contract as cds_ft_merge.  @src_key
+ * selects the source subtree to move.  @dst_key is both the destination
+ * attach point and the prefix that replaces @src_key on each moved key.
  *
- * Returns the same statuses as cds_ft_merge.  In addition,
- * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR is returned if either
- * @src_key_len or @dst_key_len exceeds the group's maximum key
- * length; if -- for a fixed-length key group -- @dst_key_len !=
- * @src_key_len (a fixed-length group accepts only keys of its fixed
- * length, so the moved keys keep that length only when the source and
- * destination prefixes are equally long); or if @src_ft == @dst_ft (a
- * same-trie move must use cds_ft_rekey_graft / cds_ft_rekey_merge).
+ * To move a subtree to a new key WITHIN one trie, use the dedicated rekey
+ * entry points:
+ * - cds_ft_rekey_graft, for an empty destination;
+ * - cds_ft_rekey_merge, for a union into an occupied destination.
+ * A same-trie cds_ft_merge_at is rejected with
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR.
+ *
+ * Returns the same statuses as cds_ft_merge.  In addition, it returns
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR in these cases:
+ * - @src_key_len or @dst_key_len exceeds the group's maximum key length;
+ * - the group has fixed-length keys and @dst_key_len != @src_key_len.  A
+ *   fixed-length group accepts only keys of its fixed length.  The moved
+ *   keys keep that length only when the source and destination prefixes
+ *   are equally long;
+ * - @src_ft == @dst_ft.  A same-trie move must use cds_ft_rekey_graft /
+ *   cds_ft_rekey_merge.
  *
  * Update concurrency depends on the group's writer strategy
  * (cds_ft_group_attr_set_writer_strategy):
  *
  *   CDS_FT_WRITER_LOCK_FINE (the default): the DESTINATION may be a live
- *   trie carrying concurrent writers, and NO caller-side mutex is needed --
+ *   trie carrying concurrent writers.  NO caller-side mutex is needed,
  *   against bulk peers OR against the point-update operations.  The library
- *   carries both, with ONE mechanism: the FT-WIDE WRITER LOCK.
+ *   handles both with ONE mechanism: the FT-WIDE WRITER LOCK.
  *
  *   A bulk op first publishes the BULK-IN-PROGRESS state and waits a grace
  *   period, which drains the point mutations already in flight (each runs
  *   inside the caller's RCU read-side bracket, so one GP retires them).
- *   While that state is live every writer entering a writer scope takes the
- *   FT-wide lock instead of skipping it -- point ops FLIP OUT of fine
- *   locking for the duration (ft_writer_lock_scope_enter's `ft->lock_fine &&
- *   !(FT_BULK_WIDE_LOCK && ft_bulk_active(ft))` test), and bulk peers queue
- *   on the same word.  So cross-trie attaches on one destination SERIALIZE
- *   rather than interleave; they do not run concurrently, they take turns.
+ *   While that state is live, every writer entering a writer scope takes
+ *   the FT-wide lock instead of skipping it.  Point ops FLIP OUT of fine
+ *   locking for the duration.  This is the `ft->lock_fine &&
+ *   !(FT_BULK_WIDE_LOCK && ft_bulk_active(ft))` test in
+ *   ft_writer_lock_scope_enter.  Bulk peers queue on the same word.  So
+ *   cross-trie attaches on one destination SERIALIZE: they take turns and
+ *   do not run concurrently.
  *
- *   The SOURCE must still be EXCLUSIVE, which is what removes the need to
- *   exclude writers on it.
+ *   The SOURCE must still be EXCLUSIVE.  This removes the need to exclude
+ *   writers on it.
  *
  *   A ROOT-LEVEL attach into an EMPTY destination (key_len 0 /
- *   dst_key_len 0) arbitrates against the bulk peers waiting their turn on
- *   the destination's root: a peer that populates the destination first wins,
- *   and this call then reports POPULATED_ERROR (cds_ft_graft) or falls
- *   through to the ordinary merge into a populated destination
- *   (cds_ft_merge_at).  A peer holding the root mid-attach yields
- *   CDS_FT_STATUS_BUSY_ERROR; the caller may retry.  In every outcome the
- *   losing side keeps its keys -- neither op's content is discarded.
+ *   dst_key_len 0) competes with the bulk peers waiting their turn on the
+ *   destination's root.  A peer that populates the destination first wins.
+ *   This call then does one of two things:
+ *   - cds_ft_graft reports POPULATED_ERROR;
+ *   - cds_ft_merge_at falls through to the ordinary merge into a populated
+ *     destination.
+ *   If a peer holds the root mid-attach, this call returns
+ *   CDS_FT_STATUS_BUSY_ERROR and the caller may retry.  In every outcome
+ *   the losing side keeps its keys: neither op's content is discarded.
  *
  *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
  *   lock per trie, so any mix of update operations may be called
@@ -2250,12 +2367,13 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
  * Moves @ft's content under @src_key to @dst_key within the SAME trie: each
  * moved key K = @src_key || S becomes @dst_key || S.  This is the same-trie
  * analog of cds_ft_graft (the destination must be empty) as cds_ft_merge_at is
- * of cds_ft_merge.  @src_key and @dst_key must be DISJOINT -- neither a prefix
- * of the other (else the move would be circular).
+ * of cds_ft_merge.  @src_key and @dst_key must be DISJOINT: neither is a
+ * prefix of the other.  Otherwise the move would be circular.
  *
- * The trie must be EAGER (not created with speculative leaf keys): a move
+ * The trie must be EAGER (not created with speculative leaf keys).  A move
  * re-parents each leaf under @dst_key but cannot rewrite its app-owned stored
- * key, so a speculative trie is refused with CDS_FT_STATUS_INVALID_ARGUMENT_ERROR.
+ * key.  So a speculative trie is refused with
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR.
  *
  * The group must be VARIABLE-length, for the same reason cds_ft_detach and
  * cds_ft_graft take a non-root key only there: the move is staged through a
@@ -2263,17 +2381,17 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
  * than a fixed-length group's one key length.  A fixed-length group is refused
  * with CDS_FT_STATUS_INVALID_ARGUMENT_ERROR and the trie is left untouched.
  *
- * COMPILED IN ON EVERY BUILD, including -DNO_FEATURE_FT_MERGE: an empty
- * destination makes this a graft, not a union, so none of the merge subsystem
- * is on its path and the build configuration never takes this call away.  Its
- * sibling cds_ft_rekey_merge, whose whole purpose is the occupied destination,
- * IS taken away by that flag -- see there.
+ * COMPILED IN ON EVERY BUILD, including -DNO_FEATURE_FT_MERGE.  An empty
+ * destination makes this a graft, not a union.  So none of the merge
+ * subsystem is on its path, and the build configuration never takes this
+ * call away.  Its sibling cds_ft_rekey_merge exists for the occupied
+ * destination.  That flag DOES take it away: see there.
  *
- * ☞ It can still answer CDS_FT_STATUS_NOT_SUPPORTED, but for a reason that has
- * nothing to do with the build: a same-trie move is served by the atomic writer
- * or not at all (staging one through a detached subtree would hide live keys
- * from readers for a grace period), so a SHAPE outside that writer's cut is
- * refused with NOT_SUPPORTED on every configuration alike.
+ * ☞ It can still answer CDS_FT_STATUS_NOT_SUPPORTED, for a reason that has
+ * nothing to do with the build.  A same-trie move is served by the atomic
+ * writer or not at all.  Staging one through a detached subtree would hide
+ * live keys from readers for a grace period.  So a SHAPE outside that
+ * writer's cut is refused with NOT_SUPPORTED on every configuration alike.
  *
  * Returns CDS_FT_STATUS_OK (including when @src_key is absent -- a no-op),
  * CDS_FT_STATUS_POPULATED_ERROR if @dst_key is occupied, CDS_FT_STATUS_MEMORY_ERROR,
@@ -2297,19 +2415,20 @@ enum cds_ft_status cds_ft_rekey_graft(struct cds_ft *ft,
  * @src_key: Source prefix selecting the subtree to move.
  * @src_key_len: Length of @src_key in bytes.
  *
- * The merge (occupied-destination) counterpart of cds_ft_rekey_graft, standing
- * to it as cds_ft_merge_at stands to cds_ft_graft.  Same disjoint-key, EAGER and
- * variable-length-group requirements.  Returns the same statuses as
- * cds_ft_rekey_graft except it never returns CDS_FT_STATUS_POPULATED_ERROR (an
- * occupied @dst_key is merged into).
+ * This is the merge (occupied-destination) counterpart of
+ * cds_ft_rekey_graft.  It is to cds_ft_rekey_graft what cds_ft_merge_at is
+ * to cds_ft_graft.  It has the same disjoint-key, EAGER and
+ * variable-length-group requirements.  It returns the same statuses as
+ * cds_ft_rekey_graft, except that it never returns
+ * CDS_FT_STATUS_POPULATED_ERROR: an occupied @dst_key is merged into.
  *
  * ONE FURTHER DIFFERENCE FROM ITS GRAFT SIBLING: the union into an occupied
- * destination is built out of the merge subsystem, so a library compiled with
- * -DNO_FEATURE_FT_MERGE answers CDS_FT_STATUS_NOT_SUPPORTED for EVERY call
- * here, as cds_ft_merge and cds_ft_merge_at do.  cds_ft_rekey_graft stays
- * compiled in on such a build; query cds_ft_merge_enabled() to tell the two
- * configurations apart rather than inferring it from a NOT_SUPPORTED, which
- * either entry can also return for an uncovered SHAPE.
+ * destination is built out of the merge subsystem.  So a library compiled
+ * with -DNO_FEATURE_FT_MERGE answers CDS_FT_STATUS_NOT_SUPPORTED for EVERY
+ * call here, as cds_ft_merge and cds_ft_merge_at do.  cds_ft_rekey_graft
+ * stays compiled in on such a build.  Query cds_ft_merge_enabled() to tell
+ * the two configurations apart.  Do not infer it from a NOT_SUPPORTED:
+ * either entry can also return that for an uncovered SHAPE.
  */
 enum cds_ft_status cds_ft_rekey_merge(struct cds_ft *ft,
 		const uint8_t *dst_key, size_t dst_key_len,
@@ -2319,13 +2438,16 @@ enum cds_ft_status cds_ft_rekey_merge(struct cds_ft *ft,
  * Trie lifecycle
  *
  * A group is a set of Fractal Trie instances that share allocation
- * arenas and configuration (key length, lookup optimization, NUMA /
- * page-size policy, ordered-list mode).  Groups exist for the bulk
- * operations (cds_ft_graft, cds_ft_graft_swap, cds_ft_detach,
- * cds_ft_merge): those move or combine whole sub-tries between tries,
- * which is sound and cheap only when the tries share a group's arenas
- * and key mapping.  Create a group with cds_ft_group_create(), then
- * create tries within it with cds_ft_create().
+ * arenas and configuration.  The configuration is the key length, the
+ * lookup optimization, the NUMA / page-size policy and the ordered-list
+ * mode.
+ *
+ * Groups exist for the bulk operations: cds_ft_graft, cds_ft_graft_swap,
+ * cds_ft_detach and cds_ft_merge.  Those move or combine whole sub-tries
+ * between tries.  This is sound and cheap only when the tries share a
+ * group's arenas and key mapping.  Create a group with
+ * cds_ft_group_create(), then create tries within it with
+ * cds_ft_create().
  */
 
 /*
@@ -2352,8 +2474,8 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
  * select a variable key length.
  *
  * This is the form to use with the modern <urcu/urcu-*.h> flavor
- * headers, which clear the URCU API mapping at the end of the header
- * (urcu/map/clear.h), making cds_ft_group_create() unavailable.
+ * headers.  Those clear the URCU API mapping at the end of the header
+ * (urcu/map/clear.h), which makes cds_ft_group_create() unavailable.
  * Mirrors cds_lfht_new_flavor().
  *
  * Returns CDS_FT_STATUS_OK on success, or a negative cds_ft_status
@@ -2374,10 +2496,10 @@ enum cds_ft_status cds_ft_group_create_flavor(const struct cds_ft_group_attr *at
  * @result_ft_group: Fractal Trie group output. Set to the newly created
  *                   trie group on success, or NULL on error.
  *
- * Same as cds_ft_group_create_flavor(), binding the group to the RCU
+ * Same as cds_ft_group_create_flavor().  The group is bound to the RCU
  * flavor selected by the URCU API mapping of the previously included
- * flavor header (legacy <urcu.h> / <urcu-qsbr.h>-style include, or
- * URCU_API_MAP defined before a modern flavor header).
+ * flavor header.  That is a legacy <urcu.h> / <urcu-qsbr.h>-style
+ * include, or URCU_API_MAP defined before a modern flavor header.
  *
  * Returns CDS_FT_STATUS_OK on success, or a negative cds_ft_status
  * on error.
@@ -2426,10 +2548,10 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
  * performed on the Fractal Trie while it is being destroyed (ensured
  * by the caller).
  *
- * The trie should be drained first: destroying a non-empty trie does
- * not reclaim its remaining internal nodes and ordered-list cells, and
- * leaves the application's external nodes unreachable
- * with their linkage fields dangling.  See the "Efficient
+ * The trie should be drained first.  Destroying a non-empty trie does
+ * not reclaim its remaining internal nodes and ordered-list cells.  It
+ * also leaves the application's external nodes unreachable, with their
+ * linkage fields dangling.  See the "Efficient
  * bulk-removal pattern" above for draining a trie with a single
  * grace period.
  */
@@ -2459,7 +2581,7 @@ bool cds_ft_empty(struct cds_ft *ft);
  * node. Duplicates at the same key are counted as one.
  *
  * O(1) when the group enables order statistics
- * (cds_ft_group_attr_set_rank_stats); otherwise (the default) O(size) -- a
+ * (cds_ft_group_attr_set_rank_stats).  Otherwise (the default) O(size): a
  * structural enumeration of the trie.  The RCU read-side lock must be held
  * while calling this function. Concurrent updates may occur, so the result is
  * an approximation when updates are in progress.
@@ -2473,14 +2595,14 @@ unsigned long cds_ft_count_keys(struct cds_ft *ft);
  * @prefix_len: Length of the prefix in bytes. Use 0 to count all keys
  *              (equivalent to cds_ft_count_keys).
  *
- * Returns the number of distinct keys whose key starts with @prefix,
- * in O(prefix_len) (it reads a maintained count, not a full scan).
+ * Returns the number of distinct keys whose key starts with @prefix.
  *
  * O(prefix_len) when the group enables order statistics
- * (cds_ft_group_attr_set_rank_stats); otherwise (the default) O(size of the
- * matching subtree) -- the prefix descent is the same, but the count is then a
- * structural enumeration.  The RCU read-side lock must be held while calling
- * this function.
+ * (cds_ft_group_attr_set_rank_stats): it reads a maintained count, not a
+ * full scan.  Otherwise (the default) O(size of the matching subtree): the
+ * prefix descent is the same, but the count is then a structural
+ * enumeration.  The RCU read-side lock must be held while calling this
+ * function.
  */
 unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 		const uint8_t *prefix, size_t prefix_len);
@@ -2513,12 +2635,13 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
  *
  * With order statistics enabled (cds_ft_group_attr_set_rank_stats) this
  * descends from the right (largest children first) using per-node key
- * counters, so concurrent updates to the low end of the key space do
- * not affect the traversal, in O(depth); otherwise (the default) it positions
- * at the last key and steps back @n, in O(n).  On success the
- * iterator points at the nth-from-last key (cds_ft_iter_node() /
- * cds_ft_iter_get_key()); on NOT_FOUND it is left unpositioned
- * (cds_ft_iter_node() returns NULL).
+ * counters, in O(depth).  So concurrent updates to the low end of the key
+ * space do not affect the traversal.  Otherwise (the default) it positions
+ * at the last key and steps back @n, in O(n).
+ *
+ * On success the iterator points at the nth-from-last key
+ * (cds_ft_iter_node() / cds_ft_iter_get_key()).  On NOT_FOUND it is left
+ * unpositioned (cds_ft_iter_node() returns NULL).
  * Returns CDS_FT_STATUS_NOT_FOUND if @n >= the number of keys.
  * The RCU read-side lock must be held.
  */
@@ -2533,13 +2656,14 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
  * @n: Number of keys to skip forward. 0 is a no-op.
  *
  * With order statistics enabled (cds_ft_group_attr_set_rank_stats) this
- * traverses locally from the current position, touching only nodes
- * between the start and end positions, so concurrent mutations in
- * unrelated key ranges do not affect the result, in O(depth); otherwise
- * (the default) it advances @n keys via cds_ft_next, in O(n).  On success the
- * iterator is repositioned at the target
- * key (cds_ft_iter_node() / cds_ft_iter_get_key()); on NOT_FOUND it is
- * left unpositioned (cds_ft_iter_node() returns NULL).  Returns
+ * traverses locally from the current position, in O(depth).  It touches
+ * only nodes between the start and end positions.  So concurrent mutations
+ * in unrelated key ranges do not affect the result.  Otherwise (the
+ * default) it advances @n keys via cds_ft_next, in O(n).
+ *
+ * On success the iterator is repositioned at the target key
+ * (cds_ft_iter_node() / cds_ft_iter_get_key()).  On NOT_FOUND it is left
+ * unpositioned (cds_ft_iter_node() returns NULL).  Returns
  * CDS_FT_STATUS_NOT_FOUND if the target is out of range. The RCU
  * read-side lock must be held.
  */
@@ -2554,13 +2678,14 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
  * @n: Number of keys to skip backward. 0 is a no-op.
  *
  * With order statistics enabled (cds_ft_group_attr_set_rank_stats) this
- * traverses locally from the current position, touching only nodes
- * between the start and end positions, so concurrent mutations in
- * unrelated key ranges do not affect the result, in O(depth); otherwise
- * (the default) it steps back @n keys via cds_ft_prev, in O(n).  On success the
- * iterator is repositioned at the target
- * key (cds_ft_iter_node() / cds_ft_iter_get_key()); on NOT_FOUND it is
- * left unpositioned (cds_ft_iter_node() returns NULL).  Returns
+ * traverses locally from the current position, in O(depth).  It touches
+ * only nodes between the start and end positions.  So concurrent mutations
+ * in unrelated key ranges do not affect the result.  Otherwise (the
+ * default) it steps back @n keys via cds_ft_prev, in O(n).
+ *
+ * On success the iterator is repositioned at the target key
+ * (cds_ft_iter_node() / cds_ft_iter_get_key()).  On NOT_FOUND it is left
+ * unpositioned (cds_ft_iter_node() returns NULL).  Returns
  * CDS_FT_STATUS_NOT_FOUND if @n exceeds the number of preceding keys.
  * The RCU read-side lock must be held.
  */
@@ -2592,16 +2717,19 @@ unsigned long cds_ft_count_entries(struct cds_ft *ft);
  * updated on insert but not decremented on remove or detach.
  * Use cds_ft_recompute_stats() to obtain the exact value.
  *
- * Two cases lower it: a same-trie rekey whose own overflow gate
- * finds the estimate too coarse to answer recomputes it exactly
- * first, so a successful unequal-length cds_ft_rekey_* may leave a
- * SMALLER value than it found; and a bulk operation (cds_ft_graft,
- * cds_ft_graft_swap, cds_ft_merge_at at the source's root) whose
- * EXCLUSIVE source this estimate would refuse with
- * CDS_FT_STATUS_OVERFLOW_ERROR recomputes the source's value before
- * answering, so a caller no longer needs cds_ft_recompute_stats()
- * for that. The result is still an upper bound on every key present,
- * which is all any caller may rely on.
+ * Two cases lower it:
+ * - A same-trie rekey.  Its own overflow gate may find the estimate
+ *   too coarse to answer.  It then recomputes the estimate exactly
+ *   first.  So a successful unequal-length cds_ft_rekey_* may leave a
+ *   SMALLER value than it found.
+ * - A bulk operation with an EXCLUSIVE source: cds_ft_graft,
+ *   cds_ft_graft_swap, or cds_ft_merge_at at the source's root.  When
+ *   this estimate would refuse the source with
+ *   CDS_FT_STATUS_OVERFLOW_ERROR, the operation recomputes the
+ *   source's value before answering.  The caller does not need to call
+ *   cds_ft_recompute_stats() first.
+ * The result is still an upper bound on every key present.  That is
+ * all any caller may rely on.
  *
  * Returns 0 if the trie is empty or has never had a key inserted.
  *
@@ -2615,10 +2743,10 @@ size_t cds_ft_max_used_key_len(const struct cds_ft *ft);
  * @ft: The Fractal Trie.
  *
  * Iterate through the trie to recompute the exact maximum used key
- * length. The caller must hold the RCU read-side lock (for
- * iteration) and ensure mutual exclusion with other writers (because
- * this operation can lower the value, unlike insert which only ever
- * increases it).
+ * length. The caller must hold the RCU read-side lock, for the
+ * iteration. The caller must also ensure mutual exclusion with other
+ * writers: this operation can lower the value, unlike insert which
+ * only ever increases it.
  *
  * Typically used after a batch of removals or a detach operation
  * when the caller needs an accurate max_used_key_len for a
@@ -2677,13 +2805,16 @@ enum cds_ft_status cds_ft_group_key_map(const struct cds_ft_group *group, uint8_
  *
  * True when the group enabled the ordered list (the default;
  * cds_ft_group_attr_set_ordered_list(attr, false) disables it).  Immutable for
- * the life of the group.  It is the precondition for the cell-cursor ordered
- * walk (cds_ft_cell_next_batch / cds_ft_cell_prev_batch and the
- * cds_ft_for_each_batched_rcu macros): a list-off group has no cell list to
- * step, so generic code should branch to cds_ft_for_each_rcu() when this
- * returns false.  (Note: cds_ft_node_get_key() is broader -- it also works on a
- * list-off trie that has an in-leaf key, since materializing ONE key needs no
- * stepping.)
+ * the life of the group.
+ *
+ * It is the precondition for the cell-cursor ordered walk:
+ * cds_ft_cell_next_batch / cds_ft_cell_prev_batch and the
+ * cds_ft_for_each_batched_rcu macros.  A list-off group has no cell list to
+ * step.  So generic code should branch to cds_ft_for_each_rcu() when this
+ * returns false.
+ *
+ * Note: cds_ft_node_get_key() is broader.  It also works on a list-off trie
+ * that has an in-leaf key, since materializing ONE key needs no stepping.
  */
 bool cds_ft_group_ordered_list(const struct cds_ft_group *group);
 
@@ -2694,11 +2825,13 @@ bool cds_ft_group_ordered_list(const struct cds_ft_group *group);
  *
  * True when the group enabled order statistics
  * (cds_ft_group_attr_set_rank_stats(attr, true); the default is OFF).
- * Immutable for the life of the group.  When true the rank / select / count
- * queries (cds_ft_count_keys / _prefix, cds_ft_lookup_nth / _last,
- * cds_ft_iter_skip_forward / _reverse) read a maintained per-node count and
- * run in O(1) / O(depth); when false they remain correct but fall back to a
- * full enumeration (count) or first/last + next/prev iteration (select / skip).
+ * Immutable for the life of the group.
+ *
+ * This affects the rank / select / count queries: cds_ft_count_keys /
+ * _prefix, cds_ft_lookup_nth / _last, cds_ft_iter_skip_forward / _reverse.
+ * When true, they read a maintained per-node count and run in O(1) /
+ * O(depth).  When false, they remain correct but fall back to a full
+ * enumeration (count) or first/last + next/prev iteration (select / skip).
  */
 bool cds_ft_group_rank_stats(const struct cds_ft_group *group);
 
@@ -2757,17 +2890,17 @@ enum cds_ft_status cds_ft_group_attr_set_max_key_len(struct cds_ft_group_attr *a
  * @ordinal_to_key: Mapping from ordered values to external key.
  *                  (caller-provided array of CDS_FT_KEY_MAP_SIZE elements)
  *
- * Both arrays must be permutations of 0..CDS_FT_KEY_MAP_SIZE-1, and
- * @ordinal_to_key must be the exact inverse of @key_to_ordinal (i.e.
- * ordinal_to_key[key_to_ordinal[i]] == i for all i).  This bijection
- * defines the trie's key ordering; maps that are not exact inverses
+ * Both arrays must be permutations of 0..CDS_FT_KEY_MAP_SIZE-1.
+ * @ordinal_to_key must be the exact inverse of @key_to_ordinal:
+ * ordinal_to_key[key_to_ordinal[i]] == i for all i.  This bijection
+ * defines the trie's key ordering.  Maps that are not exact inverses
  * are rejected.
  *
  * The map is an order-preserving bijection only: it re-orders the byte
  * alphabet but never folds distinct bytes onto one ordinal.  Folding
- * (e.g. case-insensitive matching) is intentionally unsupported here:
- * the speculative lookup fast path validates by comparing external key
- * bytes directly (memcmp against the candidate's stored key), so a
+ * (e.g. case-insensitive matching) is intentionally unsupported here.
+ * The speculative lookup fast path validates by comparing external key
+ * bytes directly (memcmp against the candidate's stored key).  So a
  * non-injective map would let descent reach a leaf that validation then
  * rejects.  For case-folding or other canonicalization, normalize keys
  * to a canonical form in the application before insert and lookup,
@@ -2794,10 +2927,10 @@ enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
  * that.
  * Both modes return identical results and differ only in descent cost.
  *
- * Requirement: on 64-bit architectures where SPECULATIVE uses the
- * skip-compressed encoding (which stores data in unused high pointer
- * bits), the external node pointers (struct cds_ft_node *) stored in
- * the trie must not carry metadata in their upper bits -- strip any
+ * Requirement: on 64-bit architectures, SPECULATIVE may use the
+ * skip-compressed encoding, which stores data in unused high pointer
+ * bits.  The external node pointers (struct cds_ft_node *) stored in
+ * the trie must then not carry metadata in their upper bits.  Strip any
  * pointer authentication (AArch64 PAC) or memory tagging (MTE)
  * signature before passing the pointer to the insertion API.
  *
@@ -2815,44 +2948,47 @@ enum cds_ft_status cds_ft_group_attr_set_lookup_optimization(
  *                                                inequality lookups.
  * @attr: Fractal Trie group attributes.
  * @key_offset: Byte offset from the (struct cds_ft_node *) stored in the
- *              trie to the start of the caller-stored key bytes -- the
- *              same value passed to cds_ft_speculative_lookup_key,
- *              typically offsetof(user_struct, key_field) -
+ *              trie to the start of the caller-stored key bytes.  It is
+ *              the same value passed to cds_ft_speculative_lookup_key.
+ *              Typically: offsetof(user_struct, key_field) -
  *              offsetof(user_struct, ft_node_field).
  *
  * KEY REPRESENTATION CONTRACT: the bytes at @key_offset must be exactly
  * the bytes the application passed to cds_ft_insert() / the lookup APIs
- * for this node -- NOT the application's native scalar.  For integer
- * keys that is the big-endian form emitted by the cds_ft_u64_to_key()
- * API family, not the host-order integer.  The library applies the group's
- * key map to these bytes when copying them into the iterator's result
- * key, so a non-identity cds_ft_key_map is supported (the stored key is
- * remapped to ordinal order on copy); an identity map is a plain copy.
+ * for this node.  They are NOT the application's native scalar.  For
+ * integer keys that is the big-endian form emitted by the
+ * cds_ft_u64_to_key() API family, not the host-order integer.
  *
- * Their byte order must therefore match what the trie was built with
- * (unlike the candidate / speculative point lookups, where the
- * caller-side validation never makes the library interpret the stored
- * bytes).
+ * The library applies the group's key map to these bytes when copying
+ * them into the iterator's result key.  So a non-identity cds_ft_key_map
+ * is supported: the stored key is remapped to ordinal order on copy.  An
+ * identity map is a plain copy.
+ *
+ * Their byte order must therefore match what the trie was built with.
+ * This differs from the candidate / speculative point lookups.  There,
+ * the caller-side validation never makes the library interpret the
+ * stored bytes.
  *
  * Optional, and only meaningful on a SPECULATIVE group on a
  * skip-compressed-capable arch (64-bit).  When provided, the
  * ordered-inequality lookups (cds_ft_lookup_ge/gt/le/lt,
  * cds_ft_next/prev) capture their result key by copying it from the
- * matched leaf -- which already stores the full key for caller-side
- * validation -- which is faster than rebuilding it from the trie
- * structure during descent.  Because those lookups read the bytes from
- * the live leaf, the key bytes at @key_offset must be present before
- * the node is inserted and must not change while the node is in the
- * trie (the same stability requirement
- * cds_ft_group_attr_set_key_len_offset states for the length).
+ * matched leaf.  The leaf already stores the full key for caller-side
+ * validation.  Copying it is faster than rebuilding it from the trie
+ * structure during descent.
+ *
+ * Those lookups read the bytes from the live leaf.  So the key bytes at
+ * @key_offset must be present before the node is inserted, and must not
+ * change while the node is in the trie.  This is the same stability
+ * requirement cds_ft_group_attr_set_key_len_offset states for the length.
  *
  * When not set (or on an EAGER / non-skip-compressed group) the
- * inequality lookups rebuild the key from the trie structure instead
- * -- same result, without the leaf-copy fast path.  Key length is
+ * inequality lookups rebuild the key from the trie structure instead.
+ * The result is the same, without the leaf-copy fast path.  Key length is
  * taken from the group's fixed key_len (or the leaf's trie depth for
  * variable-length keys), so no separate length offset is required.
  *
- * key_offset is interpreted modulo pointer arithmetic, so a key stored
+ * key_offset is interpreted modulo pointer arithmetic.  So a key stored
  * before the node in the embedding struct (a "negative" offset) is
  * supported, exactly as for cds_ft_speculative_lookup_key.
  *
@@ -2892,16 +3028,18 @@ enum cds_ft_status cds_ft_group_attr_set_key_len_offset(
  * When ENABLED, the library maintains the distinct keys in key order to
  * accelerate cds_ft_next / cds_ft_prev and cds_ft_for_each*_batched.  This is
  * entirely library-internal: struct cds_ft_node is unchanged and the
- * application declares no offset and stores no ordering fields.  Forming the
- * iteration result key does require a key source, though: either
- * cds_ft_group_attr_set_speculative_key_offset (plus
- * cds_ft_group_attr_set_key_len_offset for a variable-length-key group), or an
- * identity-mapped group (where the key is recovered from the trie structure).
- * No application-leaf order storage is ever needed.
+ * application declares no offset and stores no ordering fields.  No
+ * application-leaf order storage is ever needed.
  *
- * When DISABLED (for a write-heavy group that never iterates in key order),
- * the group uses less memory per key and mutates faster, giving up ordered
- * iteration (cds_ft_next / cds_ft_prev / cds_ft_for_each*) and the
+ * Forming the iteration result key does require a key source, one of:
+ * - cds_ft_group_attr_set_speculative_key_offset, plus
+ *   cds_ft_group_attr_set_key_len_offset for a variable-length-key group;
+ * - an identity-mapped group, where the key is recovered from the trie
+ *   structure.
+ *
+ * DISABLED is for a write-heavy group that never iterates in key order.
+ * The group then uses less memory per key and mutates faster.  It gives up
+ * ordered iteration (cds_ft_next / cds_ft_prev / cds_ft_for_each*) and the
  * node-pointer key/step helpers.
  *
  * On by default, so passing true is normally redundant (it re-affirms the
@@ -2922,17 +3060,17 @@ enum cds_ft_status cds_ft_group_attr_set_ordered_list(
  *
  * Why it is opt-in rather than always available:
  *
- *  - A trie that can host a move must carry the COHERENT lookup path, in which
- *    every exact lookup is able to run a second, key-rematerializing walk and
- *    re-descend when a concurrent move restructured its path.  A trie that will
- *    never rekey should not carry it.
+ *  - A trie that can host a move must carry the COHERENT lookup path.  On
+ *    that path, every exact lookup can run a second walk that rematerializes
+ *    the key, and re-descend when a concurrent move restructured its path.
+ *    A trie that will never rekey should not carry it.
  *
  *  - Under CDS_FT_WRITER_EXTERNAL_SYNC the move gate's grace period would be
- *    taken while YOUR writer exclusion is held, and the library can neither
+ *    taken while YOUR writer exclusion is held.  The library can neither
  *    drop that lock nor place itself outside it.  Opting in on such a group
- *    therefore selects a different reader discipline: readers run the coherent
- *    two-pass path UNCONDITIONALLY, which removes the mode transition and with
- *    it the grace period.  The cost is real and is charged to readers -- every
+ *    therefore selects a different reader discipline.  Readers run the
+ *    coherent two-pass path UNCONDITIONALLY.  This removes the mode
+ *    transition, and with it the grace period.  Readers pay the cost: every
  *    exact lookup on such a trie runs the second walk, always.  That is the
  *    price of in-trie moves under an exclusion the library does not own.
  *
@@ -2957,26 +3095,30 @@ enum cds_ft_status cds_ft_group_attr_set_rekey(
  *   - cds_ft_lookup_nth / cds_ft_lookup_nth_last
  *   - cds_ft_iter_skip_forward / cds_ft_iter_skip_reverse
  *
- * When ENABLED, every mutation propagates the count along the path to the root
- * so the queries above read a maintained aggregate: cds_ft_count_keys is O(1),
- * cds_ft_count_keys_prefix is O(prefix_len), and the select / skip queries are
- * O(depth).  This costs a root-ward count propagation on every insert / remove.
+ * When ENABLED, every mutation propagates the count along the path to the
+ * root.  So the queries above read a maintained aggregate:
+ *   - cds_ft_count_keys is O(1);
+ *   - cds_ft_count_keys_prefix is O(prefix_len);
+ *   - the select / skip queries are O(depth).
+ * This costs a root-ward count propagation on every insert / remove.
  *
- * Because every count-changing mutation updates the single root count, no two
- * such writers are ever disjoint, so order statistics imply a COARSE writer
- * strategy: a group that enables rank stats is silently coerced to
- * CDS_FT_WRITER_LOCK_COARSE from ANY other strategy (both the lock-free
- * CDS_FT_WRITER_LOCK_FINE parallelizes
- * disjoint writers, of which there are none here, and both would run the
- * root-ward count walk without the FT-wide-lock exclusion it requires).
+ * Every count-changing mutation updates the single root count.  So no two
+ * such writers are ever disjoint, and order statistics imply a COARSE
+ * writer strategy.  A CDS_FT_WRITER_LOCK_FINE group that enables rank stats
+ * is silently coerced to CDS_FT_WRITER_LOCK_COARSE, for two reasons:
+ *   - FINE parallelizes disjoint writers, of which there are none here;
+ *   - FINE would run the root-ward count walk without the FT-wide-lock
+ *     exclusion it requires.
  *
- * When DISABLED (the default), the library maintains no count and those queries
- * stay correct but fall back to enumeration / iteration: cds_ft_count_keys and
- * cds_ft_count_keys_prefix enumerate the (sub)tree in O(size); cds_ft_lookup_nth
- * / _last and cds_ft_iter_skip_forward / _reverse iterate n steps via
- * cds_ft_next / cds_ft_prev.  (With the ordered list off as well, each
- * iteration step is itself an O(depth) structural traversal, so select / skip
- * become O(n.depth) -- the two flags interact for that cost class.)
+ * When DISABLED (the default), the library maintains no count.  Those
+ * queries stay correct but fall back to enumeration / iteration:
+ *   - cds_ft_count_keys and cds_ft_count_keys_prefix enumerate the
+ *     (sub)tree in O(size);
+ *   - cds_ft_lookup_nth / _last and cds_ft_iter_skip_forward / _reverse
+ *     iterate n steps via cds_ft_next / cds_ft_prev.
+ * With the ordered list off as well, each iteration step is itself an
+ * O(depth) structural traversal.  So select / skip become O(n.depth): the
+ * two flags interact for that cost class.
  *
  * Off by default, so passing false is normally redundant.  Returns
  * CDS_FT_STATUS_OK on success, CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for a NULL
@@ -2993,17 +3135,17 @@ enum cds_ft_status cds_ft_group_attr_set_rank_stats(
  * @policy: One of enum cds_ft_numa_policy (DEFAULT, INTERLEAVE, LOCAL).
  *
  * Defaults to CDS_FT_NUMA_DEFAULT when the group attr is freshly
- * created: the library honors any explicit per-process NUMA policy but
- * interleaves its own arenas when none is set (see the enum doc for the
- * full rationale -- first-touch is a performance cliff for a shared,
- * random-access trie).  Applications can force a placement via INTERLEAVE
+ * created.  The library then honors any explicit per-process NUMA policy,
+ * and interleaves its own arenas when none is set.  See the enum doc for
+ * the full rationale: first-touch is a performance cliff for a shared,
+ * random-access trie.  Applications can force a placement via INTERLEAVE
  * or LOCAL.
  *
  * Selection guide:
  *   - DEFAULT:    honor an explicit process policy (MPOL_BIND / PREFERRED /
- *                 LOCAL set via numactl / set_mempolicy), upgrade an
- *                 explicit MPOL_INTERLEAVE to 2 MiB granularity, and
- *                 interleave when no process policy is set.  The good
+ *                 LOCAL set via numactl / set_mempolicy).  Upgrade an
+ *                 explicit MPOL_INTERLEAVE to 2 MiB granularity.
+ *                 Interleave when no process policy is set.  The good
  *                 default for most callers; never overrides a stated
  *                 process intent.
  *   - INTERLEAVE: 2 MiB-granular round-robin across allowed NUMA nodes.
@@ -3020,14 +3162,14 @@ enum cds_ft_status cds_ft_group_attr_set_rank_stats(
  *                 (single-threaded / single-node access).
  *
  * The CDS_FT_NUMA_INTERLEAVE=0 environment variable, if set, forces
- * the library to skip mbind regardless of the group's policy --
+ * the library to skip mbind regardless of the group's policy.  This is
  * useful for debugging without recompiling.  Otherwise the group's
  * policy takes effect.
  *
- * No effect on caller-provided external node storage
- * (cds_ft_external_arena_create has no group context; it applies
- * CDS_FT_NUMA_DEFAULT -- honors an explicit process policy, interleaves
- * otherwise).
+ * No effect on caller-provided external node storage.
+ * cds_ft_external_arena_create has no group context.  It applies
+ * CDS_FT_NUMA_DEFAULT: it honors an explicit process policy and
+ * interleaves otherwise.
  *
  * Returns CDS_FT_STATUS_OK on success,
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for an unknown @policy value.
@@ -3050,229 +3192,63 @@ enum cds_ft_status cds_ft_group_attr_set_optimize(
 
 /*
  * The group's structural-writer concurrency strategy (MW lock-escalation
- * model, doc/design/mw-writer-lock-escalation-model.md).  Readers are wait-free
- * under every strategy; this selects only how concurrent structural WRITERS
- * coordinate.
+ * model, doc/design/mw-writer-lock-escalation-model.md).  Readers are
+ * wait-free under every strategy.  The strategy selects only how concurrent
+ * structural WRITERS coordinate.
  *
- * CDS_FT_WRITER_LOCK_COARSE: writers serialize under one FT-wide writer lock per
- *   trie (classic RCU single-writer).  This is the single-writer opt-in.
+ * CDS_FT_WRITER_LOCK_COARSE: writers serialize under one FT-wide writer lock
+ *   per trie (classic RCU single-writer).  This is the single-writer opt-in.
  * CDS_FT_WRITER_LOCK_FINE (the DEFAULT): writers coordinate through
- *   fine-grained per-node lock-sets, so writers on disjoint subtrees proceed in
- *   parallel and only structural collisions serialize -- no FT-wide writer
- *   mutex.  Note this is the mode under which a CROSS-TRIE graft / graft_swap /
- *   merge_at requires an EXCLUSIVE source (see those functions): being the
- *   default, that requirement applies unless a group opts out to COARSE.  A trie that
- *   also maintains order statistics is coerced to CDS_FT_WRITER_LOCK_COARSE
- *   (every count-changing writer updates the shared root, so there are no
- *   disjoint writers for fine locking to parallelize).
+ *   fine-grained per-node lock-sets.  Writers on disjoint subtrees proceed in
+ *   parallel.  Only structural collisions serialize.  There is no FT-wide
+ *   writer mutex.  Note this is the mode under which a CROSS-TRIE graft /
+ *   graft_swap / merge_at requires an EXCLUSIVE source (see those functions):
+ *   being the default, that requirement applies unless a group opts out to
+ *   COARSE.  A trie that also maintains order statistics is coerced to
+ *   CDS_FT_WRITER_LOCK_COARSE.  Every count-changing writer updates the shared
+ *   root, so there are no disjoint writers for fine locking to parallelize.
  *
- * ☐ TODO -- THE FINE-LOCKING TRANSITION IS INCOMPLETE, BUT EVERY POINT OPERATION
- * IS NOW CONVERTED.  cds_ft_insert, cds_ft_remove, cds_ft_replace,
- * cds_ft_insert_unique, cds_ft_remove_all and -- since the whole-chain freeze
- * went into its commit -- cds_ft_insert_replace: their notes say they may run
- * concurrently with each other "including on the same key".  The BULK ops
- * (graft, graft_swap, merge_at, merge, detach, the rekeys) are NOT in the
- * waiting set at all -- see the mode-flip paragraph below.  What remains:
+ * CDS_FT_WRITER_EXTERNAL_SYNC: the application serializes its own writers.
+ *   See the enumerator below.
  *
- *     cds_ft_compact_step and cds_ft_recompute_stats, which carry no
- *     writer-strategy paragraph at all -- CONCURRENT COMPACTION IS THE LAST STEP
- *     OF THE TRANSITION BY PLAN, after rekey.
+ * Bulk operations on a CDS_FT_WRITER_LOCK_FINE trie (the mode flip).  The
+ * bulk operations are:
+ *   - cds_ft_graft and cds_ft_graft_swap;
+ *   - cds_ft_merge and cds_ft_merge_at;
+ *   - cds_ft_detach;
+ *   - cds_ft_rekey_graft and cds_ft_rekey_merge.
+ * A bulk operation does not exclude point operations through the per-node
+ * lock-sets.  It flips the trie to another mode instead:
+ *   1. it publishes a bulk-in-progress state on the trie;
+ *   2. it waits one grace period, so that the point operations already in
+ *      flight drain;
+ *   3. from then on, every writer on that trie takes the FT-wide writer
+ *      lock instead of skipping it.
+ * So bulk and point writers serialize on one lock while a bulk operation is
+ * live.  The caller needs no mutex of its own for that.  The cost is that
+ * point operations on that trie run one at a time during a bulk operation.
  *
- * ☠ "EVERY POINT OP IS CONVERTED" IS NOT "THE TRANSITION IS DONE", and the
- * per-op notes are the wrong place to look for the difference.  A converted op
- * is one whose CALLERS may run it concurrently; the transition also owes the
- * WORD-KIND conversions (the duplicate list to SW under the nearest ancestor
- * lock, the SKIP_X dual, metadata.parent_word / parent_slot_offset), and those
- * are tracked in the word-kind table in fractal-trie-internal.h, not here.
+ * Drain seams.  A bulk operation may wait for more grace periods inside its
+ * body.  It drops the FT-wide writer lock across each of them, so a point
+ * operation can run there.  A second trie-wide lock serializes bulk
+ * operations against each other.  It is held across those grace periods.
  *
- * ★ AND THE ORDER IS PART OF THE PLAN, not an accident of what got done first:
- * point ops, then BULK, then REKEY, and CONCURRENT COMPACTION LAST -- after
- * rekey, as the final step.  Until then cds_ft_compact / cds_ft_compact_step
- * require the caller's exclusion and are NOT in the validated set, which is
- * what lets a conversion land while a compaction producer of the same word is
- * still MW: the two never run concurrently, so they cannot disagree on a
- * word's kind.  ⇒ Do NOT hold a conversion back on account of a compaction-only
- * producer, and do NOT read "compaction still CASes it MW" as a blocker.
+ * The fine-locking transition is incomplete.  Every point operation is
+ * converted.  These may run concurrently with each other on a FINE trie,
+ * including on the same key:
+ *   - cds_ft_insert, cds_ft_insert_unique and cds_ft_insert_replace;
+ *   - cds_ft_replace;
+ *   - cds_ft_remove and cds_ft_remove_all.
+ * Three functions still need the caller's mutual exclusion against other
+ * writers of the same trie:
+ *   - cds_ft_compact and cds_ft_compact_step;
+ *   - cds_ft_recompute_stats.
+ * See each function.  By plan, concurrent compaction is the last step of
+ * the transition.
  *
- * ☠ READ THOSE SENTENCES AS A TODO, NOT AS A CONTRACT.  They describe work not
- * yet done, not a property anyone wants: there is no design reason the rest
- * cannot coordinate through the same per-node lock-sets as insert and remove,
- * and a caller-side mutex around them defeats the point of the default strategy.
- * Documented here, once, because identically-worded per-op notes read like
- * deliberate decisions.
- *
- * ★ THEY ARE NOT ALL ONE DEFECT SHAPE, and assuming they were is the trap this
- * note used to set.  Most derive something with NOTHING HELD and then trust it,
- * where the converted sibling goes on to ACQUIRE the owning node and
- * RE-VALIDATE -- but cds_ft_remove_all did not: it already acquired and
- * re-validated everything it derived, and what it lacked was PROGRESS.  Its body
- * ran EXACTLY ONCE, so every correct, published-nothing abort was handed to the
- * caller as BUSY_ERROR: 91% of its calls failed that way under a same-key peer
- * (measured 25634 BUSY vs 2473 OK), while losing NO node and corrupting NOTHING.
- * ⇒ ASK WHAT AN OP IS MISSING BEFORE APPLYING THE RECIPE.  Three of the four
- * needed exclusion; the fourth needed a loop.
- *
- * ☑ cds_ft_replace WAS THE FIRST OF THE FOUR CONVERTED, and it is the worked
- * example to copy -- with one lesson that generalises.  ITS CONVERSION IS
- * SMALLER THAN REMOVE'S, and how much re-validation an op owes after its
- * acquire is a question about the op, not a template to apply:
- *
- *   - remove re-validates its ROUTING (★ RE-VALIDATE THE CALLER'S ROUTING,
- *     ft-remove.h) because its three arms are three DIFFERENT structural
- *     transforms, so a stale decision publishes an ILLEGAL SHAPE.
- *   - replace has ONE transform in every arm, recorded with the target node as
- *     the EXPECTED-OLD, so a stale slot ABORTS.  The expected-old IS the routing
- *     validation.  What the lock adds is EXCLUSION -- plus, via ft_dlm_lock's
- *     refusal of a TOMBSTONE, the one thing a value-CAS cannot see: a stale slot
- *     ADDRESS inside a COW'd holder's retired copy, whose body still holds the
- *     expected old node, so the CAS would succeed into a dead node.
- *   - NEITHER re-validates from the root.  Both checks are a back-pointer hop.
- *
- * ☠ AND A HOLD CANCELS THE §4.B GUARD ON THE SAME WORD, which is the trap the
- * conversion has to know about: ft_flip_txn_guard_parent's expectation masks
- * FT_STATE_LOCK out, so on a word the op itself locked it can never match --
- * 100% of commits abort (49966 of 49974, attributed to the VALIDATE class by
- * -DFT_WINNER_DBG).  ft_flip_txn_lock_or_guard_parent_at already encodes the
- * skip on its @held.shared path; a hand-rolled acquire must spell it itself.
- *
- * ☑ AND cds_ft_insert_replace ANSWERED THAT QUESTION WITH A YES -- it is the
- * one op that needed MORE than the acquire+revalidate recipe.  It replaces the
- * whole duplicate chain, and freezing only the HEAD (the shape the composed
- * version had) left 21.7% of displacements with unmarked LIVE members: a
- * concurrent cds_ft_insert appends onto one of them and the key is LOST, with
- * nothing in the trie to say so.  The cure is one commit that freezes the whole
- * chain, with the length as a BOUND -- the last member recorded against the
- * derived NULL, so a concurrently appended duplicate tears the expected-old and
- * aborts instead of being marked into a tombstone.  ⇒ ASK WHAT AN OP IS MISSING
- * (above) applies a fourth time: three needed exclusion, one needed a loop, and
- * this one needed its marks folded into the COMMIT.
- *
- * ☑ cds_ft_remove_all WAS CONVERTED BY ADDING ITS RETRY LOOP, and the three
- * premises that died with its exclusion are worth naming, because each was a
- * comment asserting something the conversion falsifies: an "-EAGAIN from here is
- * the whole CALL failing" in the orphan acquire; an assert that detach cannot
- * return -ENOENT "because it has been found by a mutex-protected traversal
- * within this function" (no mutex exists there under FINE); and a discarded
- * unsplice status justified by "ABORT unreachable under its current exclusion".
- * A FOURTH was only reachable at EXPONENTIAL spacing: the op derives its holder
- * from the chain head's BACK POINTER and then re-derives it TOP-DOWN by the key
- * for the lock-set depths, and under a peer the two can disagree -- which used
- * to be impossible, and now bails retriably instead of asserting.
- *
- * THE CROSS-TRIE / BULK OPS: the SOURCE side is settled, and the destination's
- * story is NOT the per-node conversion an earlier version of this note claimed.
- *
- * Settled: cds_ft_graft and cds_ft_graft_swap require an EXCLUSIVE source under
- * FINE, cds_ft_merge_at likewise (its code returns BUSY for a concurrent source),
- * and cds_ft_detach hands back a trie exclusive by construction.  An exclusive
- * trie has no concurrent writer to coordinate with, so nothing is owed there.
- *
- * ☠ THEIR FINE PARAGRAPHS USED TO PROMISE THE OPPOSITE OF THE DESIGN, and were
- * corrected: they said bulk ops "may run concurrently on the same destination"
- * and handed point exclusion to the caller.  Neither is the goal, and neither is
- * what the code does.
- *
- * ☑ AND BULK-vs-POINT IS NOT THE CALLER'S, NOR IS IT OWED: THE MODE FLIP IS THE
- * DESIGN.  A bulk op publishes the gate and waits a GP; from then on a FINE point
- * op FLIPS MODE and takes the FT-wide writer lock instead of skipping it
- * (ft_writer_lock_scope_enter's `ft->lock_fine && !(FT_BULK_WIDE_LOCK &&
- * ft_bulk_active(ft))` test, G5.25), so bulk and point writers arbitrate on one
- * word.  That mode flip -- the FT-wide lock protecting the bulk-op mode
- * transition, which is also the reader dual-descent transition -- IS the target
- * design for bulk-vs-point, not a placeholder for per-node work.  ⇒ The bulk
- * ops' own paragraphs now say so; the POINT ops' notes still do not mention bulk
- * ops at all, which is the remaining under-description.
- *
- * ★ THE FT-WIDE LOCK IS THE MECHANISM, NOT AN OVER-HOLD AWAITING RELAXATION.
- * The goal is one word for both questions: BULK-vs-BULK is the FT-wide writer
- * lock, and BULK-vs-POINT is the same lock, reached by flipping the point ops
- * onto it.  The bulk-in-progress state is the flip, not a second mechanism --
- * publish it, wait a grace period so the point mutations already in flight
- * drain, and from then on every writer scope takes the lock.  Bulk peers queue
- * on it for the same reason point ops do.
- *
- * ⇒ An exclusion argument for a bulk op MAY rest on the FT-wide lock; that is
- * what it is for.  What it may NOT rest on is the lock being held CONTINUOUSLY
- * across the whole body, because it is not -- see the drain-seam gap below.
- *
- * ☐ THE ONE GAP AGAINST THAT GOAL, and it is the bulk op's OWN code:
- * ft_writer_lock_gp_wait UNCONDITIONALLY drops writer_lock at seven live sites
- * inside the bulk bodies (ft-detach.h:219/511/575, ft-graft.h:2960/4011,
- * ft-rekey.h:4510/5035), so the hold is NOT end-to-end and a peer bulk op can
- * enter at a drain seam.  Read that as a HOLE IN THE MECHANISM to close, not as
- * a reason to pick a different one: the drop is the COARSE discipline (there,
- * point ops wait at the ONLINE scope entry, so holding across a GP would wedge
- * them), while on a FINE trie every waiter on this lock is another BULK op and
- * bulk entries forbid a read-section caller -- so the GP may be taken while
- * HOLDING it, with the waiters parked OFFLINE.  The two paths must not share one
- * acquisition helper by accident.
- *
- * What covers the seam until then is the REFCOUNTED gate (overlapping windows
- * compose, with no per-node bit for a peer's clear to erase) plus each op's own
- * acquire/validate machinery -- a backstop, not the design.
- * ☞ doc/design/mw-to-fine-locking-remainder.md, G5.3/G5.4/G5.25.
- *
- * ⇒ SO THE OPEN QUESTION IS NARROW AND NAMED, and it is the SEAM, not the choice
- * of mechanism: what separates two bulk ops that meet inside a drain seam, where
- * the lock is momentarily not held?  FT-SLOT-3 is the live instance -- "every
- * caller here is a BULK op ... so the two arbitrate on one word" answers
- * bulk-vs-point, and two bulk ops both parking SW on one live parent word have
- * nothing stated to separate them across a seam.  Known issues get stabilised
- * first; this is later.
- *
- * ⇒ THE RULE THAT FOLLOWS, for anyone adding exclusion arguments here: you MAY
- * rest one on the FT-wide lock -- that is the design -- but state WHICH SIDE of a
- * drain seam it needs.  An argument that needs the lock held CONTINUOUSLY across
- * a GP is not true today; one that needs it held per-edit is.  Where neither
- * holds, state it on the per-node lock-set or on the gate flip.  FT-SLOT-3 is an EXISTING instance, flagged as such:
- * ft_glue_record_back_edge passes @child_held TRUE unconditionally and so parks SW
- * on a live node's parent word the op does not hold, sound only because every
- * caller is a bulk op -- "☠ SO IT IS A DEPENDENCY, NOT AN INVARIANT".  It is debt
- * against the relaxation, NOT a missing destination conversion -- and it is debt on
- * the BULK-vs-BULK side as much as the point side.
- *
- * ☠ SO DO NOT CALL THE BULK OPS "UNCONVERTED FOR FINE DESTINATION LOCKING", as an
- * earlier version of this note did.  Their bulk-vs-point story is finished by
- * design.  The unconverted list is the POINT ops above (plus compact /
- * compact_step / recompute_stats, which are caller-excluded by their own
- * contracts).  And do not cite merge_at as a destination-conversion template:
- * there is nothing there to copy that graft and detach do not already do.
- *
- * ☐ TWO HEADER BUGS FOUND WHILE ENUMERATING, both still present:
- *   - cds_ft_merge says "NOT concurrency-safe" yet its body is one line:
- *     `return cds_ft_merge_at(dst_ft, key, key_len, src_ft, key, key_len);`.
- *     Both notes cannot be right; the code says merge_at's is.
- *   - cds_ft_merge_at says "@src_ft ... May be in either exclusive or concurrent
- *     mode" in one paragraph and "The SOURCE must be EXCLUSIVE" in the next,
- *     while the code refuses a concurrent source with BUSY.
- *
- * ☐ AND FOUR MUTATORS THIS ENUMERATION FIRST MISSED -- a reminder that the list is
- * the declarations, not the ones with a writer-strategy block:
- *   - cds_ft_rekey_graft / cds_ft_rekey_merge have NO writer-strategy paragraph at
- *     all, against this section's own promise that "each operation below states
- *     the caller's mutual-exclusion requirement".  In code they arm the COHERENT
- *     bulk gate and then take a writer scope, so G5.25 excludes them exactly as it
- *     does the other bulk ops.  A DOCUMENTATION gap, not a code gap.
- *   - cds_ft_compact and cds_ft_compact_step say the caller must exclude, and mean
- *     it: the one-shot takes a writer scope, _step takes NO scope and NO bulk
- *     gate.  Its per-relocation -EAGAIN -> CDS_FT_COMPACT_BUSY plumbing is already
- *     there for the conversion, unused.
- *   - cds_ft_recompute_stats likewise, and the rekey path calls it internally
- *     inside its own bulk window.
- *
- * ☑ EXEMPT, not unconverted: a group that maintains order statistics is coerced to
- * CDS_FT_WRITER_LOCK_COARSE, so the FINE question does not arise for any op on it.
- *
- * ⇒ THE RECIPE EXISTS IN-TREE.  The point remove was converted exactly this way:
- * derive the holder, acquire it, RE-VALIDATE that it still names what the plan
- * read, and bail RETRIABLY when it does not -- see ft_chain_head_holder's
- * re-validation and its callers.  Reuse that rather than inventing a new rule.
- *
- * ☞ AND TEST IT IN-CONTRACT.  A concurrency row for an unconverted op belongs on
- * the FINE arm and is expected RED until the conversion lands; writing it
- * COARSE-only would bless the gap as the contract.  COARSE stays the adjudicator
- * for a shape that IS converted (tests/regression/test_urcu_ft_inv.c's same-key
- * rows).
+ * The transition log and its open design items are in
+ * doc/design/mw-to-fine-locking-remainder.md, section "Moved from the
+ * public header (2026-11-19)".
  */
 enum cds_ft_writer_strategy {
 	CDS_FT_WRITER_LOCK_COARSE = 1,
@@ -3280,30 +3256,32 @@ enum cds_ft_writer_strategy {
 	/*
 	 * Writer synchronization is EXTERNAL to the library: the application
 	 * serializes its own writers and the library takes no writer lock.
-	 * The name says WHERE the synchronization lives, not what it is,
-	 * because the caller is free to meet the contract however it likes --
-	 * a single mutating thread, its own mutex around every mutating call,
-	 * a partitioned schedule.  The other two enumerators name the lock THE
-	 * LIBRARY takes; here there is none to name.
+	 * The name says WHERE the synchronization lives, not what it is.  The
+	 * caller is free to meet the contract however it likes:
+	 *   - a single mutating thread;
+	 *   - its own mutex around every mutating call;
+	 *   - a partitioned schedule.
+	 * The other two enumerators name the lock THE LIBRARY takes; here
+	 * there is none to name.
 	 *
-	 * Behaves as CDS_FT_WRITER_LOCK_COARSE in every other respect (the
-	 * record kinds, the lock-set derivation, the bulk-op handling), which
+	 * Behaves as CDS_FT_WRITER_LOCK_COARSE in every other respect: the
+	 * record kinds, the lock-set derivation, the bulk-op handling.  This
 	 * is what "the synchronization is external" means: only the FT-wide
 	 * writer mutex goes away.
 	 *
 	 * ☠ THIS IS NOT cds_ft_attr_set_exclusive / cds_ft_make_exclusive,
 	 * and the distinction is READERS.  An EXCLUSIVE trie is the stronger,
-	 * &mut-like promise -- no concurrent access of ANY kind -- and the
-	 * library spends it by skipping reader-visible publication discipline.
-	 * Here READERS ARE UNAFFECTED: proxies, tags and grace periods all
-	 * stay, and concurrent lookups and iterations remain legal exactly as
+	 * &mut-like promise: no concurrent access of ANY kind.  The library
+	 * spends it by skipping reader-visible publication discipline.
+	 * Here READERS ARE UNAFFECTED.  Proxies, tags and grace periods all
+	 * stay.  Concurrent lookups and iterations remain legal exactly as
 	 * under COARSE.  The only promise is about WRITERS.
 	 *
-	 * ☞ Violating it is undefined behaviour, and a build with
-	 * -DFEATURE_FT_EXCL_VALIDATE catches it: the access validator keeps its
-	 * single-OWNER claim for any non-fine trie, so a second writer entering
-	 * concurrently reports "writer conflict -- owner ..., entering thread
-	 * ...".  Run the test suite that way at least once --
+	 * ☞ Violating it is undefined behaviour.  A build with
+	 * -DFEATURE_FT_EXCL_VALIDATE catches it.  The access validator keeps
+	 * its single-OWNER claim for any non-fine trie.  So a second writer
+	 * entering concurrently reports "writer conflict -- owner ...,
+	 * entering thread ...".  Run the test suite that way at least once:
 	 * test_external_sync_* in tests/unit/test_urcu_ft_unit.c is that run.
 	 */
 	CDS_FT_WRITER_EXTERNAL_SYNC = 3,
@@ -3316,14 +3294,16 @@ enum cds_ft_writer_strategy {
  *   CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for an unknown @strategy.
  *
  * CDS_FT_WRITER_LOCK_FINE combined with order statistics
- * (cds_ft_group_attr_set_rank_stats) is coerced to CDS_FT_WRITER_LOCK_COARSE:
- * rank stats serialize every count-changing writer on the root count, so
- * fine-grained locking buys no parallelism there, and it would run the count
- * walk without the FT-wide-lock exclusion the walk requires.  (The optimistic
- * engine this sentence also weighed no longer exists.)  COARSE and
- * CDS_FT_WRITER_EXTERNAL_SYNC are left ALONE: both already serialize every
- * structural writer, the latter by the caller's own contract, so the walk has
- * the exclusion it requires without the library coercing anything.
+ * (cds_ft_group_attr_set_rank_stats) is coerced to CDS_FT_WRITER_LOCK_COARSE.
+ * There are two reasons:
+ *   - rank stats serialize every count-changing writer on the root count, so
+ *     fine-grained locking buys no parallelism there;
+ *   - fine-grained locking would run the count walk without the FT-wide-lock
+ *     exclusion the walk requires.
+ * COARSE and CDS_FT_WRITER_EXTERNAL_SYNC are left ALONE.  Both already
+ * serialize every structural writer, the latter by the caller's own contract.
+ * So the walk has the exclusion it requires without the library coercing
+ * anything.
  */
 enum cds_ft_status cds_ft_group_attr_set_writer_strategy(
 		struct cds_ft_group_attr *attr,
@@ -3366,30 +3346,33 @@ enum cds_ft_status cds_ft_attr_set_exclusive(struct cds_ft_attr *attr,
 /*
  * cds_ft_attr_set_speculative_keys - Per-trie opt-out of speculative leaf keys.
  * @attr: Fractal Trie attributes.
- * @enabled: true (default) -- this trie uses the group's speculative result-key
- *           capture (cds_ft_group_attr_set_speculative_key_offset), reading each
- *           matched leaf's stored key field on lookup.  false -- this trie
- *           behaves as if the group had NO speculative key offset: every lookup
- *           reconstructs the result key from the trie structure (the EAGER path)
- *           and NEVER reads the stored leaf key.
+ * @enabled: true (default) -- this trie uses the group's speculative
+ *           result-key capture
+ *           (cds_ft_group_attr_set_speculative_key_offset).  It reads each
+ *           matched leaf's stored key field on lookup.
+ *           false -- this trie behaves as if the group had NO speculative
+ *           key offset.  Every lookup reconstructs the result key from the
+ *           trie structure (the EAGER path) and NEVER reads the stored leaf
+ *           key.
  *
  * Has no effect on a group that was not configured with a speculative key
  * offset (such a group is always EAGER).
  *
  * Use false for a trie whose leaves' stored keys do not match their positions:
- *   - a STAGING source built for a non-root graft, whose leaves are stamped
- *     with their FUTURE destination key (dst prefix + suffix) rather than their
- *     current staging position;
+ *   - a STAGING source built for a non-root graft.  Its leaves are stamped
+ *     with their FUTURE destination key (dst prefix + suffix) rather than
+ *     their current staging position;
  *   - the DESTINATION of a graft_swap or a re-keying merge_at that you do not
  *     speculative-look-up;
- *   - (the result of a non-root cds_ft_detach is created this way automatically,
- *     since the detach strips the key prefix).
+ *   - (the result of a non-root cds_ft_detach is created this way
+ *     automatically, since the detach strips the key prefix).
  *
- * The library only ever READS the speculative key field; it cannot rewrite it
- * across a re-keying move (it owns neither the field's layout nor its capacity),
- * so maintaining "stored key == position" across such moves is the caller's
- * responsibility.  This attribute is how a trie within a speculative group opts
- * out of that responsibility by foregoing the speculative read.
+ * The library only ever READS the speculative key field.  It cannot rewrite
+ * the field across a re-keying move, because it owns neither the field's
+ * layout nor its capacity.  So the caller must maintain "stored key ==
+ * position" across such moves.  With this attribute, a trie within a
+ * speculative group opts out of that responsibility by foregoing the
+ * speculative read.
  *
  * Default: true (inherit the group).  Returns CDS_FT_STATUS_OK, or
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @attr is NULL.
@@ -3398,27 +3381,14 @@ enum cds_ft_status cds_ft_attr_set_speculative_keys(struct cds_ft_attr *attr,
 		bool enabled);
 
 /*
- * IN-TRIE REKEY COHERENCE is automatic; there is no attribute for it.
+ * In-trie rekey (cds_ft_rekey_graft / cds_ft_rekey_merge) has no per-trie
+ * attribute.  It is a group opt-in: see cds_ft_group_attr_set_rekey().  The
+ * default is off.  Without the opt-in, the rekey functions return
+ * CDS_FT_STATUS_NOT_SUPPORTED and leave the trie unchanged.
  *
- * A rekey (cds_ft_rekey_graft / cds_ft_rekey_merge) moves a live subtree from one
- * key prefix to another WITHIN one trie, so a reader whose traversal races the
- * move could otherwise be torn onto a position the key no longer occupies.  Every
- * trie that can host such a move -- any trie whose group does not use speculative
- * stored keys, since the library cannot rewrite an application-stored key when a
- * leaf's key changes -- verifies its reads against a concurrent move.
- *
- * The cost is confined to the move itself.  A mover first publishes a per-trie
- * "a move is in flight" mode and waits one grace period, so that every reader has
- * observed the mode before any structure changes; readers check that mode once per
- * traversal.  With no move in flight, that check is a single load of a word nobody
- * writes and the read runs exactly as it always did.  While a move IS in flight,
- * readers on this trie verify each traversal and repeat it if the move restructured
- * their path -- so reads on that trie are lock-free rather than wait-free for the
- * duration of the move, and unaffected otherwise.
- *
- * A burst of concurrent moves pays about ONE grace period between them, not one
- * each.  A rekey therefore BLOCKS and must not be called from an RCU read-side
- * critical section (see the rekey functions' own documentation).
+ * A rekey can block on a grace period.  Do not call it from within an RCU
+ * read-side critical section.  The cost to readers is described at
+ * cds_ft_group_attr_set_rekey().
  */
 
 /*
@@ -3432,9 +3402,9 @@ enum cds_ft_status cds_ft_attr_set_speculative_keys(struct cds_ft_attr *attr,
  * of their own.
  *
  * The caller asserts that no new RCU readers will enter the trie
- * after this call returns (e.g. single-threaded access, or
- * mutex-protected access without RCU readers) until a matching
- * cds_ft_make_shared() call, if any.
+ * after this call returns, until a matching cds_ft_make_shared() call,
+ * if any.  Examples: single-threaded access, or mutex-protected access
+ * without RCU readers.
  *
  * No-op if the trie is already exclusive.
  */
@@ -3452,8 +3422,7 @@ void cds_ft_make_exclusive(struct cds_ft *ft);
  *
  * After this call, graft / graft_swap operations with this trie as
  * source must drain readers (one grace period) before moving the
- * content elsewhere -- unlike an exclusive trie, which skips that
- * drain.
+ * content elsewhere.  An exclusive trie skips that drain.
  */
 void cds_ft_make_shared(struct cds_ft *ft);
 
@@ -3471,10 +3440,12 @@ bool cds_ft_is_exclusive(const struct cds_ft *ft);
  *                                access-discipline validator is
  *                                compiled into the library.
  *
- * Returns true if the library was built with -DFEATURE_FT_EXCL_VALIDATE,
- * in which case writer/writer conflicts (any mode) and writer/reader
- * conflicts (exclusive mode) are detected at the public API boundary
- * and abort() the process with a violation report.
+ * Returns true if the library was built with -DFEATURE_FT_EXCL_VALIDATE.
+ * The validator then detects two kinds of conflict at the public API
+ * boundary:
+ *   - writer/writer conflicts (any mode);
+ *   - writer/reader conflicts (exclusive mode).
+ * A detected conflict abort()s the process with a violation report.
  *
  * Returns false if the validator is compiled out (the default); the
  * validator helpers are then no-ops.
@@ -3488,10 +3459,10 @@ bool cds_ft_excl_validate_enabled(void);
 /*
  * cds_ft_merge_enabled - Query whether the merge subsystem is compiled in.
  *
- * The merge family (cds_ft_merge, cds_ft_merge_at, cds_ft_rekey_merge
- * and the graft paths that reuse them) can be compiled out with
- * -DNO_FEATURE_FT_MERGE, which drops ~20 KiB of .text for a deployment
- * that never merges; those entries then return
+ * The merge family can be compiled out with -DNO_FEATURE_FT_MERGE.  The
+ * family is cds_ft_merge, cds_ft_merge_at, cds_ft_rekey_merge and the
+ * graft paths that reuse them.  Compiling it out drops ~20 KiB of .text
+ * for a deployment that never merges.  Those entries then return
  * CDS_FT_STATUS_NOT_SUPPORTED.  ☞ cds_ft_rekey_GRAFT is NOT in that
  * family and stays available on such a build: an empty destination is a
  * graft, not a union.
@@ -3499,9 +3470,9 @@ bool cds_ft_excl_validate_enabled(void);
  * Returns false in such a build, true otherwise.
  *
  * Primarily intended for tests, for the same reason
- * cds_ft_excl_validate_enabled exists: a test that exercises merge
- * directly can query this and SKIP itself rather than fail, so the
- * merge-less configuration can be tested at all instead of being
+ * cds_ft_excl_validate_enabled exists.  A test that exercises merge
+ * directly can query this and SKIP itself rather than fail.  The
+ * merge-less configuration can then be tested at all, instead of being
  * build-only.
  */
 bool cds_ft_merge_enabled(void);
@@ -3512,14 +3483,14 @@ bool cds_ft_merge_enabled(void);
  *                                     compiled into the library.
  *
  * Returns true if the library was built with
- * -DFEATURE_FT_VERIFY_AT_MUTATION, in which case the writer
- * scope-exit hook samples cds_ft_verify at a per-trie tunable period
- * (see cds_ft_verify_at_mutation_period_set).  Returns false if the
- * feature is compiled out (the default), in which case the period
- * setter / getter return CDS_FT_STATUS_NOT_SUPPORTED.
+ * -DFEATURE_FT_VERIFY_AT_MUTATION.  The writer scope-exit hook then
+ * samples cds_ft_verify at a per-trie tunable period (see
+ * cds_ft_verify_at_mutation_period_set).  Returns false if the
+ * feature is compiled out (the default).  The period setter / getter
+ * then return CDS_FT_STATUS_NOT_SUPPORTED.
  *
- * Use as a build-time gate from tests so that a negative test that
- * relies on the verify cadence can SKIP itself rather than silently
+ * Use as a build-time gate from tests.  A negative test that relies
+ * on the verify cadence can then SKIP itself rather than silently
  * pass on a non-VAM build.
  */
 bool cds_ft_verify_at_mutation_enabled(void);
@@ -3543,8 +3514,8 @@ bool cds_ft_verify_at_mutation_enabled(void);
  *
  * Returns CDS_FT_STATUS_OK on success, or
  * CDS_FT_STATUS_NOT_SUPPORTED when the library was built without
- * FEATURE_FT_VERIFY_AT_MUTATION -- the call surfaces the mismatch
- * loudly so a test that relies on the verify cadence cannot
+ * FEATURE_FT_VERIFY_AT_MUTATION.  The call reports the mismatch
+ * loudly, so that a test that relies on the verify cadence cannot
  * accidentally run with verify-at-mutation compiled out.  Use
  * cds_ft_verify_at_mutation_enabled() to gate the call.
  *
@@ -3691,32 +3662,36 @@ void cds_ft_iter_reset(struct cds_ft_iter *iter);
  * @iter: The iterator.
  *
  * Drops the RCU-protected position cached in the iterator and snapshots its
- * current key into the iterator's own storage: the next operation is forced to
- * perform a fresh top-down traversal from that key.  The key and prefix length
- * are preserved.
+ * current key into the iterator's own storage.  The next operation is then
+ * forced to perform a fresh top-down traversal from that key.  The key and
+ * prefix length are preserved.
  *
  * For CDS_FT_ITER_CACHED iterators this must be called if the RCU read-side
- * lock is dropped between operations on the same iterator, both to prevent
- * use-after-free of the cached node AND -- in a speculative skip-compressed
- * group configured with a leaf-key offset
- * (cds_ft_group_attr_set_speculative_key_offset()) or the library-owned
- * ordered list (cds_ft_group_attr_set_ordered_list()) -- because the current
- * key after an ordered lookup (cds_ft_lookup_first / cds_ft_next / the
- * relational lookups) is held as a LIVE REFERENCE into the matched leaf, valid
- * only while that lock is held.  Bind copies it out WHILE STILL HOLDING the
- * lock, so the iterator no longer depends on the soon-to-be-reclaimable leaf.
+ * lock is dropped between operations on the same iterator.  There are two
+ * reasons:
+ *   - it prevents use-after-free of the cached node;
+ *   - after an ordered lookup, the current key may be held as a LIVE
+ *     REFERENCE into the matched leaf.  That reference is valid only while
+ *     that lock is held.  The ordered lookups are cds_ft_lookup_first /
+ *     cds_ft_next / the relational lookups.
+ * The second reason applies in a speculative skip-compressed group configured
+ * with a leaf-key offset (cds_ft_group_attr_set_speculative_key_offset()) or
+ * the library-owned ordered list (cds_ft_group_attr_set_ordered_list()).
+ * Bind copies the key out WHILE STILL HOLDING the lock, so the iterator no
+ * longer depends on the soon-to-be-reclaimable leaf.
  *
- * CDS_FT_ITER_UNCACHED iterators do not require this call -- the cached
- * position is discarded (and any referenced key snapshotted) automatically
- * after each operation.
+ * CDS_FT_ITER_UNCACHED iterators do not require this call.  After each
+ * operation, the cached position is discarded automatically, and any
+ * referenced key is snapshotted.
  *
- * After bind the iterator resumes like an uncached one: cds_ft_iter_get_key()
- * still returns the bound key, and the next cds_ft_next() in a fresh critical
- * section re-descends from the root and yields the bound key's successor
- * (robust even if the bound key was removed in the meantime).  Note that bind
- * also drops the current result -- cds_ft_iter_node() returns NULL until that
- * re-descent -- whereas a plain uncached iterator keeps the last operation's
- * result node readable until its next operation.
+ * After bind the iterator resumes like an uncached one:
+ *   - cds_ft_iter_get_key() still returns the bound key;
+ *   - the next cds_ft_next() in a fresh critical section re-descends from
+ *     the root and yields the bound key's successor.  This is robust even if
+ *     the bound key was removed in the meantime.
+ * Note that bind also drops the current result: cds_ft_iter_node() returns
+ * NULL until that re-descent.  A plain uncached iterator instead keeps the
+ * last operation's result node readable until its next operation.
  *
  * Piecewise iteration:
  *
@@ -3752,11 +3727,11 @@ void cds_ft_iter_bind_key(struct cds_ft_iter *iter);
  *
  * Both iterators must be bound to the same Fractal Trie.
  *
- * The copy carries @src's cached position (and, when @src's result key
- * is held as a live reference into a leaf, that dependency too), so @dst
- * is valid only while the RCU read-side lock that produced @src's
- * position is held continuously; reusing @dst's position then carries
- * the same stale-position hazard as @src's.  To carry @dst across a
+ * The copy carries @src's cached position.  When @src's result key is
+ * held as a live reference into a leaf, it carries that dependency too.
+ * So @dst is valid only while the RCU read-side lock that produced
+ * @src's position is held continuously.  Reusing @dst's position then
+ * carries the same stale-position hazard as @src's.  To carry @dst across a
  * critical section, cds_ft_iter_bind_key() it (or @src before copying)
  * while the lock is held.
  */
@@ -3797,13 +3772,14 @@ struct cds_ft_node *cds_ft_iter_node(const struct cds_ft_iter *iter);
  * the group declares a speculative key offset, otherwise from the trie
  * structure (ordered-list groups only).
  *
- * RCU CONTRACT: @node, and the trie structure its key is read from, are valid
- * only while the RCU read-side lock that produced @node is held CONTINUOUSLY.
- * Unlike an iterator -- which an UNCACHED caller can carry across a critical
- * section because it materializes the key into its own storage -- a bare node
- * pointer must NOT outlive its read-side critical section.  This is the
- * within-CS companion to the iterator, for a node from a point lookup; for a
- * batched ordered scan use the cell batch (cds_ft_cell_get_key()) instead.
+ * RCU CONTRACT: @node is valid only while the RCU read-side lock that
+ * produced it is held CONTINUOUSLY.  The same holds for the trie structure
+ * its key is read from.  An UNCACHED caller can carry an iterator across a
+ * critical section, because the iterator materializes the key into its own
+ * storage.  A bare node pointer must NOT outlive its read-side critical
+ * section.  This is the within-CS companion to the iterator, for a node from
+ * a point lookup.  For a batched ordered scan use the cell batch
+ * (cds_ft_cell_get_key()) instead.
  *
  * Returns CDS_FT_STATUS_OK on success.
  * Returns CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @node is NULL.
@@ -3824,13 +3800,12 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
  * @count: Output -- number of cells written to @buf (0 at the end of the walk).
  * @next_cursor: Output -- the cell to pass as @cursor next, or NULL at the end.
  *
- * Walks @ft's ordered cell list without an iterator object, emitting opaque CELL
- * handles a batch at a time so the per-call boundary is paid once per @cap cells.
- * From each handle, recover the node with cds_ft_cell_node() (off the
- * cached cds_ft_cell_node_offset()) and the key with
- * cds_ft_cell_get_key().  Stop when @next_cursor comes back
- * NULL (NOT when *@count is 0): a NULL cursor is BOTH the start sentinel and the
- * end signal, so terminate on the returned cursor, not the count:
+ * Walks @ft's ordered cell list without an iterator object.  It emits opaque
+ * CELL handles a batch at a time, so the per-call boundary is paid once per
+ * @cap cells.  From each handle, recover the node with cds_ft_cell_node()
+ * (off the cached cds_ft_cell_node_offset()) and the key with
+ * cds_ft_cell_get_key().  Stop when @next_cursor comes back NULL, NOT when
+ * *@count is 0.  A NULL cursor is BOTH the start sentinel and the end signal:
  *
  *   const struct cds_ft_cell *cur = NULL;
  *   size_t off = cds_ft_cell_node_offset(), n, i;
@@ -3844,14 +3819,15 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
  *   } while (cur);
  *
  * ORDERED-LIST ONLY: a list-off trie (cds_ft_group_attr_set_ordered_list(attr,
- * false)) has no cell list, so it returns CDS_FT_STATUS_NOT_SUPPORTED (*@count =
- * 0, *@next_cursor = NULL); use cds_ft_next()/cds_ft_for_each_rcu() (a stateful
- * iterator) there.  Query the mode up front with cds_ft_group_ordered_list().
+ * false)) has no cell list.  The call then returns
+ * CDS_FT_STATUS_NOT_SUPPORTED (*@count = 0, *@next_cursor = NULL).  Use
+ * cds_ft_next()/cds_ft_for_each_rcu() (a stateful iterator) there.  Query the
+ * mode up front with cds_ft_group_ordered_list().
  *
  * RCU CONTRACT: @cursor and every returned cell are valid only while the RCU
- * read-side lock that produced @cursor is held CONTINUOUSLY.  A cell handle (and
- * any node/key derived from it) must not outlive its critical section; for a
- * resumable scan that spans grace periods, use the iterator.
+ * read-side lock that produced @cursor is held CONTINUOUSLY.  A cell handle
+ * (and any node/key derived from it) must not outlive its critical section.
+ * For a resumable scan that spans grace periods, use the iterator.
  *
  * Returns CDS_FT_STATUS_OK (batch in @buf/@count, possibly 0 at the end), or
  * CDS_FT_STATUS_NOT_SUPPORTED on a list-off trie.
@@ -3871,10 +3847,10 @@ enum cds_ft_status cds_ft_cell_prev_batch(struct cds_ft *ft,
 /*
  * cds_ft_cell_node_offset - Byte offset of the head-node pointer in a cell.
  *
- * Invariant for the process: fetch it once, cache it, and pass it to
+ * Invariant for the process.  Fetch it once, cache it, and pass it to
  * cds_ft_cell_node() per element with no further library call.  It is a
- * runtime getter rather than a header constant so the cell stays opaque and
- * the offset stays ABI-stable: a caller that fetches it at runtime keeps
+ * runtime getter rather than a header constant.  This keeps the cell opaque
+ * and the offset ABI-stable: a caller that fetches it at runtime keeps
  * working if the layout ever changes.
  */
 size_t cds_ft_cell_node_offset(void);
@@ -3884,9 +3860,9 @@ size_t cds_ft_cell_node_offset(void);
  * cached @node_offset from cds_ft_cell_node_offset().  A MACRO (not an inline) so
  * rcu_dereference resolves in the CALLER's translation unit, where the RCU
  * flavor is included.  The cell's node pointer can change under concurrent
- * mutation, so this is an rcu_dereference snapshot -- valid old-or-new under a
- * continuously held read lock, like the iterator's node read.  @cell and
- * @node_offset are each evaluated once.
+ * mutation, so this is an rcu_dereference snapshot.  Under a continuously
+ * held read lock the snapshot is valid, old or new, like the iterator's node
+ * read.  @cell and @node_offset are each evaluated once.
  */
 #define cds_ft_cell_node(cell, node_offset)				\
 	((struct cds_ft_node *) rcu_dereference(			\
@@ -3918,10 +3894,10 @@ enum cds_ft_status cds_ft_cell_get_key(const struct cds_ft *ft,
  * - 0: NIL key (returns 0).
  * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
  *
- * Works whenever the resolved @key_len falls in [1..8]: fixed-length
- * tries with a configured length <= 8 (pass CDS_FT_LEN_DEFAULT or a
- * matching explicit length) and variable-length tries (pass an
- * explicit length).  Behaves as a big-endian conversion over that
+ * Works whenever the resolved @key_len falls in [1..8].  A fixed-length
+ * trie needs a configured length <= 8 (pass CDS_FT_LEN_DEFAULT or a
+ * matching explicit length).  A variable-length trie needs an
+ * explicit length.  Behaves as a big-endian conversion over that
  * many bytes.
  *
  * Returns 0 if the resolved @key_len exceeds 8 or is invalid for
@@ -3941,10 +3917,10 @@ uint64_t cds_ft_key_to_u64(const struct cds_ft *ft, const uint8_t *key, size_t k
  * - 0: NIL key (no-op).
  * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
  *
- * Works whenever the resolved @key_len falls in [1..8]: fixed-length
- * tries with a configured length <= 8 (pass CDS_FT_LEN_DEFAULT or a
- * matching explicit length) and variable-length tries (pass an
- * explicit length).  Truncates the most significant bits beyond the
+ * Works whenever the resolved @key_len falls in [1..8].  A fixed-length
+ * trie needs a configured length <= 8 (pass CDS_FT_LEN_DEFAULT or a
+ * matching explicit length).  A variable-length trie needs an
+ * explicit length.  Truncates the most significant bits beyond the
  * key range.
  *
  * No-op if the resolved @key_len exceeds 8 or is invalid for this
@@ -3962,10 +3938,10 @@ void cds_ft_u64_to_key(const struct cds_ft *ft, uint64_t v, uint8_t *key, size_t
  * - 0: NIL key (returns 0).
  * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
  *
- * Works whenever the resolved @key_len falls in [1..4]: fixed-length
- * tries with a configured length <= 4 (pass CDS_FT_LEN_DEFAULT or a
- * matching explicit length) and variable-length tries (pass an
- * explicit length).
+ * Works whenever the resolved @key_len falls in [1..4].  A fixed-length
+ * trie needs a configured length <= 4 (pass CDS_FT_LEN_DEFAULT or a
+ * matching explicit length).  A variable-length trie needs an
+ * explicit length.
  *
  * Returns 0 if the resolved @key_len exceeds 4 or is invalid for
  * this trie's configuration (e.g. CDS_FT_LEN_DEFAULT on a
@@ -3984,10 +3960,10 @@ uint32_t cds_ft_key_to_u32(const struct cds_ft *ft, const uint8_t *key, size_t k
  * - 0: NIL key (no-op).
  * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
  *
- * Works whenever the resolved @key_len falls in [1..4]: fixed-length
- * tries with a configured length <= 4 (pass CDS_FT_LEN_DEFAULT or a
- * matching explicit length) and variable-length tries (pass an
- * explicit length).  Truncates the most significant bits beyond the
+ * Works whenever the resolved @key_len falls in [1..4].  A fixed-length
+ * trie needs a configured length <= 4 (pass CDS_FT_LEN_DEFAULT or a
+ * matching explicit length).  A variable-length trie needs an
+ * explicit length.  Truncates the most significant bits beyond the
  * key range.
  *
  * No-op if the resolved @key_len exceeds 4 or is invalid for this
@@ -4010,10 +3986,10 @@ void cds_ft_u32_to_key(const struct cds_ft *ft, uint32_t v, uint8_t *key, size_t
  *
  * The same principle applies to 32-bit signed integers.
  *
- * When the key is narrower than the integer type (e.g. a 2-byte key
- * representing a signed 16-bit range within a 64-bit integer), the
- * sign bit is at position (key_len * 8 - 1), not at the MSB of the
- * full integer type. The key-to-integer helpers sign-extend from the
+ * The key may be narrower than the integer type (e.g. a 2-byte key
+ * representing a signed 16-bit range within a 64-bit integer).  The
+ * sign bit is then at position (key_len * 8 - 1), not at the MSB of
+ * the full integer type. The key-to-integer helpers sign-extend from the
  * key's MSB to fill the integer. The integer-to-key helpers flip the
  * sign bit at the key's MSB and truncate to the key width.
  */
@@ -4027,10 +4003,10 @@ void cds_ft_u32_to_key(const struct cds_ft *ft, uint32_t v, uint8_t *key, size_t
  * - 0: NIL key (returns 0).
  * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
  *
- * Works whenever the resolved @key_len falls in [1..8]: fixed-length
- * tries with a configured length <= 8 (pass CDS_FT_LEN_DEFAULT or a
- * matching explicit length) and variable-length tries (pass an
- * explicit length).  When the key is narrower than 8 bytes the
+ * Works whenever the resolved @key_len falls in [1..8].  A fixed-length
+ * trie needs a configured length <= 8 (pass CDS_FT_LEN_DEFAULT or a
+ * matching explicit length).  A variable-length trie needs an
+ * explicit length.  When the key is narrower than 8 bytes the
  * result is sign-extended to 64 bits.
  *
  * Returns 0 if the resolved @key_len is 0, exceeds 8, or is invalid
@@ -4050,10 +4026,10 @@ int64_t cds_ft_key_to_s64(const struct cds_ft *ft, const uint8_t *key, size_t ke
  * - 0: NIL key (no-op).
  * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
  *
- * Works whenever the resolved @key_len falls in [1..8]: fixed-length
- * tries with a configured length <= 8 (pass CDS_FT_LEN_DEFAULT or a
- * matching explicit length) and variable-length tries (pass an
- * explicit length).  Truncates the most significant bits beyond the
+ * Works whenever the resolved @key_len falls in [1..8].  A fixed-length
+ * trie needs a configured length <= 8 (pass CDS_FT_LEN_DEFAULT or a
+ * matching explicit length).  A variable-length trie needs an
+ * explicit length.  Truncates the most significant bits beyond the
  * key range.
  *
  * No-op if the resolved @key_len is 0, exceeds 8, or is invalid for
@@ -4071,10 +4047,10 @@ void cds_ft_s64_to_key(const struct cds_ft *ft, int64_t v, uint8_t *key, size_t 
  * - 0: NIL key (returns 0).
  * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
  *
- * Works whenever the resolved @key_len falls in [1..4]: fixed-length
- * tries with a configured length <= 4 (pass CDS_FT_LEN_DEFAULT or a
- * matching explicit length) and variable-length tries (pass an
- * explicit length).  When the key is narrower than 4 bytes the
+ * Works whenever the resolved @key_len falls in [1..4].  A fixed-length
+ * trie needs a configured length <= 4 (pass CDS_FT_LEN_DEFAULT or a
+ * matching explicit length).  A variable-length trie needs an
+ * explicit length.  When the key is narrower than 4 bytes the
  * result is sign-extended to 32 bits.
  *
  * Returns 0 if the resolved @key_len is 0, exceeds 4, or is invalid
@@ -4094,10 +4070,10 @@ int32_t cds_ft_key_to_s32(const struct cds_ft *ft, const uint8_t *key, size_t ke
  * - 0: NIL key (no-op).
  * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
  *
- * Works whenever the resolved @key_len falls in [1..4]: fixed-length
- * tries with a configured length <= 4 (pass CDS_FT_LEN_DEFAULT or a
- * matching explicit length) and variable-length tries (pass an
- * explicit length).
+ * Works whenever the resolved @key_len falls in [1..4].  A fixed-length
+ * trie needs a configured length <= 4 (pass CDS_FT_LEN_DEFAULT or a
+ * matching explicit length).  A variable-length trie needs an
+ * explicit length.
  *
  * No-op if the resolved @key_len is 0, exceeds 4, or is invalid for
  * this trie's configuration (e.g. CDS_FT_LEN_DEFAULT on a
@@ -4138,8 +4114,8 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out);
  *       to suppress output).
  *
  * Runs the cds_ft_verify walk on each trie in turn, all against ONE
- * visited set, so a node reachable from more than one of them is
- * reported instead of passing as it does per-trie.
+ * visited set.  A node reachable from more than one of them is then
+ * reported, instead of passing as it does per-trie.
  *
  * The cross-trie operations (cds_ft_graft, cds_ft_graft_swap,
  * cds_ft_merge_at with src != dst) MOVE nodes between tries of a group;
@@ -4164,11 +4140,13 @@ enum cds_ft_status cds_ft_verify_disjoint(struct cds_ft *const *fts,
  * Returned by cds_ft_compact_step (DONE / MORE / OOM / BUSY) and
  * cds_ft_compact (DONE / OOM / BUSY, never MORE).
  *
- * OOM and BUSY are BOTH "stopped early, resume from the interrupted key", and
- * they are distinct because the caller's remedy differs: OOM asks it to free
- * memory, BUSY only to try again -- a relocation lost a lock-set to a peer and
- * nothing is wrong with memory.  Reporting contention as OOM would send a
- * caller freeing memory it does not need to free.
+ * OOM and BUSY BOTH mean "stopped early, resume from the interrupted key".
+ * They are distinct because the caller's remedy differs:
+ *   - OOM asks the caller to free memory;
+ *   - BUSY asks it only to try again.  A relocation lost a lock-set to a
+ *     peer and nothing is wrong with memory.
+ * Reporting contention as OOM would send a caller freeing memory it does not
+ * need to free.
  */
 enum cds_ft_compact_status {
 	CDS_FT_COMPACT_DONE	= 0,	/* fully compacted (terminal success) */
@@ -4183,19 +4161,21 @@ enum cds_ft_compact_status {
  * Recovers the descent locality and resident memory that churn or
  * graft-based population fragmentation cost a trie over time.
  *
- * One-shot convenience wrapper around cds_ft_compact_begin/step/end: the
+ * One-shot convenience wrapper around cds_ft_compact_begin/step/end.  The
  * caller must exclude concurrent writers on @ft for the whole call (the same
  * mutual-exclusion contract as the other mutators). Concurrent RCU readers are
- * permitted throughout, and other tries sharing the group keep mutating -- the
+ * permitted throughout.  Other tries sharing the group keep mutating: the
  * group stays online.
  *
- * Returns CDS_FT_COMPACT_DONE once the trie is fully compacted, or
- * CDS_FT_COMPACT_OOM if it stopped early under memory pressure: an allocation
- * failed, so the one-shot leaves the affected node in place and STOPS rather
- * than walking the rest of the trie into doomed allocations. The trie stays
- * valid and correct, only partially compacted. A caller that wants to free
- * memory and continue from where it stopped should drive the resumable
- * cds_ft_compact_begin/step/end API instead (cds_ft_compact does not resume).
+ * Returns CDS_FT_COMPACT_DONE once the trie is fully compacted.  Returns
+ * CDS_FT_COMPACT_OOM if it stopped early under memory pressure.  An
+ * allocation failed, so the one-shot leaves the affected node in place and
+ * STOPS rather than walking the rest of the trie into doomed allocations.
+ * Returns CDS_FT_COMPACT_BUSY if a step stopped early on writer contention.
+ * In both early-stop cases the trie stays valid and correct, only partially
+ * compacted. A caller that wants to free memory and continue from where it
+ * stopped should drive the resumable cds_ft_compact_begin/step/end API
+ * instead (cds_ft_compact does not resume).
  *
  * Memory reclaim is deferred (RCU grace period): resident memory does not
  * drop synchronously when this returns, but once a grace period has
@@ -4210,11 +4190,11 @@ enum cds_ft_compact_status cds_ft_compact(struct cds_ft *ft);
  * Resumable compaction (cds_ft_compact_begin / _step / _end).
  *
  * Lets a long compaction be interleaved with concurrent mutations of the
- * SAME trie: the caller drives it, holding its writer mutex only around each
- * cds_ft_compact_step and releasing it between steps so other writers (and
- * grace periods that drain reclaimed ranges) get a window. Each step
- * tolerates the structure changing between steps (a writer may mutate
- * the trie while the lock is dropped).
+ * SAME trie.  The caller drives it.  It holds its writer mutex only around
+ * each cds_ft_compact_step and releases it between steps.  Other writers
+ * then get a window, and so do the grace periods that drain reclaimed
+ * ranges.  Each step tolerates the structure changing between steps (a
+ * writer may mutate the trie while the lock is dropped).
  *
  *   struct cds_ft_compact_state *st = cds_ft_compact_begin(ft);
  *   enum cds_ft_compact_status s;
@@ -4233,10 +4213,10 @@ struct cds_ft_compact_state;
 /*
  * cds_ft_compact_begin - Start a resumable compaction of @ft.
  *
- * Returns an opaque state to drive with cds_ft_compact_step, or NULL on
- * allocation failure or if a compaction is already in progress on @ft
- * (only one may be in flight per trie at a time; end the current one with
- * cds_ft_compact_end first). The returned state must be released with
+ * Returns an opaque state to drive with cds_ft_compact_step.  Returns NULL
+ * on allocation failure, or if a compaction is already in progress on @ft.
+ * Only one may be in flight per trie at a time; end the current one with
+ * cds_ft_compact_end first.  The returned state must be released with
  * cds_ft_compact_end.
  */
 struct cds_ft_compact_state *cds_ft_compact_begin(struct cds_ft *ft);
@@ -4248,17 +4228,21 @@ struct cds_ft_compact_state *cds_ft_compact_begin(struct cds_ft *ft);
  *
  * The caller must hold its writer exclusion for @ft across this call.  On a
  * CDS_FT_WRITER_LOCK_FINE trie the step also takes part in the bulk-op mode
- * flip on its own, like a point op: while a bulk op (detach, graft, graft_swap,
- * merge, rekey) is live on @ft, the step queues on the trie-wide writer lock.
+ * flip on its own, like a point op.  While a bulk op (detach, graft,
+ * graft_swap, merge, rekey) is live on @ft, the step queues on the trie-wide
+ * writer lock.
  * Returns:
  *   CDS_FT_COMPACT_MORE - more work remains; call again.
  *   CDS_FT_COMPACT_DONE - the trie is fully compacted.
- *   CDS_FT_COMPACT_OOM  - stopped early: a relocation hit an allocation failure.
+ *   CDS_FT_COMPACT_OOM  - stopped early: a relocation hit an allocation
+ *                         failure.
+ *   CDS_FT_COMPACT_BUSY - stopped early: a relocation lost a lock-set to a
+ *                         peer.
  * The trie is valid at every step boundary. On CDS_FT_COMPACT_OOM the bound
- * cursor is left at the interrupted key, so after freeing memory the caller may
- * call this again to RESUME -- it re-attempts that key inclusively and loses no
- * key (an un-relocated node of any key pins its whole old arena range against
- * reclaim).
+ * cursor is left at the interrupted key.  After freeing memory the caller
+ * may call this again to RESUME.  The step then re-attempts that key
+ * inclusively and loses no key.  (An un-relocated node of any key pins its
+ * whole old arena range against reclaim.)
  */
 enum cds_ft_compact_status cds_ft_compact_step(struct cds_ft_compact_state *st,
 		size_t batch);
