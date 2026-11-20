@@ -4112,6 +4112,29 @@ enum ft_descent_action ft_insert_compressed(struct cds_ft *ft,
 	return FT_DESCENT_END;
 }
 
+/*
+ * Raise @ft's key-length hint to at least @key_len.  On a FINE trie two
+ * inserts can raise it at once.  A plain load then store would let the
+ * smaller length land last, and the hint would then under-state a key the
+ * trie holds.  The rekey and graft overflow checks trust the hint, so
+ * raise it with a compare-and-swap loop.
+ */
+static inline
+void ft_raise_max_used_key_len(struct cds_ft *ft, size_t key_len)
+{
+	size_t cur = uatomic_load(&ft->max_used_key_len, CMM_RELAXED);
+
+	ft_delay_seam(FT_DELAY_SITE_HINT);
+	while (key_len > cur) {
+		size_t seen = uatomic_cmpxchg(&ft->max_used_key_len, cur,
+				key_len);
+
+		if (seen == cur)
+			break;
+		cur = seen;
+	}
+}
+
 static
 int _cds_ft_insert(struct cds_ft *ft,
 		const uint8_t *_key, size_t _key_len,
@@ -4969,8 +4992,7 @@ insert_done:
 	 */
 	ft_op_end(&optxn);
 	if (ret == 0) {
-		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
-			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
+		ft_raise_max_used_key_len(ft, key_len);
 	}
 
 	return ret;
@@ -7405,8 +7427,7 @@ insert_replace_done:
 		 * That is a smaller and quieter wrong than an unheld writer on an
 		 * owned word, but it is not nothing, and it is the next step.
 		 */
-		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
-			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
+		ft_raise_max_used_key_len(ft, key_len);
 	}
 
 	ft_op_end(&optxn);

@@ -6097,6 +6097,12 @@ enum ft_delay_site {
 	 */
 	FT_DELAY_SITE_LANE      = (1 << 6),
 	FT_DELAY_SITE_ALL       = 0x7f,
+	/*
+	 * Between the load and the update of the key-length hint
+	 * (ft_raise_max_used_key_len).  Opt-in only (FT_DELAY_SITES=hint),
+	 * not in _ALL, so the existing injection runs are unchanged.
+	 */
+	FT_DELAY_SITE_HINT      = (1 << 7),
 };
 
 #ifdef FT_DELAY_INJECT
@@ -6154,7 +6160,7 @@ unsigned int ft_delay_rand(void)
 static unsigned long ft_delay_fired[8];
 static const char *const ft_delay_site_name[8] = {
 	"acquire", "recompact", "insert", "postlock", "staterec", "held",
-	"lane", "?7"
+	"lane", "hint"
 };
 static __attribute__((destructor)) void ft_delay_fired_report(void)
 {

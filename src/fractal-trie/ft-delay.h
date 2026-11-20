@@ -74,6 +74,8 @@ ft_delay_init(void)
 			m |= FT_DELAY_SITE_HELD;
 		if (strstr(sites, "lane"))
 			m |= FT_DELAY_SITE_LANE;
+		if (strstr(sites, "hint"))
+			m |= FT_DELAY_SITE_HINT;
 		if (strstr(sites, "all"))
 			m = FT_DELAY_SITE_ALL;
 		if (m)

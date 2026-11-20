@@ -19,6 +19,7 @@
 #include <urcu-call-rcu.h>
 
 #include <inttypes.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -29,7 +30,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	12
+#define NR_TESTS	13
 
 #define KEY_LEN		8
 /*
@@ -771,6 +772,86 @@ static int test_graft_swap_delegate_vs_rekey(enum cds_ft_writer_strategy strateg
 	return ret;
 }
 
+/*
+ * Concurrent inserts of keys of different lengths must leave the key-length
+ * hint at the longest one.  The rekey and graft overflow checks trust it, so
+ * a hint below a key the trie holds lets a move overrun the key buffers.
+ * Each round starts NR_HINT_THREADS inserts at once into a fresh trie.
+ */
+#define NR_HINT_THREADS	16
+#define NR_HINT_ROUNDS	3000
+
+static struct cds_ft *hint_ft;
+static unsigned long hint_gen, hint_done;
+
+static void *hint_inserter(void *arg)
+{
+	unsigned int id = (unsigned int) (uintptr_t) arg;
+	unsigned long gen = 0;
+
+	rcu_register_thread();
+	for (;;) {
+		uint8_t k[NR_HINT_THREADS + 1];
+		unsigned long g;
+
+		while ((g = uatomic_read(&hint_gen)) == gen)
+			caa_cpu_relax();
+		if (g == ULONG_MAX)
+			break;
+		gen = g;
+		cmm_smp_rmb();	/* pairs with the wmb before the gen store */
+		/* Key i is i + 1 bytes long; its first byte keeps it apart. */
+		memset(k, 0, sizeof(k));
+		k[0] = (uint8_t) (id + 1);
+		if (insert_one(hint_ft, k, id + 1, id) < 0)
+			abort();
+		uatomic_inc(&hint_done);	/* full barrier: the insert is done */
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int test_max_used_key_len_concurrent(void)
+{
+	pthread_t th[NR_HINT_THREADS];
+	unsigned int i, round, low = 0;
+	size_t low_seen = 0;
+
+	for (i = 0; i < NR_HINT_THREADS; i++)
+		if (pthread_create(&th[i], NULL, hint_inserter,
+				(void *) (uintptr_t) i))
+			abort();
+	for (round = 1; round <= NR_HINT_ROUNDS; round++) {
+		struct cds_ft_group *group;
+		struct cds_ft *ft = create_rekey_ft(CDS_FT_WRITER_LOCK_FINE,
+				&group);
+		size_t hint;
+
+		hint_ft = ft;
+		uatomic_set(&hint_done, 0);
+		cmm_smp_wmb();	/* hint_ft before the gen the workers wait on */
+		uatomic_set(&hint_gen, round);
+		while (uatomic_read(&hint_done) != NR_HINT_THREADS)
+			caa_cpu_relax();
+		cmm_smp_mb();
+		hint = cds_ft_max_used_key_len(ft);
+		if (hint != NR_HINT_THREADS) {
+			if (!low++)
+				low_seen = hint;
+		}
+		if (drain_and_destroy(ft, group) < 0)
+			abort();
+	}
+	uatomic_set(&hint_gen, ULONG_MAX);
+	for (i = 0; i < NR_HINT_THREADS; i++)
+		if (pthread_join(th[i], NULL))
+			abort();
+	diag("max_used_key_len: %u of %u rounds ended below the longest key "
+		"(first seen: %zu, longest %u)", low, NR_HINT_ROUNDS, low_seen,
+		NR_HINT_THREADS);
+	return low ? -1 : 0;
+}
+
 int main(void)
 {
 	if (create_all_cpu_call_rcu_data(0))
@@ -814,6 +895,8 @@ int main(void)
 	ok(test_graft_swap_delegate_vs_rekey(CDS_FT_WRITER_LOCK_COARSE,
 			"swap_vs_rekey_coarse") == 0,
 		"graft_swap: a delegate beside a rekey completes (COARSE)");
+	ok(test_max_used_key_len_concurrent() == 0,
+		"insert: concurrent inserts keep max_used_key_len at the longest key");
 
 	rcu_unregister_thread();
 	return exit_status();
