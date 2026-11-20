@@ -5,7 +5,8 @@
 /*
  * src/fractal-trie/ft-lifecycle.h
  *
- * Userspace RCU library - Fractal Trie: group / trie / attr create + destroy, group accessors, verify-at-mutation knobs.
+ * Userspace RCU library - Fractal Trie: group / trie / attr create +
+ * destroy, group accessors, verify-at-mutation knobs.
  *
  * Implementation unit: #included once by fractal-trie.c, in dependency
  * order, into a single translation unit (preserves cross-module inlining).
@@ -44,14 +45,17 @@ unsigned long cds_ft_count_entries(struct cds_ft *ft)
 
 /*
  * Validate that the pointer bits used by the skip-compressed encoding
- * are outside the process's virtual address range.  Attempt to mmap a
- * page at the encoding boundary; if the mapping succeeds (or fails with
- * EEXIST) the bit is within the VA range and skip-compressed cannot be
- * used safely.  Only ENOMEM (address beyond TASK_SIZE) confirms the bit
- * is available, and only after a positive control rules out a spurious
- * ENOMEM from a global mmap failure (see below); any other failure
- * (EPERM, EINVAL, EAGAIN, seccomp, ...) is treated conservatively as
- * unavailable.
+ * are outside the process's virtual address range.  Return true when
+ * the bit is available.
+ *
+ * Try to mmap a page at the encoding boundary:
+ *   - The mapping succeeds, or fails with EEXIST: the bit is within the
+ *     VA range.  Skip-compressed cannot be used safely.
+ *   - It fails with ENOMEM (address beyond TASK_SIZE): the bit is
+ *     available.  A positive control must first rule out a spurious
+ *     ENOMEM from a global mmap failure (see below).
+ *   - Any other failure (EPERM, EINVAL, EAGAIN, seccomp, ...): treat
+ *     the bit as unavailable, to stay conservative.
  */
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 static
@@ -70,15 +74,18 @@ bool ft_skip_compressed_validate(void)
 	if (errno != ENOMEM)
 		return false;	/* EEXIST / EPERM / EINVAL / seccomp / ... */
 	/*
-	 * ENOMEM is overloaded: besides "address beyond TASK_SIZE" (what we
-	 * want to confirm) it is also returned for a global mmap failure --
-	 * notably vm.max_map_count exhaustion -- regardless of the address.
+	 * ENOMEM is overloaded.  It means "address beyond TASK_SIZE", which
+	 * is what we want to confirm.  It is also returned for a global mmap
+	 * failure, regardless of the address.  The notable case is
+	 * vm.max_map_count exhaustion.
+	 *
 	 * Cross-check with a positive control: map one page at a
-	 * kernel-chosen address.  If the control succeeds, mmap is healthy
-	 * and the boundary ENOMEM was a genuine out-of-range rejection, so
-	 * the bit is available.  If the control also fails, mmap is failing
-	 * globally and the boundary ENOMEM proves nothing -- stay
-	 * conservative and leave skip-compressed disabled.
+	 * kernel-chosen address.
+	 *   - The control succeeds: mmap is healthy.  The boundary ENOMEM
+	 *     was a genuine out-of-range rejection, so the bit is available.
+	 *   - The control also fails: mmap is failing globally.  The
+	 *     boundary ENOMEM proves nothing.  Stay conservative and leave
+	 *     skip-compressed disabled.
 	 */
 	ctrl = mmap(NULL, page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (ctrl == MAP_FAILED)
@@ -114,29 +121,34 @@ enum cds_ft_status cds_ft_group_attr_create(struct cds_ft_group_attr **result)
 		attr->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
 #endif
 	/*
-	 * Ordered sibling list ON by default: the library-owned cell is allocated
-	 * per head regardless, so the key-ordered cds_ft_next / cds_ft_prev /
-	 * cds_ft_for_each*_batched fast paths are available out of the box.  A
-	 * group that never iterates in key order and wants to skip the per-mutation
-	 * splice / unsplice opts out with cds_ft_group_attr_set_ordered_list(attr, false).
+	 * The ordered sibling list is ON by default.  The library-owned cell
+	 * is allocated per head regardless.  So the key-ordered fast paths
+	 * are available out of the box: cds_ft_next, cds_ft_prev and
+	 * cds_ft_for_each*_batched.  A group that never iterates in key
+	 * order may want to skip the per-mutation splice / unsplice.  It
+	 * opts out with cds_ft_group_attr_set_ordered_list(attr, false).
 	 */
 	attr->ordered_list_set = true;
 	/*
 	 * Order-statistics (per-node nr_keys) default OFF: calloc already left
-	 * rank_stats_set false.  A group that needs O(1) cds_ft_count_keys /
-	 * O(depth) cds_ft_lookup_nth / cds_ft_iter_skip_* opts in with
-	 * cds_ft_group_attr_set_rank_stats(attr, true); otherwise those queries
-	 * fall back to enumeration / iteration.
+	 * rank_stats_set false.  A group opts in with
+	 * cds_ft_group_attr_set_rank_stats(attr, true).  It then gets:
+	 *   - O(1) cds_ft_count_keys;
+	 *   - O(depth) cds_ft_lookup_nth and cds_ft_iter_skip_*.
+	 * Otherwise those queries fall back to enumeration / iteration.
 	 */
 	/*
-	 * NUMA placement default: defer to process / libnuma policy.
-	 * The library applies no mbind() of its own; the kernel honors
-	 * numactl wrappers, set_mempolicy() calls, or falls back to
-	 * first-touch when no process policy is set.  Applications that
-	 * want explicit library-side placement should opt into
-	 * CDS_FT_NUMA_INTERLEAVE (multi-reader workloads) or
-	 * CDS_FT_NUMA_LOCAL (single-threaded / sharded workloads) via
-	 * cds_ft_group_attr_set_numa_policy.
+	 * NUMA placement default: CDS_FT_NUMA_DEFAULT, which defers to an
+	 * explicit process / libnuma policy (see ft_apply_interleave).
+	 *   - The process policy is MPOL_BIND, PREFERRED or LOCAL (numactl
+	 *     wrappers, set_mempolicy() calls): the library applies no
+	 *     mbind() of its own.  The kernel honors the process policy.
+	 *   - The process policy is MPOL_INTERLEAVE, or no process policy
+	 *     is set: the library interleaves its own arenas.
+	 * Applications that want explicit library-side placement should opt
+	 * in via cds_ft_group_attr_set_numa_policy:
+	 *   - CDS_FT_NUMA_INTERLEAVE for multi-reader workloads;
+	 *   - CDS_FT_NUMA_LOCAL for single-threaded / sharded workloads.
 	 */
 	attr->numa_policy = CDS_FT_NUMA_DEFAULT;
 	attr->optimize = CDS_FT_OPTIMIZE_THROUGHPUT;
@@ -184,9 +196,11 @@ enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
 	/*
 	 * Verify the two maps are exact inverse permutations.  Checking
 	 * ordinal_to_key[key_to_ordinal[i]] == i for every i is sufficient:
-	 * it forces key_to_ordinal to be injective (hence a bijection over
-	 * the byte values) and ordinal_to_key to be its inverse (hence also
-	 * a bijection), so both maps are valid permutations.
+	 *   - it forces key_to_ordinal to be injective, hence a bijection
+	 *     over the byte values;
+	 *   - it forces ordinal_to_key to be its inverse, hence also a
+	 *     bijection.
+	 * So both maps are valid permutations.
 	 */
 	for (i = 0; i < sizeof(attr->key_map.key_to_ordinal); i++) {
 		if (ordinal_to_key[key_to_ordinal[i]] != i)
@@ -212,9 +226,9 @@ enum cds_ft_status cds_ft_group_attr_set_lookup_optimization(
 		/*
 		 * Speculative descent always works.  Opportunistically
 		 * enable the skip-compressed pointer encoding when the
-		 * arch supports it; on archs without it the descent still
-		 * skips per-step byte compares -- just without the extra
-		 * compressed-CL bypass.
+		 * arch supports it.  On archs without it, the descent
+		 * still skips per-step byte compares.  It only lacks the
+		 * extra compressed-CL bypass.
 		 */
 		attr->speculative = true;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
@@ -260,26 +274,27 @@ enum cds_ft_status cds_ft_group_attr_set_ordered_list(
 /*
  * ☞ REKEY IS OPT-IN, and the default is OFF.  (MATHIEU, 2026-09-20.)
  *
- * Two reasons, and the second is a correctness one:
+ * There are two reasons.  The second is a correctness one.
  *
- * 1. A trie that can host an in-trie MOVE has to carry the COHERENT lookup
- *    specializations -- every exact lookup able to run a second, key-
- *    rematerializing walk -- because a move can start at any time.  A trie
- *    that will never rekey pays for a capability it never uses.  This flag is
- *    what lets ft_install_lookup_ops select the plain variants instead.
+ * 1. A move can start at any time.  So a trie that can host an in-trie MOVE
+ *    has to carry the COHERENT lookup specializations.  With them, every
+ *    exact lookup is able to run a second, key-rematerializing walk.  A
+ *    trie that will never rekey pays for a capability it never uses.  This
+ *    flag is what lets ft_install_lookup_ops select the plain variants
+ *    instead.
  *
  * 2. Under CDS_FT_WRITER_EXTERNAL_SYNC the move gate's grace period is taken
- *    while the APPLICATION holds its own writer exclusion, which the library
- *    can neither drop nor get outside of.  Opting IN there is what turns on
- *    @rekey_always_coherent, which removes that grace period entirely -- so
- *    the opt-in is also the place the library gets to decide how to serve the
- *    request.  See cds_ft::rekey_always_coherent.
+ *    while the APPLICATION holds its own writer exclusion.  The library can
+ *    neither drop that exclusion nor get outside of it.  Opting IN there
+ *    turns on @rekey_always_coherent, which removes that grace period
+ *    entirely.  So the opt-in is also the place where the library decides
+ *    how to serve the request.  See cds_ft::rekey_always_coherent.
  *
- * ☠ A REFUSAL IS A CLAIM ABOUT THE TRIE, not a return code: a caller that
+ * ☠ A REFUSAL IS A CLAIM ABOUT THE TRIE, not a return code.  A caller that
  * does not opt in gets CDS_FT_STATUS_NOT_SUPPORTED from the rekey entries,
- * NOT a silent no-op.  Tests that exercise rekey must opt in, and both suites
- * carry a positive control that FAILS when no rekey actually ran -- otherwise
- * a missed creator reads as a green suite with zero rekey coverage.
+ * NOT a silent no-op.  Tests that exercise rekey must opt in.  Both suites
+ * carry a positive control that FAILS when no rekey actually ran.  Without
+ * it, a missed creator reads as a green suite with zero rekey coverage.
  */
 enum cds_ft_status cds_ft_group_attr_set_rekey(
 		struct cds_ft_group_attr *attr, bool rekey)
@@ -350,9 +365,12 @@ enum cds_ft_status cds_ft_attr_create(struct cds_ft_attr **result)
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	/*
-	 * The per-instance attr currently carries only the exclusive-
-	 * access flag (see cds_ft_attr_set_exclusive); calloc leaves it
-	 * false (concurrent RCU readers permitted) as the default.
+	 * The per-instance attr carries two flags.  calloc leaves both
+	 * false, which is the default:
+	 *   - @exclusive false: concurrent RCU readers are permitted (see
+	 *     cds_ft_attr_set_exclusive);
+	 *   - @speculative_keys_disabled false: the trie inherits the
+	 *     group's setting (see cds_ft_attr_set_speculative_keys).
 	 */
 	*result = attr;
 	return CDS_FT_STATUS_OK;
@@ -438,17 +456,17 @@ bool cds_ft_verify_at_mutation_enabled(void)
  *   period >  1 : verify every @period mutations -- useful on large
  *                 tries where O(N) per mutation is impractical.
  *
- * The counter is reset to 0 on each period boundary, so it never
- * exceeds @period - 1 and there is no overflow / cadence-drift
- * concern on long-running workloads.
+ * The counter is reset to 0 on each period boundary.  So it never
+ * exceeds @period - 1.  Long-running workloads have no overflow and
+ * no cadence drift to worry about.
  *
- * Returns CDS_FT_STATUS_OK on success, or
+ * Returns CDS_FT_STATUS_OK on success.  Returns
  * CDS_FT_STATUS_NOT_SUPPORTED if the library was built without
- * FEATURE_FT_VERIFY_AT_MUTATION -- the call surfaces the mismatch
- * loudly rather than silently doing nothing, so a test that relies
- * on the verify cadence cannot accidentally run with verify-at-
- * mutation compiled out.  Use cds_ft_verify_at_mutation_enabled()
- * to gate the call.
+ * FEATURE_FT_VERIFY_AT_MUTATION.  The call reports the mismatch
+ * loudly rather than silently doing nothing.  So a test that relies
+ * on the verify cadence cannot accidentally run with
+ * verify-at-mutation compiled out.  Use
+ * cds_ft_verify_at_mutation_enabled() to gate the call.
  *
  * Write-side only (mutex-held); not safe to call concurrently
  * with writers on the same trie.
@@ -471,9 +489,9 @@ enum cds_ft_status cds_ft_verify_at_mutation_period_set(struct cds_ft *ft,
  * Read the verify-at-mutation sampling period for @ft into
  * *@period.
  *
- * Returns CDS_FT_STATUS_OK on success, or
+ * Returns CDS_FT_STATUS_OK on success.  Returns
  * CDS_FT_STATUS_NOT_SUPPORTED if the library was built without
- * FEATURE_FT_VERIFY_AT_MUTATION -- distinguishing the
+ * FEATURE_FT_VERIFY_AT_MUTATION.  This distinguishes the
  * build-disabled case from a runtime period == 0.
  */
 enum cds_ft_status cds_ft_verify_at_mutation_period_get(
@@ -533,34 +551,40 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		ft_group->optimize = attr->optimize;
 		/*
 		 * DLM (per-node lock-sets) is the default.  calloc-zero is not a
-		 * valid strategy any more (the enumerator that occupied 0 is
-		 * gone), hence @writer_strategy_set: unset means "no choice
+		 * valid strategy any more: the enumerator that occupied 0 is
+		 * gone.  Hence @writer_strategy_set.  Unset means "no choice
 		 * made", which resolves to LOCK_FINE.
 		 */
 		ft_group->writer_strategy = attr->writer_strategy_set ?
 			attr->writer_strategy : CDS_FT_WRITER_LOCK_FINE;
 		/*
-		 * Order statistics maintain ONE global count on the root's nr_keys
-		 * word, which EVERY count-changing mutation walks up to and updates
-		 * (ft_flip_txn_record_count_parent to the root) -- so no two
-		 * count-changing writers are ever disjoint.  FINE exploits
-		 * disjointness it does not have here: its per-node lock-sets let
-		 * would-be-disjoint writers proceed without the FT-wide lock, but with
-		 * rank stats all writers collide on the root count, so it buys no
-		 * concurrency over the single lock.  Worse, the count-parent walk
-		 * assumes WRITER EXCLUSION for a stable, proxy-free ancestor chain
-		 * (ft_flip_txn_record_count_parent) -- an assumption FINE breaks under
-		 * the FT-wide-lock drop.  A rank-stats trie is therefore
-		 * the COARSE single-lock target (§10.5): coerce ANY non-coarse
-		 * strategy to COARSE so it keeps the FT-wide lock (writer exclusion).
+		 * Order statistics maintain ONE global count on the root's
+		 * nr_keys word.  EVERY count-changing mutation walks up to the
+		 * root and updates it (ft_flip_txn_record_count_parent).  So no
+		 * two count-changing writers are ever disjoint.
+		 *
+		 * FINE exploits disjointness it does not have here.  Its
+		 * per-node lock-sets let would-be-disjoint writers proceed
+		 * without the FT-wide lock.  But with rank stats all writers
+		 * collide on the root count, so FINE buys no concurrency over
+		 * the single lock.
+		 *
+		 * Worse, the count-parent walk assumes WRITER EXCLUSION for a
+		 * stable, proxy-free ancestor chain
+		 * (ft_flip_txn_record_count_parent).  FINE breaks that
+		 * assumption under the FT-wide-lock drop.
+		 *
+		 * A rank-stats trie is therefore the COARSE single-lock target
+		 * (§10.5).  Coerce the strategy to COARSE so the trie keeps the
+		 * FT-wide lock (writer exclusion).
 		 */
 		/*
-		 * ☞ ONLY *FINE* IS COERCED.  COARSE is already the target, and
-		 * CDS_FT_WRITER_EXTERNAL_SYNC already serializes every structural
-		 * writer -- by the caller's contract rather than by the FT-wide
-		 * mutex -- so the count walk has the exclusion it requires.
-		 * Coercing it would silently hand back a lock the caller
-		 * explicitly asked the library not to take.
+		 * ☞ ONLY *FINE* IS COERCED.  COARSE is already the target.
+		 * CDS_FT_WRITER_EXTERNAL_SYNC already serializes every
+		 * structural writer, by the caller's contract rather than by
+		 * the FT-wide mutex.  So the count walk has the exclusion it
+		 * requires.  Coercing EXTERNAL_SYNC would silently hand back a
+		 * lock the caller explicitly asked the library not to take.
 		 */
 		if (ft_group->rank_stats_set
 				&& ft_group->writer_strategy
@@ -569,11 +593,12 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 	} else {
 		/*
 		 * NULL attr: mirror the defaults set by
-		 * cds_ft_group_attr_create -- identity key map plus
-		 * SPECULATIVE lookup optimization with opportunistic
-		 * SKIP_COMPRESSED on supported archs, and the DEFAULT NUMA
-		 * policy (interleave unless the process set an explicit
-		 * preference -- see ft_apply_interleave).
+		 * cds_ft_group_attr_create:
+		 *   - identity key map;
+		 *   - SPECULATIVE lookup optimization, with opportunistic
+		 *     SKIP_COMPRESSED on supported archs;
+		 *   - the DEFAULT NUMA policy: interleave unless the process
+		 *     set an explicit preference (see ft_apply_interleave).
 		 */
 		ft_group->key_map.identity = true;
 		ft_group->speculative = true;
@@ -598,11 +623,12 @@ enum cds_ft_status cds_ft_group_destroy(struct cds_ft_group *ft_group)
 		return CDS_FT_STATUS_BUSY_ERROR;
 	FT_TP(group_destroy, (const void *) ft_group);
 	/*
-	 * All tries are destroyed (nr_ft_instances == 0) and each
-	 * cds_ft_destroy drained its deferred frees, so every ordered-list
-	 * cell and every internal/compressed node that was allocated should
-	 * have had its free issued.  Both balances are group-scoped because
-	 * the bulk ops migrate cells and nodes between the group's tries.
+	 * All tries are destroyed (nr_ft_instances == 0), and each
+	 * cds_ft_destroy drained its deferred frees.  So every allocated
+	 * ordered-list cell and every allocated internal/compressed node
+	 * should have had its free issued.  Both balances are group-scoped
+	 * because the bulk ops migrate cells and nodes between the group's
+	 * tries.
 	 */
 	if (ft_debug_counters() &&
 	    ft_group->nr_cells_allocated != ft_group->nr_cells_freed) {
@@ -633,10 +659,13 @@ enum cds_ft_status cds_ft_group_destroy(struct cds_ft_group *ft_group)
 /*
  * DEBUG_COUNTERS-only cell leak introspection (no public header decl; tests
  * weak-reference it).  Reports the group's ordered-list cell alloc / free
- * balance.  Cells migrate between the group's tries via the bulk ops, so the
- * balance is meaningful only at group granularity; after every trie is drained
- * @allocated should equal @freed.  Caller must ensure no concurrent cell
- * mutation.
+ * balance.
+ *
+ * Cells migrate between the group's tries via the bulk ops.  So the balance
+ * is meaningful only at group granularity.  After every trie is drained,
+ * @allocated should equal @freed.
+ *
+ * Caller must ensure no concurrent cell mutation.
  */
 void cds_ft_debug_cell_balance(const struct cds_ft_group *group,
 		unsigned long *allocated, unsigned long *freed)
@@ -650,10 +679,13 @@ void cds_ft_debug_cell_balance(const struct cds_ft_group *group,
 /*
  * DEBUG_COUNTERS-only node leak introspection (no public header decl; tests
  * weak-reference it).  Reports the group's internal/compressed node alloc /
- * free balance.  Nodes migrate between the group's tries via the bulk ops, so
- * the balance is meaningful only at group granularity; after every trie is
- * drained @allocated should equal @freed.  Caller must ensure no concurrent
- * node mutation.
+ * free balance.
+ *
+ * Nodes migrate between the group's tries via the bulk ops.  So the balance
+ * is meaningful only at group granularity.  After every trie is drained,
+ * @allocated should equal @freed.
+ *
+ * Caller must ensure no concurrent node mutation.
  */
 void cds_ft_debug_node_balance(const struct cds_ft_group *group,
 		unsigned long *allocated, unsigned long *freed)
@@ -665,10 +697,12 @@ void cds_ft_debug_node_balance(const struct cds_ft_group *group,
 }
 
 /*
- * How many up-walks started on a duplicate-chain MEMBER and hopped to its head
- * (ft_ext_head_word) -- the positive control for the same-parent splice
- * oracle: a run of its merge flavours that never took that branch has not
- * exercised what it claims to.  Test-only, no public header declaration.
+ * Report how many up-walks started on a duplicate-chain MEMBER and hopped to
+ * its head (ft_ext_head_word).
+ *
+ * This is the positive control for the same-parent splice oracle.  A run of
+ * the oracle's merge flavours that never took that branch has not exercised
+ * what it claims to.  Test-only, no public header declaration.
  */
 void cds_ft_debug_ext_member_hops(const struct cds_ft_group *group,
 		unsigned long *hops)
@@ -681,21 +715,24 @@ void cds_ft_debug_ext_member_hops(const struct cds_ft_group *group,
 /*
  * Root-is-internal probe (no public header decl; the inv suite weak-references
  * it).  Reads ft->root under the caller's RCU read lock and returns whether it
- * tags a plain internal node.  Used by inv_root_always_internal to sample the
- * root CONCURRENTLY with a re-rooting bulk op (graft_swap) -- a transient
- * compressed / skip-compressed root, which no mutator should ever publish,
- * would show up here even though a post-op probe (after canonicalization)
- * cannot see it.
+ * tags a plain internal node.
+ *
+ * The inv suite uses it to sample the root CONCURRENTLY with a re-rooting
+ * bulk op (graft_swap).  No mutator should ever publish a
+ * transient compressed / skip-compressed root.  If one did, it would show up
+ * here.  A post-op probe cannot see it, because it runs after
+ * canonicalization.
  */
 int cds_ft_debug_root_is_internal(struct cds_ft *ft);
 int cds_ft_debug_root_is_internal(struct cds_ft *ft)
 {
 	/*
-	 * Resolve a flip proxy: the empty-dst root-level graft fuses the root
-	 * swap with the ordered-list head/tail transfer in one flip, parking a
-	 * transient proxy here.  It resolves to an internal node in BOTH phases
-	 * (old empty root XOR new src root), so the root-always-internal
-	 * invariant this probe checks still holds through the flip.
+	 * Resolve a flip proxy.  The empty-dst root-level graft fuses the root
+	 * swap with the ordered-list head/tail transfer in one flip.  That
+	 * parks a transient proxy here.  The proxy resolves to an internal
+	 * node in BOTH phases (old empty root XOR new src root).  So the
+	 * root-always-internal invariant this probe checks still holds
+	 * through the flip.
 	 */
 	struct cds_ft_inode_flag *rf = ft_root_dereference(ft);
 
@@ -714,22 +751,24 @@ void ft_install_lookup_ops(struct cds_ft *ft)
 	const struct cds_ft_group *group = ft->group;
 	bool sc = ft_group_skip_compressed(group);
 	/*
-	 * Limit-none relational entries: resolve the immutable use_keycopy config
-	 * once and install the matching specialization, so cds_ft_lookup_le/ge/lt/gt
-	 * (and cds_ft_next/prev) tail-call through @ft with no per-call config
-	 * branch.  Independent of key_map.identity (ft_speculative_keycopy handles
-	 * non-identity via ft_key_to_ordinals), so installed before the early
-	 * non-identity return below.
+	 * Limit-none relational entries.  Resolve the immutable use_keycopy
+	 * config once and install the matching specialization.  Then
+	 * cds_ft_lookup_le/ge/lt/gt (and cds_ft_next/prev) tail-call through
+	 * @ft with no per-call config branch.
+	 *
+	 * This is independent of key_map.identity: ft_speculative_keycopy
+	 * handles non-identity via ft_key_to_ordinals.  So it is installed
+	 * before the early non-identity return below.
 	 */
 	bool kc = ft->speculative_key_offset_active && group->speculative &&
 			(group->flags & CDS_FT_FLAG_SKIP_COMPRESSED);
 
 	/*
 	 * REKEY-coherent relational entries: the two-pass (visited-node witness)
-	 * variants, which fall through to the plain specializations below
-	 * whenever no move is in flight.  @kc is necessarily false here --
-	 * rekey_coherence implies !speculative_key_offset_active -- so only the
-	 * EAGER siblings exist.
+	 * variants.  They fall through to the plain specializations below
+	 * whenever no move is in flight.  @kc is necessarily false here,
+	 * because rekey_coherence implies !speculative_key_offset_active.  So
+	 * only the EAGER siblings exist.
 	 */
 	if (ft->rekey_coherence) {
 		assert(!kc);
@@ -745,9 +784,9 @@ void ft_install_lookup_ops(struct cds_ft *ft)
 	}
 
 	/*
-	 * Iter-form lookup_iter_fn: iter always carries ordinals-mapped
-	 * key bytes (see cds_ft_iter_set_key), so the non-identity key_map
-	 * case is handled at iter-set time and the lookup-time inner only
+	 * Iter-form lookup_iter_fn.  The iter always carries ordinals-mapped
+	 * key bytes (see cds_ft_iter_set_key).  So the non-identity key_map
+	 * case is handled at iter-set time.  The lookup-time inner only
 	 * needs (skip_compressed) specialization.
 	 */
 	/*
@@ -816,12 +855,12 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	const struct cds_ft_type *type0 = &ft_types[0];
 
 	/*
-	 * posix_memalign, not calloc: the trie pointer is stored in the
-	 * TRANSACTED metadata->parent slot of its root (ft_trie_parent), so it
-	 * must clear FT's whole in-band tag.  malloc only promises
-	 * _Alignof(max_align_t) -- 16 on LP64, but 8 on common 32-bit ABIs,
-	 * which would let a trie pointer alias the tag space.  Freed with
-	 * free() as before.
+	 * Use posix_memalign, not calloc.  The trie pointer is stored in the
+	 * TRANSACTED metadata->parent slot of its root (ft_trie_parent).  So
+	 * it must clear FT's whole in-band tag.  malloc only promises
+	 * _Alignof(max_align_t).  That is 16 on LP64, but 8 on common 32-bit
+	 * ABIs, which would let a trie pointer alias the tag space.  Freed
+	 * with free() as before.
 	 */
 	if (posix_memalign((void **) &ft, FT_PARENT_TRIE_ALIGN, sizeof(*ft))) {
 		*result_ft = NULL;
@@ -835,71 +874,79 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	/* Cache the group's order-statistics mode (per-node nr_keys upkeep). */
 	ft->rank_stats = ft_group->rank_stats_set;
 	/*
-	 * A fresh trie's ordinal-cell list is empty: init the circular sentinel so
-	 * it points at itself (calloc would leave it NULL, which is not a valid
-	 * empty circular list).  Done unconditionally -- cheap, and every created
-	 * trie (incl. the transient detach / merge tries) flows through here.
+	 * A fresh trie's ordinal-cell list is empty.  Init the circular
+	 * sentinel so it points at itself.  The zeroed struct would leave it
+	 * NULL, which is not a valid empty circular list.  Done
+	 * unconditionally, because it is cheap.  Every created trie flows
+	 * through here, including the transient detach / merge tries.
 	 */
 	urcu_txn_list_init(&ft->ord_sentinel);
 	/*
 	 * The three ownerless words' lock anchors.  A zeroed @state is CLEAN,
-	 * which is what ft_meta_lock_acquire expects to CAS from; nothing else
-	 * in cds_ft_metadata is read for a lock-only anchor.
+	 * which is what ft_meta_lock_acquire expects to CAS from.  Nothing
+	 * else in cds_ft_metadata is read for a lock-only anchor.
 	 */
 	memset(&ft->ord_begin_lock, 0, sizeof(ft->ord_begin_lock));
 	memset(&ft->ord_end_lock, 0, sizeof(ft->ord_end_lock));
 	memset(&ft->root_lock, 0, sizeof(ft->root_lock));
 	/*
-	 * Effective per-trie speculative-key state: the group is configured for
-	 * speculative result-key capture AND this trie did not opt out via
-	 * cds_ft_attr_set_speculative_keys(attr, false).  Set BEFORE
-	 * ft_install_lookup_ops (which keys @kc off it) so an opted-out trie gets
-	 * the EAGER lookup specializations.
+	 * Effective per-trie speculative-key state.  It is true when both
+	 * hold:
+	 *   - the group is configured for speculative result-key capture;
+	 *   - this trie did not opt out via
+	 *     cds_ft_attr_set_speculative_keys(attr, false).
+	 * Set BEFORE ft_install_lookup_ops, which keys @kc off it.  An
+	 * opted-out trie then gets the EAGER lookup specializations.
 	 */
 	ft->speculative_key_offset_active = ft_group->speculative_key_offset_set &&
 		(!attr || !attr->speculative_keys_disabled);
 	/*
-	 * REKEY coherence is no longer an opt-in: the MOVE GATE
-	 * (struct cds_ft::move_active) makes it free when no move is in flight, so
-	 * every trie that CAN host an in-trie move carries the coherent lookup
-	 * variants and decides per call.  The opt-in attr is gone with it.
+	 * History: REKEY coherence was for a time not an opt-in, and the
+	 * opt-in attr was removed.  The reason was that the MOVE GATE
+	 * (struct cds_ft::move_active) makes coherence free when no move is
+	 * in flight.  So every trie that CAN host an in-trie move carried
+	 * the coherent lookup variants and decided per call.  The next
+	 * comment says why it is an opt-in again.
 	 *
-	 * Which tries can: EAGER ones only -- a move changes a leaf's key and the
-	 * library cannot rewrite an application-stored speculative key, so a
-	 * speculative trie must never host a move (and needs no coherence).  The
-	 * ordered list is NOT required: the point witness is two forward descents
-	 * and the continuation rides the carried key, neither of which needs a
-	 * cell.  Set BEFORE
+	 * Which tries can host a move: EAGER ones only.  A move changes a
+	 * leaf's key, and the library cannot rewrite an application-stored
+	 * speculative key.  So a speculative trie must never host a move,
+	 * and needs no coherence.  The ordered list is NOT required.  The
+	 * point witness is two forward descents, and the continuation rides
+	 * the carried key.  Neither needs a cell.  Set BEFORE
 	 * ft_install_lookup_ops, which selects the specializations off it.
 	 */
 	/*
-	 * ☞ AND NOW IT IS AN OPT-IN AGAIN, for a reason the move gate does not
-	 * cover.  The note above is still right about COST -- the gate does make
-	 * coherence free while no move is in flight -- but it assumed the gate's
-	 * grace period is always payable.  Under CDS_FT_WRITER_EXTERNAL_SYNC it
-	 * is not: it is taken under an exclusion the library does not own.  So
-	 * the capability is declared (cds_ft_group_attr_set_rekey) and a trie
-	 * that never rekeys carries no coherent variant at all.
+	 * ☞ AND NOW IT IS AN OPT-IN AGAIN, for a reason the move gate does
+	 * not cover.  The note above is still right about COST: the gate
+	 * does make coherence free while no move is in flight.  But it
+	 * assumed the gate's grace period is always payable.  Under
+	 * CDS_FT_WRITER_EXTERNAL_SYNC it is not: it is taken under an
+	 * exclusion the library does not own.  So the capability is declared
+	 * (cds_ft_group_attr_set_rekey).  A trie that never rekeys carries
+	 * no coherent variant at all.
 	 *
-	 * Which tries can still host a move, given the opt-in: EAGER ones only
-	 * -- a move changes a leaf's key and the library cannot rewrite an
-	 * application-stored speculative key.
+	 * Which tries can still host a move, given the opt-in: EAGER ones
+	 * only.  A move changes a leaf's key, and the library cannot rewrite
+	 * an application-stored speculative key.
 	 */
 	ft->rekey_coherence = ft_group->rekey_set &&
 			!ft->speculative_key_offset_active;
 	/*
-	 * EXTERNAL_SYNC + rekey => readers never leave the coherent path, so the
-	 * move gate publishes no mode change and owes no grace period.  Decided
-	 * HERE, before ft_install_lookup_ops, and immutable after it for the
-	 * same reason @rekey_coherence is: the specializations are selected off
-	 * it, so a concurrent reader's fn-ptr choice is race-free.
+	 * EXTERNAL_SYNC + rekey => readers never leave the coherent path.
+	 * So the move gate publishes no mode change and owes no grace
+	 * period.  Decided HERE, before ft_install_lookup_ops, and immutable
+	 * after it.  The reason is the same as for @rekey_coherence: the
+	 * specializations are selected off it.  So a concurrent reader's
+	 * fn-ptr choice is race-free.
 	 */
 	/*
-	 * ☠ FROM THE GROUP, NOT FROM @ft->external_sync, WHICH IS NOT SET YET --
-	 * that assignment is ~30 lines below this one.  Reading the trie's own
-	 * field here would be a constant false, and the failure would be
-	 * SILENT: every external-sync trie would quietly keep the move gate's
-	 * grace period, which is the exact thing this flag exists to remove.
+	 * ☠ FROM THE GROUP, NOT FROM @ft->external_sync, WHICH IS NOT SET
+	 * YET.  That assignment is ~30 lines below this one.  Reading the
+	 * trie's own field here would be a constant false, and the failure
+	 * would be SILENT.  Every external-sync trie would quietly keep the
+	 * move gate's grace period.  Removing that grace period is the
+	 * exact thing this flag exists for.
 	 */
 	ft->rekey_always_coherent = ft->rekey_coherence &&
 			ft_group->writer_strategy == CDS_FT_WRITER_EXTERNAL_SYNC;
@@ -907,10 +954,10 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 	/*
 	 * Default to verify-every-mutation cadence to preserve the
-	 * historical -DFEATURE_FT_VERIFY_AT_MUTATION behavior; tests
+	 * historical -DFEATURE_FT_VERIFY_AT_MUTATION behavior.  Tests
 	 * working with large tries can call
-	 * cds_ft_set_verify_at_mutation_period() to dial it down.
-	 * Counter is already zero from calloc.
+	 * cds_ft_verify_at_mutation_period_set() to dial it down.
+	 * Counter is already zero from the memset above.
 	 */
 	ft->verify_at_mutation_period = 1;
 #endif
@@ -928,9 +975,9 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	ft->lock_fine = (ft_group->writer_strategy == CDS_FT_WRITER_LOCK_FINE);
 	/*
 	 * The caller's contract replaces the FT-wide writer mutex, and NOTHING
-	 * else: @lock_fine is false here, so every kind, lock-set and door
-	 * decision reads exactly as it does on a COARSE trie, and @exclusive
-	 * stays false so the reader-visible discipline is untouched.
+	 * else.  @lock_fine is false here.  So every kind, lock-set and door
+	 * decision reads exactly as it does on a COARSE trie.  @exclusive
+	 * stays false, so the reader-visible discipline is untouched.
 	 */
 	ft->external_sync = (ft_group->writer_strategy
 			== CDS_FT_WRITER_EXTERNAL_SYNC);
@@ -995,9 +1042,9 @@ void cds_ft_destroy(struct cds_ft *ft)
 	/*
 	 * A compaction the caller never ended would otherwise strand its
 	 * private ranges (relocated nodes in arena-untracked ranges) and leak
-	 * its state/iter.  Finalize it here: cds_ft_compact_end merges the
-	 * private ranges back into the arenas and frees the state, leaving a
-	 * consistent trie to tear down.
+	 * its state/iter.  Finalize it here.  cds_ft_compact_end merges the
+	 * private ranges back into the arenas and frees the state.  That
+	 * leaves a consistent trie to tear down.
 	 */
 	if (caa_unlikely(ft->active_compact != NULL)) {
 		fprintf(stderr,
@@ -1008,18 +1055,18 @@ void cds_ft_destroy(struct cds_ft *ft)
 	FT_TP(ft_destroy, (const void *) ft);
 	/*
 	 * Free root node.  No concurrent readers at this point.  The root was a
-	 * published (reader-visible) node throughout the trie's life, so it gets
-	 * its freeze-on-free tombstone like any other retired node (doc §4.B);
-	 * here it is a teardown no-op, but it keeps the mark-before-free
-	 * invariant universal (see FT_DEBUG_TOMBSTONE_AUDIT).
+	 * published (reader-visible) node throughout the trie's life.  So it
+	 * gets its freeze-on-free tombstone like any other retired node (doc
+	 * §4.B).  Here it is a teardown no-op, but it keeps the
+	 * mark-before-free invariant universal (see FT_DEBUG_TOMBSTONE_AUDIT).
 	 */
 	ft_meta_tombstone_set_flip(cds_ft_item_to_metadata(ft_node_ptr(ft->root)));
 	free_cds_ft_node(ft, ft_node_ptr(ft->root));
 	/*
-	 * Wait for in-flight call_rcu free to complete, so every deferred
-	 * node free this trie issued is counted (group-scoped) before the
-	 * trie's instance count is dropped.  The group-level node-leak check
-	 * runs in cds_ft_group_destroy, once all tries have drained.
+	 * Wait for in-flight call_rcu free to complete.  Every deferred
+	 * node free this trie issued is then counted (group-scoped) before
+	 * the trie's instance count is dropped.  The group-level node-leak
+	 * check runs in cds_ft_group_destroy, once all tries have drained.
 	 */
 	flavor->barrier();
 	pthread_cond_destroy(&ft->move_gate_cond);
@@ -1072,15 +1119,15 @@ bool cds_ft_empty(struct cds_ft *ft)
 	root_node = ft_node_ptr(root_flag);
 
 	/*
-	 * The root is always an internal node (invariant enforced by
-	 * ft_make_root_internal_glue at every site that publishes
-	 * ft->root), so no tag dispatch is needed before reading metadata.
+	 * The root is always an internal node.  ft_make_root_internal_glue
+	 * enforces this invariant at every site that publishes ft->root.
+	 * So no tag dispatch is needed before reading metadata.
 	 */
 	rmeta = cds_ft_item_to_metadata(root_node);
 
 	/*
 	 * Empty trie: the root has no children and no NIL-key entries.
-	 * For popcount root, nr_child is derived from the bitmap and a
+	 * For popcount root, nr_child is derived from the bitmap.  A
 	 * freshly-allocated (calloc'd) root with bitmap == 0 correctly
 	 * reports nr_child == 0.  Resolve the state word through the MCAS
 	 * proxy (§9): a peer's mid-commit FT_STATE_PROXY word would
@@ -1117,19 +1164,21 @@ struct cds_ft_stats {
 };
 
 /*
- * The recompute proper, WITHOUT the writer scope: the exact maximum key length
- * of the keys the trie holds RIGHT NOW, stored over the conservative hint.
+ * Compute the exact maximum key length of the keys the trie holds RIGHT NOW.
+ * Store it over the conservative hint.  This is the recompute proper, WITHOUT
+ * the writer scope.  Return CDS_FT_STATUS_OK, or the iterator's error status.
  *
- * Split out because a caller that is ALREADY inside the writer scope needs it
- * -- ft_rekey_graft_simple_locked repairs the hint from here before its shape
- * gate reads it.  CDS_FT_SCOPED_WRITER nests on one trie (@ft_wlock_depth), so
- * that caller could take it again; the split says which of the two things a
- * call site wants rather than relying on the nesting.
+ * It is split out because a caller that is ALREADY inside the writer scope
+ * needs it.  ft_rekey_graft_simple_locked repairs the hint from here before
+ * its shape gate reads it.  CDS_FT_SCOPED_WRITER nests on one trie
+ * (@ft_wlock_depth), so that caller could take it again.  The split says
+ * which of the two things a call site wants, rather than relying on the
+ * nesting.
  *
- * ☠ THE EXCLUSION IS THE CALLER'S, and the store LOWERS: a walk that misses a
- * key (a peer writer inserting a longer one under it) under-states the hint,
- * and the hint is what bounds the key buffers.  That is the same requirement
- * cds_ft_recompute_stats documents to its own callers.
+ * ☠ THE EXCLUSION IS THE CALLER'S, and the store LOWERS.  A walk misses a key
+ * when a peer writer inserts a longer one under it.  Such a walk under-states
+ * the hint, and the hint is what bounds the key buffers.  That is the same
+ * requirement cds_ft_recompute_stats documents to its own callers.
  */
 static
 enum cds_ft_status ft_recompute_max_used_key_len(struct cds_ft *ft)
@@ -1154,9 +1203,9 @@ enum cds_ft_status ft_recompute_max_used_key_len(struct cds_ft *ft)
 	uatomic_store(&ft->max_used_key_len, max_len, CMM_RELAXED);
 	/*
 	 * HINT FIRST, THEN THE WATERMARK OF THE WALK.  A peer raise that lands
-	 * between the two leaves them unequal, which buys one extra walk later
-	 * and never skips a needed one; the reverse order could record "already
-	 * exact" over a value the walk never saw.
+	 * between the two stores leaves them unequal.  That costs one extra
+	 * walk later and never skips a needed one.  The reverse order could
+	 * record "already exact" over a value the walk never saw.
 	 */
 	uatomic_store(&ft->max_used_key_len_walked, max_len, CMM_RELAXED);
 	return CDS_FT_STATUS_OK;
@@ -1179,9 +1228,9 @@ void calc_stats_node(const struct cds_ft *ft __attribute__((unused)),
 	metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 	node_stats->count++;
 	/*
-	 * Proxy-resolved load (§9): the raw state word is the ARRAY INDEX
-	 * here -- a mid-flip FT_STATE_PROXY word's 9-bit count field can
-	 * read up to 511, overrunning distribution[257].
+	 * Proxy-resolved load (§9).  The raw state word is the ARRAY INDEX
+	 * here.  The 9-bit count field of a mid-flip FT_STATE_PROXY word can
+	 * read up to 511, which overruns distribution[257].
 	 */
 	node_stats->distribution[ft_meta_nr_child_load(metadata)]++;
 	stats->level[level].nr_internal_nodes++;
@@ -1354,10 +1403,11 @@ void cds_ft_show_stats(const struct cds_ft *ft, FILE *out)
 	int level = 0;
 
 	/*
-	 * struct cds_ft_stats is several MiB: a per-level node-type
-	 * distribution histogram (257 buckets) for each of FT_MAX_DEPTH
-	 * levels.  That is far too large for the stack on threads with a
-	 * small stack (e.g. musl's 128 KiB default), so heap-allocate it.
+	 * struct cds_ft_stats is several MiB.  It holds a per-level
+	 * node-type distribution histogram (257 buckets) for each of
+	 * FT_MAX_DEPTH levels.  That is far too large for the stack on
+	 * threads with a small stack (e.g. musl's 128 KiB default).  So
+	 * heap-allocate it.
 	 */
 	stats = calloc(1, sizeof(*stats));
 	if (!stats) {
