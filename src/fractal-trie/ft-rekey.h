@@ -10489,7 +10489,7 @@ enum cds_ft_status ft_rekey_spine_copy(struct cds_ft *dst_ft,
 	 *    - the merge-point forward slot.
 	 *    ft_glue_record_back_edge mirrors ft_set_parent's child-kind
 	 *    dispatch.  It reads the field's current value as the old target.
-	 *    It also runs the writer-only slot bookkeeping early.  The commit's
+	 *    It also records the parent slot offset with it.  The commit's
 	 *    settle below writes each field to its new parent.  That subsumes
 	 *    the old step-7 ft_set_parent.
 	 *    Nothing is parked yet.  The commit's auto-install stages every

@@ -2529,7 +2529,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 *    dst-origin child's parent re-parent and the merge-point forward slot.
 	 *    ft_glue_record_back_edge mirrors ft_set_parent's child-kind
 	 *    dispatch.  It reads the field's current value as the old target,
-	 *    and runs the writer-only slot bookkeeping early.  The commit's
+	 *    and records the parent slot offset with it.  The commit's
 	 *    settle below writes each field to its new parent.  That subsumes
 	 *    the old step-7 ft_set_parent.  Nothing is parked yet.  Commit's
 	 *    auto-install stages every proxy (selector 0, resolving to old).

@@ -2984,11 +2984,12 @@ void ft_set_parent_slot(struct cds_ft_metadata *meta,
  */
 #ifdef FT_DEBUG_PAIR_STORE
 /*
- * PROBE, SAME-OP TORN WINDOW.  ft_glue_record_back_edge stores a LIVE child's
- * offset PLAIN and only RECORDS its parent word.  So until the commit, this
- * very op's non-RYW ft_resolve_parent_slot would pair the OLD parent with the
- * NEW offset.  Other writers are excluded by the bulk gate.  Readers never
- * read the offset.  This ring names the one observer left.
+ * PROBE, SAME-OP TORN WINDOW.  ft_glue_record_back_edge used to store a LIVE
+ * child's offset PLAIN and only RECORD its parent word.  So until the commit,
+ * this very op's non-RYW ft_resolve_parent_slot would pair the OLD parent
+ * with the NEW offset.  It now records both words, so it no longer feeds
+ * this ring (ft_dt_glue_note has no caller).  The probe is kept for a future
+ * site that splits the pair again.
  */
 /* The ring itself sits in fractal-trie-internal.h: the writer scope clears it. */
 static unsigned long ft_dt_glue_noted, ft_dt_glue_torn_read;

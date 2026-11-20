@@ -24725,6 +24725,63 @@ struct cds_ft_metadata *ft_flip_txn_record_parent_word(const struct cds_ft *ft,
 }
 
 /*
+ * ft_glue_record_back_edge_slot: the slot half of a glue back edge.
+ *
+ * Record @meta's parent_slot_offset {old -> the offset of @slot in
+ * @parent_nf} into @txn, beside the parent word that
+ * ft_flip_txn_record_parent_word just recorded.  The two then commit
+ * together, or not at all.  The offset used to be a plain store made
+ * before the commit.  A commit that aborted then left a live child with
+ * its OLD parent and its NEW offset.  ft_get_parent_slot then pointed
+ * into the wrong slot of the old parent.
+ *
+ * The owner follows ft_reparent_record_meta's offset edge: the parent
+ * word's owner when the txn holds it, else @meta.  Every glue back edge
+ * passes @child_held true.  @pow is the owner that
+ * ft_flip_txn_record_parent_word returned.
+ *
+ * incoming_byte stays a plain store, as in ft_set_parent_slot.  The
+ * reader up-walk skips it while the old parent is compressed, and that
+ * holds for every glue back edge (see ft_glue_record_back_edge).
+ */
+static inline
+void ft_glue_record_back_edge_slot(struct ft_flip_txn *txn,
+		struct cds_ft_metadata *meta,
+		struct cds_ft_inode_flag *parent_nf,
+		struct cds_ft_inode_flag **slot,
+		struct cds_ft_metadata *pow)
+{
+	unsigned int off;
+	uintptr_t old_pso, new_pso;
+	bool parent_compressed;
+	struct cds_ft_metadata *owner =
+		(pow && ft_flip_txn_owns(txn, pow)) ? pow : meta;
+
+	if (!slot)
+		return;	/* Slot unknown: preserve the existing offset. */
+	off = parent_nf ? (unsigned int) ((char *) slot -
+		(char *) ft_node_ptr(parent_nf)) / sizeof(void *) : 0;
+	old_pso = (uintptr_t) ft_txn_load(txn->mtxn,
+		(void **) &meta->parent_slot_offset, FT_STATE_PROXY);
+	new_pso = FT_PSO_ENCODE(off);
+	if (old_pso != new_pso)
+		ft_flip_txn_record_tag(txn, owner,
+			(void **) &meta->parent_slot_offset,
+			(void *) old_pso, (void *) new_pso, FT_STATE_PROXY);
+	if (!parent_nf)
+		return;
+	parent_compressed = ft_node_compressed(parent_nf);
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	parent_compressed = parent_compressed ||
+		ft_node_skip_compressed(parent_nf);
+#endif
+	if (!parent_compressed)
+		meta->incoming_byte = FT_DT_IB_STORE(meta, ft_slot_to_byte(
+			&ft_types[ft_node_type(parent_nf)],
+			ft_node_ptr(parent_nf), slot));
+}
+
+/*
  * ft_glue_record_back_edge: the flip-txn dual of a deferred back-pointer.
  *
  * RECORD the parent-field transition {old -> @parent_nf} of @child_nf into
@@ -24733,13 +24790,12 @@ struct cds_ft_metadata *ft_flip_txn_record_parent_word(const struct cds_ft *ft,
  * post-drain ft_set_parent.
  *
  * The field address and the old value mirror ft_set_parent's child-kind
- * dispatch exactly.  The SAME writer-only bookkeeping (parent_slot_offset /
- * incoming_byte) runs EARLY.  This is safe because it is unobservable in the
- * graft window:
- *   - parent_slot_offset is read only by writers (ft_get_parent_slot);
- *   - the reader up-walk skips incoming_byte while @child_nf's OLD parent is
- *     compressed/NULL.
- * The second condition holds for every graft live re-parent.  The displaced
+ * dispatch exactly.  parent_slot_offset is recorded into @txn too, so the
+ * (parent, offset) pair commits together or not at all
+ * (ft_glue_record_back_edge_slot).  incoming_byte alone runs EARLY, as a
+ * plain store.  That is safe because the reader up-walk skips incoming_byte
+ * while @child_nf's OLD parent is compressed/NULL.
+ * That condition holds for every graft live re-parent.  The displaced
  * child's old parent is the compressed node being split.  Every payload
  * back-edge sits on a node unreachable until the forward flip.
  *
@@ -24752,16 +24808,14 @@ struct cds_ft_metadata *ft_flip_txn_record_parent_word(const struct cds_ft *ft,
  * its prev directly.  Records cannot fail: the caller reserved @txn to the
  * bounded cluster size up front.
  *
- * ☑ "UNOBSERVABLE" MEASURED FOR THE OFFSET (lock-set inventory §10.2).  The
- * plain store DOES land on reachable children, ~36k-56k per ft_inv leg, so
- * the claim rests on its observers, not on invisibility:
- *   - readers never read the offset;
- *   - other writers are shut out by the bulk gate, which is a DEPENDENCY on the
- *     FT-wide lock (see FT-SLOT-3 below);
- *   - this op never resolves the pair non-RYW before its commit: 0 of ~60k-73k
- *     windows, red 67,880/67,880.
- * The byte half holds as written: 0 changed bytes on a reachable node, with a
- * positive control of ~1M same-value stores.
+ * HISTORY: THE OFFSET WAS A PLAIN STORE (lock-set inventory §10.2).  It
+ * landed on reachable children, ~36k-56k per ft_inv leg.  Its safety rested
+ * on its observers: readers never read it, the bulk gate shut out other
+ * writers, and this op never resolved the pair before its commit.  It missed
+ * the ABORT: a commit that aborted left the new offset beside the old parent.
+ * The offset is now recorded into @txn instead.  The byte half was measured
+ * as written: 0 changed bytes on a reachable node, with a positive control
+ * of ~1M same-value stores.
  *
  * ★ WHICH ARM the published-node case reaches matters.  This comment used to
  * leave it open.  It is the METADATA arms, and those are exactly the arms
@@ -24813,15 +24867,9 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_metadata *cn_meta =
 			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 
-		ft_set_parent_slot(cn_meta, parent_nf, slot);
-#ifdef FT_DEBUG_PAIR_STORE
-		ft_dt_glue_note(cn_meta, parent_nf);
-# ifdef FT_DT_GLUE_RED
-		(void) ft_resolve_parent_slot(cn_meta, ft, NULL);	/* RED: must count */
-# endif
-#endif
-		ft_flip_txn_record_parent_word(ft, txn, cn_meta, parent_nf,
-		/*child_held=*/ true);
+		ft_glue_record_back_edge_slot(txn, cn_meta, parent_nf, slot,
+			ft_flip_txn_record_parent_word(ft, txn, cn_meta,
+				parent_nf, /*child_held=*/ true));
 		return;
 	}
 	if (ft_node_compressed(child_nf)) {
@@ -24830,15 +24878,9 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_metadata *cn_meta =
 			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 
-		ft_set_parent_slot(cn_meta, parent_nf, slot);
-#ifdef FT_DEBUG_PAIR_STORE
-		ft_dt_glue_note(cn_meta, parent_nf);
-# ifdef FT_DT_GLUE_RED
-		(void) ft_resolve_parent_slot(cn_meta, ft, NULL);	/* RED: must count */
-# endif
-#endif
-		ft_flip_txn_record_parent_word(ft, txn, cn_meta, parent_nf,
-		/*child_held=*/ true);
+		ft_glue_record_back_edge_slot(txn, cn_meta, parent_nf, slot,
+			ft_flip_txn_record_parent_word(ft, txn, cn_meta,
+				parent_nf, /*child_held=*/ true));
 		return;
 	}
 #endif
@@ -24881,30 +24923,14 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 			cds_ft_item_to_metadata(ft_node_ptr(child_nf));
 
 		/*
-		 * Mirror ft_set_parent's internal branch.  First pre-store
-		 * incoming_byte under an internal new parent: a node re-homed
-		 * from a compressed parent gets its real branch byte.  Then
-		 * store the offset + idempotent byte via ft_set_parent_slot.
-		 * Both are unobservable now (see the function header).  The
-		 * parent pointer itself flips via @txn.
+		 * Mirror ft_set_parent's internal branch.  The parent word
+		 * and the offset flip via @txn.  incoming_byte is stored now:
+		 * a node re-homed from a compressed parent gets its real
+		 * branch byte (see the function header).
 		 */
-		if (slot && parent_nf && !ft_node_compressed(parent_nf)
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-				&& !ft_node_skip_compressed(parent_nf)
-#endif
-		   )
-			meta->incoming_byte = FT_DT_IB_STORE(meta, ft_slot_to_byte(
-				&ft_types[ft_node_type(parent_nf)],
-				ft_node_ptr(parent_nf), slot));
-		ft_set_parent_slot(meta, parent_nf, slot);
-#ifdef FT_DEBUG_PAIR_STORE
-		ft_dt_glue_note(meta, parent_nf);
-# ifdef FT_DT_GLUE_RED
-		(void) ft_resolve_parent_slot(meta, ft, NULL);	/* RED: must count */
-# endif
-#endif
-		ft_flip_txn_record_parent_word(ft, txn, meta, parent_nf,
-		/*child_held=*/ true);
+		ft_glue_record_back_edge_slot(txn, meta, parent_nf, slot,
+			ft_flip_txn_record_parent_word(ft, txn, meta,
+				parent_nf, /*child_held=*/ true));
 	}
 }
 
@@ -27376,13 +27402,12 @@ enum urcu_txn_status ft_glue_lock_anchors(struct cds_ft *ft, struct ft_glue *g)
  *
  * Called AFTER the source unlink + drain.  The commit can still abort: an
  * anchor take can fail, or a peer can win the flip.  The callers then call
- * ft_glue_abort (or re-descend) and retry.  The live back-edge bookkeeping
- * (ft_set_parent_slot inside ft_glue_record_back_edge) runs here rather
- * than during the build.  Doing it during the build would corrupt a live
- * node's parent_slot_offset if a later build step OOM'd and aborted.  The
- * build is unchanged: edges queue in
- * g->deferred, and fresh-to-fresh edges + top->publish_parent are wired during
- * the build.
+ * ft_glue_abort (or re-descend) and retry.  The live back edges are
+ * recorded here, not during the build: a build step that OOM'd would leave
+ * them behind.  Each one records its parent word and its offset into
+ * @g->txn (ft_glue_record_back_edge), so an abort leaves both unchanged.
+ * The build is unchanged: edges queue in g->deferred, and fresh-to-fresh
+ * edges + top->publish_parent are wired during the build.
  *
  * The records cannot fail: g->txn was reserved to the bounded cluster size up
  * front (ft_flip_txn_reserve).  Reclaims the txn (deferred via the flavor, or
@@ -27431,15 +27456,12 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 		}
 		/*
 		 * FOLD (coherent rekey one-decide writer): a live child's
-		 * re-home must be the co-committed (parent, offset) PAIR.  It
-		 * must not be ft_glue_record_back_edge's parent edge beside an
-		 * EARLY plain ft_set_parent_slot.  That store is unobservable
-		 * in the ordinary graft window (its header says so, and it is
-		 * right there).  But the fold re-parents children that stay
-		 * READER-REACHABLE through the old spine until the flip.  So a
-		 * concurrent backtracker would read the new offset against the
-		 * still-old meta->parent.  That is the torn (parent, slot) pair
-		 * ft_reparent_record_meta exists to prevent.
+		 * re-home must be the co-committed (parent, offset) PAIR.
+		 * ft_glue_record_back_edge used to store the offset EARLY and
+		 * plain.  It now records it too.  But the fold re-parents
+		 * children that stay READER-REACHABLE through the old spine
+		 * until the flip, and it needs the state edge below as well.
+		 * ft_reparent_record_meta records all three words.
 		 *
 		 * ★ AND THE MARK.  Under structural_sw these records PARK: they
 		 * are plain stores that never validate.
