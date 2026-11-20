@@ -22508,32 +22508,43 @@ static void *rks_reader(void *arg)
 		}
 
 		/*
-		 * Ordered walks: the climb in the inequality descent, which
-		 * cds_ft_next / cds_ft_prev run on every step during a move.
-		 * Each step must land on a key of the namespace.  The steps'
-		 * ORDER is not checked: a walk across a move can step back
-		 * into the other namespace, a separate open question.
+		 * Ordered walks.  Every step runs the inequality descent's
+		 * climb during a move, and each must move strictly forward
+		 * (next) or back (prev) from the key the step before returned,
+		 * across the move and across the gate closing after it.
 		 */
 		{
+			uint8_t lk[32];
+			size_t ll = 0;
 			unsigned int step;
 
 			rcu_read_lock();
 			if (cds_ft_lookup_first(ra->ft, iter) == CDS_FT_STATUS_OK) {
 				rks_check_iter(iter, "first");
+				cds_ft_iter_get_key(iter, lk, sizeof(lk), &ll);
 				for (step = 0; step < 6 &&
 				     cds_ft_next(ra->ft, iter) == CDS_FT_STATUS_OK;
-				     step++)
-					rks_check_iter(iter, "next");
+				     step++) {
+					rks_check_order(iter, "next", lk, ll, 1,
+						true);
+					cds_ft_iter_get_key(iter, lk, sizeof(lk),
+						&ll);
+				}
 			}
 			rcu_read_unlock();
 			rcu_quiescent_state();
 			rcu_read_lock();
 			if (cds_ft_lookup_last(ra->ft, iter) == CDS_FT_STATUS_OK) {
 				rks_check_iter(iter, "last");
+				cds_ft_iter_get_key(iter, lk, sizeof(lk), &ll);
 				for (step = 0; step < 6 &&
 				     cds_ft_prev(ra->ft, iter) == CDS_FT_STATUS_OK;
-				     step++)
-					rks_check_iter(iter, "prev");
+				     step++) {
+					rks_check_order(iter, "prev", lk, ll, -1,
+						true);
+					cds_ft_iter_get_key(iter, lk, sizeof(lk),
+						&ll);
+				}
 			}
 			rcu_read_unlock();
 			rcu_quiescent_state();

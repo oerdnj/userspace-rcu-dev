@@ -691,6 +691,12 @@ enum cds_ft_status ft_ord_cell_iter_land(struct cds_ft *ft,
 	iter->ord_cell_node = node;
 	iter->cache_valid = true;
 	/*
+	 * A cell landing does not spell the key.  Even if it lands on the
+	 * node a coherent step confirmed, iter_key no longer holds that key
+	 * in the carried form (@pos_key_node), so drop the carry.
+	 */
+	iter->pos_key_node = NULL;
+	/*
 	 * Materialize as little as possible.  The cell walk's point is that a
 	 * keyless / count traversal touches NO leaf.
 	 *

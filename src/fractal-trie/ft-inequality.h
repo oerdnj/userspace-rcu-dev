@@ -2435,6 +2435,25 @@ enum cds_ft_status ft_ineq_two_pass(struct cds_ft *ft, struct cds_ft_iter *iter,
 }
 
 /*
+ * The gate is down, but @iter may still sit on a position a coherent step
+ * confirmed while a move was in flight.  That move may have completed since,
+ * and moved the node.  The fast path would then hop the cells from the
+ * node's NEW place, and the step could land in the other namespace, below
+ * the key it returned last.  Instead descend once from the carried key:
+ * with no move in flight, one descent is coherent.  Dropping the carry
+ * returns the iterator to the fast path for the steps after that.
+ */
+static inline
+void ft_ineq_drop_carried_position(struct cds_ft_iter *iter)
+{
+	if (caa_unlikely(iter->node && iter->cache_valid &&
+			iter->pos_key_node == iter->node)) {
+		iter->pos_key_node = NULL;
+		iter->cache_valid = false;	/* top-descend from iter_key */
+	}
+}
+
+/*
  * REKEY-coherent relational specializations.  When ft->rekey_coherence is
  * set, ft_install_lookup_ops installs them on ft->lookup_{le,ge,lt,gt}_fn.
  * They replace the ft_ineq_*_eager ones.  Only the EAGER (no in-leaf key)
@@ -2453,8 +2472,10 @@ enum cds_ft_status ft_ineq_two_pass(struct cds_ft *ft, struct cds_ft_iter *iter,
 	static enum cds_ft_status name(struct cds_ft *ft,		\
 			struct cds_ft_iter *iter)			\
 	{								\
-		if (caa_likely(!ft_move_active(ft)))			\
+		if (caa_likely(!ft_move_active(ft))) {			\
+			ft_ineq_drop_carried_position(iter);		\
 			return fast(ft, iter);				\
+		}							\
 		CDS_FT_SCOPED_READER(ft);				\
 		return ft_ineq_two_pass(ft, iter, (mode),		\
 				FT_LOOKUP_LIMIT_NONE);			\
