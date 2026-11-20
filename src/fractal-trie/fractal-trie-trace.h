@@ -11,11 +11,13 @@
  * Userspace RCU library - Fractal Trie tracing macros
  *
  * FT_TP() and friends expand to LTTng-UST tracepoints when FT_ENABLE_TRACING
- * is defined, and to no-ops otherwise (arguments discarded, no code emitted).
+ * is defined.  Otherwise they expand to no-ops: the arguments are discarded
+ * and no code is emitted.
  * The key-payload variants resolve the key length before the LTTng sequence
- * field serializes it.  These are macros, so the symbols they reference
- * (ft_key_len(), iter_key(), iter fields, the CDS_FT_LEN_* sentinels) only
- * need to be in scope at each FT_TP* use site in fractal-trie.c, not here.
+ * field serializes it.  These are macros.  So the symbols they reference need
+ * to be in scope only at each FT_TP* use site in fractal-trie.c, not here.
+ * These symbols are ft_key_len(), iter_key(), the iter fields and the
+ * CDS_FT_LEN_* sentinels.
  *
  * Included by fractal-trie.c AFTER fractal-trie-internal.h.
  */
@@ -26,45 +28,47 @@
 /*
  * ★ WAS THE UNHELD CAPTURE ALREADY WRONG BY THE TIME THE LOCK LANDED?
  *
- * cds_ft_insert_unique used to answer -EEXIST from the descent's landing, a word
- * no exclusion covered.  Whether that cost anything cannot be measured FROM A
- * TEST: the only observable is "the returned node is not on the key's chain",
- * and a peer may legitimately remove the key between the call and the check, so
- * the count mixes the defect with a benign race.  ☠ AND THE COARSE ARM DOES NOT
- * DISCRIMINATE IT -- the FT-wide lock serialises the TEST'S OWN follow-up walk
- * too (the peer must be woken and scheduled after the release), so coarse draws
- * a near-zero for a reason that has nothing to do with the verdict.  A control
- * that differs from the arm in more ways than the one being measured is not a
- * control.
+ * cds_ft_insert_unique used to answer -EEXIST from the descent's landing.  No
+ * exclusion covered that word.  A TEST cannot measure whether that cost
+ * anything.  The only observable is "the returned node is not on the key's
+ * chain".  But a peer may legitimately remove the key between the call and
+ * the check.  So the count mixes the defect with a benign race.
  *
- * The honest instrument lives INSIDE the op, where the question is decided under
- * the holder lock and the answer cannot change under it: compare the capture
- * against the re-read the walk already performs.  A mismatch, or a retired
- * capture, means the verdict taken at the OLD position WOULD HAVE BEEN WRONG --
- * and that is a fact, not a sample.  Costs one increment on a path that is
- * already aborting.
+ * ☠ AND THE COARSE ARM DOES NOT DISCRIMINATE IT.  The FT-wide lock also
+ * serialises the TEST'S OWN follow-up walk: the peer must be woken and
+ * scheduled after the release.  So coarse draws a near-zero for a reason that
+ * has nothing to do with the verdict.  A control that differs from the arm in
+ * more ways than the one being measured is not a control.
+ *
+ * The honest instrument lives INSIDE the op.  There the question is decided
+ * under the holder lock, and the answer cannot change under it.  Compare the
+ * capture against the re-read that the walk already performs.  A mismatch or a
+ * retired capture means that the verdict taken at the OLD position WOULD HAVE
+ * BEEN WRONG.  That is a fact, not a sample.  It costs one increment on a path
+ * that is already aborting.
  */
 #ifdef FT_DEBUG_UNIQUE_VERDICT
 static unsigned long ft_dbg_unique_stale;	/* capture wrong under the lock */
 static unsigned long ft_dbg_unique_ok;		/* capture still good */
 /*
  * ☠ AND THE OTHER HALF, or the zero above is a WRONG ZERO.  @stale is counted
- * AFTER the holder acquire, and the acquire itself refuses a PROXY | TOMBSTONE |
- * LOCK word -- so the very cases the verdict most needs protecting from (a
- * same-key SOLE remove that RETIRED the holder) bail out BEFORE the re-validate
- * runs and are invisible there.  Counted here, they are the rest of the window.
+ * AFTER the holder acquire.  The acquire itself refuses a word with PROXY |
+ * TOMBSTONE | LOCK.  So the cases the verdict most needs protection from bail
+ * out BEFORE the re-validate runs, and are invisible there.  An example is a
+ * same-key SOLE remove that RETIRED the holder.  Counted here, these cases are
+ * the rest of the window.
  */
 static unsigned long ft_dbg_unique_acqfail;
 /*
  * ★ AND SPLIT THAT REFUSAL BY ITS BIT, or it over-claims.  ft_dlm_lock refuses
- * PROXY | TOMBSTONE | LOCK as one test, and only one of the three says the
+ * PROXY | TOMBSTONE | LOCK as one test.  Only one of the three says that the
  * VERDICT is wrong:
  *   LOCK       a peer merely holds the word.  The captured head may be perfectly
- *              live -- this is exposure, not error.
+ *              live.  This is exposure, not error.
  *   PROXY      a commit is mid-flight on the holder: in doubt.
- *   TOMBSTONE  the holder is RETIRED.  One-way, so observing it is a FACT: the
- *              captured chain is gone, and the unheld verdict would have named a
- *              dead head.  THIS is the defect population.
+ *   TOMBSTONE  the holder is RETIRED.  This is one-way, so observing it is a
+ *              FACT.  The captured chain is gone.  The unheld verdict would
+ *              have named a dead head.  THIS is the defect population.
  */
 static unsigned long ft_dbg_unique_af_lock, ft_dbg_unique_af_proxy,
 		ft_dbg_unique_af_tomb;
@@ -72,17 +76,17 @@ static unsigned long ft_dbg_unique_af_lock, ft_dbg_unique_af_proxy,
  * ★★ AND THE ONE COUNTER THAT NEEDS NO CONTROL AT ALL.  Everything above is an
  * upper bound on something:
  *   - a LOCK refusal is exposure, not error;
- *   - a TOMBSTONED HOLDER means the capture's ROUTING is stale, but a
- *     recompaction can re-home the chain with the SAME head still live, and then
+ *   - a TOMBSTONED HOLDER means that the capture's ROUTING is stale.  But a
+ *     recompaction can re-home the chain with the SAME head still live.  Then
  *     "-EEXIST, here is the head" was arguably still TRUE;
- *   - and the COARSE arm cannot bound any of it, because ft->lock_fine is false
- *     there so this code never runs.  ☠ Twice in one investigation the coarse arm
- *     was reached for as a control; the second time it was not even executing the
- *     measured path.
+ *   - and the COARSE arm cannot bound any of it.  ft->lock_fine is false
+ *     there, so this code never runs.  ☠ Twice in one investigation the coarse
+ *     arm was reached for as a control.  The second time it was not even
+ *     executing the measured path.
  *
- * The question that is decidable on its own is whether the RETURNED HEAD has left
- * the trie: a removal mark is ONE-WAY, so a marked head is marked forever and a
- * single observation is a fact about that verdict -- no peer schedule can make it
+ * One question is decidable on its own: has the RETURNED HEAD left the trie?
+ * A removal mark is ONE-WAY, so a marked head is marked forever.  A single
+ * observation is then a fact about that verdict.  No peer schedule can make it
  * innocent, and no control is needed to interpret it.
  */
 static unsigned long ft_dbg_unique_head_gone;
@@ -141,30 +145,30 @@ void ft_dbg_unique_dump(void)
 
 
 /*
- * FAST STOP.  `lttng stop` is a round trip to the session daemon and
- * `lttng snapshot record` a fork+exec -- MILLISECONDS.  On a workload emitting
- * millions of events per second a 64 KiB ring wraps many times over in that
- * window, so a violation site that calls them directly dumps a snapshot from
- * which its own violation event has already been evicted.  (Measured: 6
- * snapshots, 0 violation events in any of them.)
+ * FAST STOP.  `lttng stop` is a round trip to the session daemon.
+ * `lttng snapshot record` is a fork+exec.  Both take MILLISECONDS.  A workload
+ * may emit millions of events per second.  A 64 KiB ring then wraps many
+ * times over in that window.  So a violation site that calls them directly
+ * dumps a snapshot without its own violation event: it was already evicted.
+ * (Measured: 6 snapshots, 0 violation events in any of them.)
  *
- * So freeze emission in-process FIRST, with a single relaxed store, and only
- * then pay for the slow calls.  Every emitter checks the flag, so the ring stops
- * advancing within a store-buffer drain of the violation instead of within a
- * process spawn.
+ * So freeze emission in-process FIRST, with a single relaxed store.  Only
+ * then pay for the slow calls.  Every emitter checks the flag.  So the ring
+ * stops advancing within a store-buffer drain of the violation, instead of
+ * within a process spawn.
  *
- * ORDER AT THE SITE: emit the violation, THEN freeze -- the violation must be
+ * ORDER AT THE SITE: emit the violation, THEN freeze.  The violation must be
  * the last event IN the buffer, not the first one dropped by its own flag.
  *
- * SINGLE-PROCESS ONLY, and that is exactly the case here: the flag is
- * process-local, so it silences this process's emitters and no others.  A
- * multi-process session still needs `lttng stop` to freeze its peers, which is
- * why the slow path stays.
+ * SINGLE-PROCESS ONLY, and that is exactly the case here.  The flag is
+ * process-local.  It silences this process's emitters and no others.  A
+ * multi-process session still needs `lttng stop` to freeze its peers.  This
+ * is why the slow path stays.
  *
- * RELAXED is deliberate.  This is not ordering data -- it is a "stop shouting"
- * hint whose only requirement is to become visible fast; on x86 a relaxed store
- * lands in tens of nanoseconds, and a straggler event or two from a thread that
- * has not yet observed it is harmless next to a full ring wrap.
+ * RELAXED is deliberate.  This is not ordering data.  It is a "stop shouting"
+ * hint, and its only requirement is to become visible fast.  On x86 a relaxed
+ * store lands in tens of nanoseconds.  A straggler event or two from a thread
+ * that has not yet observed it is harmless next to a full ring wrap.
  */
 extern int ft_trace_frozen;
 
@@ -173,15 +177,16 @@ extern int ft_trace_frozen;
 /*
  * ONE SESSION PER PROCESS, over PER-UID buffers.
  *
- * per-UID rings are owned by the session daemon, so they SURVIVE the traced
- * process -- which per-process rings do not: a process that vanishes before the
- * snapshot is issued takes its trace with it.  Isolation instead comes from
- * giving each process its OWN session (`lttng track -u --pid`), so peers cannot
- * evict each other's window and a process-local freeze corresponds exactly to
- * one session's buffers.
+ * The session daemon owns the per-UID rings, so they SURVIVE the traced
+ * process.  Per-process rings do not.  A process that vanishes before the
+ * snapshot is issued takes its trace with it.  Isolation comes instead from
+ * giving each process its OWN session (`lttng track -u --pid`).  Then peers
+ * cannot evict each other's window.  And a process-local freeze corresponds
+ * exactly to one session's buffers.
  *
  * The session name arrives in FT_TRACE_SESSION from the launcher that created
- * and PID-tracked it; "ftrd" keeps the single-process case working unchanged.
+ * and PID-tracked it.  The default "ftrd" keeps the single-process case
+ * working unchanged.
  */
 static inline
 const char *ft_trace_session(void)
@@ -197,8 +202,8 @@ const char *ft_trace_session(void)
 }
 
 /*
- * Freeze, then stop and dump THIS process's session.  Order is load-bearing:
- * the caller must already have emitted its violation event, because the freeze
+ * Freeze, then stop and dump THIS process's session.  The order matters.  The
+ * caller must already have emitted its violation event, because the freeze
  * silences every emitter in this process.
  */
 static inline
@@ -243,9 +248,9 @@ void ft_trace_capture(void)
 			_tp_klen == CDS_FT_LEN_ERROR ? 0 : _tp_klen);	\
 	} while (0)
 /*
- * FT_TP_ITER_KEY: emit an iter-keyed key event.  Uses the resolved
- * iter->key_len; ft is carried alongside iter for snapshot safety
- * (iter_create may have already scrolled out of a flight recorder).
+ * FT_TP_ITER_KEY: emit an iter-keyed key event.  Use the resolved
+ * iter->key_len.  ft is carried alongside iter for snapshot safety:
+ * iter_create may have already scrolled out of a flight recorder.
  */
 #define FT_TP_ITER_KEY(name, iter)					\
 	FT_TP(name, (const void *) (iter)->ft, (const void *) (iter),	\
@@ -271,24 +276,29 @@ void ft_trace_capture(void)
  *
  * ☠ WHY A COUNTER IS A CORRECTNESS INSTRUMENT AND NOT A PERFORMANCE ONE.
  * -EAGAIN in this tree carries a PROMISE: "retrying can help, because a PEER is
- * responsible for this refusal".  A retry count that runs away therefore does
- * not mean the machine is busy -- it means the op is refusing ITSELF, on a
- * condition no re-descent can change.  Single-threaded that reading is certain;
- * with peers it is a hypothesis the event's @nr_writers lets the reader judge.
+ * responsible for this refusal".  So a retry count that runs away does not
+ * mean that the machine is busy.  It means that the op is refusing ITSELF.  No
+ * re-descent can change the condition.  Single-threaded, that reading is
+ * certain.  With peers it is a hypothesis.  The event's @nr_writers lets the
+ * reader judge it.
  *
- * The rekey writer already had a private version of this (FT_DEBUG_REKEY_RETRY_
- * CAP), and it found three self-refusals by hand.  This is that detector made
- * GENERIC -- insert, remove, replace and rekey share it -- and made TRACEABLE:
- * instead of only printing, it fires an LTTng violation event, records the
- * flight-recorder snapshot, and aborts, so the window that led to the spin is
- * on disk instead of being overwritten by the spin itself.
+ * The rekey writer already had a private version of this
+ * (FT_DEBUG_REKEY_RETRY_CAP).  It found three self-refusals by hand.  This is
+ * that detector made GENERIC: insert, remove, replace and rekey share it.  It
+ * is also made TRACEABLE.  Instead of only printing, it does three things:
+ * - it fires an LTTng violation event;
+ * - it records the flight-recorder snapshot;
+ * - it aborts.
+ * So the window that led to the spin is on disk.  The spin itself does not
+ * overwrite it.
  *
- * ☞ IT IS PER OP, NOT PER THREAD.  Reset at every entry: a thread that does a
- * million ordinary mutations must not accumulate its way into a false positive,
- * and the question is always "did THIS call converge".
+ * ☞ IT IS PER OP, NOT PER THREAD.  Reset it at every entry.  A thread that
+ * does a million ordinary mutations must not accumulate them into a false
+ * positive.  The question is always "did THIS call converge".
  *
- * The cap is deliberately far above real contention -- a saturated multi-writer
- * arm re-attempts in single digits, so five figures cannot be a peer.
+ * The cap is deliberately far above real contention.  A saturated
+ * multi-writer arm re-attempts in single digits.  So five figures cannot be a
+ * peer.
  */
 #ifdef FT_DEBUG_OP_RETRY_CAP
 # include <stdio.h>
@@ -307,12 +317,14 @@ enum ft_op_kind {
 };
 
 /*
- * ★ WHICH RETRY SITE.  The cap says an op spun; it does not say WHERE, and an
- * op with four distinct "publishes nothing, retry" exits has four different
- * diagnoses.  Mirrors ft_dbg_rm_site (ft-helpers.h): each site stamps its own
- * __LINE__, and the livelock report names the line that spun, how many times
- * consecutively, and the last OTHER line seen -- so a single spinning exit is
- * distinguishable from a cycle between two.
+ * ★ WHICH RETRY SITE.  The cap says that an op spun.  It does not say WHERE.
+ * An op with four distinct "publishes nothing, retry" exits has four
+ * different diagnoses.  This mirrors ft_dbg_rm_site (ft-helpers.h).  Each
+ * site stamps its own __LINE__.  The livelock report names:
+ * - the line that spun;
+ * - how many times it spun consecutively;
+ * - the last OTHER line seen.
+ * So a single spinning exit is distinguishable from a cycle between two.
  */
 static __thread unsigned int ft_dbg_retry_line;
 static __thread unsigned long ft_dbg_retry_line_nr;
@@ -333,17 +345,18 @@ void ft_dbg_retry_stamp(unsigned int line)
 # define FT_DBG_RETRY_SITE()	ft_dbg_retry_stamp(__LINE__)
 
 /*
- * ★ WHICH -EAGAIN.  The retry-exit stamp above names the EXIT; on an op whose
- * body has forty-odd -EAGAIN producers that is still a whole file.  This stamps
- * the PRODUCER, as an expression so it is safe in a braceless `if` and in both
- * `return -EAGAIN;` and `ret = -EAGAIN;` forms.
+ * ★ WHICH -EAGAIN.  The retry-exit stamp above names the EXIT.  On an op whose
+ * body has forty-odd -EAGAIN producers, that is still a whole file.  This
+ * stamps the PRODUCER.  It is an expression, so it is safe in a braceless
+ * `if`.  It works in both `return -EAGAIN;` and `ret = -EAGAIN;` forms.
  *
- * NOT applied at rest: wrapping fifty-odd returns costs more readability in a
- * shipping header than it is worth once the ACQUIRE stamp below exists, and the
- * two ends of the path usually pin the middle.  Re-apply mechanically when they
- * do not -- sed 's/return -EAGAIN;/return FT_DBG_EAGAIN(-EAGAIN);/' over the op's
- * file, plus the same for `<var> = -EAGAIN;` -- which is how ft-remove.h's
- * line 5622 (the holder acquire) was named.
+ * NOT applied at rest.  Wrapping fifty-odd returns costs readability in a
+ * shipping header.  That cost is not worth it once the ACQUIRE stamp below
+ * exists.  And the two ends of the path usually pin the middle.  When they do
+ * not, re-apply it mechanically:
+ *   sed 's/return -EAGAIN;/return FT_DBG_EAGAIN(-EAGAIN);/' over the op's
+ *   file, plus the same for `<var> = -EAGAIN;`.
+ * This is how line 5622 of ft-remove.h (the holder acquire) was named.
  */
 static __thread unsigned int ft_dbg_eagain_line;
 static __thread unsigned long ft_dbg_eagain_line_nr;
@@ -366,9 +379,10 @@ int ft_dbg_eagain_stamp(int v, unsigned int line)
 
 /*
  * ★ AND WHICH REFUSAL INSIDE THE ACQUIRE.  One -EAGAIN producer in the caller
- * can be four in ft_dlm_acquire_set_at, which funnels every refusal through one
- * `eagain:` label -- so the label erases the reason.  Stamp at the GOTO, in a
- * do/while so it stays one statement inside a braceless `if`.
+ * can be four in ft_dlm_acquire_set_at.  That function funnels every refusal
+ * through one `eagain:` label, so the label erases the reason.  Stamp at the
+ * GOTO.  Use a do/while, so that it stays one statement inside a braceless
+ * `if`.
  */
 static __thread unsigned int ft_dbg_acq_line;
 static __thread unsigned long ft_dbg_acq_line_nr;
@@ -390,29 +404,32 @@ void ft_dbg_acq_stamp(unsigned int line)
 
 /*
  * ★ AND WHICH BIT.  ft_dlm_lock refuses on PROXY | TOMBSTONE | LOCK as one
- * test, and the three have different cures: LOCK is contention (it clears when
- * the holder commits), PROXY is a parked flip that settles, but TOMBSTONE is
- * PERMANENT -- a retired word whose expected-old can never recur, which is the
- * immortal-old livelock, not contention.  Counted apart, with the last refused
- * word kept so the report can name the state.
+ * test.  The three have different cures:
+ * - LOCK is contention.  It clears when the holder commits.
+ * - PROXY is a parked flip that settles.
+ * - TOMBSTONE is PERMANENT.  It is a retired word whose expected-old can never
+ *   recur.  This is the immortal-old livelock, not contention.
+ * Count them apart.  Keep the last refused word, so that the report can name
+ * the state.
  */
 static __thread unsigned long ft_dbg_lock_refuse_lock;
 static __thread unsigned long ft_dbg_lock_refuse_proxy;
 static __thread unsigned long ft_dbg_lock_refuse_tomb;
 static __thread unsigned long ft_dbg_lock_refuse_state;
 /*
- * ★ LEAKED OR CHURNING.  A LOCK refusal that is always the SAME word is a lock
- * nobody will release (a peer's bail path lost it); one that moves is ordinary
- * contention the op is losing.  Same cure-splitting question as the bit above.
+ * ★ LEAKED OR CHURNING.  A LOCK refusal that is always on the SAME word is a
+ * lock that nobody will release: a peer's bail path lost it.  A refusal that
+ * moves is ordinary contention that the op is losing.  This is the same
+ * cure-splitting question as the bit above.
  */
 static __thread const void *ft_dbg_lock_refuse_meta;
 static __thread unsigned long ft_dbg_lock_refuse_streak;
 static __thread unsigned long ft_dbg_lock_refuse_switches;
 /*
- * ★ AND FOR A PROXY, ASK THE DESCRIPTOR.  "PROXY settles" is the reason the
- * split above gives for not worrying about a proxy refusal -- but a settle is
- * an ACT, performed by the parking commit's owner, and a word that stays
- * proxied across thousands of refusals says that act never happened.  Only the
+ * ★ AND FOR A PROXY, ASK THE DESCRIPTOR.  The split above does not worry
+ * about a proxy refusal, because "PROXY settles".  But a settle is an ACT.
+ * The parking commit's owner performs it.  A word that stays proxied across
+ * thousands of refusals says that this act never happened.  Only the
  * descriptor can tell the two apart:
  *
  *   UNDECIDED, one descriptor, forever  the parker is stuck mid-commit (it is
@@ -425,7 +442,7 @@ static __thread unsigned long ft_dbg_lock_refuse_switches;
  *                                       livelock wearing a proxy.
  *   a CHURN of descriptors               ordinary contention this op is losing.
  *
- * Captured at the refusal, reported at the cap.  @poisoned is carried too: a
+ * Captured at the refusal, reported at the cap.  @poisoned is carried too.  A
  * poisoned descriptor can never commit, so it can never settle by committing.
  */
 static __thread const void *ft_dbg_proxy_desc;
@@ -447,10 +464,10 @@ struct ft_op_retry {
 };
 
 /*
- * @nr_writers is what separates "certain" from "hypothesis" at the event, and
- * it is sampled rather than tracked: the trie knows how many writer scopes are
- * open.  Zero when the build cannot answer, which reads as "unknown", never as
- * "single".
+ * @nr_writers separates "certain" from "hypothesis" at the event.  It is
+ * sampled rather than tracked: the trie knows how many writer scopes are
+ * open.  Return zero when the build cannot answer.  Zero reads as "unknown",
+ * never as "single".
  */
 static inline
 unsigned int ft_op_retry_nr_writers(const struct cds_ft *ft)
@@ -465,13 +482,13 @@ void ft_op_retry_init(struct ft_op_retry *r, unsigned int op,
 {
 	/*
 	 * ☠ PER OP, NOT PER THREAD.  The refusal and parker counters are
-	 * `static __thread` and nothing used to clear them, so the cap's
+	 * `static __thread`.  Nothing used to clear them.  So the cap's
 	 * fingerprint summed every refusal the thread had EVER suffered.  A
 	 * `streak=15878 switches=2` read as "one word refused 15878 times in
-	 * this op" when it was the thread's lifetime total across a workload
-	 * whose eight keys all hang off ONE junction -- i.e. it said nothing.
-	 * The cap's whole question is "did THIS call converge", so its evidence
-	 * has to have THIS call's scope.
+	 * this op".  In fact it was the thread's lifetime total.  The
+	 * workload's eight keys all hung off ONE junction.  So the number said
+	 * nothing.  The cap's whole question is "did THIS call converge".  So
+	 * its evidence has to have THIS call's scope.
 	 */
 	ft_dbg_lock_refuse_lock = 0;
 	ft_dbg_lock_refuse_proxy = 0;
@@ -506,13 +523,13 @@ void ft_op_retry_init(struct ft_op_retry *r, unsigned int op,
 }
 
 /*
- * Called once per attempt.  Emits the per-retry step event (low value until the
- * violation has named a site, high rate -- enable by name), and on the cap
- * fires the violation, records the snapshot and aborts.
+ * Call once per attempt.  Emit the per-retry step event.  That event has a
+ * high rate, and low value until the violation has named a site: enable it by
+ * name.  On the cap, fire the violation, record the snapshot and abort.
  *
- * ☠ THE SNAPSHOT MUST BE TAKEN BEFORE THE ABORT AND AFTER THE VIOLATION: the
- * ring is overwritten by the spin itself, so the event that explains the window
- * has to be IN the window it explains.
+ * ☠ TAKE THE SNAPSHOT BEFORE THE ABORT AND AFTER THE VIOLATION.  The spin
+ * itself overwrites the ring.  So the event that explains the window has to
+ * be IN the window it explains.
  */
 static inline
 void ft_op_retry_tick(const struct cds_ft *ft, struct ft_op_retry *r, int last_ret)
@@ -561,13 +578,13 @@ void ft_op_retry_tick(const struct cds_ft *ft, struct ft_op_retry *r, int last_r
 		ft_dbg_proxy_rec_old, ft_dbg_proxy_rec_new);
 #ifdef FT_DEBUG_RETRY_CAP_SHOW
 	/*
-	 * ★ THE SHAPE, not just the word.  A cap says an op cannot converge and
-	 * the refusal stamps say WHICH word it keeps losing; neither says what
-	 * the trie LOOKS LIKE, and that is what a single-threaded replay needs.
-	 * Under COARSE this dump is safe by construction -- the spinning writer
-	 * HOLDS the FT-wide mutex, so every peer is parked in
-	 * cds_fair_mutex_park and the structure cannot move under the walk --
-	 * which is exactly the arm a self-refusal lives on.
+	 * ★ THE SHAPE, not just the word.  A cap says that an op cannot
+	 * converge.  The refusal stamps say WHICH word it keeps losing.
+	 * Neither says what the trie LOOKS LIKE.  A single-threaded replay
+	 * needs that.  Under COARSE this dump is safe by construction.  The
+	 * spinning writer HOLDS the FT-wide mutex.  So every peer is parked
+	 * in cds_fair_mutex_park, and the structure cannot move under the
+	 * walk.  COARSE is exactly the arm a self-refusal lives on.
 	 */
 	fprintf(stderr, "FT OP RETRY SHAPE:\n");
 	cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
@@ -575,12 +592,12 @@ void ft_op_retry_tick(const struct cds_ft *ft, struct ft_op_retry *r, int last_r
 	if (system("lttng snapshot record 1>&2") == -1)
 		fprintf(stderr, "FT OP RETRY: snapshot record failed\n");
 	/*
-	 * ☠ abort() RUNS NO DESTRUCTOR, so it silently voids every exit-time
-	 * dump in the tree -- ft_tk_dump_at_exit (the which-record-lost report,
-	 * -DFT_WINNER_DBG) among them.  That is the report you WANT at a retry
-	 * cap: the cap says an op cannot converge, and the dump says which
-	 * record kept losing.  Arming both and getting nothing reads as "the
-	 * instrument found nothing", which is the wrong zero
+	 * ☠ abort() RUNS NO DESTRUCTOR.  So it silently voids every exit-time
+	 * dump in the tree.  ft_tk_dump_at_exit is among them: it holds the
+	 * which-record-lost report (-DFT_WINNER_DBG).  That is the report you
+	 * WANT at a retry cap.  The cap says that an op cannot converge.  The
+	 * dump says which record kept losing.  Arming both and getting nothing
+	 * reads as "the instrument found nothing".  That is the wrong zero
 	 * [[feedback_an_instrument_can_be_armed_firing_and_blind]].
 	 * -DFT_RETRY_CAP_EXIT trades the core for the destructors.
 	 */
