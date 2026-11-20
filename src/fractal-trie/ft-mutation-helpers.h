@@ -27572,26 +27572,14 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	 */
 	FT_AB_COUNT_PUB_PAIR(ft_slot_in_node(g->publish_parent, g->publish_slot));
 	/*
-	 * ☑ @dual_owner_held TRUE: a glue publish is a BULK op (graft / merge /
-	 * rekey) and its exclusion over the SKIP_X dual's grandparent is the
-	 * FT-WIDE WRITER LOCK -- this function's own header says so ("no peer
-	 * recompaction can be copying the SKIP_X dual's owner under it"), which
-	 * is exactly why it deliberately does NOT call ft_lock_skip_dual_gp.
-	 * That is the design's bulk-vs-everything mechanism, not an absence of
-	 * ownership, so recording MW here understated what the op holds.
-	 *
-	 * ☠ IT NEEDED THE ASSERT TAUGHT FIRST.  FT_OWNER_ASSERT_OWNED asked a
-	 * PER-NODE question (ft_flip_txn_owns reads @locks[] only), so a true
-	 * here would have aborted a correctly excluded op under
-	 * --enable-rcu-debug.  It now also accepts "this op holds THIS trie's
-	 * FT-wide lock", keyed on the txn's own trie.
-	 *
-	 * ☞ ft_glue_txn_commit_edges' publish is NOT flipped with it: it carries
-	 * no such statement of its exclusion, and a shared helper is not a
-	 * shared argument.
+	 * @dual_owner_held false.  This function makes no statement of its
+	 * own exclusion over the SKIP_X dual's grandparent, and a shared
+	 * helper is not a shared argument (fd88fa8e).  The dual is recorded
+	 * MW unless this thread holds the trie's FT-wide writer lock
+	 * (ft_pub_slot_excluded).  ft_glue_publish passes true: see there.
 	 */
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
-		ft_glue_publish_expected_old(g), &rec, true);
+		ft_glue_publish_expected_old(g), &rec, false);
 	/*
 	 * ANNOUNCE THE DUAL, if this publish produced one.  @rec's first edge is
 	 * the publish itself; a COMPRESSED publish parent adds the SKIP_X dual
@@ -28637,8 +28625,28 @@ enum urcu_txn_status ft_glue_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
 		ft_flip_txn_lock_or_guard_parent(ft, txn, &gctx,
 			g->publish_parent, FT_DEPTH_FROM_DESCENT);
 	}
+	/*
+	 * ☑ @dual_owner_held TRUE.  A glue publish is a BULK op (graft, merge,
+	 * rekey).  Its exclusion over the SKIP_X dual's grandparent is the
+	 * FT-WIDE WRITER LOCK.  The comment at the top of this function says
+	 * so.  That is also why it does NOT call ft_lock_skip_dual_gp.  This
+	 * is the design's bulk-vs-everything mechanism, not an absence of
+	 * ownership.
+	 * So recording MW here understated what the op holds.
+	 *
+	 * ☠ IT NEEDED THE ASSERT TAUGHT FIRST.  FT_OWNER_ASSERT_OWNED asked a
+	 * PER-NODE question: ft_flip_txn_owns reads @locks[] only.  So a true
+	 * here would have aborted a correctly excluded op under
+	 * --enable-rcu-debug.  It now also accepts "this op holds THIS trie's
+	 * FT-wide lock", keyed on the txn's own trie.
+	 *
+	 * ☞ ft_glue_txn_commit_edges' publish is NOT flipped with it.  It
+	 * carries no such statement of its exclusion, and a shared helper is
+	 * not a shared argument.  fd88fa8e put this comment and the true flag
+	 * in ft_glue_txn_commit_edges by mistake.
+	 */
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
-		ft_glue_publish_expected_old(g), &rec, false);
+		ft_glue_publish_expected_old(g), &rec, true);
 	n = ft_pub_rec_sedges(&rec, sedges);
 	/*
 	 * Order-statistics fold (BULK): record the +count_delta nr_keys walk
