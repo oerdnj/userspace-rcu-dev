@@ -9166,10 +9166,7 @@ sweep:
 	 * successful commit each of these nodes is LIVE and CLEAN.  So a peer
 	 * that re-marked one in the commit->sweep window has its fence
 	 * CLEARED here.  That is fence theft, the same shape as the
-	 * publish-parent holder's.  It is the precise thing
-	 * ft_glue_release_reparent_marks' own contract ("call ONLY on paths
-	 * that did NOT reach a successful commit") exists to avoid.  The fold
-	 * is not concurrent yet, which is why this was invisible.  It has to
+	 * publish-parent holder's.  The fold is not concurrent yet, which is why this was invisible.  It has to
 	 * be right before it is.
 	 */
 	/*
@@ -9554,13 +9551,8 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
  * would pay two grace periods for one move.  The caller must therefore
  * already hold the gate and, by the gate's own contract, not be inside a read
  * section.
- *
- * It has hidden visibility rather than static.  The public entries live in
- * ft-merge.h, which is included ABOVE the composition this wraps (it needs
- * detach, graft and merge all in scope).  The declaration in
- * fractal-trie-internal.h is what bridges that.
  */
-__attribute__((visibility("hidden")))
+static
 int ft_rekey_one_decide(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_len,
 		const uint8_t *dst_key, size_t dst_len, bool require_empty)

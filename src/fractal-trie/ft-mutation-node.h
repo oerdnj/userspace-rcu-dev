@@ -3174,57 +3174,12 @@ skip_copy:
 				/*
 				 * §9.3 LOCK_FINE: P is compressed and carries a
 				 * SKIP_X dual, so this recompact's publish also
-				 * re-encodes @skip_slot -- a slot in GP.  GP is
-				 * therefore the third lock-set member, in EVERY
-				 * mode: DEL does not write the dual here, but it
-				 * does not escape it either -- it defers the very
-				 * same write to ft_detach_node's republish, which
-				 * commits in THIS txn.  So the lock is taken here
-				 * (the only place that knows P is compressed) and
-				 * released by the commit either way.
-				 *
-				 * Like P, a same-slot value swap: SKIP_X(old, len)
-				 * -> SKIP_X(new, len) leaves GP's shape untouched.
-				 * A NULL GP means the dual lives in &ft->root.
+				 * re-encodes @skip_slot, a slot in GP.  So GP is
+				 * the third lock-set member.  The DLM acquire takes
+				 * it up front whenever P is compressed, and the
+				 * commit releases it either way.  A NULL GP means
+				 * the dual lives in &ft->root.
 				 */
-				/*
-				 * @new_node gates the lock so that "locked" implies
-				 * "reserved".  The +2 widen for these two
-				 * release records lives in the
-				 * new_type_index != NULL arm above.  That is
-				 * also the only arm that produces a fresh
-				 * copy.  A DEL that shrinks its node away
-				 * entirely (NULL type = prune) allocates no
-				 * copy.  So it re-encodes no dual here:
-				 * there is nothing to point GP's SKIP_X at.
-				 * The prune's own edges belong to the
-				 * caller's lock-set (remove, step 5), not to
-				 * this atom.
-				 */
-				if (ft->lock_fine && fenced && new_node) {
-					struct cds_ft_inode_flag *gp_parent;
-
-					/*
-					 * Same §11 coherence: the great-grandparent
-					 * to node lock is cn's parent.  Prefer the
-					 * hint's LIVE reanchored great-grandparent
-					 * (d->pppnf) over
-					 * ft_resolve_parent_slot(cn_meta).
-					 * That call reads cn's stale
-					 * back-pointer.  It would false-succeed
-					 * the lock on a reclaimed node.
-					 * NULL @gp (cn at the root: dual lives in
-					 * &ft->root) skips the lock, as the raw NULL did.
-					 */
-					if (inh_hint)
-						gp_parent = inh_hint->gp;
-					else
-						(void) ft_resolve_parent_slot(cn_meta,
-							ft, &gp_parent);
-					/* DLM: GP was acquired up front (whenever
-					 * P is compressed) -- already held. */
-					(void) gp_parent;
-				}
 				/*
 				 * FT_RECOMPACT_DEL relocates the rebuilt
 				 * (smaller) node into a LOCAL out-param.

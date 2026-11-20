@@ -837,9 +837,6 @@ void *_cds_ft_debug_child_at(struct cds_ft *ft, const uint8_t *key,
 }
 
 
-#ifdef FEATURE_FT_MERGE
-#endif /* FEATURE_FT_MERGE */
-
 
 /*
  * TEST/DEBUG (coherent-rekey sub-step 3, NOT public API): the SIMPLEST

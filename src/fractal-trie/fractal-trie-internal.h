@@ -5862,27 +5862,6 @@ __attribute__((visibility("hidden")))
 void cds_ft_alloc_reserve_drain(struct cds_ft *ft, struct cds_ft_alloc_reserve *r);
 
 /*
- * ft_rekey_one_decide - move @src_key's subtree to @dst_key as ONE decide.
- *
- * The atomic rekey writer.  It is defined in ft-rekey.h because it composes
- * detach, graft and merge, so it must sit below all three.  It is declared
- * here so the public rekey entry points in ft-rekey.h can dispatch to it.
- *
- * Returns:
- *   0        committed atomically;
- *   -EINVAL  shape outside its cut -- fall back to the staged writer;
- *   -EEXIST  @require_empty and the destination holds content;
- *   -ENOMEM or -ENOTSUP.
- *
- * Caller holds the move gate, not a read section; see the definition for the
- * full contract.
- */
-__attribute__((visibility("hidden")))
-int ft_rekey_one_decide(struct cds_ft *ft,
-		const uint8_t *src_key, size_t src_len,
-		const uint8_t *dst_key, size_t dst_len, bool require_empty);
-
-/*
  * cds_ft_free_item_unpublished - immediate free for items that were
  * never published (no reader can possibly hold a reference).  Bypasses
  * call_rcu and returns the slot directly to the arena free list.

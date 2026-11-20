@@ -962,13 +962,6 @@ bool ft_owner_ctx_holds(const struct ft_lock_ctx *ctx,
 # define FT_OWNER_ASSERT_TXN_FIELD	bool dbg_arm_per_op;
 # define FT_OWNER_ASSERT_INIT(t)					\
 	do { (t)->dbg_arm_per_op = false; } while (0)
-/*
- * ☞ THE TRIE IS @t->ft NOW, a production field every creator sets.  So this
- * hook is gone.  The debug copy could be read NULL at a record (seen in a core
- * from inv_concurrent_remove_all_prefix).  That silently disabled the
- * FT-wide-lock term of the asserts below for that txn.
- */
-# define FT_OWNER_ASSERT_SET_FT(t, ft_)	do { (void) (ft_); } while (0)
 # define FT_OWNER_ASSERT_SET_PER_OP(t)					\
 	do { (t)->dbg_arm_per_op = true; } while (0)
 /*
@@ -1030,7 +1023,6 @@ bool ft_owner_ctx_holds(const struct ft_lock_ctx *ctx,
 # define FT_OWNER_ASSERT_TXN_FIELD
 # define FT_OWNER_ASSERT_INIT(t)	do { } while (0)
 # define FT_OWNER_ASSERT_SET_PER_OP(t)	do { } while (0)
-# define FT_OWNER_ASSERT_SET_FT(t, ft_)	do { (void) (ft_); } while (0)
 # define FT_OWNER_ASSERT_OWNED(t, owner)				\
 	do { (void) (t); (void) (owner); } while (0)
 # define FT_OWNER_ASSERT_OWNED_CTX(t, ctx, owner, slot, new_ptr)	\
@@ -1735,13 +1727,11 @@ static void ft_dt_engine_clear(const struct urcu_txn_record *r, void *v)
 	{
 		struct ft_dt_ent *e = ft_dt_slot(m);
 		unsigned int self = ft_ll_violation_tid(), owner = 0;
-		uintptr_t live;
 
 		ft_dt_ent_lock(e);
 		if (uatomic_read(&e->word) == m)
 			owner = uatomic_read(&e->tid);
 		ft_dt_ent_unlock(e);
-		live = (uintptr_t) CMM_LOAD_SHARED(*r->slot);
 		/*
 		 * ☠ NOT filtered on the live word.  A first cut counted only
 		 * while the word read unlocked, to exclude a peer's legitimate
@@ -1752,7 +1742,6 @@ static void ft_dt_engine_clear(const struct urcu_txn_record *r, void *v)
 		 * re-take shows up in the backtrace; a hidden steal shows up
 		 * nowhere.
 		 */
-		(void) live;
 		if (owner && owner != self &&
 				uatomic_add_return(&ft_dt_engine_steal, 1) <= 8) {
 			void *sbt[20];
@@ -4289,7 +4278,6 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	t->acquire_miss = false;
 	FT_MISS_RESET(t);
 	t->acquire_enomem = false;
-	FT_OWNER_ASSERT_SET_FT(t, ft);
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	t->sa_ft = ft;
 	t->sa_npend = 0;
@@ -4579,7 +4567,6 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->acquire_miss = false;
 	FT_MISS_RESET(t);
 	t->acquire_enomem = false;
-	FT_OWNER_ASSERT_SET_FT(t, ft);
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	t->sa_ft = ft;
 	t->sa_npend = 0;
@@ -4699,7 +4686,6 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	t->acquire_miss = false;
 	FT_MISS_RESET(t);
 	t->acquire_enomem = false;
-	FT_OWNER_ASSERT_SET_FT(t, ft);
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	t->sa_ft = ft;
 	t->sa_npend = 0;
@@ -22201,9 +22187,6 @@ void ft_ord_cell_run_unlink(struct cds_ft *ft, struct ft_flip_txn *txn,
 }
 #endif /* FEATURE_FT_MERGE */
 
-#ifdef FEATURE_FT_MERGE
-#endif /* FEATURE_FT_MERGE */
-
 /*
  * Set @child's parent back-pointer to a raw flag @value (a flip-proxy)
  * verbatim, WITHOUT touching parent_slot_offset.  Mirrors ft_set_parent's
@@ -23045,21 +23028,11 @@ struct ft_glue_deferred_edge {
 	 */
 	bool live;
 	/*
-	 * FOLD: this op holds @child's lock acquire, taken by
-	 * ft_glue_acquire_reparent_marks because the commit SW-PARKS @child's
-	 * state word.  Released by the re-parent's own state guard edge at the
-	 * flip; swept by ft_glue_release_reparent_marks on every path that does
-	 * NOT reach a successful commit.  Never set outside structural_sw.
-	 */
-	bool marked;
-	/*
 	 * FOLD: this op HOLDS @child's LOCK.  Either
-	 * ft_glue_acquire_reparent_marks took it (@marked), or another of the
-	 * op's lock sets already had it.  The second case is
-	 * ft_glue_op_holds, the caller_holder case: we must NOT take or
-	 * release the lock, but we DO hold it.  This is distinct from
-	 * @marked, which is release attribution.  This one picks the
-	 * re-parent's state-edge KIND.  Confusing the two turns the
+	 * ft_glue_acquire_reparent_marks took it, or another of the op's lock
+	 * sets already had it.  The second case is ft_glue_op_holds, the
+	 * caller_holder case: we must NOT take or release the lock, but we DO
+	 * hold it.  This field picks the re-parent's state-edge KIND.  Confusing the two turns the
 	 * caller-held child's guard MW against a fence we own.  That is a
 	 * guaranteed abort on every attempt.
 	 */
@@ -25445,14 +25418,8 @@ void ft_glue_defer_edge_origin(struct cds_ft *ft, struct ft_glue *g,
 	/*
 	 * Every field of a new entry is set HERE and nowhere else.  The
 	 * backing arrays are an uninitialised inline floor (or a malloc'd
-	 * grow).  So an unset @marked is garbage.
-	 * ft_glue_release_reparent_marks would read it as "we hold this" and
-	 * clear a fence belonging to nobody.  That is not hypothetical.  It
-	 * is what this field did before this line existed, on EVERY glue
-	 * abort in every config.  The release sweep runs whether or not the
-	 * fold ever acquired.
+	 * grow), so an unset field is garbage.
 	 */
-	g->deferred[g->nr_deferred].marked = false;
 	g->deferred[g->nr_deferred].held_lock = false;
 	g->deferred[g->nr_deferred].lock_word = NULL;
 	g->nr_deferred++;
@@ -26281,7 +26248,6 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 		uintptr_t cm_snap;
 		bool cm_rat, dup = false;
 
-		g->deferred[i].marked = false;
 		g->deferred[i].held_lock = false;
 		g->deferred[i].lock_word = NULL;
 		/*
@@ -26300,10 +26266,8 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 			continue;
 		if (detect_only) {
 			/*
-			 * @lock_word stays NULL and @marked false.  This
-			 * pass took nothing, so it owes no release.
-			 * ft_glue_release_reparent_marks skips the entry on
-			 * every path.
+			 * @lock_word stays NULL.  This pass took nothing,
+			 * so it owes no release.
 			 *
 			 * ft_lock_ctx_holds reads the WHOLE held set the
 			 * exclusion logic already trusts for dedupe: txn
@@ -26403,12 +26367,11 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 #ifdef FEATURE_FT_FAULT_INJECT
 		/*
 		 * Test-only: miss this acquire exactly as a peer holding the child
-		 * would.  Without it the bail AND the release sweep below are
-		 * DEAD CODE.  Measured: 1883 marks taken and 0 released
-		 * across the whole FT_INV_MW oracle plan, because nothing in
-		 * the suite contends a re-parented child.  That dead sweep is
-		 * where an uninitialised @marked hid.  So it gets its own
-		 * armed test rather than inherited confidence.  Needs
+		 * would.  Without it the bail below is DEAD CODE.  Measured:
+		 * 1883 marks taken and 0 released across the whole FT_INV_MW
+		 * oracle plan, because nothing in the suite contends a
+		 * re-parented child.  So it gets its own armed test rather than
+		 * inherited confidence.  Needs
 		 * FEATURE_FT_FAULT_INJECT *and* fault injection in one build:
 		 * the gate's `fault-audit`.
 		 */
@@ -26471,11 +26434,8 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 			 * ANYWAY.  The re-parent record that
 			 * ft_glue_apply_deferred plants names @cm as its
 			 * owner.  A record-time owner check reads locks[]
-			 * and nothing else.  The mark being sweep-owned is
-			 * an answer to who CLEARS, not to whether the
-			 * commit owns the word.  @marked then stays false,
-			 * exactly as the coarsened arm below leaves it.  So
-			 * the abort sweep does not double-release against
+			 * and nothing else.  The txn then releases it on
+			 * either outcome, through
 			 * ft_flip_txn_lock_release_all.
 			 */
 			ft_flip_txn_lock_register(g->txn, h.lock, h.lock_snap);
@@ -26486,8 +26446,7 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 		 * CHILD and the LOCK sits on its ANCESTOR.  So record the
 		 * anchor's own {LOCK|s -> s} release and hand it to the txn,
 		 * exactly as the publish parent's held fence is handed over.
-		 * The registry then releases it on either outcome.  @marked
-		 * stays false so the abort sweep does not double-release.
+		 * The registry then releases it on either outcome.
 		 *
 		 * Bounded by TWO, well inside FT_FLIP_TXN_MAX_LOCKS:
 		 *  - a dated child is the CURSOR's own child (nothing else
@@ -26500,44 +26459,6 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 		ft_flip_txn_record_release_lock(g->txn, h.lock, h.lock_snap);
 	}
 	return 0;
-}
-
-/*
- * Release every re-parent mark still held.  Call ONLY on paths that did NOT
- * reach a successful commit.
- *
- * ☠ This is NOT the unconditional post-op sweep that ft_glue_clear_fenced
- * and the orphan chain use.  The difference is load-bearing:
- *   - Those sweep RETIRED nodes.  A consumed fence leaves the word
- *     TOMBSTONE, and no peer will ever re-mark it.  So "clear it if it is
- *     set" is unambiguous.
- *   - A re-parented child SURVIVES.  Its guard edge releases it to
- *     LIVE-and-CLEAN, and a peer can re-mark it immediately.
- * A sweep after a successful commit would therefore race a peer's fresh mark
- * and silently clear it.  That breaks an exclusion this op does not own.
- * The driver already reasons exactly this way about publish_parent_holder:
- * "once ft_glue_txn_commit_edges has run, the txn registry owns it and
- * clearing here would race a peer's re-mark."
- *
- * On a commit that did not happen, no guard edge landed, so every mark is still
- * ours and clearing is unambiguous.  Idempotent.
- */
-static
-void ft_glue_release_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
-{
-	int i;
-
-	for (i = 0; i < g->nr_deferred; i++) {
-		struct cds_ft_metadata *cm;
-
-		if (!g->deferred[i].marked)
-			continue;
-		cm = g->deferred[i].lock_word;
-		if (cm) {
-			ft_meta_lock_release(cm);
-		}
-		g->deferred[i].marked = false;
-	}
 }
 
 /*
@@ -26662,16 +26583,6 @@ void ft_glue_abort(struct cds_ft *ft, struct ft_glue *g)
 	 * before.  No-op for a glue that never fenced.
 	 */
 	ft_glue_clear_fenced(g, /*committed=*/ false);
-	/*
-	 * FOLD: same argument for the re-parent marks.  This is the choke point for
-	 * every path that reaches here without a successful commit -- pre-commit
-	 * bails AND the fold driver's abort branch, which calls ft_glue_abort before
-	 * ft_glue_fini frees the array these marks are recorded in.  A commit that
-	 * SUCCEEDED must not come through here: its guard edges already released
-	 * every mark to LIVE-and-CLEAN, and re-clearing would race a peer's re-mark
-	 * (see ft_glue_release_reparent_marks).
-	 */
-	ft_glue_release_reparent_marks(ft, g);
 
 	/*
 	 * Split-retire cn fence (MW LOCK_FINE drop).  A GLUE graft build marks
@@ -27095,7 +27006,7 @@ void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
 			 * entry carries the LOCK the acquire pass above took on
 			 * it (`h.lock == cm`).  That pass documents this
 			 * entry's guard edge as the ONLY thing that releases
-			 * the LOCK: @marked stays false, so no sweep does.
+			 * the LOCK.
 			 * Dropping such an entry would leave a permanent mark
 			 * on a live node.
 			 *

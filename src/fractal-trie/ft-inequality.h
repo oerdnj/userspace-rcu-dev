@@ -1915,7 +1915,6 @@ descend_children:
 	 * max_key_len.
 	 */
 	assert(level <= (int) ft->group->max_key_len);
-	assert(level <= (int) ft->group->max_key_len);
 found_minmax:
 	{
 		int j;

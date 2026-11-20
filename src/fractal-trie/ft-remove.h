@@ -9041,8 +9041,8 @@ unsigned long ft_dbg_rm_stale_holder;
  *   - ft_unit 331/331 and ft_inv LIST-OFF 128/128 pass.  But ft_inv LIST-ON
  *     and the FT_INV_MW concurrent-writer leg BOTH HANG at test 44
  *     (inv_insert_replace_splice_window, rc=124 after `ok 43`).  It is the
- *     very test FT_RM_ACQUIRE_FIRST hangs.  The same alternation is moved up
- *     to the wrapper:
+ *     very test the acquire-first arm (since removed) hung.  The same
+ *     alternation is moved up to the wrapper:
  *       - the tombstone arm runs a DESCENT precisely when @node->prev is
  *         lazily stale;
  *       - so @holder_flag is descent-derived, while @fresh here is
@@ -9319,45 +9319,6 @@ bool ft_rm_miss_unconfirmed(struct cds_ft *ft, const struct ft_lock_ctx *lctx,
 #endif
 }
 
-/*
- * Drop the hoisted holder mark on every exit of _cds_ft_remove_locked.
- * ☞ The arms dedupe against it (ft_dlm_acquire_set_at -> ft_lock_ctx_holds).
- * They do not take their own, so no arm's commit terminal releases it.  This
- * is the only release, so it must run on every path.  It is guarded the way
- * ft_detach_node's orphan sweep is.  Never touch a mark this op no longer
- * owns (@shared) or has handed to a txn (@txn_owned).
- */
-#if defined(FT_RM_ACQUIRE_FIRST) && defined(FT_RM_REVALIDATE)
-# error "FT_RM_ACQUIRE_FIRST and FT_RM_REVALIDATE are alternative dispositions of the same defect; enable at most one"
-#endif
-
-#if defined(FT_RM_ACQUIRE_FIRST) || defined(FT_RM_REVALIDATE)
-/*
- * @committed: did this op's commit run?
- *
- * Most uses are bails, retries and re-aims.  Nothing committed there, and the
- * fence is provably still ours.  The success arm of the exit switch is the
- * exception.  It must not ask the word.  A committed terminal may have dropped
- * our lock, and a set bit then means a peer's fence.
- */
-#define FT_RM_RELEASE_OUTCOME(committed_)	do {			\
-		if (rm_hold && !rm_held.shared && !rm_held.txn_owned) {	\
-			if (committed_) {				\
-				FT_ORPHAN_CONSUMED();			\
-				FT_ORPHAN_PREMISE_CHECK(rm_held.lock);	\
-			} else {					\
-				FT_ORPHAN_RELEASED();			\
-				ft_meta_lock_release(rm_held.lock);	\
-			}						\
-		}							\
-		rm_hold = false;					\
-	} while (0)
-#define FT_RM_RELEASE()	FT_RM_RELEASE_OUTCOME(false)
-#else
-#define FT_RM_RELEASE()			do { } while (0)
-#define FT_RM_RELEASE_OUTCOME(c_)	do { } while (0)
-#endif
-
 static
 enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
@@ -9436,13 +9397,6 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	 * bails and can be retried.  This is the work of ft_chain_head_holder's
 	 * re-check, of ft_unchain_kind's under-lock routing and of the txn's
 	 * own expected-old.  The derivation here is a plan, not a conclusion.
-	 *
-	 * ☐ The alternative dispositions of this same defect are dead code.
-	 * No build reaches the FT_RM_ACQUIRE_FIRST and FT_RM_REVALIDATE arms
-	 * below: neither macro is defined anywhere in the tree.  Their
-	 * measurements ("48/160 seeds") describe a path nothing compiles.
-	 * Decide them or delete them.  Left as they are, they read like live
-	 * coverage.
 	 */
 	/*
 	 * The slot derivation itself:
@@ -9703,288 +9657,6 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 #endif
 	ft_lock_ctx_init(&lctx, have_descent ? &d : NULL, NULL, op);
 
-#ifdef FT_RM_ACQUIRE_FIRST
-	/*
-	 * ★ ACQUIRE, THEN SELECT.
-	 *
-	 * Everything below reads words that belong to @holder_flag: the cell
-	 * capture, the four-way branch and its two identity compares.
-	 * @holder_flag was derived from @node->prev with no exclusion held.
-	 * A peer that re-homes the head in that window makes the branch test
-	 * the wrong node.  The branch answers NOT_FOUND for a key that exists,
-	 * and the contract forbids refusing for a transient reason.
-	 *
-	 * ☠ Retrying does not fix it (measured).  Handing the op back to
-	 * @need_retry is a pre-commit bail, which forfeits the op's lane turn.
-	 * Each restart then re-derives against a tree that is still moving.
-	 * 5 runs in 20 died on wall-clock or the memcg.  The exclusion has to
-	 * be held across derive -> select -> compare.  This code does that.
-	 *
-	 * Why it converges.  The peer that re-homes @node is a holder copier.
-	 * It holds H's FT_STATE_LOCK from mark to commit and retires H in that
-	 * same commit.  Two conditions are needed: the acquire succeeds (it
-	 * refuses a tombstone), and ft_node_holder(@node) still answers H when
-	 * re-read after the CAS.  Then nothing can move H:
-	 *
-	 *  - a publish into H fails the §4.B guard;
-	 *  - a copy of H needs the lock we hold.
-	 *
-	 * The branch then reads frozen words.  A mismatch below is a fact
-	 * about the trie, and the contract allows that refusal.
-	 *
-	 * The arms re-acquire the same holder.  ft_dlm_acquire_set_at dedupes
-	 * against the op's held set (ft_lock_ctx_holds).  This is why the hold
-	 * is published into @lctx.  It is also why the hoist costs no extra
-	 * CAS.  Every arm already took this lock, one step later.
-	 *
-	 * ☠☠☠ BROKEN — DO NOT ENABLE.  Measured: ft_inv hangs
-	 * deterministically in test 44 (inv_insert_replace_splice_window).  gdb
-	 * on the hung process puts the spinning thread in the ft_anchor_descend
-	 * below.  The loop alternates forever:
-	 *
-	 *  1. The descent finds the live holder.
-	 *  2. The acquire takes it.
-	 *  3. The validation asks @node->prev who the holder is.  That still
-	 *     names the retired one, because a back-pointer is updated lazily.
-	 *  4. The validation mismatches and releases.
-	 *  5. The loop re-aims at the dead holder and refuses it as a
-	 *     tombstone.
-	 *  6. The loop descends again.
-	 *
-	 * ★ The fix direction is the lesson the STALE BACK-EDGE note above
-	 * already teaches: the forward path is authoritative.  The validation
-	 * must ask whether @holder_flag is still the node's holder by descent,
-	 * not by ft_node_holder(@node->prev).  Every use of the back-pointer
-	 * as an authority in this function has now been wrong twice.
-	 *
-	 * ☐ PER-NODE SPACING ONLY.  A coarse anchor needs a byte-depth for the
-	 * re-derived holder, and this loop has none.  Coarse keeps today's
-	 * behaviour.  Per-node is the default, and the defect is measured
-	 * there.
-	 */
-	struct ft_held_anchor rm_held = { 0 };
-	bool rm_hold = false;
-
-	if (ft->lock_fine &&
-	    holder_flag && !ft_node_external(holder_flag)) {
-		for (;;) {
-			struct cds_ft_inode_flag *fresh;
-
-			if (ft_acquire_member(ft, &lctx, holder_flag,
-					ft_flag_to_metadata(ft, holder_flag),
-					holder_depth, &rm_held)) {
-				/*
-				 * ☠☠ -EAGAIN folds three facts into one
-				 * code: a peer LOCK, a mid-flip PROXY, or a
-				 * TOMBSTONE.  Only the first two are transient.
-				 * "A TOMBSTONE IS PERMANENT, NOT CONTENTION".
-				 * This file already measured what treating it
-				 * as contention costs.  It cost 2,000,000+
-				 * consecutive attempts.  11 of 12 writers were
-				 * parked.  See the STALE BACK-EDGE note above.
-				 * It is the same bug at the same derivation.
-				 * Re-deriving from @node->prev cannot escape
-				 * it.  A back-pointer is updated lazily and
-				 * goes on naming the retired holder.  The loop
-				 * would refuse the same dead word forever.
-				 *
-				 * The forward path is authoritative.  On a dead
-				 * holder, re-derive by the key-guided descent
-				 * and carry on with the live parent.  That arm
-				 * already applies this cure.  A descent may no
-				 * longer reach @node.  The key is then really
-				 * gone, which is a fact about the trie.  The
-				 * branch's own compare may then legally answer
-				 * NOT_FOUND.
-				 */
-				if (ft_flag_tombstoned(ft, holder_flag)) {
-					const uint8_t *ik2 = iter_key;
-
-					ft_anchor_descend(ft, &d, iter_key,
-							key_len, &ik2);
-					if (!d.nf || !d.pnf ||
-					    ft_flag_tombstoned(ft, d.pnf))
-						break;	/* gone: the branch refuses */
-					holder_flag = d.pnf;
-					holder_depth = d.pdepth;
-					have_descent = true;
-					continue;
-				}
-				/* A peer LOCK/PROXY: genuinely in progress. */
-				FT_DBG_RETRY_SITE();
-				*need_retry = true;
-				FT_RM_RELEASE();
-				return CDS_FT_STATUS_OK;
-			}
-			fresh = ft_node_holder(ft, node);
-			if (fresh == holder_flag) {
-				rm_hold = true;
-				lctx.held.extra = &rm_held;
-				lctx.held.nr_extra = 1;
-				break;
-			}
-			/* It moved while we were taking it: drop and re-aim. */
-			if (!rm_held.shared && !rm_held.txn_owned)
-				ft_meta_lock_release(rm_held.lock);
-			rm_held = (struct ft_held_anchor){ 0 };
-			if (!fresh || ft_node_external(fresh))
-				break;	/* no state word to hold: as before */
-			/*
-			 * ☞ @holder_depth is not re-derived here.  This is
-			 * harmless under the PER_NODE gate above: every member
-			 * anchors on itself, and the depth is unused.  It
-			 * becomes a MIS-ANCHOR the moment that gate widens.
-			 * Widening it means routing this through the descent
-			 * too.
-			 */
-			holder_flag = fresh;
-		}
-	}
-#endif
-
-#ifdef FT_RM_REVALIDATE
-	/*
-	 * ★ REVALIDATE UNDER THE LOCK, AND RETRY THE WHOLE OP IF IT MOVED.
-	 *
-	 * The defect is root-caused in
-	 * doc/design/ft-stale-disposal-predicate.md §5.10.  Everything below
-	 * reads words belonging to @holder_flag.  They are the cell capture,
-	 * the four-way branch and its two identity compares.  @holder_flag was
-	 * derived from @node->prev at the top of this function with no
-	 * exclusion held.  The comment there used to say "the writer mutex held
-	 * here freezes the structure".  That was true under
-	 * CDS_FT_WRITER_LOCK_COARSE and is false under the fine-grained
-	 * default.  So the arm is selected from two unlocked reads taken in
-	 * different epochs.  A peer may insert a key that extends @node's.  It
-	 * converts @node's leaf into a prefix head in place on the live holder.
-	 * The slot edge and @node's back-edge flip in one commit
-	 * (ft-insert.h:2099-2141).  The compare below then tests the fresh
-	 * internal node against @node.  It answers NOT_FOUND for a key that is
-	 * present throughout.
-	 *
-	 * Measured: 48/160 seeds of the rig, 0/160 under
-	 * CDS_FT_WRITER_LOCK_COARSE (which restores exactly the premise above).
-	 *
-	 * Why this converges, and why it is not the refuted blind retry.  A lap
-	 * happens only when a peer's commit is observed to have moved the
-	 * holder.  Every lap is therefore charged to a distinct peer commit,
-	 * not to an attempt count.  An attempt count is the
-	 * refusal-without-a-fact the contract forbids.  The re-derivation is
-	 * also correct, not lazily stale.  The conversion parks @node's
-	 * back-edge into the same commit as the forward publish ("must flip
-	 * ATOMICALLY with the forward publish", ft-insert.h:2129-2135).  Once
-	 * that commit lands, @node->prev names the new holder and the next
-	 * attempt selects the right arm.
-	 *
-	 * ☠ Why it is not FT_RM_ACQUIRE_FIRST, which hangs test 44
-	 * deterministically.  That disposition re-aims in-loop.  On a mismatch
-	 * it assigns @holder_flag = fresh and continues, while its tombstone
-	 * arm re-aims from a descent.  The two derivations disagree whenever a
-	 * back-pointer is lazily stale, so the loop alternates forever:
-	 *
-	 *  1. The descent finds the live holder.
-	 *  2. The validation re-aims at the dead one.
-	 *  3. The acquire refuses it as a tombstone.
-	 *  4. The loop descends again.
-	 *
-	 * There is no loop here.  Derivation and validation both read
-	 * @node->prev.  They can only disagree because a peer committed in
-	 * between.  The answer to that is to hand the whole op back and derive
-	 * once, cleanly.
-	 *
-	 * A tombstoned holder is not handled here.  The re-derivation runs the
-	 * ft_node_is_removed / tombstone recovery arm at the top of this
-	 * function, and that arm descends for a live holder.  That is why a
-	 * retry terminates on a dead word and does not refuse it forever.
-	 *
-	 * ☐ PER-NODE SPACING ONLY.  A coarser anchor needs a byte-depth for the
-	 * holder, and this path derives none (ft-remove.h:5653-5657: it becomes
-	 * a MIS-ANCHOR the moment that gate widens).  Per-node is the default,
-	 * and the defect is measured there.
-	 *
-	 * ☠☠☠ MEASURED AND REFUTED AS WRITTEN — DO NOT ENABLE.  The
-	 * table shows 41 seeds of the rig (same workload as §5.9/§5.10)
-	 * against the flag OFF control.
-	 *
-	 *     rc=124 (HANG)   20 / 41      control ~10 / 160
-	 *     rc=137 (memcg)   7 / 41
-	 *     rc=134 (abort)   8 / 41  -- RM-FAIL 4, STALE-FOUND 5: NOT cured
-	 *     rc=20 / rc=21    2 / 2   -- READER-VISIBLE regressions the control
-	 *                                 does not produce at this rate: a HARD
-	 *                                 miss (a key LOST) and a wrong identity
-	 *     runs reaching their final line: 0 / 41
-	 *
-	 * ☞ Why: this is a fact about the disposition, not a coding slip.
-	 * The hold is published into @lctx, so it spans the whole op, through
-	 * the arms and the detach.  Under -DFEATURE_FT_HOLD_TRACE the ledger says
-	 * so directly.  Peers are refused the word repeatedly.  Each of three
-	 * seeds has the next line three times on one word.
-	 * "FT REFUSED (LOCK, unknown holder): ft_insert_dlm_acquire_split:778"
-	 * There are also refusals at ft_node_recompact:1405, at
-	 * ft_chain_compress_fused:1315 and at _cds_ft_remove_locked:5726
-	 * itself.  Every peer insert that needs the holder's word is blocked
-	 * for the duration of a remove.  This re-creates the FT-wide writer
-	 * lock one node at a time, with none of its ordering.  ☞ The seam
-	 * rule also applies here.  No node lock may be held across a grace
-	 * period.  See ft_seam_check (ft-mutation-helpers.h:2592), called from
-	 * ft_writer_lock_gp_wait.
-	 *
-	 * ★ What this does not refute: revalidating under the lock.  The
-	 * measurement indicts the scope of the hold, not the revalidation.  The
-	 * untried refinement is:
-	 *
-	 *  - hold only across derive -> select -> compare;
-	 *  - release immediately after the compare, without publishing into
-	 *    @lctx;
-	 *  - let each arm take its own word, as it does today;
-	 *  - let the txn's expected-old catch a move that happens after the
-	 *    decision.
-	 *
-	 * That is a different disposition and is not measured.
-	 */
-	struct ft_held_anchor rm_held = { 0 };
-	bool rm_hold = false;
-
-	if (ft->lock_fine &&
-	    holder_flag && !ft_node_external(holder_flag)) {
-		if (ft_acquire_member(ft, &lctx, holder_flag,
-				ft_flag_to_metadata(ft, holder_flag),
-				holder_depth, &rm_held)) {
-			/*
-			 * -EAGAIN folds LOCK / PROXY / TOMBSTONE.  All three
-			 * get the same answer.  Nothing was acquired, so
-			 * nothing is released.  The re-derivation above sorts
-			 * a dead holder out through its own recovery arm.
-			 */
-			FT_DBG_RETRY_SITE();
-			*need_retry = true;
-			return CDS_FT_STATUS_OK;	/* value unused: wrapper retries */
-		}
-		if (ft_node_holder(ft, node) != holder_flag) {
-			/*
-			 * It moved between the derive and the lock.  Retry the
-			 * WHOLE op rather than re-aim: see the alternation above.
-			 */
-			if (!rm_held.shared && !rm_held.txn_owned)
-				ft_meta_lock_release(rm_held.lock);
-			FT_DBG_RETRY_SITE();
-			*need_retry = true;
-			return CDS_FT_STATUS_OK;	/* value unused: wrapper retries */
-		}
-		/*
-		 * Held across derive -> select -> compare.  It is published
-		 * into @lctx so that the arms dedupe against it
-		 * (ft_dlm_acquire_set_at -> ft_lock_ctx_holds) and do not take
-		 * their own.  No arm's commit terminal releases it.
-		 * FT_RM_RELEASE is therefore the only release, and it must run
-		 * on every exit below.
-		 */
-		rm_hold = true;
-		lctx.held.extra = &rm_held;
-		lctx.held.nr_extra = 1;
-	}
-#endif
-
 	/*
 	 * ★ DERIVE -> SELECT -> COMPARE window (-DFT_DELAY_INJECT only; a no-op
 	 * in every shipping build, fractal-trie-internal.h:4236).
@@ -10105,7 +9777,6 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			FT_ORD_CELL_UNSPLICE_MAX_EDGES);
 		if (!unsplice_txn) {
 			FT_TP(remove_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
-			FT_RM_RELEASE();
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 	}
@@ -10164,14 +9835,12 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 						holder_meta, holder_depth, -1)) {
 				FT_DBG_RETRY_SITE();
 				*need_retry = true;
-				FT_RM_RELEASE();
 				return CDS_FT_STATUS_OK;
 			}
 			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 #if defined(FT_ENABLE_TRACING) || defined(FT_DEBUG_RM_SITE)
 			ft_dbg_rm_site = __LINE__;
 #endif
-			FT_RM_RELEASE();
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
 		if (!succ_node) {
@@ -10395,7 +10064,6 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 						if (unsplice_txn)
 							ft_flip_txn_destroy(unsplice_txn);
 						FT_TP(remove_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
-						FT_RM_RELEASE();
 						return CDS_FT_STATUS_MEMORY_ERROR;
 					}
 					/* VALIDATE (§4.B): lock (or guard-fallback) the
@@ -10531,14 +10199,12 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 						iter_key[key_len - 1])) {
 				FT_DBG_RETRY_SITE();
 				*need_retry = true;
-				FT_RM_RELEASE();
 				return CDS_FT_STATUS_OK;
 			}
 			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 #if defined(FT_ENABLE_TRACING) || defined(FT_DEBUG_RM_SITE)
 			ft_dbg_rm_site = __LINE__;
 #endif
-			FT_RM_RELEASE();
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
 		if (!succ_node) {
@@ -10637,11 +10303,9 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	switch (ret) {
 	case 0:
 		FT_TP(remove_exit, (int) CDS_FT_STATUS_OK);
-		FT_RM_RELEASE_OUTCOME(true);
 		return CDS_FT_STATUS_OK;
 	case -ENOMEM:
 		FT_TP(remove_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
-		FT_RM_RELEASE();
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	case -ESTALE:
 		/*
@@ -10655,7 +10319,6 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 #if defined(FT_ENABLE_TRACING) || defined(FT_DEBUG_RM_SITE)
 		ft_dbg_rm_site = __LINE__;
 #endif
-		FT_RM_RELEASE();
 		return CDS_FT_STATUS_NOT_FOUND;
 	case -EAGAIN:
 	case -ENOENT:
@@ -10687,7 +10350,6 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			ft_dbg_rm_enoent++;
 #endif
 		*need_retry = true;
-		FT_RM_RELEASE();
 		return CDS_FT_STATUS_OK;	/* value unused: wrapper retries */
 	default:
 		abort();
@@ -11855,8 +11517,8 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		 *   (ft_detach_node climbs from holder_meta) and waits on
 		 *   itself forever.
 		 * - Published into @lctx, it becomes the whole-op scope.  That
-		 *   scope was measured with -DFT_RM_REVALIDATE and refuted
-		 *   (20/41 hangs, reader-visible key loss).
+		 *   scope was measured with a revalidate arm (since removed)
+		 *   and refuted (20/41 hangs, reader-visible key loss).
 		 * The lock was never the answer.
 		 *
 		 * @nr_frozen is the DERIVATION.  ft_hlist_freeze_chain_prepare
