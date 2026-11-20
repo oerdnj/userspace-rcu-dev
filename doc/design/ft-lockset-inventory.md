@@ -2,9 +2,10 @@
 
 Mathieu's shape for the work: *"we need to complete the missing lock-set
 transition for fine and exponential. only when it is COMPLETE can we turn MW
-into SW."* This is the inventory that transition starts from: **which mutation
-primitives do not hold their lock set, at per-node and at exponential
-spacing**, measured and attributed to the primitive rather than argued.
+into SW."* This is the inventory that transition starts from. It answers one
+question: **which mutation primitives do not hold their lock set, at per-node
+and at exponential spacing**. The answer is measured and attributed to the
+primitive. It is not argued.
 
 It is an inventory, not a plan. No primitive is converted here, and nothing
 below is a proposal to convert one class on its own.
@@ -13,19 +14,19 @@ below is a proposal to convert one class on its own.
 
 ## 0. The question, and how it was asked
 
-**"Holds its lock set"** means: at the moment a word is written, the op holds
-the lock that `ft-dlm-lock-coarseness.md` §1/§2 assign to that word — the
-**anchor of the word's owner** (the owner itself at per-node). Two ways to fail
-it, and they need different instruments:
+**"Holds its lock set"** is a property of an op at the moment it writes a word.
+The op holds the lock that `ft-dlm-lock-coarseness.md` §1/§2 assign to that
+word. That lock is the **anchor of the word's owner** (the owner itself at
+per-node). An op can fail it in two ways, and they need different instruments:
 
 * **Coverage** — the op writes a word and holds no lock covering it.
 * **Agreement** — the op holds *a* lock, but not the one every other op
   computes for that node, so it excludes nobody (§1).
 
-`-DFT_DEBUG_STRUCT_ANCHOR` (needs `-DFT_DEBUG_TXN_KIND`; build with
-`-fno-omit-frame-pointer`) answers both against an **independent** anchor: it
-climbs the owner's parent words to the root, sums the spans to get the byte
-depth, and applies §2 over that path. This is §5.3's rejected up-walk, used as
+`-DFT_DEBUG_STRUCT_ANCHOR` answers both against an **independent** anchor. It
+needs `-DFT_DEBUG_TXN_KIND`, and a build with `-fno-omit-frame-pointer`. It
+climbs the owner's parent words to the root. It sums the spans to get the byte
+depth. Then it applies §2 over that path. This is §5.3's rejected up-walk, used as
 an oracle only. A parked proxy, a NULL parent word (transient re-home) or an
 external on the path reads UNDATED rather than guessed.
 
@@ -35,11 +36,14 @@ external on the path reads UNDATED rather than guessed.
 | B | `__ft_flip_txn_record_tag_ctx` / `ft_flip_txn_record_tag_mw`, re-asked in `ft_flip_txn_commit` | at record time, is the owner's anchor held? If not, is it held by commit (LATE) or never (NEVER)? Keyed by (txn creation site, call site, one frame up), symbolized offline with `addr2line -i` |
 | C | the chain audit arms (`-DFT_DEBUG_CHAIN_HOLD`) | the same exact-anchor verdict for the words that never reach a record helper: hlist stores, raw parent/head words, in-place body writes. Writes the caller declares `FT_EXCL_HIDDEN` are skipped **except chain words**, which carry no declaration and are always scored |
 
-The witness is the union the owner assert uses: the txn registry, the ctx
-frames, the per-thread hold ledger (`-DFEATURE_FT_HOLD_TRACE`), and this trie's
-FT-wide writer lock. COARSE and EXCLUSIVE tries are bucketed out (no peer to
-exclude), as are commits already carrying `@acquire_miss` (discarded before the
-engine).
+The witness is the union the owner assert uses:
+- the txn registry;
+- the ctx frames;
+- the per-thread hold ledger (`-DFEATURE_FT_HOLD_TRACE`);
+- this trie's FT-wide writer lock.
+
+Two cases are bucketed out. COARSE and EXCLUSIVE tries have no peer to exclude.
+Commits that already carry `@acquire_miss` are discarded before the engine.
 
 **Red control, and it fires.** `FT_SA_RED=root` asks every record about the
 ROOT instead of its real anchor, without touching the ops. ft_unit at
@@ -65,9 +69,10 @@ park is legal only if the lock was held when the overwritten value was read.
 
 ## 1. Coverage: primitives that write while holding NOTHING — both spacings
 
-Probe B puts these in NOLOCKS (registry and ledger both empty), and the commit
-re-check puts them in NEVER: the lock is still not held when the descriptor goes
-to the engine. None of them depends on spacing, because nothing is held.
+Probe B puts these in NOLOCKS: the registry and the ledger are both empty. The
+commit re-check puts them in NEVER: the lock is still not held when the
+descriptor goes to the engine. None of them depends on spacing, because nothing
+is held.
 
 | # | primitive | ft_inv per-node | ft_inv exponential | ft_unit | what is missing |
 |---|---|---|---|---|---|
@@ -78,24 +83,31 @@ to the engine. None of them depends on spacing, because nothing is held.
 | 5 | bulk glue writes outside the FT-wide lock — `ft_glue_apply_deferred`, `ft_glue_defer_edge_origin`, `ft_store_at_graft_point_commit` | ≤ 45 | ≤ 40 | ≤ 11 | bulk ops are excluded by design by the FT-wide lock; these few rows are writes the lock did not cover at that instant — not yet attributed |
 
 **Everything else that holds a lock holds the right one for the words it
-records.** Across the structural record lane, ft_inv at exponential: HELD
-29,243,068, held through a coarser anchor 1,207,645, **SELF_ONLY 0, UNHELD 0**
-(UNDATED 1,925, 1,923 of them in row 1's commit, racing re-homes). Per-node likewise has
-no UNHELD. On the raw lanes the chain words of `ft_chain_compress_fused:2326`
-and `ft_detach_node:3902`, and the in-place body writes
-(`ft_popcount_node_set_nth` / `ft_pigeon_node_set_nth`), are covered at
-exponential, a large share of them through an ancestor anchor.
-(`ft_popcount_node_set_nth:516` reads UNHELD / UNDATED on an unpublished node
-and is the refused-arm false positive `ft-reintroduce-in-place-mutations.md`
-§6.3 already names.)
+records.** The structural record lane, ft_inv at exponential, reads:
+- HELD 29,243,068;
+- held through a coarser anchor 1,207,645;
+- **SELF_ONLY 0, UNHELD 0**;
+- UNDATED 1,925. Row 1's commit has 1,923 of them, racing re-homes.
+
+Per-node likewise has no UNHELD.
+
+On the raw lanes, these writes are covered at exponential:
+- the chain words of `ft_chain_compress_fused:2326` and `ft_detach_node:3902`;
+- the in-place body writes (`ft_popcount_node_set_nth` /
+  `ft_pigeon_node_set_nth`).
+
+A large share of them is covered through an ancestor anchor.
+(`ft_popcount_node_set_nth:516` reads UNHELD / UNDATED on an unpublished node.
+It is the refused-arm false positive that
+`ft-reintroduce-in-place-mutations.md` §6.3 already names.)
 
 ---
 
 ## 2. Agreement: acquires that take the WRONG word — exponential only
 
-Probe A, ft_inv at exponential (per-node is exact by construction). The
-mismatch is independent of load for rows 6–9: each one also shows up in
-single-threaded ft_unit, or has a mechanism read directly off the anchor table
+Probe A, ft_inv at exponential (per-node is exact by construction). For rows
+6–9 the mismatch does not depend on load. Each row also shows up in
+single-threaded ft_unit, or its mechanism is read directly off the anchor table
 in the sample.
 
 | # | acquire site | mismatches | mechanism (from the samples) |
@@ -105,10 +117,10 @@ in the sample.
 | 8 | `ft_node_recompact:1761` | 11 (1 non-stale); ft_unit 6 | the cursor is the member's **SKIP-encoded** flag (`0xa007…f00b` over a member `0x7ff…f00b`). The pending-level fallback returns it, `anchor == nf` fails on the encoding, and `ft_flag_to_metadata` resolves the skip word to the elided compressed node (ABOVE) |
 | 9 | `ft_merge_lock_overlap:523` | 22 | the cursor is at depth 0 and level 2 was never crossed (`crossed=0`); a member three bytes down goes through `ft_descent_anchor_child`, whose rule is exact for ONE hop only, and anchors on itself. Bulk: the FT-wide lock excludes today |
 
-**Live evidence that 7 breaks exclusion.** With the E.2 exclusion oracle armed
-(`FEATURE_FT_HOLD_TRACE` without `FT_EXCL_REPORT_ONLY`), ft_inv at exponential
-aborts in `inv_concurrent_insert_unique_nolist`: **2 of 80** filtered runs, plus
-1 full leg. The shape is identical each time:
+**Live evidence that 7 breaks exclusion.** The E.2 exclusion oracle is armed
+with `FEATURE_FT_HOLD_TRACE` and without `FT_EXCL_REPORT_ONLY`. ft_inv at
+exponential then aborts in `inv_concurrent_insert_unique_nolist`: **2 of 80**
+filtered runs, plus 1 full leg. The shape is identical each time:
 
     FT EXCLUSION VIOLATION: node X claimed at ft_flip_txn_lock_or_guard_parent_ex
       by tid B (anchor X=SELF) while owned by tid A (from ft_detach_orphan_planlock:984,
@@ -125,8 +137,8 @@ pending-level fallback, `a->bound ? a->bound : d->nf`, names the node starting a
 `bound_start` through the cursor. It assumes the cursor is the not-yet-entered node
 at `d->depth`. `ft_walk_extend` leaves the cursor on the node it ENTERED (row 7), and
 `ft_node_recompact` left it skip-encoded (row 8). The member passed to the query
-starts at `bound_start`, so it IS that node: the query now takes the member
-(`self`) and answers with it when `bound_start == clamp`.
+starts at `bound_start`, so it IS that node. The query now takes the member
+(`self`). It answers with the member when `bound_start == clamp`.
 
 **Row 6** gives `ft_detach_node`'s first orphan walk its own descent copy, extended
 per orphan with its depth advanced, as the phase-2 walk already did. Re-entering
@@ -143,23 +155,24 @@ Probe A and the anchor-property probe (§7), ft_inv at exponential, before -> af
 | `ft_merge_lock_overlap` (row 9) | 29 | 27 -- **not fixed** |
 | non-locked-word writes: op holds A and the parent shares A | 1,090,320 of 1,090,340; 2 SELF_ANCHORED | **1,160,550 of 1,160,552; 0** |
 
-The live E.2 violation above no longer reproduces at HEAD before this change
-(0 of 400 filtered runs; the rows 1-4 conversions changed that test's
-interleavings), so it cannot confirm the fix. The probe rows do.
+The live E.2 violation above cannot confirm the fix. It no longer reproduces at
+HEAD before this change: 0 of 400 filtered runs. The rows 1-4 conversions
+changed that test's interleavings. The probe rows do confirm the fix.
 
-One on-path mismatch remains at `ft_chain_compress_fused:1614` (1 in 2.46M). Its
-descent dates the compressed parent's end at byte 18 while the member starts at
-byte 12. That is not the pending-boundary case, so it is unaffected by this change.
-Not yet explained.
+One on-path mismatch remains at `ft_chain_compress_fused:1614`: 1 in 2.46M.
+Its descent dates the compressed parent's end at byte 18. The member starts at
+byte 12. That is not the pending-boundary case, so this change does not affect
+it. Not yet explained.
 
-**Row 9 is not an agreement defect to fix; it is a bulk op that should take no
+**Row 9 is not an agreement defect to fix. It is a bulk op that should take no
 DLM lock at all.** Its 27-33 mismatches come from the cross-trie merge
-(`inv_ordered_bulk_consistency`, `inv_merge_root_src_cross_view`): `ft_merge_build`
-fences each dst overlap node through the glue's descent, which ends at the merge
-point. But `cds_ft_merge_at` holds the dst's FT-wide writer lock for its whole
-body (its exclusive source skips every grace-period wait), and while a bulk op is
-live a fine trie's point ops re-take that lock (G5.25). So the fence excludes
-nothing that is not already excluded, whatever word it takes.
+(`inv_ordered_bulk_consistency`, `inv_merge_root_src_cross_view`).
+`ft_merge_build` fences each dst overlap node through the glue's descent. That
+descent ends at the merge point. But the fence excludes nothing that is not
+already excluded, whatever word it takes:
+- `cds_ft_merge_at` holds the dst's FT-wide writer lock for its whole body (its
+  exclusive source skips every grace-period wait);
+- while a bulk op is live, a fine trie's point ops re-take that lock (G5.25).
 
 Mathieu: the bulk-op transformation is INCOMPLETE -- bulk ops "should not have to
 take _any_ node or exp locks, because they exclude all other ops with per-ft
@@ -167,16 +180,20 @@ locking". Two facts support it:
 - the FT-wide lock is dropped only at `ft_writer_lock_gp_wait` (reader drains in
   detach, graft, graft_swap and rekey on a live trie);
 - the seam rule forbids holding a node lock across one.
-The one duty a take still performs incidentally is refusing a TOMBSTONE/PROXY
-word for a plan read before a drain seam and used after it. The next step is to
-measure which bulk-op plans cross a seam.
+A take still performs one duty incidentally. It refuses a TOMBSTONE/PROXY word
+for a plan that was read before a drain seam and used after it. The next step
+is to measure which bulk-op plans cross a seam.
 
-**Stale plans, not defects.** The other ~2,330 mismatches (2,192 at the
-plan-lock, 85 at `ft_chain_compress_fused:1614`, 25 at
-`ft_flip_txn_lock_or_guard_parent_ex`, 13 at `_cds_ft_insert:3812`, 10 at
-`ft_node_recompact`, 2 at `ft_unchain_node`) are OFF PATH, and **every one**
-has its anchor or its member TOMBSTONED at the check. That is the §2.1
-"planned against the pre-change node hits TOMBSTONE and replans" path working.
+**Stale plans, not defects.** The other ~2,330 mismatches are OFF PATH:
+- 2,192 at the plan-lock;
+- 85 at `ft_chain_compress_fused:1614`;
+- 25 at `ft_flip_txn_lock_or_guard_parent_ex`;
+- 13 at `_cds_ft_insert:3812`;
+- 10 at `ft_node_recompact`;
+- 2 at `ft_unchain_node`.
+
+**Every one** has its anchor or its member TOMBSTONED at the check. That is the
+§2.1 "planned against the pre-change node hits TOMBSTONE and replans" path working.
 
 ---
 
@@ -206,11 +223,14 @@ Records per ft_inv leg, by class (the `-DFT_DEBUG_STRUCT_ANCHOR` legs of §7.2):
 
 ## 4. Not reached by either suite
 
-`_cds_ft_remove_locked`'s and `_cds_ft_remove_all_locked`'s ordered-cell
-unsplice RETRY txns, `ft_compact_relocate_compressed`'s own txn, and every
-rekey spine / subpos site. `cds_ft_replace` commits 3 times in ft_unit and not
-enough in ft_inv to score. A primitive missing from §1 is only as clean as its
-coverage.
+Neither suite reaches these:
+- `_cds_ft_remove_locked`'s and `_cds_ft_remove_all_locked`'s ordered-cell
+  unsplice RETRY txns;
+- `ft_compact_relocate_compressed`'s own txn;
+- every rekey spine / subpos site.
+
+`cds_ft_replace` commits 3 times in ft_unit and not enough in ft_inv to score.
+A primitive missing from §1 is only as clean as its coverage.
 
 ---
 
@@ -222,18 +242,27 @@ the change excludes ops that hold it *concurrently*. The question was whether it
 also excludes an op that PLANNED before the change and ACQUIRES the old anchor
 after the restructurer released it. It does not.
 
-**The rig** (`doc/design/ft-anchor-move-rig.c`, against a library built with
-`-DFT_DEBUG_INTERLEAVE`, whose test-only hook parks the delete tier's leaf hoist
-before and after its acquire). Exponential spacing:
+**The rig** is `doc/design/ft-anchor-move-rig.c`. It runs against a library
+built with `-DFT_DEBUG_INTERLEAVE`. That build has a test-only hook that parks
+the delete tier's leaf hoist before and after its acquire. Exponential spacing:
 
     root [0,1) -'a'-> cn [1,9) "bcdefghi" -> A @9 -'J'-> X @10, children '1'..'8'
     anchor(X): depth 10, L = 8, first boundary >= 8 is A          ==> A
     split: insert "abcdefghQzz" (diverges at byte 8), boundary B @8 ==> anchor(X) = B
 
-The VICTIM removes `abcdefghiJ8` (a leaf directly in X's slot, so it holds
-nothing before its hoist) and is parked at PRE, with its plan -- anchor A --
-already taken. The split commits. The victim then acquires A and is parked at
-POST, holding it. A PEER runs with a 2 s budget.
+The VICTIM removes `abcdefghiJ8`. That leaf is directly in X's slot, so the
+victim holds nothing before its hoist. The steps, one column per thread, time
+going down:
+
+```
+VICTIM                        SPLIT             PEER
+plan taken: anchor A
+parked at PRE
+                              commits
+acquires A
+parked at POST, holding A
+                                                runs, 2 s budget
+```
 
 | mode | peer | peer completed while the victim held its anchor | reading |
 |---|---|---|---|
@@ -243,26 +272,26 @@ POST, holding it. A PEER runs with a 2 s budget.
 
 Probe A records the victim's acquire as a LIVE mismatch (neither node
 tombstoned): `op anchor A (start 9), trie anchor B (start 8)`. Both commits
-landed and both keys are gone -- today's MW records arbitrated the two writes to
+landed and both keys are gone. Today's MW records arbitrated the two writes to
 X's slot and state word. Under SW parks they would not.
 
-☠ **The insert peer is not a counter-example.** Growing X recompacts it with lock
-set {X, A, ...}: A is X's PARENT and therefore a coarsened MEMBER, whose own word
-the acquire samples -- and A's own word carries the victim's lock. It waits on A
-as a member, not on the anchor it computed. A peer whose lock set is {X} alone
-(the leaf delete) shows the gap.
+☠ **The insert peer is not a counter-example.** Growing X recompacts it with
+lock set {X, A, ...}. A is X's PARENT, so it is a coarsened MEMBER. The acquire
+samples a coarsened member's own word, and A's own word carries the victim's
+lock. So the insert waits on A as a member, not on the anchor it computed. A
+peer whose lock set is {X} alone (the leaf delete) shows the gap.
 
 **What the split does do**, observed on the way: its lock set includes the child
-it re-homes (A), so a victim already HOLDING A blocks the split. The gap is only
-the late acquire: the acquire validates the MEMBER's back edge, and X's edge is
-unchanged by a split above A; nothing re-checks that A is still the first
-boundary at or after L once it is held.
+it re-homes (A). So a victim already HOLDING A blocks the split. The gap is only
+the late acquire. The acquire validates the MEMBER's back edge, and a split
+above A leaves X's edge unchanged. Once A is held, nothing re-checks that A is
+still the first boundary at or after L.
 
 ### 5.1 The cure: a missing tombstone validation (Mathieu)
 
-At the victim's stale acquire, the node the plan derived A from -- cn, which
-covers level 8 -- was already `TOMBSTONE` (probe A: `cover state 0x6`), retired
-by the split's fenced tombstone. The anchor answer depends on that node:
+The plan derived A from cn, the node that covers level 8. At the victim's stale
+acquire, cn was already `TOMBSTONE` (probe A: `cover state 0x6`). The split's
+fenced tombstone had retired it. The anchor answer depends on that node:
 
 - A boundary can appear in `[L, anchor)` only by splitting the node that covers
   L strictly inside its span.
@@ -277,22 +306,23 @@ TOMBSTONE never clears, so a load after the commit answers for the commit --
 **read logically**.
 
 ☠ **The first version read it raw, and the skeptic REFUTED it by running.** A
-split's commit settles its guard on the old anchor A (a plain late record) BEFORE
-the fenced tombstone on cn (a registered lock word settles last, `8c517957`).
+split's commit settles its guard on the old anchor A BEFORE the fenced tombstone
+on cn. The guard is a plain late record. The tombstone is on a registered lock
+word, and those settle last (`8c517957`).
 Between the two, A is takeable while cn still holds the split's SUCCEEDED proxy.
 That raw word carries `FT_STATE_PROXY` (bit 0), not `FT_STATE_TOMBSTONE` (bit 1),
 so the check passed and the hole was back. The check now resolves the word
 (`urcu_txn_resolve`: SUCCEEDED answers new, anything else old). An UNDECIDED
-restructure cannot succeed past the guard on A that the lock just taken fails.
-`-DFT_DEBUG_INTERLEAVE` gained `FT_IL_SETTLE_LOCKS_LAST`, fired from
-`ft_flip_txn_late_last` at the start of the last settle pass, so the rig's
-`splitlate` mode parks the split in exactly that window.
+restructure cannot succeed: the lock just taken fails its guard on A.
+`-DFT_DEBUG_INTERLEAVE` gained `FT_IL_SETTLE_LOCKS_LAST`.
+`ft_flip_txn_late_last` fires it at the start of the last settle pass. The
+rig's `splitlate` mode uses it to park the split in exactly that window.
 
 A load after the commit is enough only if no split can land while the lock is
-held. That holds because moving the boundary re-homes (or retires) the old
-anchor, and the re-home records a guard on that node's CLEAN state word
-(`ft_reparent_record_meta`), which the victim's lock fails. `splitheld` measures
-that, with a red control:
+held. That holds. Moving the boundary re-homes (or retires) the old anchor. The
+re-home records a guard on that node's CLEAN state word
+(`ft_reparent_record_meta`). The victim's lock fails that guard. `splitheld`
+measures that, with a red control:
 
 | mode (peer = delete `J7`) | coverer check | split while held | peer while held | reading |
 |---|---|---|---|---|
@@ -303,10 +333,11 @@ that, with a red control:
 | splitlate, RED: coverer read raw | 17 checked, 0 retired | -- | **completed** (3/3) | a committed tombstone read as a proxy: **HOLE** |
 | splitlate | 17 checked, **1 retired** | -- | waited (3/3) | resolved: **no hole** |
 
-A skip-encoded coverer names its node only through the child's back pointer --
-which the very split being guarded against re-homes -- so the check re-plans on
-one rather than resolve it. The descents enter resolved flags, so it is not
-expected to occur. `-DFT_DEBUG_STRUCT_ANCHOR` counts it (`FT_SA_COVER ... skip=`).
+A skip-encoded coverer names its node only through the child's back pointer.
+The very split being guarded against re-homes that pointer. So the check
+re-plans on a skip-encoded coverer rather than resolve it. The descents enter
+resolved flags, so it is not expected to occur. `-DFT_DEBUG_STRUCT_ANCHOR`
+counts it (`FT_SA_COVER ... skip=`).
 
 ---
 
@@ -320,13 +351,15 @@ expected to occur. `-DFT_DEBUG_STRUCT_ANCHOR` counts it (`FT_SA_COVER ... skip=`
 | 4 compaction (compressed + cell relocation) | `06662abe` | raw writes 1,030 -> 1 (the exclusive-trie test) |
 
 **Found on the way, and a precondition of the flip:** the engine's late settle
-pass selected the words it hands ownership over by PROXY TAG, and the trie's
-duplicate-chain links share tag 1 with its state words. A registered lock's
-release was settled before the chain links it protects, so a peer could take the
-lock while a link was still a proxy. It surfaced as a pre-existing SIGSEGV in
-`inv_concurrent_insert_replace_nolist` (28/1500 filtered runs before row 1,
-40/1200 after -- row 1 put a release next to a chain mark in one more commit),
-and it is 0/1200 once the registered lock words settle last (`8c517957`).
+pass selected the words it hands ownership over by PROXY TAG. The trie's
+duplicate-chain links share tag 1 with its state words. So a registered lock's
+release was settled before the chain links it protects. A peer could then take
+the lock while a link was still a proxy. It surfaced as a pre-existing SIGSEGV
+in `inv_concurrent_insert_replace_nolist`:
+- 28/1500 filtered runs before row 1;
+- 40/1200 after row 1, which put a release next to a chain mark in one more
+  commit;
+- 0/1200 once the registered lock words settle last (`8c517957`).
 
 ---
 
@@ -356,13 +389,15 @@ member. That is §1's coverage question, and rows 1-4 closed the measured cases
 
 `-DFT_DEBUG_STRUCT_ANCHOR` gains two probes.
 - **DEAD MEMBER.** After `ft_dlm_acquire_set_at` returns 0, a member whose node
-  reads logically TOMBSTONE is counted by arm (taken / shared / shared-coarsened /
-  coarsened-taken) and sampled with the acquire's `fn:line`.
-- **DEAD-OWNER WRITE.** Every owner-bearing record whose verdict was reached
-  through the owner has that owner's state resolved at commit ENTRY, while the
-  op's locks are held. An owner already TOMBSTONE before a commit that lands is
-  a lock holder writing into a retired node. It is counted per (txn site, pc0,
-  pc1) as `T_DEAD_HELD_OK` / `T_DEAD_UNCOV_OK` / `t_dead_ab`, and sampled.
+  reads logically TOMBSTONE is counted and sampled. The count is by arm (taken /
+  shared / shared-coarsened / coarsened-taken). The sample carries the acquire's
+  `fn:line`.
+- **DEAD-OWNER WRITE.** This probe covers every owner-bearing record whose
+  verdict was reached through the owner. It resolves that owner's state at
+  commit ENTRY, while the op's locks are held. An owner already TOMBSTONE before
+  a commit that lands is a lock holder writing into a retired node. It is
+  counted per (txn site, pc0, pc1) as `T_DEAD_HELD_OK` / `T_DEAD_UNCOV_OK` /
+  `t_dead_ab`. It is sampled.
 
 RED CONTROL, `FT_SA_RED_DEAD=1`: the acquire takes and samples TOMBSTONED words.
 
@@ -375,8 +410,10 @@ RED CONTROL, `FT_SA_RED_DEAD=1`: the acquire takes and samples TOMBSTONED words.
 | ft_inv exponential, RED | -- | 5 sampled (3 taken, 1 shared, 1 coarsened-taken) | 4 sampled | key loss (`an OK insert is NOT READABLE`), hang in test 27 |
 | ft_inv per-node, RED | -- | 4 sampled (taken) | 5 sampled | key loss (2 reports), hang in test 27 |
 
-The same legs' record verdicts: NOLOCKS 0, UNHELD 0, SELF_ONLY 0 at both
-spacings; HELD 38.3M + held-coarse 1.7M (exponential), HELD 44.7M (per-node).
+The same legs give these record verdicts:
+- NOLOCKS 0, UNHELD 0, SELF_ONLY 0 at both spacings;
+- HELD 38.3M + held-coarse 1.7M (exponential);
+- HELD 44.7M (per-node).
 
 ### 7.3 What the measurement does NOT cover
 
@@ -448,10 +485,10 @@ five sites, where property 2 predicts it (§7). For those children the check is
 redundant.
 
 **RED CONTROL, `FT_LV_RED_DROP=1`:** the check is dropped inside the
-span-preserving re-homes only (`ft_node_recompact`'s sweep and compaction's
-compressed relocation, bracketed by `FT_LV_SPAN`). No anchor moves there, and a
-peer that retires or recompacts a child must rewrite the child's slot, so it holds
-the parent the re-homer holds.
+span-preserving re-homes only. These are `ft_node_recompact`'s sweep and
+compaction's compressed relocation, bracketed by `FT_LV_SPAN`. No anchor moves
+there. A peer that retires or recompacts a child must rewrite the child's slot.
+So it holds the parent, which the re-homer also holds.
 
 | leg | checks dropped | suite | exclusion violations | dead members | dead-owner writes |
 |---|---|---|---|---|---|
@@ -471,23 +508,27 @@ avoids the fan the reverted lock-the-sweep experiment choked on.
 
 ## 9. Bulk ops take no node lock; compaction follows the mode flip (Mathieu, 2026-09-17)
 
-**The rule.** A bulk op excludes every other op through per-FT locking: the bulk
-lock, and point ops flipped onto the FT-wide writer lock while the gate is open
-(G5.25). So it should take no node or anchor lock at all. Point ops and
-compaction take BOTH the FT-wide lock and their nearest-ancestor locks in bulk
-mode, because the regime is mixed at the gate's two edges:
+**The rule.** A bulk op excludes every other op through per-FT locking. That
+locking has two parts: the bulk lock, and point ops flipped onto the FT-wide
+writer lock while the gate is open (G5.25). So a bulk op should take no node or
+anchor lock at all. In bulk mode, point ops and compaction take BOTH the FT-wide
+lock and their nearest-ancestor locks. They do so because the regime is mixed at
+the gate's two edges:
 - while the gate opens, ops that saw it clear hold node locks only until its grace
   period ends;
 - after it closes, fresh ops are back on node locks while flipped ones may still run.
 
 Only the bulk BODY, strictly inside the gate, may drop them.
 
-**Compaction now takes part in the flip, per step.** `cds_ft_compact_step` enters
-the writer scope inside its own read-side section, as a point op does, so the
-gate's grace period covers a step in flight and a bulk op that starts between two
-steps makes the next one queue. Sampling once per `cds_ft_compact` pass did not
-work: the pass drops the read lock between steps, and the gate's grace period
-completed in that gap. The step keeps its relocations' node locks (row 4).
+**Compaction now takes part in the flip, per step.** `cds_ft_compact_step`
+enters the writer scope inside its own read-side section, as a point op does.
+Two things follow:
+- the gate's grace period covers a step in flight;
+- a bulk op that starts between two steps makes the next step queue.
+
+Sampling once per `cds_ft_compact` pass did not work. The pass drops the read
+lock between steps, and the gate's grace period completed in that gap. The step
+keeps its relocations' node locks (row 4).
 
 **The inventory** (`-DFT_DEBUG_BULK_ACQ`): every DLM acquire made inside a bulk op.
 - ft_inv makes 1,201,459 (exponential) / 1,064,667 (per-node) of them, at 12 sites:
@@ -502,8 +543,8 @@ completed in that gap. The step keeps its relocations' node locks (row 4).
 - ft_unit reaches 26 sites, including the rekey graft attempts and the glue marks.
 - **Every one** is made under the FT-wide lock of its trie, or on an exclusive trie.
 - **None** follows a drain seam (`ft_writer_lock_gp_wait`) earlier in the same op.
-  The arm yield confirms seams occur inside bulk ops: 825,704 / 708,654 in ft_inv,
-  45 in ft_unit.
+  The arm yield confirms that seams occur inside bulk ops: 825,704 / 708,654 in
+  ft_inv and 45 in ft_unit.
 - So no bulk-op take provides exclusion or stale-plan detection that per-FT locking
   does not already give.
 
@@ -522,8 +563,8 @@ lock-lifecycle call sites:
 
 Two shapes for later:
 - **A (central):** a sentinel `lock_snap` for "held by per-FT exclusion, never
-  taken", honoured by register, the release records, the fenced tombstone, and a
-  bulk-scoped `ft_meta_lock_release`.
+  taken". Four places honour it: register, the release records, the fenced
+  tombstone and a bulk-scoped `ft_meta_lock_release`.
 - **B (per site):** each bulk site stops acquiring and drops its lifecycle code.
 
 `doc/design/ft-compact-bulk-rig.c` is the harness for it.
@@ -532,15 +573,15 @@ Two shapes for later:
 
 **A. Span-preserving re-homes, no check.** `ft_node_recompact`'s sweep and
 compaction's compressed relocation now pass `check_child = false`. No anchor
-moves, and a peer that could freeze or retire the child must rewrite its slot in
-the node being copied, whose lock the re-homer holds.
+moves. A peer that could freeze or retire the child must rewrite its slot in the
+node being copied. The re-homer holds that node's lock.
 
 **B1. The split TAKES its live child.** A compressed split ADDS a boundary above
-cn's only child without retiring that child, so everything anchored on the child
+cn's only child without retiring that child. So everything anchored on the child
 re-anchors under the fresh junction. `ft_insert_dlm_acquire_split` now takes the
 child (when internal) in the same lock set as {cn, P}, and re-reads `cn->child`
-under cn's lock. The lock is carried on the insert commit like P's, released on a
-pre-publish bail, and registered with its release record in
+under cn's lock. The lock is carried on the insert commit like P's. It is
+released on a pre-publish bail. It is registered with its release record in
 `ft_insert_publish_or_park` before the arm. `ft_park_live_parent_edge` asks the
 txn registry, so a held child records no state edge.
 
@@ -552,13 +593,13 @@ Rig `splitheld` (the §5 held order):
 | RED `-DFT_RED_SPLIT_NO_CHILD_LOCK` (child neither locked nor checked) | COMPLETED | COMPLETED -- **HOLE, 3/3** |
 
 **B2. The fuse, no check.** The chain-compress fuse moves boundaries only by
-REMOVING them: the boundary node, and a fused compressed child. It retires and
-holds both. A node anchored on either one is excluded by the fuse, and a plan
+REMOVING them. It removes the boundary node and a fused compressed child. It
+retires and holds both. A node anchored on either one is excluded by the fuse, and a plan
 made before it hits the tombstone. A node anchored on the surviving child or
 below keeps its anchor. Its per-node losses (4,839 of 92,772) were aborts for
 nothing.
 
-Measured, `-DFT_DEBUG_LIVE_VALIDATE`, ft_inv, per-node / exponential:
+Measured with `-DFT_DEBUG_LIVE_VALIDATE` on ft_inv (per-node / exponential):
 
 | | before | after |
 |---|---|---|
@@ -574,11 +615,11 @@ Measured, `-DFT_DEBUG_LIVE_VALIDATE`, ft_inv, per-node / exponential:
   (`ft_flip_txn_record_anchor_release_held`, as P's is), not as a fixed
   `{LOCK|snap -> snap}`.
 
-The skeptic's open question was LIVENESS: the split now also conflicts with ops
-that hold the child but not cn, and escalation rescues a refused commit, not a
-refused acquire. Measured with `-DFT_DEBUG_LIVE_VALIDATE` counters in
-`ft_insert_dlm_acquire_split`, ft_inv, against the same tree with the child lock
-compiled out:
+The skeptic's open question was LIVENESS. The split now also conflicts with ops
+that hold the child but not cn. And escalation rescues a refused commit, not a
+refused acquire. The measurement uses `-DFT_DEBUG_LIVE_VALIDATE` counters in
+`ft_insert_dlm_acquire_split`, on ft_inv. It compares against the same tree
+with the child lock compiled out:
 
 | | split acquires | with a child member | refused | longest refusal streak (one thread) |
 |---|---|---|---|---|
@@ -648,8 +689,8 @@ The glue site stores a live child's offset plain before the commit parks its
 `parent_word`. It is unobservable, for three reasons:
 - **readers** never read the offset: the up-walk and `ft_skip_to_compressed` read
   `parent_word` only. The one iterator use is an `FT_DEBUG_PARENT_VIOLATION` dump;
-- **other writers** are excluded: every caller is a bulk op, whose gate is
-  published and followed by a grace period, and point ops and compaction steps
+- **other writers** are excluded: every caller is a bulk op. Its gate is
+  published and followed by a grace period. Point ops and compaction steps
   then take the FT-wide lock (§9). ☠ So this is a DEPENDENCY on the FT-wide lock,
   the same one `ft_glue_record_back_edge`'s FT-SLOT-3 note names;
 - **the op itself**: a per-thread ring notes each glue store and checks it in
@@ -661,9 +702,9 @@ The glue site stores a live child's offset plain before the commit parks its
 
 ### 10.3 Every DUAL_UNNAMED record asked, and the uncovered re-asked at commit
 
-**Commit-time re-ask.** An uncovered lane record is kept on the txn and asked
-again when its commit goes to the engine, this time without the site's lock
-context:
+**Commit-time re-ask.** An uncovered lane record is kept on the txn. It is
+asked again when its commit goes to the engine, this time without the site's
+lock context:
 - `c_LATE`: covered by then;
 - `c_NEVER_OK`: still uncovered, and the commit landed;
 - `c_NEVER_AB`: still uncovered, and the commit aborted;
@@ -692,8 +733,8 @@ Asked at the list-on leaf arm, per leg:
 | SKIP_X variant, the dual (owner GP) | **15,729 UNCOVERED, all NEVER_OK** | **10,279 UNCOVERED, all NEVER_OK** | **130 UNCOVERED** |
 
 The leaf replace under a compressed parent wrote the grandparent's dual slot
-holding only {P}. §8.1 A drops the live check on the premise that a writer of a
-child's slot holds the node it lives in, and this writer broke that premise. The
+holding only {P}. §8.1 A drops the live check on a premise: a writer of a
+child's slot holds the node it lives in. This writer broke that premise. The
 list-off arm has the same shape, reached about once per leg. `cds_ft_replace`
 already takes GP (`ft_lock_skip_dual_gp`, §9.3's third member).
 
@@ -732,9 +773,9 @@ and root-only is MW *by construction*: `ft_flip_txn_arm_per_op` refuses any
 spacing but per-node (`ft_txn_per_op_spacing_ok`, "door 2"). The refusal
 exists because `ft_flip_txn_owns` is exact at per-node and anchor-blind above
 it. So the flip is two changes that must land together:
-- lift door 2, with an owner witness that resolves the anchor (the debug
-  owner assert would otherwise fire on every coarse leg, as it did when
-  measured before);
+- lift door 2, with an owner witness that resolves the anchor. Otherwise the
+  debug owner assert would fire on every coarse leg, as it did when measured
+  before;
 - convert the unfinished always-MW lanes (§3, §10) to owner-dispatched records,
   the exponential anchored retires, and the not-held `nr_child--`.
 
@@ -754,9 +795,9 @@ ft_unit: 0 at both spacings on every row.
 
 **The chain audit had no exclusive-trie bucket.** It scored an exclusive trie
 (a bulk product or source, no peer) as UNHELD. At the in-place delete's fused
-freeze_leaf that was the entire residue: 57,823 per ft_inv per-node leg and 24
-in ft_unit, confirmed one for one by a probe splitting the same population on
-`ft->exclusive`. Bucketed now (`exclTrie`). The site then reads 0 at every
+freeze_leaf, that was the entire residue: 57,823 per ft_inv per-node leg and 24
+in ft_unit. A probe splitting the same population on `ft->exclusive` confirmed
+it one for one. Bucketed now (`exclTrie`). The site then reads 0 at every
 spacing (149,152 / 119,208 exclusive records per leg).
 
 ☠ A first probe at that site counted "registry and ledger both empty" and
@@ -779,8 +820,8 @@ The five open items, in order. Probe trees `blane4` (struct anchor) and
    (17,022 own + 52,758 ancestor), 41,800 root-only (ancestor).
 2. **UNDATED owner-bearing records: settled.** The record keeps the owner's held
    ancestors (`anc_rec`). At commit the report says whether the owner's anchor
-   was among them, or, for an owner still undatable, whether every ancestor held
-   at commit was already held at the record. 8 exponential legs: every LATE
+   was among them. For an owner still undatable, it says whether every ancestor
+   held at commit was already held at the record. 8 exponential legs: every LATE
    record reads `anchor_held_at_record 1`, and the 7 still undatable read
    `ancestor_held 1`, subset 1. No hold arrived between record and commit on
    any of them.
@@ -829,14 +870,15 @@ exponential, GREEN.
 
 ☑ **CLOSED @659bc54f, and by measurement rather than by work.** This item
 assumed the not-held `nr_child--` had a FINE-trie population to convert. It does
-not: NR_CHILD_DEC reads **0 on a fine trie at all three spacings** (§11.6). Every
-one of its records is on a coarse or exclusive trie, where §12.1.1 now parks it.
+not: NR_CHILD_DEC reads **0 on a fine trie at all three spacings** (§11.6).
+Every one of its records is on a coarse or exclusive trie. §12.1.1 now parks it
+there.
 The text below is the original statement of the item.
 
 **`ft_remove_one_commit`'s not-held `nr_child--` keeps its MW kind until the
-flip.** Its kind is chosen by `ft_flip_txn_owns` -- the per-node lock registry --
-so it takes the hardcoded-MW branch wherever the registry is empty, which
-includes the tries that are armed SW trie-wide by door 1:
+flip.** `ft_flip_txn_owns` (the per-node lock registry) chooses its kind. So it
+takes the hardcoded-MW branch wherever the registry is empty. That includes the
+tries that door 1 arms SW trie-wide:
 
 | per ft_inv leg | per-node | exponential |
 |---|---|---|
@@ -845,54 +887,55 @@ includes the tries that are armed SW trie-wide by door 1:
 | fine, shared (op holds the ANCHOR, an ancestor) | 0 | 536,499 |
 | fine, bulk (FT-wide lock) | 0 | 25 |
 
-Nothing chose MW for the first two rows: the txn around them parks every other
-state-word record SW (`ft_txn_content_sw_ok`), and the other producers of this
-very word (`nr_child++`, the tombstone) park SW there too, so the MW record is
-the odd one out -- harmless only because those tries exclude every peer. MW
+Nothing chose MW for the first two rows. The txn around them parks every other
+state-word record SW (`ft_txn_content_sw_ok`). The other producers of this very
+word (`nr_child++`, the tombstone) park SW there too. So the MW record is the
+odd one out. It is harmless only because those tries exclude every peer. MW
 stays correct meanwhile (a CAS that arbitrates against nobody).
 
-The third row is door 2's anchor-blindness: the op holds the holder's anchor and
-`owns()` looks for the holder itself. ⇒ at the flip, pick the kind from the
-trie's mode AND an anchor-aware ownership answer, and correct the register row
-(`metadata.state nr_child--`), whose "MW [DESIGN]" is not backed by its own
-note (2) -- that note is about the TAG (FT-SLOT-1), not the kind, and the code's
-"self-guarded by this very CAS" comment predates the leaf-delete hoist.
+The third row is door 2's anchor-blindness. The op holds the holder's anchor,
+and `owns()` looks for the holder itself. ⇒ At the flip:
+- pick the kind from the trie's mode AND an anchor-aware ownership answer;
+- correct the register row (`metadata.state nr_child--`). Its own note (2) does
+  not back its "MW [DESIGN]". That note is about the TAG (FT-SLOT-1), not the
+  kind. The code's "self-guarded by this very CAS" comment predates the
+  leaf-delete hoist.
 
 ### 11.5 The flip, spacing axis: door 2 opened for exponential and root-only
 
 Mathieu chose both coarse spacings, and the chain class in scope (see §11.6 for
-the rest). What door 2 refused was never the spacing -- it was the PREDICATE.
+the rest). Door 2 never refused the spacing. It refused the PREDICATE.
 `ft_flip_txn_owns` compared the registry's words against the node a record
-names, while a coarse spacing registers that node's ANCHOR, so it answered
-"miss" for a word that IS excluded, and under an arm a false miss is fatal.
+names. A coarse spacing registers that node's ANCHOR instead. So it answered
+"miss" for a word that IS excluded. Under an arm, a false miss is fatal.
 
 Four changes make the answer exact, and one makes a wrong answer harmless:
 
 1. **The acquire's answer travels with the registration.** `ft_held_anchor`
-   carries the MEMBER its word was taken for, `ft_flip_txn_lock_register_held`
+   carries the MEMBER its word was taken for. `ft_flip_txn_lock_register_held`
    files both, and `ft_flip_txn_holds` matches either. Only the acquire knows
    this (the anchor comes from the op's descent).
-2. **Members whose word deduped onto another member's** file no entry at all --
-   they owe no release. The acquire records them in the txn's `@covered` list,
-   and the three sites that hand a shared member on (the split's P and child,
-   the fuse's retire and publish parent) say so explicitly.
-3. **ROOT-ONLY needs no descent:** every node's anchor IS the trie's root, so
+2. **Members whose word deduped onto another member's** file no entry at all.
+   They owe no release. The acquire records them in the txn's `@covered` list.
+   Three sites hand a shared member on, and they say so explicitly: the split's
+   P and child, and the fuse's retire and publish parent.
+3. **ROOT-ONLY needs no descent:** every node's anchor IS the trie's root. So
    `ft_flip_txn_owns` resolves it directly from the txn's trie (`@ft`, a
-   production field; the debug copy it replaces was read NULL in a core).
-4. **The kind is decided PER RECORD** (the former `-DFT_SW_REQUIRES_OWNER`): a
-   per-op armed txn parks SW only where it owns the record's owner, and records
-   MW otherwise. So an arm can no longer convert a word the op does not own --
-   the structural weakness that made the arm's "registry is non-empty" gate too
-   coarse -- and the park and the assert share ONE predicate.
-   ☠ A whole-body SW writer (the rekey / root-COW driver, `@sw_body`) is EXEMPT:
-   its edges sit on words it fenced itself, so an MW fallback aborts its own
-   commit forever. Measured as a livelock at ft_unit test 111, then as a 16G
-   leak at test 117, until the flag existed.
+   production field). The debug copy it replaces was read NULL in a core.
+4. **The kind is decided PER RECORD** (the former `-DFT_SW_REQUIRES_OWNER`). A
+   per-op armed txn parks SW only where it owns the record's owner. Otherwise
+   it records MW. So an arm can no longer convert a word the op does not own.
+   That structural weakness made the arm's "registry is non-empty" gate too
+   coarse. The park and the assert now share ONE predicate.
+   ☠ A whole-body SW writer (the rekey / root-COW driver, `@sw_body`) is
+   EXEMPT. Its edges sit on words it fenced itself. So an MW fallback aborts
+   its own commit forever. Until the flag existed, this was measured as a
+   livelock at ft_unit test 111, then as a 16G leak at test 117.
 
 **Debug gate, `--enable-rcu-debug` with the owner assert armed, 6 legs GREEN:**
 ft_unit 358/358 and ft_inv 152/152 at per-node, exponential and root-only.
-Each gap was named by that assert, one at a time; the last two needed a
-self-diagnosing dump and a core, because they did not reproduce under gdb.
+That assert named each gap, one at a time. The last two did not reproduce
+under gdb. They needed a self-diagnosing dump and a core.
 
 **Positive control** (same tree, door 2 shut vs open, per ft_inv leg):
 
@@ -906,16 +949,16 @@ Per-node loses about 8% of its SW parks: that is change 4 refusing to park
 where the registry cannot confirm the owner. MW is correct there, just a CAS
 that arbitrates against nobody, and its aborts fell too.
 
-☞ USER-VISIBLE VALUE STILL WAITS ON THE API: both coarse spacings remain
-refused by `cds_ft_group_attr_set_lock_spacing` unless
-`FEATURE_FT_ANCHOR_VALIDATE` (§12.3). The flip makes them correct; graduating
+☞ USER-VISIBLE VALUE STILL WAITS ON THE API.
+`cds_ft_group_attr_set_lock_spacing` still refuses both coarse spacings unless
+`FEATURE_FT_ANCHOR_VALIDATE` (§12.3). The flip makes them correct. Graduating
 exponential is a separate decision.
 
 ### 11.6 Still owed for the flip -- MEASURED, not listed from memory
 
 This section used to be a list. It is now the per-class FINE-trie residue of
-`ft_flip_txn_record_tag_mw`, which IS the remaining conversion surface:
-everything door 1 retires (§12.1.1) is gone from it by construction, so what is
+`ft_flip_txn_record_tag_mw`. That residue IS the remaining conversion surface.
+Everything door 1 retires (§12.1.1) is gone from it by construction. So what is
 left is what a FINE trie still CASes. `-DFT_DEBUG_MWA_DOOR1`, per leg, all four
 legs GREEN:
 
@@ -932,46 +975,51 @@ legs GREEN:
 | ROOT | 1,196,702 | 1,026,182 | 1,150,475 | 638 | ✖ [DESIGN] -- a root lives in no node |
 | CELL | 6,983,744 | 7,265,261 | 6,844,722 | 2,029,561 | ✖/☐ ALIASED: see below |
 
-**What this changes.** The old list named RANK and NR_CHILD_DEC as owed; both
-read ZERO on a fine trie at every spacing, because they only ever occur on
-coarse/exclusive tries and §12.1.1 retired them there. §11.4's queued item is
+**What this changes.** The old list named RANK and NR_CHILD_DEC as owed. Both
+read ZERO on a fine trie at every spacing. They only ever occur on
+coarse/exclusive tries, and §12.1.1 retired them there. §11.4's queued item is
 closed by measurement, not by work.
 
-☑ **DUAL_UNNAMED IS DISCHARGED**, and it was plumbing in the most literal sense:
-the owners were ALREADY DERIVED in `ft_insert_replace_leaf_sedges` -- but only
-inside `FT_IR_SEDGE_LANE_ASK`, which is compiled out without
+☑ **DUAL_UNNAMED IS DISCHARGED**, and it was plumbing in the most literal sense.
+The owners were ALREADY DERIVED in `ft_insert_replace_leaf_sedges`. But that
+happened only inside `FT_IR_SEDGE_LANE_ASK`, which is compiled out without
 `-DFT_DEBUG_STRUCT_ANCHOR`. Production filed NULL and took the hardcoded-MW arm.
-The three edges now carry their owner ({P} for the in-parent slots,
-`ft_owner_of_parent_word(cn)` for the SKIP_X dual in the grandparent), and both
-leaf arms CAPTURE `ft_lock_skip_dual_gp`'s answer instead of discarding it with a
-`(void)` cast, so `owner_held` is the acquire's verdict rather than an assumption.
+Now:
+- the three edges carry their owner: {P} for the in-parent slots, and
+  `ft_owner_of_parent_word(cn)` for the SKIP_X dual in the grandparent;
+- both leaf arms CAPTURE `ft_lock_skip_dual_gp`'s answer, instead of discarding
+  it with a `(void)` cast. So `owner_held` is the acquire's verdict rather than
+  an assumption.
 
-☞ NAMING IS SAFE BY CONSTRUCTION, which is what makes this a different shape of
-change from §11.9's: `ft_flip_txn_record_tag` routes to the per-record gate, and
-that gate RE-ASKS `ft_flip_txn_owns`. A named owner the op does not hold answers
-MW exactly as before; `owner_held` selects the route, it does not decide the
-kind. A mis-derived owner costs a conservative MW, never a wrong park.
+☞ NAMING IS SAFE BY CONSTRUCTION. That makes this change a different shape
+from §11.9's. `ft_flip_txn_record_tag` routes to the per-record gate, and that
+gate RE-ASKS `ft_flip_txn_owns`. A named owner the op does not hold answers MW
+exactly as before. `owner_held` selects the route; it does not decide the kind.
+A mis-derived owner costs a conservative MW, never a wrong park.
 
 ☞ AND IT MAKES THE SITE AGREE WITH THE SLOT'S OTHER WRITERS. The dual's other
-producers already record it owner-keyed, so it was THIS site's unconditional MW
-that was the odd kind out on a slot the others park -- the reverse of
-introducing a mixed kind. It also retires a "stay MW" branch, which the fuse
-rule says becomes wrong the day the class converts.
+producers already record it owner-keyed. So THIS site's unconditional MW was
+the odd kind out on a slot the others park. The change is the reverse of
+introducing a mixed kind. It also retires a "stay MW" branch. The fuse rule
+says that branch is wrong from the day the class converts.
 
 Measured at `_cds_ft_insert_replace`'s leaf-replace txn, ft_inv per-node:
-**MW_ALWAYS 433,125 -> 1**, OWN_HELD 128,267 -> 254,834, and the class is ABSENT
-from the census at all three spacings. ☠ The records do NOT park yet -- that
-txn arms SW on 125,111 of 401,153 creations, so the gate mostly answers
-MW_STRUCT. They are now on the ordinary conversion surface, asked and answered,
-instead of hardcoded where no instrument could reach them; parking is door 2's
-business, not this change's.
+- **MW_ALWAYS 433,125 -> 1**;
+- OWN_HELD 128,267 -> 254,834;
+- the class is ABSENT from the census at all three spacings.
+
+☠ The records do NOT park yet. That txn arms SW on 125,111 of 401,153
+creations, so the gate mostly answers MW_STRUCT. The records are now on the
+ordinary conversion surface, asked and answered. Before, they were hardcoded
+where no instrument could reach them. Parking is door 2's business, not this
+change's.
 
 ☑ **THE CELL ROW IS NOT ALIASED -- I HAD CONFLATED TWO INSTRUMENTS.** This
-table is the MW_ALWAYS class census, filed only by `ft_flip_txn_record_tag_mw`,
-and `FT_TK_MWA_CELL` is chosen there by `tag != FT_FLIP_PROXY_TAG` inside
-`ft_ord_cell_flip_into` -- the ORDERED-CELL list alone, `[DESIGN]` MW. The
+table is the MW_ALWAYS class census. Only `ft_flip_txn_record_tag_mw` files it.
+There, `tag != FT_FLIP_PROXY_TAG` inside `ft_ord_cell_flip_into` chooses
+`FT_TK_MWA_CELL`. That is the ORDERED-CELL list alone, `[DESIGN]` MW. The
 duplicate chain never reaches that recorder: `ft_hlist_store_*` call
-`urcu_txn_store_mw/sw` DIRECTLY. ⇒ with DUAL_UNNAMED discharged, **this table
+`urcu_txn_store_mw/sw` DIRECTLY. ⇒ With DUAL_UNNAMED discharged, **this table
 has no open conversion item left**.
 
 ☠ THE ALIAS WAS IN A DIFFERENT COUNTER, and it is now split (§11.6.1).
@@ -983,11 +1031,11 @@ same bucket the ORDERED-CELL list writes from
 `ft_ord_cell_insert_after_prepare`. Its own header asked for the split:
 *"Sharing one bucket means no instrument can tell them apart, and any 'MW is
 correct here' reasoning earned by the cell list reads as though it covered the
-chain."* Both reach the engine handle directly, so neither is site-attributed,
+chain."* Both reach the engine handle directly. So neither is site-attributed,
 and neither could be SIZED. They now count apart (`chain_mw`/`chain_sw`).
 
-☠ AND THE TAG CANNOT DO THIS JOB: `FT_HLIST_TAG` **IS** `URCU_TXN_TAG` (1), the
-ordered-cell tag, so a tag test classes a chain word as a cell. The PRODUCER
+☠ AND THE TAG CANNOT DO THIS JOB. `FT_HLIST_TAG` **IS** `URCU_TXN_TAG` (1), the
+ordered-cell tag. So a tag test classes a chain word as a cell. The PRODUCER
 names the class ⇒ [[a tag cannot name a word class]].
 
 | per leg | ordered-cell MW | ordered-cell SW | **duplicate chain MW** | chain SW |
@@ -997,8 +1045,8 @@ names the class ⇒ [[a tag cannot name a word class]].
 | ft_inv root-only | 2,971,680 | 0 | **7,427,938** | 1,380,789 |
 | ft_unit per-node | 1,350,026 | 0 | **682,006** | 1,514 |
 
-⇒ **The duplicate chain is the LARGEST remaining MW population in the tree** --
-an order of magnitude above every row of §11.6 -- and roughly 4.5x the
+⇒ **The duplicate chain is the LARGEST remaining MW population in the tree.**
+It is an order of magnitude above every row of §11.6. It is roughly 4.5x the
 ordered-cell list it was hidden inside. Its already-SW share is the coarse /
 exclusive dispatch plus `ft_glue_record_splices`. The ordered-cell list reads SW
 = 0 at every spacing, as `[DESIGN]` predicts.
@@ -1009,17 +1057,17 @@ watch when it is attempted again.
 ### 11.7 FT-SLOT-3 settled: the back edge belongs to the PARENT
 
 Mathieu asked what is wrong with keying the kind on the CHILD, as the code did,
-and whether the model might be outdated. It is not, for a mechanical reason: a
-re-home changes WHICH SLOT names the child, so every writer of that word
-rewrites the slot in the parent and therefore holds the parent, while only some
-of them also hold the child. The parent is what makes those writers exclude
-each other. Keying on the child left the recompaction sweep -- which re-homes
-every child of the node it copies and holds none of them -- permanently MW.
+and whether the model might be outdated. It is not, for a mechanical reason. A
+re-home changes WHICH SLOT names the child. So every writer of that word
+rewrites the slot in the parent, and therefore holds the parent. Only some of
+them also hold the child. The parent is what makes those writers exclude each
+other. The recompaction sweep re-homes every child of the node it copies, and
+holds none of them. Keying on the child left that sweep permanently MW.
 
-Taken literally, "lock both" would mean the sweep locks each child: the fan of
-up to 256 acquires that was implemented in full and reverted ("a contended
-child fails the acquire, and escalation cannot rescue it"). The parent rule
-needs NO new acquire.
+Taken literally, "lock both" would mean the sweep locks each child. That is the
+fan of up to 256 acquires that was implemented in full and reverted ("a
+contended child fails the acquire, and escalation cannot rescue it"). The
+parent rule needs NO new acquire.
 
 Priced first (`-DFT_DEBUG_SLOT3`, per ft_inv leg, one producer):
 
@@ -1029,35 +1077,41 @@ Priced first (`-DFT_DEBUG_SLOT3`, per ft_inv leg, one producer):
 | exponential | 1,390,475 | 1,390,410 | 24,864 | 65 |
 | root-only | 1,272,917 | 1,272,852 | 1,162,228 | 65 |
 
-Every record the child licensed, the parent licensed too, so the switch loses
+Every record the child licensed, the parent licensed too. So the switch loses
 nothing. The identical 65 are compaction's own txns (ft-compact.h:92 / :418,
-`nr_locks` 0) -- the exclusion the API leaves to the caller (§12.1) -- and they
+`nr_locks` 0). The API leaves their exclusion to the caller (§12.1), and they
 stay MW.
 
 After the switch, per leg at EVERY spacing: **PARENT_WORD 65, PSO 0** (from
-1.22M-1.37M and 0.42M). `@child_held` survives as a legacy branch, counted:
-5-18 per ft_unit leg with **FINE SHARED = 0**, i.e. only on tries whose
-exclusion is trie-wide, where door 1 decides the kind and the named owner does
-not. Both branches record the same kind, so one word can never get two.
+1.22M-1.37M and 0.42M). `@child_held` survives as a legacy branch, counted. It
+fires 5-18 times per ft_unit leg, with **FINE SHARED = 0**. So it fires only on
+tries whose exclusion is trie-wide. There door 1 decides the kind, not the
+named owner. Both branches record the same kind, so one word can never get two.
 
 ### 11.8 A head's back edge joins the SW transition (the same rule)
 
-`ft_back_edge_owner` already names the owner Mathieu decided on 2026-09-03 --
-the PARENT the head hangs from -- which is FT-SLOT-3's rule for a metadata
-child's back edge (§11.7). The lane probe had measured that owner held (0
-uncovered, 0 NEVER_OK). So the lane converts the same way: the record names it
-and the per-record gate parks SW where the op holds it.
+`ft_back_edge_owner` already names the owner Mathieu decided on 2026-09-03: the
+PARENT the head hangs from. That is FT-SLOT-3's rule for a metadata child's back
+edge (§11.7). The lane probe had measured that owner held (0 uncovered, 0
+NEVER_OK). So the lane converts the same way. The record names the owner, and
+the per-record gate parks SW where the op holds it.
 
-☠ THE OWNER IS RESOLVED BY THE CALLER, not inside the recorder, because only
-the caller knows what the word's OLD VALUE IS: at compaction's cell relocation
-it is the CELL, not a parent word, and a derivation inside would misparse it.
-`ft_flip_txn_record_head_back_edge_owned` takes the owner; the old spelling
+☠ THE CALLER RESOLVES THE OWNER, not the recorder. Only the caller knows what
+the word's OLD VALUE IS. At compaction's cell relocation it is the CELL, not a
+parent word, and a derivation inside the recorder would misparse it.
+`ft_flip_txn_record_head_back_edge_owned` takes the owner. The old spelling
 passes NULL and stays always-MW (compaction's site keeps it).
 
-Ten producers converted (the re-parent arms, the recompaction back edge, the
-insert's src-use relocation, the child back edge, the glue's two arms, the
-rekey re-parent, the detach's compressed-parent pair and its unchain). Per
-ft_inv leg:
+Ten producers converted:
+- the re-parent arms;
+- the recompaction back edge;
+- the insert's src-use relocation;
+- the child back edge;
+- the glue's two arms;
+- the rekey re-parent;
+- the detach's compressed-parent pair and its unchain.
+
+Per ft_inv leg:
 
 | HEAD_BACK records | before | after |
 |---|---|---|
@@ -1071,37 +1125,40 @@ spacings, NO_FEATURE_FT_SKIP_COMPRESSED 6/6.
 ### 11.9 The duplicate CHAIN class: CONVERTED (2026-09-19)
 
 ☑ **THE CLASS PARKS SW BY DEFAULT.** `cds_ft_node.next` / `.prev` dispatch
-`urcu_txn_store_sw` unconditionally; `-DNO_FEATURE_FT_CHAIN_SW` builds the MW
-arm back as an ablation, and the gate runs it (config `chainmw`, with `imw`,
-because the property the flip changes — an SW abort writes `old_ptr` back blind
-where a failed MW CAS writes nothing — is a multi-writer phenomenon).
+`urcu_txn_store_sw` unconditionally. `-DNO_FEATURE_FT_CHAIN_SW` builds the MW
+arm back as an ablation, and the gate runs it (config `chainmw`, with `imw`).
+`imw` is needed because the flip changes a multi-writer property. An SW abort
+writes `old_ptr` back blind, where a failed MW CAS writes nothing.
 
-Proof the default parks, not merely that it compiles (`-DFT_DEBUG_TXN_KIND`,
-ft_inv per-node): chain **MW = 0, SW = 14,600,409**, against MW = 13,629,079 /
-SW = 1,346,661 on the ablation arm. This is the largest conversion in the tree.
+Proof that the default parks, not merely that it compiles
+(`-DFT_DEBUG_TXN_KIND`, ft_inv per-node): chain **MW = 0, SW = 14,600,409**.
+The ablation arm reads MW = 13,629,079 / SW = 1,346,661. This is the largest
+conversion in the tree.
 
-**Gate, 20 legs, all green with matched plans**: default and ablation, ft_inv
-153/153 + ft_unit 361/361 at all three spacings (12); the six same legs under
-`--enable-rcu-debug`, which arms the engine's nine `urcu_assert_debug`
-self-checks *including* the SW/MW-kind-conflict-on-one-slot detector — silent
-throughout, and its arming verified by a two-line TU rather than assumed;
-`NO_FEATURE_FT_SKIP_COMPRESSED` ft_inv 153/153 + ft_unit 361/361, the config
-where the 09-17 attempt saw its one unreproduced red.
+**Gate, 20 legs, all green with matched plans**:
+- default and ablation, ft_inv 153/153 + ft_unit 361/361 at all three spacings
+  (12);
+- the six same legs under `--enable-rcu-debug`. It arms the engine's nine
+  `urcu_assert_debug` self-checks, *including* the
+  SW/MW-kind-conflict-on-one-slot detector. The detector stayed silent throughout. A two-line TU verified its
+  arming; it was not assumed;
+- `NO_FEATURE_FT_SKIP_COMPRESSED` ft_inv 153/153 + ft_unit 361/361. In this
+  config the 09-17 attempt saw its one unreproduced red.
 
 ☠ **READ THE HISTORY BELOW BEFORE TOUCHING THIS.** The class was attempted and
-withdrawn TWICE, and *both attempts gated green*. On this surface a green gate
-has twice been produced by an instrument that could not see, so what licenses
-the conversion is the six refutations being PAID — each by a measurement,
-recorded in `ft_hlist_store_chain_at`'s header — and the gate is the last check
-rather than the argument.
+withdrawn TWICE, and *both attempts gated green*. On this surface, an
+instrument that could not see has twice produced a green gate. So the gate is
+not what licenses the conversion. The six refutations being PAID license it,
+each by a measurement recorded in `ft_hlist_store_chain_at`'s header. The gate
+is the last check rather than the argument.
 
 ---
 
 #### The history: step 1 is DONE, step 2 was ATTEMPTED and REFUTED
 
 ☞ **Read the 2026-09-19 subsections at the end before the middle ones.** The
-first verdict recorded there ("the exclusion does not exist") was taken from a
-witness that cannot see a registered hold, and has been WITHDRAWN and
+first verdict recorded there was "the exclusion does not exist". It came from a
+witness that cannot see a registered hold. It has been WITHDRAWN and
 re-measured. The flip is still parked, for a shorter and differently-placed
 list of reasons.
 
@@ -1122,82 +1179,94 @@ every FULL row of the chain hold audit:
 | exponential | 0 UNHELD | 0 UNHELD |
 
 `FT CHAIN-DATE on_descent=3,963,730 no_holder=0`; `derived(off-path)` 0 in
-seven of eight audit legs and **2** in one exponential ft_inv leg. The gap this
-class was blocked on -- `ft_detach_node`'s fused `freeze_leaf`, 2,340,730
-UNHELD, plus 678 members reachable only by a back-pointer walk -- closed when
-the delete tier converted. `ft_lock_chain_holder`, written for step 1 and never
-wired, is not needed for the acquire.
+seven of eight audit legs and **2** in one exponential ft_inv leg. This class
+was blocked on one gap: `ft_detach_node`'s fused `freeze_leaf` (2,340,730
+UNHELD), plus 678 members reachable only by a back-pointer walk. That gap closed
+when the delete tier converted. `ft_lock_chain_holder` was written for step 1
+and never wired. It is not needed for the acquire.
 
 ☞ BUT THE AUDIT ANSWERS A WEAKER QUESTION THAN THE FLIP ASKS. Its HELD verdict
-is a UNION of three witnesses -- `ft_flip_txn_owns` (the registry), the
-per-thread hold LEDGER, and the lock CONTEXT. A park can only be licensed by
-the first: the ledger is debug-only (`FEATURE_FT_HOLD_TRACE`) and a record
-helper has no ctx. **So "0 UNHELD" does not certify the dispatch**, and reading
-it as the step-2 gate was the error below.
+is a UNION of three witnesses:
+- `ft_flip_txn_owns` (the registry);
+- the per-thread hold LEDGER;
+- the lock CONTEXT.
+
+Only the first can license a park. The ledger is debug-only
+(`FEATURE_FT_HOLD_TRACE`), and a record helper has no ctx. **So "0 UNHELD" does
+not certify the dispatch.** Reading it as the step-2 gate was the error below.
 
 #### ☠☠ Step 2 attempted, and refuted before landing
 
-The attempt: make a chain word's kind the ordinary ownership question
-(`ft_chain_word_sw_ok`: coarse -> SW, the txn owns the chain's HOLDER -> SW,
-else MW), asked once per prepare, with the two caller-DERIVED expected-olds
-(`ft_hlist_freeze_sole_prepare`, and the TAIL of
-`ft_hlist_freeze_chain_prepare`) re-read under the lock so a park could only
-happen on a value read there. It measured 98% converted on ft_unit, 63-77% on
-ft_inv, and passed the 18-leg gate including `--enable-rcu-debug`.
+The attempt made a chain word's kind the ordinary ownership question
+(`ft_chain_word_sw_ok`):
+- coarse -> SW;
+- the txn owns the chain's HOLDER -> SW;
+- else MW.
+
+It asked once per prepare. Two expected-olds are caller-DERIVED:
+`ft_hlist_freeze_sole_prepare`, and the TAIL of `ft_hlist_freeze_chain_prepare`.
+The attempt re-read them under the lock, so a park could only happen on a value
+read there. It measured 98% converted on ft_unit and 63-77% on ft_inv. It
+passed the 18-leg gate, including `--enable-rcu-debug`.
 
 **It is still wrong, and the tree had already written the reason.** An
-adversarial review found six, of which these are decisive:
+adversarial review found six. These are decisive:
 
 1. **The kind became a property of the ASKING TXN, not of the SLOT.** The
-   engine's rule is "a slot is SW xor MW, **globally**". The three point-op
-   sites -- `ft_chain_node`, `ft_unchain_node`, `_cds_ft_replace_locked` --
-   acquire the holder into a STACK `ft_held_anchor` BEFORE creating the content
-   txn, so their registry is empty and they can only ever answer MW; the
-   structural sites (`ft_detach_node`'s commit, `_cds_ft_remove_all_locked`,
-   `cds_ft_insert_replace`) carry registered holder locks and answer SW. Same
-   slot, two kinds, by construction.
+   engine's rule is "a slot is SW xor MW, **globally**".
+   - The three point-op sites (`ft_chain_node`, `ft_unchain_node`,
+     `_cds_ft_replace_locked`) acquire the holder into a STACK
+     `ft_held_anchor` BEFORE creating the content txn. So their registry is
+     empty, and they can only ever answer MW.
+   - The structural sites (`ft_detach_node`'s commit,
+     `_cds_ft_remove_all_locked`, `cds_ft_insert_replace`) carry registered
+     holder locks and answer SW.
+
+   Same slot, two kinds, by construction.
 2. **THE GATE THIS TREE SET WAS NOT MET.** `ft_lock_chain_holder`'s header:
    *"STEP 2 IS GATED ON THIS BRANCH BEING MEASURED UNREACHABLE (a counter
    reading ZERO across every spacing), never on it being 'safe'."* The
-   attempt's own counter read 4.8M unowned per ft_inv leg, and I argued the
-   residue safe instead of zero -- the exact move the header forbids.
+   attempt's own counter read 4.8M unowned per ft_inv leg. I argued the residue
+   safe instead of zero. That is the exact move the header forbids.
 3. **An SW abort WRITES.** `settle()` stores `old_ptr` (abort) or `new_ptr`
    (commit) **BLIND** (rcu-txn-mcas.h). A failed MW CAS never parks, so its
-   abort writes nothing; an SW record always parks, so its abort restores
+   abort writes nothing. An SW record always parks, so its abort restores
    `old_ptr` into a live slot. Three chain stores pass an expected-old that is
    an ARGUMENT, never loaded (`succ->prev = pos`, `next->prev = elem`,
-   `next->prev = old`) -- under SW those become abort-time WRITES of a derived
-   value.
-4. **`ft_hlist_append_run_prepare` was missed**, and it is the same shape as
-   `freeze_sole`: its literal `NULL` expected-old is, by its own header, *"the
+   `next->prev = old`). Under SW, each of them is an abort-time WRITE of a
+   derived value.
+4. **`ft_hlist_append_run_prepare` was missed.** It has the same shape as
+   `freeze_sole`. By its own header, its literal `NULL` expected-old is *"the
    serializing one (CAS old = NULL: a concurrent freeze of the tail fails this
    commit)"*. The attempt made it parkable without the re-read.
 5. **The re-read is RYW.** `urcu_txn_load` returns this txn's own pending value
-   when the slot is already in its write set, so for a FUSED commit the "re-read
-   under the lock" is not a read of the word at all. It needs
+   when the slot is already in its write set. So for a FUSED commit, the
+   "re-read under the lock" is not a read of the word at all. It needs
    `urcu_txn_load_committed`.
-6. **Raw producers remain**, and a raw store cannot be SW-parked: a bare
-   `uatomic_cmpxchg` on `node->next` holding NOTHING in `ft_detach_node`'s
-   standalone freeze fallback (ft-remove.h, audited with a NULL txn), and four
-   plain `new_node->next->prev = ...` stores in `_cds_ft_replace_locked`.
+6. **Raw producers remain**, and a raw store cannot be SW-parked:
+   - a bare `uatomic_cmpxchg` on `node->next`, holding NOTHING, in
+     `ft_detach_node`'s standalone freeze fallback (ft-remove.h, audited with a
+     NULL txn);
+   - four plain `new_node->next->prev = ...` stores in
+     `_cds_ft_replace_locked`.
 
-One RED was seen with the attempt in tree -- ft_inv per-node on
-`NO_FEATURE_FT_SKIP_COMPRESSED`, SIGKILLed by the 16G memcg at 395s on
-`inv_concurrent_same_key_removes`, with a writer spinning in
-`urcu_txn_install_mw_depth`. It did NOT reproduce (3 runs with the flip, 3 with
-it compiled out, 6/6 GREEN), so it is recorded, not attributed.
+One RED was seen with the attempt in tree. It was ft_inv per-node on
+`NO_FEATURE_FT_SKIP_COMPRESSED`, on `inv_concurrent_same_key_removes`. The 16G
+memcg SIGKILLed it at 395s, with a writer spinning in
+`urcu_txn_install_mw_depth`. It did NOT reproduce: 3 runs with the flip and 3
+with it compiled out, 6/6 GREEN. So it is recorded, not attributed.
 
 #### ☠☠ THE FIRST VERDICT WAS A WRONG ZERO, AND IT HAS BEEN WITHDRAWN
 
-The flip was built, measured GREEN (ft_unit 361/361, ft_inv 152/152, per-node
-AND exponential) and **taken back out**. That part stands: green was not
-evidence, and the `UNHELD = 0` that licensed it is a UNION-OF-WITNESSES zero
-(txn registry, per-thread ledger, lock ctx -- a row scores HELD if ANY of them
-sees a hold, while a park is licensed by the registry alone).
+The flip was built and measured GREEN (ft_unit 361/361, ft_inv 152/152,
+per-node AND exponential). Then it was **taken back out**. That part stands.
+Green was not evidence. The `UNHELD = 0` that licensed it is a
+UNION-OF-WITNESSES zero (txn registry, per-thread ledger, lock ctx). A row
+scores HELD if ANY of them sees a hold, while only the registry licenses a park.
 
 What does **not** stand is the reading that replaced it. On 2026-09-19 the same
-question was asked of a POSITIVE claim -- `cds_ft_metadata.dbg_owner_tid` --
-and read `US = 0` over ~27,000 events at both spacings, which was written up as
+question was asked of a POSITIVE claim, `cds_ft_metadata.dbg_owner_tid`. It
+read `US = 0` over ~27,000 events at both spacings. That was written up as
 *"cds_ft_remove holds NOTHING; the chain SW flip is blocked on locking"*.
 
 **That instrument cannot see a registered hold**, and the tree had already said
@@ -1212,24 +1281,28 @@ so in two places:
   by the frame. Reading BARE as exposure would invert the meaning of the
   conversion this instrument exists to measure."* Every `lock_or_guard` hoist
   has exactly that shape.
-* the duplicate-chain canary's own header prices it numerically: the chain hold
+* the duplicate-chain canary's own header prices it numerically. The chain hold
   audit measures **`ft_detach_node` at REG = 2,579,201 / LED = 0**, *"so a
   ledger-only verdict calls every one of those holds a violation"*.
 
 `US = 0` beside `ft_chain_node`'s 2.6M was read as proof the instrument works.
-It is the opposite: `ft_chain_node` takes the holder into a **stack**
-`ft_held_anchor` and keeps it, so its stamp survives; every converted,
+It is the opposite. `ft_chain_node` takes the holder into a **stack**
+`ft_held_anchor` and keeps it, so its stamp survives. Every converted,
 registry-held site drops its stamp at the acquire. The asymmetry *is* the
 blindness.
 
 #### ☑ RE-MEASURED WITH THE WITNESSES SIDE BY SIDE (2026-09-19, later)
 
-`-DFT_DEBUG_HLIST_TAIL_WHY` now reports the REGISTRY (`ft_flip_txn_owns` on the
-`ft_flip_txn` whose handle the freeze was given) and the LEDGER **at the same
-event**, in one run -- not a second run at a second point, which is how an
-unmatched control gets read as a result. The stamp plumbing is self-checked:
-the classifier counts a stamped wrapper whose handle is not the handle the
-record is going into (`stale = 0`, `no ftxn = 0` in every leg below).
+`-DFT_DEBUG_HLIST_TAIL_WHY` now reports two witnesses **at the same event**, in
+one run:
+- the REGISTRY (`ft_flip_txn_owns` on the `ft_flip_txn` whose handle the freeze
+  was given);
+- the LEDGER.
+
+It does not use a second run at a second point. That is how an unmatched
+control gets read as a result. The stamp plumbing is self-checked. The
+classifier counts a stamped wrapper whose handle is not the handle the record
+is going into (`stale = 0`, `no ftxn = 0` in every leg below).
 
 The two sole-entry `ft_detach_node` call sites are now STAMPED, so the rows are
 named rather than reasoned into a `(unstamped)` bucket.
@@ -1244,18 +1317,18 @@ ft_inv, `-O2 -g -DNDEBUG`, 152/152 green at both spacings:
 | `_cds_ft_insert_replace:5160` | 13,683 / 14,337 | 22% / 22% | 0 | **834 / 1,094** |
 
 **LEDGER = 0 on every row at both spacings**, including the rows the registry
-owns outright -- the demonstration, at matched points, that the stamp was
-reporting *"this hold was registered"* and not *"there is no hold"*.
+owns outright. This shows, at matched points, what the stamp was reporting:
+*"this hold was registered"*, and not *"there is no hold"*.
 
-Reproduced on a second pair of legs (11,111 / 23,382 disagreements at `:8211`,
-again 100% / 100% registry-owned).
+Reproduced on a second pair of legs: 11,111 / 23,382 disagreements at `:8211`,
+again 100% / 100% registry-owned.
 
 ☠ **AND THE TWO POSITIVE WITNESSES DO NOT CONTRADICT EACH OTHER.** "Our registry
-owns the holder AND a peer claims it" cannot both be true -- `ft_meta_lock_acquire`
-refuses a word that already carries `FT_STATE_LOCK` -- so the classifier counts
-the overlap. It is **0 on every row at both spacings**. The peer claims are
-therefore DISJOINT from our own holds, not an artefact of reading two witnesses
-at once, and they keep their weight as a finding.
+owns the holder AND a peer claims it" cannot both be true.
+`ft_meta_lock_acquire` refuses a word that already carries `FT_STATE_LOCK`. So
+the classifier counts the overlap. It is **0 on every row at both spacings**.
+So the peer claims are DISJOINT from our own holds. They are not an artefact of
+reading two witnesses at once, and they keep their weight as a finding.
 
 The chain hold audit shows the same split from the other side. Per ft_inv
 per-node leg, the `chain` word rows:
@@ -1270,109 +1343,121 @@ per-node leg, the `chain` word rows:
 | `_cds_ft_replace_locked:6146` | 174,896 | 0 | 46,904 | 0 | 0 |
 | `ft_detach_node_replace_compressed_parent` | 75,664 | 0 | 0 | 75,549 | 0 |
 
-The stack-anchor shape (`ft_chain_node`, `_cds_ft_replace_locked` -- the point
-ops, which take the holder into an `ft_held_anchor` BEFORE creating the content
-txn) is the one the stamp CAN see, and it is the minority. Everything the
-transition has already converted reads REG-held / LED-zero, which is precisely
-the population the withdrawn verdict scored as unprotected.
+The stack-anchor shape is the one the stamp CAN see, and it is the minority.
+That shape is the point ops (`ft_chain_node`, `_cds_ft_replace_locked`). They
+take the holder into an `ft_held_anchor` BEFORE creating the content txn.
+Everything the transition has already converted reads REG-held / LED-zero.
+That is precisely the population the withdrawn verdict scored as unprotected.
 
 ☞ And it re-frames what the union objection actually forbids. "A park is
-licensed by the registry alone" was written when the flip was PREDICATE-based
-(`ft_flip_txn_owns` choosing SW or MW per record); there, a hold the predicate
-cannot see is useless. For an UNCONDITIONAL dispatch there is no predicate, and
-`ft_flip_txn_owns`' own header applies -- *"read a miss as 'the registry cannot
+licensed by the registry alone" was written when the flip was PREDICATE-based:
+`ft_flip_txn_owns` chose SW or MW per record. There, a hold the predicate
+cannot see is useless. An UNCONDITIONAL dispatch has no predicate. Then
+`ft_flip_txn_owns`' own header applies: *"read a miss as 'the registry cannot
 see this hold', never as 'the op does not hold it'"*. So the union is not
-disqualified as EVIDENCE OF EXCLUSION; it is disqualified as a RUNTIME GATE.
-Which of the two the next attempt needs decides whether `ft_chain_node`'s
-REG = 0 / LED = 2.1M row is a gap or a bookkeeping difference. ☐ Not decided
-here.
+disqualified as EVIDENCE OF EXCLUSION. It is disqualified as a RUNTIME GATE.
+The next attempt needs one of the two. That choice decides whether
+`ft_chain_node`'s REG = 0 / LED = 2.1M row is a gap or a bookkeeping
+difference. ☐ Not decided here.
 
-`ft_flip_txn_owns` is EXACT at per-node and conservative above it (a coarser
-anchor is held while the owner itself is absent), so these percentages are
-**lower bounds** on ownership, which is the right direction for licensing a
-park: a registry HIT is a positive licence, a registry MISS is inconclusive and
-owes the ctx witness before it is called a gap.
+`ft_flip_txn_owns` is EXACT at per-node. Above it, it is conservative: a coarser
+anchor is held while the owner itself is absent. So these percentages are
+**lower bounds** on ownership. That is the right direction for licensing a
+park:
+- a registry HIT is a positive licence;
+- a registry MISS is inconclusive. It owes the ctx witness before it is called
+  a gap.
 
-ft_unit reads DISAGREE = 0 on every row -- the class is only visible under
+ft_unit reads DISAGREE = 0 on every row. The class is only visible under
 ft_inv's concurrency, so ft_unit cannot certify it either way.
 
 #### What this changes about the work list
 
 * **The 09-19 "SCOPE question" for `cds_ft_remove`'s holder lock is not the
-  work.** It was posed because the op appeared to hold nothing at the freeze;
-  it holds the holder at 100% of the sole path's disagreements. Nothing here
-  argues for widening a hold across the op -- the disposition measured at
-  20/41 hangs under `FT_RM_REVALIDATE` stays refuted and stays unneeded.
+  work.** It was posed because the op appeared to hold nothing at the freeze.
+  In fact it holds the holder at 100% of the sole path's disagreements. Nothing
+  here argues for widening a hold across the op. That disposition was measured
+  at 20/41 hangs under `FT_RM_REVALIDATE`. It stays refuted and stays unneeded.
 * `cds_ft_remove`'s own acquire really is dead code (`#ifdef FT_RM_REVALIDATE`,
-  defined in no build). That static fact is unchanged and remains worth
-  deciding or deleting -- but it is about *that* acquire, not about whether the
-  chain freeze is covered: the freeze rides `ft_detach_node`'s commit, and it
-  is the detach's lock set that covers it.
+  defined in no build). That static fact is unchanged. It remains worth
+  deciding or deleting. But it is about *that* acquire, not about whether the
+  chain freeze is covered. The freeze rides `ft_detach_node`'s commit, and the
+  detach's lock set covers it.
 * ☐ **The sole path's remaining discriminator, and it has not been run.** We
-  own the holder at the record, and a duplicate is there anyway. Either the
-  append COMMITTED BEFORE our acquire -- a STALE PLAN, since `@len` is the
-  literal `1` derived from an unheld read of `@succ_node`, exactly what
-  `ft_hlist_chain_len`'s header forbids ("☠ CALL IT UNDER THE CHAIN HOLDER"),
-  cured by re-validating the sole-entry claim under the lock with a retriable
-  bail -- or it landed AFTER, which is an exclusion gap on the APPENDER's side
-  (`ft_hlist_insert_after_prepare:529`, the producer the canary names for
-  100% of them). **The discriminator is a snapshot of the tail word taken at
-  the holder acquire.** Both cures are local; neither is a scope change.
-* ☐ `_cds_ft_insert_replace:5160` is now the strongest real gap: 78%
-  registry-unowned, plus 834-1,041 / 1,094-1,143 events (two legs each) where a
-  **peer positively claims** the holder while this op records into that chain,
-  DISJOINT from our own holds. A stack hold is what the ledger CAN see, so that
-  column does not explain away.
+  own the holder at the record, and a duplicate is there anyway. There are two
+  cases:
+  - The append COMMITTED BEFORE our acquire. That is a STALE PLAN: `@len` is
+    the literal `1`, derived from an unheld read of `@succ_node`. That is
+    exactly what `ft_hlist_chain_len`'s header forbids ("☠ CALL IT UNDER THE
+    CHAIN HOLDER"). The cure is to re-validate the sole-entry claim under the
+    lock, with a retriable bail.
+  - The append landed AFTER. That is an exclusion gap on the APPENDER's side
+    (`ft_hlist_insert_after_prepare:529`). The canary names that producer for
+    100% of them.
+
+  **The discriminator is a snapshot of the tail word taken at the holder
+  acquire.** Both cures are local; neither is a scope change.
+* ☐ `_cds_ft_insert_replace:5160` is now the strongest real gap. It is 78%
+  registry-unowned. It also has 834-1,041 / 1,094-1,143 events (two legs each)
+  where a **peer positively claims** the holder while this op records into that
+  chain. Those claims are DISJOINT from our own holds. A stack hold is what the
+  ledger CAN see, so that column does not explain away.
 * ☐ `_cds_ft_remove_all_locked:9301`: 63% / 38% registry-unowned.
-* ☐ The per-node events at `:7969` the registry does not own -- 0 of 8 and 0 of
-  12 over two legs, against 37/37 and 25/25 at exponential, and `:8211` at 100%
+* ☐ The per-node events at `:7969` the registry does not own: 0 of 8 and 0 of
+  12 over two legs. Exponential reads 37/37 and 25/25, and `:8211` reads 100%
   in all four. Reproducible, per-node ONLY, and small is not zero: a tolerated
   residue is not a licence.
 
 
 #### What the flip costs, so the next attempt does not rediscover it
 
-The MW expected-old is load-bearing BEYOND arbitration in three places, and each
-becomes a WRITE once the record parks (`urcu_txn_settle` stores `old_ptr` on
-abort and `new_ptr` on commit, BLIND, and an SW record always parks):
+The MW expected-old is load-bearing BEYOND arbitration in three places. Each
+one turns into a WRITE once the record parks. `urcu_txn_settle` stores
+`old_ptr` on abort and `new_ptr` on commit, BLIND, and an SW record always
+parks:
 
-1. `ft_hlist_del_prepare` derives `&pred->next` by LOADING `@elem->prev`; a
+1. `ft_hlist_del_prepare` derives `&pred->next` by LOADING `@elem->prev`. A
    stale or head `@pred` points that slot at something that is not a live node.
    The CAS rejects it today. (Found the hard way: the canary's first spelling
    wrote through `caa_container_of` from the slot and corrupted the heap within
    seven tests, "corrupted size vs. prev_size".)
-2. `ft_hlist_freeze_chain_prepare`'s TAIL, whose derived NULL detects a duplicate
-   appended since the caller counted `@len` -- live at ~24k/leg, above. ☞ On
-   the sole-entry path this is the arbitration that absorbs the stale plan
-   today: the commit loses its install CAS and the caller re-derives. Parking
-   removes it, which is why that path owes the under-lock re-validation.
+2. `ft_hlist_freeze_chain_prepare`'s TAIL. Its derived NULL detects a duplicate
+   appended since the caller counted `@len`. That is live at ~24k/leg, above.
+   ☞ On the sole-entry path, this is the arbitration that absorbs the stale
+   plan today: the commit loses its install CAS and the caller re-derives.
+   Parking removes it. That is why that path owes the under-lock
+   re-validation.
 3. Five structural expected-olds that are arguments rather than loads
    (`succ->prev <- pos`, `pred->next <- elem`, `next->prev <- elem`, and
    replace's two). MEASURED with `-DFT_DEBUG_HLIST_EXPECTED_OLD`: **0
-   disagreements** over both suites and all three spacings, so these are cheap
+   disagreements** over both suites and all three spacings. So they are cheap
    and safe to convert to loads whenever the class does park.
 
 #### The instruments, all in tree and debug-gated
 
 - `-DFT_DEBUG_CHAIN_CANARY` -- records, per chain WORD, the (fn, line) of the
-  site that last stored it, in a side table keyed BY SLOT ADDRESS. It named the
-  producer of every surprise duplicate in one run
-  (`ft_hlist_insert_after_prepare`) after three witness-based attempts failed.
-  ☠ Keyed on the slot, never on a field inside the node: a chain store's slot is
-  not always inside a live `cds_ft_node` (see (1) above).
-- `-DFT_DEBUG_HLIST_TAIL_WHY` -- interns the `len` DERIVATION site, counts tail
-  disagreements, and reports the holder's ownership by **all three witnesses at
-  the same event**: the ledger's positive claim (split by trie mode), the
-  per-thread ledger asked directly, and the txn REGISTRY. ☠ It reports them
-  together on purpose: a single-witness verdict on this question has now been
-  wrong in both directions, the union reading it HELD and the stamp reading it
-  UNHELD. The registry source is stamped in `ft_flip_txn_handle()` -- the one
-  place a `*_prepare` caller converts its wrapper into the engine handle -- and
-  the classifier VERIFIES the stamp against the handle the record is going into
-  rather than trusting it (`stale`, `no ftxn` columns).
-  ☠ The derivation stamp is CLEARED once consumed: left standing, the next
-  freeze on the same thread whose `@len` is a literal is filed under whatever
-  site last called `ft_hlist_chain_len`.
+  site that last stored it. The side table is keyed BY SLOT ADDRESS. Three
+  witness-based attempts had failed. Then this canary named the producer of
+  every surprise duplicate in one run (`ft_hlist_insert_after_prepare`).
+  ☠ Keyed on the slot, never on a field inside the node. A chain store's slot
+  is not always inside a live `cds_ft_node` (see (1) above).
+- `-DFT_DEBUG_HLIST_TAIL_WHY` -- interns the `len` DERIVATION site and counts
+  tail disagreements. It reports the holder's ownership by **all three
+  witnesses at the same event**:
+  - the ledger's positive claim (split by trie mode);
+  - the per-thread ledger, asked directly;
+  - the txn REGISTRY.
+
+  ☠ It reports them together on purpose. A single-witness verdict on this
+  question has now been wrong in both directions: the union read it HELD, and
+  the stamp read it UNHELD. The registry source is stamped in
+  `ft_flip_txn_handle()`. That is the one place a `*_prepare` caller converts
+  its wrapper into the engine handle. The classifier does not trust the stamp.
+  It VERIFIES it against the handle the record is going into (`stale`,
+  `no ftxn` columns).
+  ☠ The derivation stamp is CLEARED once consumed. If it were left standing,
+  the next freeze on the same thread whose `@len` is a literal would be filed
+  under whatever site last called `ft_hlist_chain_len`.
 
 ### 11.10 The post-flip census: where the conversion surface actually is
 
@@ -1387,23 +1472,26 @@ next. `-DFT_DEBUG_TXN_KIND`, ft_inv per-node, default build:
 | SW | 25,631,033 | — |
 
 ☠ **AND OWN_MISS IS A WRONG ZERO'S MIRROR IMAGE WITHOUT THE LEDGER.** The census
-splits MW_STRUCT by whether the op holds the word's owner: OWN_HELD (the txn
-registry names it), OWN_LEDGER (only this thread's hold ledger does — a REGISTRY
-gap), OWN_MISS (neither — a real exclusion gap). `OWN_LEDGER` reads **0** unless
-the build carries `-DFEATURE_FT_HOLD_TRACE`, and the report says so — so a census
-without it folds the registry gap into OWN_MISS and over-reports:
+splits MW_STRUCT by whether the op holds the word's owner:
+- OWN_HELD: the txn registry names it;
+- OWN_LEDGER: only this thread's hold ledger does (a REGISTRY gap);
+- OWN_MISS: neither does (a real exclusion gap).
+
+`OWN_LEDGER` reads **0** unless the build carries `-DFEATURE_FT_HOLD_TRACE`.
+The report says so. A census without it folds the registry gap into OWN_MISS.
+It then over-reports:
 
 | | without the ledger | with it |
 |---|---|---|
 | OWN_MISS, total | 3,305,319 | **2,259,139** |
 | OWN_MISS, `ft-remove.h:4845` | 1,245,467 | **9,808** (LEDGER 1,266,317) |
 
-The detach's commit txn -- 58M records, the second-largest site in the tree --
-looks like the #2 exclusion gap and is in fact the CLEANEST big site at 0.02%.
-Its holds live in the orphan plan-lock chain, which is `FT_MAX_DEPTH` long
-against a registry of `FT_ENTRY_PER_NODE + 1` and therefore cannot be registered
-by construction. A no-ledger census would have sent the next piece of work
-straight at it.
+The detach's commit txn has 58M records. It is the second-largest site in the
+tree. It looks like the #2 exclusion gap. In fact it is the CLEANEST big site,
+at 0.02%. Its holds live in the orphan plan-lock chain. That chain is
+`FT_MAX_DEPTH` long, and the registry holds `FT_ENTRY_PER_NODE + 1`. So the
+chain cannot be registered, by construction. A no-ledger census would have sent
+the next piece of work straight at it.
 
 **The real ranking** (ledger armed, ft_inv per-node):
 
@@ -1418,9 +1506,9 @@ straight at it.
 | `ft-remove.h:4845` | 58,183,980 | 9,808 | 0.0% |
 
 ⇒ **`ft-insert.h:1183` carries 79% of the entire remaining exclusion gap.** It is
-the next piece of work by size. The three sites at 27-39% are the next by RATE,
-and small enough to be tractable individually — which of the two orders to take
-is a judgement, but both are now numbers rather than impressions.
+the next piece of work by size. The three sites at 27-39% are the next by RATE.
+They are small enough to handle one at a time. Which of the two orders to take
+is a judgement. But both are now numbers rather than impressions.
 
 ☞ The report's own rule still governs: *"a site with OWN_MISS == 0 is ready for
 the Phase B per-op arm; OWN_MISS is the size of its exclusion gap."*
@@ -1431,8 +1519,8 @@ the Phase B per-op arm; OWN_MISS is the size of its exclusion gap."*
 
 **What it turned out to be.** The tombstone record already takes the SW-capable
 path (`ft_flip_txn_record_state` → `record_state_kind(..., sw_ok=1)`). It does
-not park because the *txn* is unarmed, and it is unarmed because
-`ft_txn_content_sw_ok(ft)` is `!ft->lock_fine || ft->exclusive` and never asks
+not park because the *txn* is unarmed. The txn is unarmed because
+`ft_txn_content_sw_ok(ft)` is `!ft->lock_fine || ft->exclusive`. It never asks
 whether the caller is inside the FT-wide writer scope. Measured, per ft_inv leg:
 
 | where the retire's lock-bearing word stands | records |
@@ -1442,26 +1530,27 @@ whether the caller is inside the FT-wide writer scope. Measured, per ft_inv leg:
 | unlocked, coarse / exclusive | 32,923 / 886,675 |
 | unlocked, FINE **inside the FT-wide writer scope** | **203,006** |
 
-All 203,006 are one shape: a FINE trie inside a bulk window, where G5.25 makes
-every writer re-take the FT-wide mutex. So this is not a retire-specific change
-— it is the arm predicate missing a case, and widening it would arm **every**
-record on those txns, not just the retire.
+All 203,006 have one shape. It is a FINE trie inside a bulk window. There,
+G5.25 makes every writer re-take the FT-wide mutex. So this is not a
+retire-specific change. It is the arm predicate missing a case. Widening it
+would arm **every** record on those txns, not just the retire.
 
 **Two wrong zeros closed before the number was believed.**
 
 1. *Identity is not continuity.* The first probe re-read `ft_wlock_held == ft`
-   at the commit and reported `LOST=0`. It cannot mean anything:
-   `ft_writer_lock_gp_wait` DROPS the mutex across every grace period and
-   restores **the same pointer**, so a hold that a peer writer ran through reads
-   identical to one that never broke. Replaced by `ft_wlock_gen`, which counts
-   RELEASES, stamped at CREATE and compared at the commit — and given a positive
-   control, the total release count, because `DROPPED=0` against zero releases
-   is an inert probe, not a measurement.
+   at the commit and reported `LOST=0`. That result cannot mean anything.
+   `ft_writer_lock_gp_wait` DROPS the mutex across every grace period. It then
+   restores **the same pointer**. So a hold that a peer writer ran through
+   reads the same as one that never broke. The probe was replaced by
+   `ft_wlock_gen`, which counts RELEASES. It is stamped at CREATE and compared
+   at the commit. It was also given a positive control: the total release
+   count. `DROPPED=0` against zero releases is an inert probe, not a
+   measurement.
 
-2. *The retire subset is not the population.* The flag was set at the RECORD,
-   which only covers retire-recording txns; widening the arm arms every txn
-   created in that scope. Moved to the three constructors, via a new
-   `FT_TXN_ARM_TRIE_WIDE` helper so the three cannot drift apart.
+2. *The retire subset is not the population.* The flag was set at the RECORD.
+   That only covers retire-recording txns. But widening the arm arms every txn
+   created in that scope. The flag moved to the three constructors. A new
+   `FT_TXN_ARM_TRIE_WIDE` helper sets it, so the three cannot drift apart.
 
 Measured, create→commit, all three spacings plus ft_unit:
 
@@ -1474,12 +1563,12 @@ watched txns=1,883,283   FT-wide lock releases this run=4,224,082
 and not sufficient**, see below.
 
 **☠ THE HAZARD THAT IS NOT A SEAM.** On a FINE trie the FT-wide lock is taken
-only while `ft_bulk_active(ft)`. A point op that took it because a **peer's**
-bulk gate was up keeps holding it — but `ft_bulk_gate_exit` lowers `bulk_state`
-with **no grace period and without the writer mutex** (deliberately: for a
-READER a stale gate is "never wrong, only slower"). Once the word reads 0 the
-next point writer skips the mutex entirely and runs beside us, and an SW park
-cannot fail — it erases. So the population splits:
+only while `ft_bulk_active(ft)`. A point op may take it because a **peer's**
+bulk gate was up. That op keeps holding it. But `ft_bulk_gate_exit` lowers
+`bulk_state` with **no grace period and without the writer mutex**. This is
+deliberate: for a READER a stale gate is "never wrong, only slower". Once the
+word reads 0, the next point writer skips the mutex entirely. It runs beside
+us. An SW park cannot fail; it erases. So the population splits:
 
 - **SELF-gated** (`ft_bulk_lock_held == ft`): this thread owns a refcount on
   this trie's gate for its whole body, so `bulk_state` cannot reach 0 under it.
@@ -1491,11 +1580,11 @@ cannot fail — it erases. So the population splits:
 to ask "did the constructor arm this txn trie-wide?" --
 `ft_flip_txn_claim_per_op_armable`, `ft_flip_txn_arm_per_op_at` and
 `ft_flip_txn_arm_structural`. Today the predicate and `t->trie_wide_sw` agree
-exactly, so they are correct. The moment the arm gains a fourth licence they
-stop agreeing, and `ft_flip_txn_arm_per_op_at` would then fall through and set
-`sw_per_op = true` on a trie-wide-armed txn -- demanding a registered owner per
-record and DOWNGRADING it to MW, which is exactly the shape of the @f6ab074d
-uninitialised-`sw_per_op` defect. They must be changed to ask
+exactly, so they are correct. They stop agreeing the moment the arm gains a
+fourth licence. `ft_flip_txn_arm_per_op_at` would then fall through. It would
+set `sw_per_op = true` on a trie-wide-armed txn. That demands a registered
+owner per record, and DOWNGRADES the record to MW. This is exactly the shape of
+the @f6ab074d uninitialised-`sw_per_op` defect. They must be changed to ask
 `t->trie_wide_sw` **before** any widening lands.
 
 ### 11.11.1 The writer-word fence is FINE-only (Mathieu, 2026-09-20) — ☑ LANDED
@@ -1507,20 +1596,20 @@ uninitialised-`sw_per_op` defect. They must be changed to ask
 `@bulk_state` has exactly one non-instrumentation consumer in the tree:
 `ft_writer_lock_scope_enter`'s FINE branch. Every other reference is inside
 `FT_ANC_LEDGER` / `FT_DEBUG_WIDEN_OWNER` / `FT_DEBUG_TXN_KIND`. COARSE takes the
-FT-wide mutex unconditionally; EXTERNAL_SYNC and exclusive return from the scope
+FT-wide mutex unconditionally. EXTERNAL_SYNC and exclusive return from the scope
 *before* the FINE branch. On those tries the word was published, **fenced with a
 full grace period**, and read by nobody.
 
-The fence is the expensive half: a `FT_BULK_WRITER_ONLY` op (detach / graft /
-graft_swap / merge_at) publishes no reader word, so `@bulk_state` is the only
+The fence is the expensive half. A `FT_BULK_WRITER_ONLY` op (detach / graft /
+graft_swap / merge_at) publishes no reader word. So `@bulk_state` is the only
 thing that can make the 0→1 opener own a grace period.
 
 ⇒ `ft_bulk_state_has_consumer()` = `FT_BULK_WIDE_LOCK && lock_fine &&
-!exclusive && !external_sync`. The **store stays unconditional** (one relaxed
-word; a trie leaving `@external_sync` mid-window then degrades to "peers take
-the lock", the conservative side). A rekey is unaffected — it owns its GP for
-`@move_active`, a READER word needed in every mode, since EXTERNAL_SYNC excludes
-writers and nothing else.
+!exclusive && !external_sync`. The **store stays unconditional**: it is one
+relaxed word. A trie may leave `@external_sync` mid-window. It then degrades to
+"peers take the lock", the conservative side. A rekey is unaffected. It owns
+its GP for `@move_active`. That is a READER word, needed in every mode, since
+EXTERNAL_SYNC excludes writers and nothing else.
 
 Measured, and it confirms Mathieu's rule rather than assuming it:
 
@@ -1538,15 +1627,15 @@ skip it. A/B against the `-DFT_RED_BULK_FENCE_ALWAYS` control (a coarse trie,
 | 8 | 10,342 µs/op | 10,256 µs/op | 8.6 µs/op ≈ **4.3 µs per fence** |
 | 32 | 10,373 µs/op | 10,262 µs/op | 11.1 µs/op ≈ **5.5 µs per fence** |
 
-Reproducible in direction across every alternating pair, and it scales with
+The direction reproduces across every alternating pair. The saving scales with
 grace-period cost, as a skipped `synchronize_rcu` should. The control is a gate
 config (`bulkfence`) so the claim stays refutable.
 
 **Not changed: `ft_bulk_lock` on a COARSE trie.** It already skips exclusive and
-external_sync. On coarse it still looks load-bearing to me: it is the
-bulk-vs-bulk serializer *held across the drain seams*, and a coarse trie's
-FT-wide mutex IS dropped at every `ft_writer_lock_gp_wait`, so without it two
-bulk bodies interleave at a seam. Flagged rather than removed.
+external_sync. On coarse it still looks load-bearing to me. It is the
+bulk-vs-bulk serializer *held across the drain seams*. A coarse trie's FT-wide
+mutex IS dropped at every `ft_writer_lock_gp_wait`. So without it, two bulk
+bodies interleave at a seam. Flagged rather than removed.
 
 
 ### 11.11.2 EXTERNAL_SYNC takes grace periods under the APPLICATION's lock; rekey becomes opt-in (Mathieu, 2026-09-20) -- ☑ LANDED
@@ -1557,12 +1646,12 @@ bulk bodies interleave at a seam. Flagged rather than removed.
 > sync"* / *"Maybe it should be opt in"*
 
 **First, the coarse question, measured.** Every bulk op does scope the FT-wide
-mutex around its whole body (`CDS_FT_SCOPED_WRITER`); the only holes are the
-eight `ft_writer_lock_gp_wait` drain seams, and those MUST drop -- a writer
-parked on the mutex is an online, non-quiescent QSBR reader, so a GP taken
-while holding it waits for the thread it is blocking. Instrumented at the
-RELEASE (`held != NULL`), not at the seam, because `ft_bl_seam_under` counts
-seams *reached* and scores on a FINE trie that holds nothing:
+mutex around its whole body (`CDS_FT_SCOPED_WRITER`). The only holes are the
+eight `ft_writer_lock_gp_wait` drain seams. Those MUST drop the mutex. A writer
+parked on the mutex is an online, non-quiescent QSBR reader. So a GP taken
+while holding the mutex waits for the thread it is blocking. The probe counts
+at the RELEASE (`held != NULL`), not at the seam. `ft_bl_seam_under` counts
+seams *reached*, and it scores on a FINE trie that holds nothing:
 
 ```
 seams that ACTUALLY RELEASED the FT-wide mutex (ft_unit):
@@ -1570,14 +1659,14 @@ seams that ACTUALLY RELEASED the FT-wide mutex (ft_unit):
   cross-trie=0
 ```
 
-⇒ on COARSE the mutex is **not** held across a whole bulk op, so `ft_bulk_lock`
-is load-bearing there (it is the bulk-vs-bulk serializer held *across* the
-seams). It stays.
+⇒ on COARSE the mutex is **not** held across a whole bulk op. So `ft_bulk_lock`
+is load-bearing there: it is the bulk-vs-bulk serializer held *across* the
+seams. It stays.
 
 **Then the consequence for EXTERNAL_SYNC, which is the important one.** Every
-seam guards on `@exclusive`, **none on `@external_sync`**, so they all fire
-there -- and the library holds no mutex of its own to drop. What it cannot drop
-is the APPLICATION's exclusion. Per-site, one op each:
+seam guards on `@exclusive`, **none on `@external_sync`**. So they all fire
+there. The library holds no mutex of its own to drop. What it cannot drop is
+the APPLICATION's exclusion. Per-site, one op each:
 
 | site | op | GPs under the app's lock |
 |---|---|---|
@@ -1585,14 +1674,14 @@ is the APPLICATION's exclusion. Per-site, one op each:
 | `ft-detach.h:513` | detach reader drain | 1 |
 | `ft-lifecycle.h:485` | `make_exclusive` drain | 1 |
 
-COARSE takes the *same four* -- the difference is entirely who holds a lock
-across them. The contract text says nothing about this; it mentions grace
-periods only to say readers are unaffected.
+COARSE takes the *same four*. The only difference is who holds a lock across
+them. The contract text says nothing about this. It mentions grace periods only
+to say readers are unaffected.
 
 **The cure, and its exact reach.** `cds_ft_group_attr_set_rekey()`, default OFF.
-On an EXTERNAL_SYNC group that opts in, `@rekey_always_coherent` makes
-`ft_move_active()` answer true outright: readers never leave the two-pass path,
-so the move gate publishes no mode *transition* and owes no grace period.
+Take an EXTERNAL_SYNC group that opts in. There, `@rekey_always_coherent` makes
+`ft_move_active()` answer true outright. Readers never leave the two-pass path.
+So the move gate publishes no mode *transition* and owes no grace period.
 Measured before / after, same program:
 
 ```
@@ -1600,32 +1689,36 @@ EXTERNAL_SYNC gate GPs:  2  ->  0        (COARSE unchanged at 2 -- correctly sco
 ```
 
 ☠ **It removes the rekey GPs and nothing else.** `ft-detach.h:513` and
-`ft-lifecycle.h:485` are reader DRAINS, not mode transitions; external sync
-excludes writers only, so they are exactly as necessary as under coarse. **The
-contract still owes a requirement that a writer blocked on the application's
-exclusion be RCU-quiescent** (`thread_offline` while waiting), which is what the
-library already does for its own locks (`ft_bulk_lock_enter`,
+`ft-lifecycle.h:485` are reader DRAINS, not mode transitions. External sync
+excludes writers only. So these drains are exactly as necessary as under
+coarse. **The contract still owes a requirement that a writer blocked on the
+application's exclusion be RCU-quiescent** (`thread_offline` while waiting).
+The library already does that for its own locks (`ft_bulk_lock_enter`,
 `ft_writer_lock_park`). Forbidding rekey would NOT have closed this.
 
-**The opt-in also pays for itself off external sync**: a trie that will never
-rekey no longer carries the coherent lookup specializations at all
-(`ft_install_lookup_ops` selects the plain ones), which is what
-`ft-lifecycle.h`'s *"REKEY coherence is no longer an opt-in ... the opt-in attr
-is gone with it"* had traded away. The note was right about cost and wrong
-about the grace period always being payable.
+**The opt-in also pays for itself off external sync.** A trie that will never
+rekey no longer carries the coherent lookup specializations at all.
+`ft_install_lookup_ops` selects the plain ones. `ft-lifecycle.h` had traded
+that away, in its note *"REKEY coherence is no longer an opt-in ... the opt-in
+attr is gone with it"*. The note was right about cost. It was wrong about the
+grace period always being payable.
 
 **Wrong-green guard, because this is exactly the shape that has bitten before.**
-A creator that forgets the opt-in keeps calling rekey, collects `-7` every time,
-and reports green with zero coverage. Three things prevent that:
-`-DFT_DEBUG_REKEY_OPTIN_STRICT` turns a refusal into an abort naming the trie;
-gate config `rekeyoptin` arms it (**0 aborts** over ft_unit + ft_inv); and
-`test_rekey_optin_default_refuses` covers the default arm, which every other
-rekey test opts out of exercising. Converting the suites was itself the
-evidence: 48 tests went RED on the flip, not silently green.
+A creator may forget the opt-in. It then keeps calling rekey and collects `-7`
+every time. It reports green with zero coverage. Three things prevent that:
+- `-DFT_DEBUG_REKEY_OPTIN_STRICT` turns a refusal into an abort naming the
+  trie;
+- gate config `rekeyoptin` arms it (**0 aborts** over ft_unit + ft_inv);
+- `test_rekey_optin_default_refuses` covers the default arm. Every other rekey
+  test opts out of exercising it.
 
-☠ And the TAP plan has TWO arms -- `NR_TESTS` is defined once per
+Converting the suites was itself the evidence: 48 tests went RED on the flip,
+not silently green.
+
+☠ And the TAP plan has TWO arms: `NR_TESTS` is defined once per
 `FEATURE_FT_FAULT_INJECT` branch. Bumping one left 363 tests running against
-`1..361`: every line `ok`, the `^ok` grep green, exit status 2.
+`1..361`. Every line was `ok` and the `^ok` grep was green. The exit status was
+2.
 
 
 ## 12. API / design questions queued by Mathieu (2026-09-17)
@@ -1635,45 +1728,46 @@ Not implemented; recorded so the flip does not silently decide them.
 ### 12.1 An application-provided writer exclusion mode -- ☑ LANDED @f6ab074d
 
 ☑ **RESTORED as `CDS_FT_WRITER_EXTERNAL_SYNC`**, the third
-`cds_ft_writer_strategy`. Named for the CONTRACT, not a lock (Mathieu): the
-other two are named for the lock the LIBRARY takes, and here it takes none --
-the caller meets the contract however it likes, a single mutating thread or its
+`cds_ft_writer_strategy`. Named for the CONTRACT, not a lock (Mathieu). The
+other two are named for the lock the LIBRARY takes. Here it takes none. The
+caller meets the contract however it likes: a single mutating thread, or its
 own mutex around every mutating call.
 
-Implemented as a SEPARATE trie flag, never `exclusive`, so all 71 consumers of
-that flag are untouched and no reader-side shortcut is reachable: `lock_fine` is
-false, so every kind / lock-set / door decision reads as COARSE (door 1 arms it
-SW trie-wide) and only the FT-wide mutex goes away. Two early-outs, both the
-same argument as `exclusive`'s -- `ft_writer_lock_scope_enter` (no mutex to
-take) and `ft_bulk_lock_enter` (nothing to promote: the bulk gate and rekey
-promote FINE locking, and there is none here, nor in COARSE).
+It is implemented as a SEPARATE trie flag, never `exclusive`. So all 71
+consumers of that flag are untouched, and no reader-side shortcut is reachable.
+`lock_fine` is false. So every kind / lock-set / door decision reads as COARSE
+(door 1 arms it SW trie-wide). Only the FT-wide mutex goes away. There are two
+early-outs. Both use the same argument as `exclusive`'s:
+- `ft_writer_lock_scope_enter`: no mutex to take;
+- `ft_bulk_lock_enter`: nothing to promote. The bulk gate and rekey promote
+  FINE locking, and there is none here, nor in COARSE.
 
 ☞ RANK STATS NOW COERCE *FINE* ONLY. The coercion read "any strategy !=
-COARSE"; EXTERNAL_SYNC already serialises every structural writer, so coercing it
+COARSE". EXTERNAL_SYNC already serialises every structural writer. Coercing it
 would hand back the very lock the caller asked the library not to take.
 
 ☑ THE CONTRACT CHECK NEEDED NO NEW CODE. The access validator keeps its
-single-OWNER claim for any non-fine trie, so EXTERNAL_SYNC lands on the owner CAS.
-Measured with a guaranteed-overlap control (two writers, one trie,
-`-DFEATURE_FT_EXCL_VALIDATE`): COARSE **survives** (the mutex serialises them)
-while EXTERNAL_SYNC reports *"writer conflict -- owner 0x…, entering thread 0x…"*
-and aborts -- which is also the proof that the mutex is genuinely skipped, since
-under COARSE those two writers cannot overlap at all.
+single-OWNER claim for any non-fine trie. So EXTERNAL_SYNC lands on the owner
+CAS. We measured it with a guaranteed-overlap control: two writers, one trie,
+`-DFEATURE_FT_EXCL_VALIDATE`. COARSE **survives**, because the mutex serialises
+them. EXTERNAL_SYNC reports *"writer conflict -- owner 0x…, entering thread
+0x…"* and aborts. This also proves that the mutex is genuinely skipped. Under
+COARSE those two writers cannot overlap at all.
 
-In contract (`test_urcu_ft -W external-sync`, 4 readers + 1 writer, 5s):
-380,623,969 reads / 864,142 writes, and the always-MW lanes converted
+In contract (`test_urcu_ft -W external-sync`, 4 readers + 1 writer, 5s), the
+run did 380,623,969 reads / 864,142 writes. The always-MW lanes converted
 (`FT MWA DOOR1 converted=1,107,522`).
 
 ☞ THE NAME CHANGED, AND THE OTHER SIDE OF THE COLLISION MOVED. It landed as
-`CDS_FT_WRITER_EXCL_CALLER`, which read too close to `cds_ft_make_exclusive`
-even though the two promise different things -- the strategy is about WRITERS,
-the trie flag is about writers AND readers. Mathieu asked whether the trie mode
-should be renamed; the mapping says otherwise. In Rust's vocabulary an
-EXCLUSIVE trie is `&mut T`, the *exclusive* (unique) reference -- no concurrent
-access of any kind -- and the default trie is `&T` where `T: Sync`, the *shared*
-reference. So "exclusive trie" is already the right name and its antonym is
-SHARED; what was misnamed is the strategy, which is not about exclusive ACCESS
-at all but about WHERE the synchronization lives. Hence:
+`CDS_FT_WRITER_EXCL_CALLER`. That read too close to `cds_ft_make_exclusive`,
+even though the two promise different things. The strategy is about WRITERS.
+The trie flag is about writers AND readers. Mathieu asked whether the trie mode
+should be renamed. The mapping says otherwise. In Rust's vocabulary an
+EXCLUSIVE trie is `&mut T`, the *exclusive* (unique) reference: no concurrent
+access of any kind. The default trie is `&T` where `T: Sync`, the *shared*
+reference. So "exclusive trie" is already the right name, and its antonym is
+SHARED. What was misnamed is the strategy. It is not about exclusive ACCESS at
+all. It is about WHERE the synchronization lives. Hence:
 
 - `CDS_FT_WRITER_EXCL_CALLER` -> **`CDS_FT_WRITER_EXTERNAL_SYNC`**. Still named
   for the contract, not a lock -- it says the synchronization is the
@@ -1683,128 +1777,140 @@ at all but about WHERE the synchronization lives. Hence:
 - `cds_ft_make_exclusive` / `cds_ft_attr_set_exclusive` / `cds_ft_is_exclusive`
   are UNCHANGED, and "exclusive" now has exactly one meaning in the API.
 
-☠ `private` was considered and REJECTED, twice over: it is already the FT
-allocator's word for a range owned by one compactor or writer and not yet
-published (~85 sites in the same files), and it is a C++ keyword -- a trial
-rename put `bool private` in the public header, which would have broken every
-C++ consumer including `test_urcu_ft_unit_cxx`. `FEATURE_FT_EXCL_VALIDATE` and
-the `ft_excl_*` validator internals keep their names on purpose: that machinery
-polices BOTH modes, so its "excl" means access exclusion in general.
+☠ `private` was considered and REJECTED, for two reasons:
+- it is already the FT allocator's word for a range owned by one compactor or
+  writer and not yet published (~85 sites in the same files);
+- it is a C++ keyword. A trial rename put `bool private` in the public header.
+  That would have broken every C++ consumer, including
+  `test_urcu_ft_unit_cxx`.
+
+`FEATURE_FT_EXCL_VALIDATE` and the `ft_excl_*` validator internals keep their
+names on purpose. That machinery polices BOTH modes. So its "excl" means access
+exclusion in general.
 
 ☑ THE CONTRACT IS NOW TESTED, not just documented. `test_urcu_ft -W
-external-sync` did NOT catch a violation -- its writers rarely overlap inside
-the claim window. Three matched rows in `tests/unit/test_urcu_ft_unit.c` do,
-one body with one variable changed per row: EXTERNAL_SYNC + a caller mutex
-survives and verifies coherent; LOCK_COARSE with no caller mutex survives and
-verifies coherent (the control: the library's own mutex is what serialises it);
-EXTERNAL_SYNC with no caller mutex aborts under the validator. The third row
-SKIPs, loudly, on a build without `-DFEATURE_FT_EXCL_VALIDATE`.
+external-sync` did NOT catch a violation. Its writers rarely overlap inside the
+claim window. Three matched rows in `tests/unit/test_urcu_ft_unit.c` do catch
+it. They share one body, with one variable changed per row:
+- EXTERNAL_SYNC + a caller mutex survives and verifies coherent;
+- LOCK_COARSE with no caller mutex survives and verifies coherent. This is the
+  control: the library's own mutex is what serialises it;
+- EXTERNAL_SYNC with no caller mutex aborts under the validator.
+
+The third row SKIPs, loudly, on a build without `-DFEATURE_FT_EXCL_VALIDATE`.
 
 The original statement of the item follows.
 
-Planned, removed from the API, to be restored: the app guarantees writer
-exclusion (single-threaded, or its own mutex around every caller). It should
-behave "pretty much as COARSE", except the contract comes from the caller and
-the library takes no writer lock of its own. Debug builds keep the validation
-macros that check the contract.
+Planned, removed from the API, to be restored. The app guarantees writer
+exclusion: single-threaded, or its own mutex around every caller. It should
+behave "pretty much as COARSE". The difference: the contract comes from the
+caller, and the library takes no writer lock of its own. Debug builds keep the
+validation macros that check the contract.
 
-For the record kinds this costs nothing: `ft_txn_content_sw_ok` is
-`!lock_fine || exclusive`, so such a trie is armed SW trie-wide by door 1, like
+For the record kinds this costs nothing. `ft_txn_content_sw_ok` is
+`!lock_fine || exclusive`. So door 1 arms such a trie SW trie-wide, like
 COARSE. The requirement is that the mode be DECLARED, so the library can read
-it; nothing needs to be inferred.
+it. Nothing needs to be inferred.
 
 Two things to pin when it returns:
-- it is NOT `cds_ft_attr_set_exclusive`, which additionally promises NO
-  concurrent RCU readers (and so licenses skipping reader-visible publication
-  discipline -- the reachability climb of §11.3 treats an exclusive trie as
-  unreachable by readers). This mode keeps readers, so proxies, tags and grace
-  periods all stay. It is a third writer strategy;
-- the existing hold-ledger oracle polices LOCK collisions, which this mode has
-  none of. The contract to check is "no two writers inside the trie at once",
-  i.e. a writer-scope entry counter that must never exceed one.
+- it is NOT `cds_ft_attr_set_exclusive`. That one also promises NO concurrent
+  RCU readers. So it licenses skipping reader-visible publication discipline:
+  the reachability climb of §11.3 treats an exclusive trie as unreachable by
+  readers. This mode keeps readers, so proxies, tags and grace periods all
+  stay. It is a third writer strategy;
+- the existing hold-ledger oracle polices LOCK collisions. This mode has none.
+  The contract to check is "no two writers inside the trie at once". That is,
+  a writer-scope entry counter that must never exceed one.
 
-☑ **THE MW RETIREMENT IS DONE** (the half that does not need the mode to exist):
+☑ **THE MW RETIREMENT IS DONE** (the half that does not need the mode to exist).
 `ft_flip_txn_record_tag_mw` now asks `ft_txn_content_sw_ok(t->ft)` and parks
-instead of CASing. See §12.1.1 below; the rest of this section is the mode
+instead of CASing. See §12.1.1 below. The rest of this section is the mode
 itself, still owed.
 
-☞ AND IT RETIRES THE REMAINING MW (Mathieu): under app exclusion the always-MW
-lanes can go SW too, except the ones that are genuinely MW by design. They are
-MW today on a COARSE trie as well, and not because anything decided it: the
-lanes call `ft_flip_txn_record_tag_mw` UNCONDITIONALLY (the root pointer, the
-cell list, head back edges, parent_word, PSO, state, RANK, NR_CHILD_DEC), so
-door 1 arms the rest of the txn SW and these stay MW. Nothing can race them
-there and no validate can fail, so one predicate (`ft_txn_content_sw_ok`)
-consulted by those recorders converts the lot. The only record that must stay
-MW is the DLM lock TAKE -- the arbitration point -- and such a trie takes no
-DLM locks at all. Independent of the fine-spacing flip; do it right after.
+☞ AND IT RETIRES THE REMAINING MW (Mathieu). Under app exclusion the always-MW
+lanes can go SW too. The exception is the lanes that are genuinely MW by
+design. These lanes are MW today on a COARSE trie as well. Nothing decided it.
+The lanes call `ft_flip_txn_record_tag_mw` UNCONDITIONALLY for:
+- the root pointer;
+- the cell list;
+- head back edges;
+- parent_word;
+- PSO, state, RANK, NR_CHILD_DEC.
+
+So door 1 arms the rest of the txn SW, and these stay MW. Nothing can race them
+there, and no validate can fail. So one predicate (`ft_txn_content_sw_ok`),
+consulted by those recorders, converts the lot. The only record that must stay
+MW is the DLM lock TAKE: the arbitration point. Such a trie takes no DLM locks
+at all. This is independent of the fine-spacing flip; do it right after.
 
 ### 12.1.1 Landed: the always-MW lanes consult door 1
 
-"Always MW" was never a decision about the WORD -- it was this recorder being
-called unconditionally. On a COARSE trie every writer sits behind the FT-wide
-mutex, and on an EXCLUSIVE one the caller promises a single writer, so there is
-no peer CAS for a park to race, **for any slot in that trie**. That is the same
-exclusion door 1 already arms the rest of the txn on.
+"Always MW" was never a decision about the WORD. It came from this recorder
+being called unconditionally. On a COARSE trie every writer sits behind the
+FT-wide mutex. On an EXCLUSIVE one the caller promises a single writer. So
+there is no peer CAS for a park to race, **for any slot in that trie**. Door 1
+already arms the rest of the txn on that same exclusion.
 
 ☞ WHY THIS IS NOT THE TRAP §11.9 FELL INTO. The chain attempt made the kind a
-property of the ASKING TXN (its lock registry), so one slot got two kinds
-depending on which op wrote it. This predicate is a property of the TRIE: every
-writer of every slot in it gets the same answer, so per-slot uniformity is
+property of the ASKING TXN (its lock registry). So one slot got two kinds,
+depending on which op wrote it. This predicate is a property of the TRIE. Every
+writer of every slot in it gets the same answer. So per-slot uniformity is
 automatic.
 
 **Three things had to be true, and each one was wrong first.** An adversarial
-review refuted the first version of this change; these are its findings, fixed.
+review refuted the first version of this change. These are its findings, fixed.
 
 #### ☠☠ 1. A record whose old == new is a VALIDATE, and can never be parked
 
-Two lanes here are pure §4.B guards -- `ft_flip_txn_guard_installed_child` and
-the recompaction sweep's child validate -- recording `{live_state ->
+Two lanes here are pure §4.B guards: `ft_flip_txn_guard_installed_child` and
+the recompaction sweep's child validate. They record `{live_state ->
 live_state}`, which rcu-txn.h calls `urcu_txn_validate`. Parking one does two
 wrong things, **neither of which needs a peer writer**:
 
-1. the check disappears (a park cannot fail), and that check is what catches a
-   node ALREADY frozen or locked when the record was made. The dangling parent
-   slot and the concurrent-recompaction UAF both came through it;
-2. worse, the value parked is `live_state` -- the word with TOMBSTONE and LOCK
-   **masked out** -- so the commit CLEARS a tombstone on a node whose grace
+1. the check disappears, because a park cannot fail. That check is what
+   catches a node ALREADY frozen or locked when the record was made. The
+   dangling parent slot and the concurrent-recompaction UAF both came through
+   it;
+2. worse, the value parked is `live_state`: the word with TOMBSTONE and LOCK
+   **masked out**. So the commit CLEARS a tombstone on a node whose grace
    period is running, or a DLM lock the op does not hold. `settle()` writes
    `old_ptr` BLIND, so even an ABORTED commit stomps those bits.
 
 The guard's own header already said it: *"MW kind, unconditionally: an SW park
 validates nothing (it cannot fail), so recording this through the
-structural_sw-dispatching helper would be a guard in name only"* -- and this
-recorder BECAME that helper. The test is therefore STRUCTURAL, not a list of
-lanes to remember: **same value in and out means MW**. (Measured: 293 such
-records per ft_unit leg. The first version parked all of them, and the 18-leg
-gate was green.)
+structural_sw-dispatching helper would be a guard in name only"*. This recorder
+then turned into that helper. So the test is STRUCTURAL, not a list of lanes to
+remember: **same value in and out means MW**. (Measured: 293 such records per
+ft_unit leg. The first version parked all of them, and the 18-leg gate was
+green.)
 
 #### ☠ 2. The answer must be LATCHED, because `exclusive` is mutable
 
-`ft->exclusive` is a plain bool that `cds_ft_make_exclusive` /
-`_make_shared` and the graft_swap restore assign. Sampled per record it
-could answer differently within ONE txn and disagree with the `structural_sw`
-the constructor latched from the same call -- and the whole argument needs the
+`ft->exclusive` is a plain bool. `cds_ft_make_exclusive` / `_make_shared` and
+the graft_swap restore assign it. Sampled per record, it could answer
+differently within ONE txn. It could also disagree with the `structural_sw`
+the constructor latched from the same call. The whole argument needs the
 answer fixed for the txn's life. It is now latched into `t->trie_wide_sw` at
 construction.
 
-☠☠ AND THE LATCH MUST BE INITIALISED EXPLICITLY. These txn structs are REUSED
-and the constructors initialise field by field -- there is no memset -- so a
-flag that is only ever SET carries a previous op's trie answer into the next
-one. Measured while that was missing: a thread that had run one coarse op
-parked the always-MW lanes on **every FINE trie it touched afterwards** --
-1,647,382 records in one ft_unit leg instead of 8,298 -- and **the leg was
-GREEN**. Found only because the counter disagreed with the expected magnitude.
+☠☠ AND THE LATCH MUST BE INITIALISED EXPLICITLY. These txn structs are REUSED.
+The constructors initialise them field by field; there is no memset. So a flag
+that is only ever SET carries a previous op's trie answer into the next one.
+We measured this while the init was missing. A thread that had run one coarse
+op parked the always-MW lanes on **every FINE trie it touched afterwards**.
+That was 1,647,382 records in one ft_unit leg instead of 8,298. And **the leg
+was GREEN**. It was found only because the counter disagreed with the expected
+magnitude.
 
 #### ☠ 3. The ROOT pin must key on the SLOT, not the producer's flag
 
-A cross-trie dual NAMES one trie and writes TWO roots, so `t->ft` being coarse
-says nothing about the other trie, which may be fine with live peer writers.
-`ft_flip_txn_record_root` calls a PINNED twin that never converts -- its own
-header's rule, "the rule is a property of the SLOT, not of the txn's named
-trie". But that pinning depended entirely on the producer setting `.root`, so
-the converting arm now also refuses any slot that IS the named trie's root, and
-counts when that test is what saved it.
+A cross-trie dual NAMES one trie and writes TWO roots. So `t->ft` being coarse
+says nothing about the other trie. That trie may be fine, with live peer
+writers. `ft_flip_txn_record_root` calls a PINNED twin that never converts. Its
+own header gives the rule: "the rule is a property of the SLOT, not of the
+txn's named trie". But that pinning depended entirely on the producer setting
+`.root`. So the converting arm now also refuses any slot that IS the named
+trie's root. It counts when that test is what saved it.
 
 #### The two witnesses, and they read ZERO
 
@@ -1816,23 +1922,23 @@ counts when that test is what saved it.
 The first covers the three recorders that take a trie separately from the txn
 (`ft_flip_txn_record_count_parent`, `ft_ord_cell_flip_into`,
 `ft_ord_cell_record_into_ft`). With both at zero, every slot these lanes record
-belongs to the trie the predicate asked about, which is what makes the
+belongs to the trie the predicate asked about. That is what makes the
 trie-wide argument apply to the slot.
 
-☠ AND THE LOCK TAKE IS NOT IN THIS RECORDER. It is MW_LOCK, a separate kind:
-it IS the arbitration point and can never park. A coarse trie takes no DLM lock
-at all; an EXCLUSIVE FINE trie does, and keeps its CAS.
+☠ AND THE LOCK TAKE IS NOT IN THIS RECORDER. It is MW_LOCK, a separate kind.
+It IS the arbitration point and can never park. A coarse trie takes no DLM lock
+at all. An EXCLUSIVE FINE trie does, and keeps its CAS.
 
-☞ A BONUS: the guard at `ft_flip_txn_guard_installed_child` is always-MW and its
+☞ A BONUS: the guard at `ft_flip_txn_guard_installed_child` is always-MW. Its
 header records a ONE SLOT, TWO KINDS livelock from landing beside an SW record
 (ft_unit `test_rekey_collapse_one_slot_two_kinds`, 50,001 attempts). It stays
 MW under rule 1, so that pairing is unchanged.
 
 #### Measured
 
-`-DFT_DEBUG_MWA_DOOR1`, ft_unit per-node leg: of 2,666,930 always-MW records,
-11,804 sit on a trie door 1 says yes to. Four classes are ENTIRELY coarse-only,
-so they retire completely:
+Build with `-DFT_DEBUG_MWA_DOOR1`, ft_unit per-node leg. There are 2,666,930
+always-MW records. Of these, 11,804 sit on a trie door 1 says yes to. Four
+classes are ENTIRELY coarse-only, so they retire completely:
 
 | class | convertible | fine |
 |---|---|---|
@@ -1847,12 +1953,12 @@ so they retire completely:
 | DUAL_UNNAMED | 2 | 1,974 |
 | ROOT (pinned) | 380 | 638 |
 
-☠ ft_unit is the wrong place to SIZE it -- that leg is fine-dominated. The
-in-tree counter (`FT MWA DOOR1`, under `-DFT_DEBUG_MWA_DOOR1`) reads per leg:
-ft_unit 8,298 converted; ft_inv 2.0M-2.7M. And for a user who runs a coarse
-trie, or the app-provided exclusion mode of §12.1 when it returns, this is 100%
-of the always-MW traffic, every record of it a CAS that arbitrates against
-nobody.
+☠ ft_unit is the wrong place to SIZE it: that leg is fine-dominated. The
+in-tree counter is `FT MWA DOOR1`, under `-DFT_DEBUG_MWA_DOOR1`. Per leg it
+reads: ft_unit 8,298 converted; ft_inv 2.0M-2.7M. Some users run a coarse
+trie, or the app-provided exclusion mode of §12.1 when it returns. For them,
+this is 100% of the always-MW traffic. Every record of it is a CAS that
+arbitrates against nobody.
 
 ### 12.2 COARSE vs FINE + ROOT_ONLY -- redundant?
 
@@ -1870,9 +1976,11 @@ machinery, no:
 | bulk ops | FT-wide lock | FT-wide lock -- common |
 
 Root-only earns its keep as the MAXIMAL-COLLAPSE TEST AXIS for the anchor
-machinery, not as a configuration: every gap this flip had to close (members
-deduping onto one word with nothing filing them, and a record whose owner is
-covered only by the root) was invisible at per-node and exponential.
+machinery, not as a configuration. This flip had to close two gaps:
+- members deduping onto one word with nothing filing them;
+- a record whose owner is covered only by the root.
+
+Both were invisible at per-node and exponential.
 
 ### 12.3 Gate ROOT_ONLY as non-public (Mathieu) -- ☑ LANDED
 
@@ -1884,23 +1992,24 @@ though the setter refused it. Now:
   anchor-validation one it shared -- with the value 3 documented as RESERVED.
   Code that names the symbol fails to COMPILE without the gate, which is the
   strongest "not public" signal there is;
-- the library's own dozen spacing branches keep compiling through an internal
-  spelling of the reserved value in `fractal-trie-internal.h`; without the gate
-  nothing can SET the spacing, so those branches are unreachable, not wrong;
-- `cds_ft_group_attr_set_lock_spacing` refuses the raw value 3 without the gate,
-  and the unit test asserts exactly that -- by NUMBER, since the name does not
+- the library's own dozen spacing branches keep compiling. They use an
+  internal spelling of the reserved value in `fractal-trie-internal.h`.
+  Without the gate nothing can SET the spacing. So those branches are
+  unreachable, not wrong;
+- `cds_ft_group_attr_set_lock_spacing` refuses the raw value 3 without the
+  gate. The unit test asserts exactly that, by NUMBER, since the name does not
   exist there. That assertion IS the "not public" property.
 
 ☠ THE ENVIRONMENT KNOB WAS THE TRAP. The 18-leg gate reaches root-only through
-`CDS_FT_LOCK_SPACING=root-only`, not the setter. Gated silently, every root-only
-leg would have degraded to per-node and read GREEN -- a trie CREATOR is a feature
-gate, and a degraded creator is the wrong zero. So the knob now ABORTS loudly:
-`[Fatal] Fractal Trie: CDS_FT_LOCK_SPACING=root-only requested, but this build
+`CDS_FT_LOCK_SPACING=root-only`, not the setter. Gated silently, every
+root-only leg would have degraded to per-node and read GREEN. A trie CREATOR is
+a feature gate, and a degraded creator is the wrong zero. So the knob now
+ABORTS loudly: `[Fatal] Fractal Trie: CDS_FT_LOCK_SPACING=root-only requested, but this build
 has no -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY` (measured, rc=134). The dev trees
-carry the macro; a shipping build cannot be talked into the axis by an env var.
+carry the macro. A shipping build cannot be talked into the axis by an env var.
 
-☞ EXPONENTIAL IS UNCHANGED BY THIS: still refused at the setter without
-`FEATURE_FT_ANCHOR_VALIDATE`, still reachable through the env knob under
-`FEATURE_FT_LOCK_SPACING_ENV`. Whether it GRADUATES -- the flip (§11.5) serves
-it, and it has been green at 18/18 for every gate since -- is a separate,
-deliberate decision, not folded in here.
+☞ EXPONENTIAL IS UNCHANGED BY THIS. It is still refused at the setter without
+`FEATURE_FT_ANCHOR_VALIDATE`. It is still reachable through the env knob under
+`FEATURE_FT_LOCK_SPACING_ENV`. Whether it GRADUATES is a separate, deliberate
+decision, not folded in here. The flip (§11.5) serves it, and it has been green
+at 18/18 for every gate since.
