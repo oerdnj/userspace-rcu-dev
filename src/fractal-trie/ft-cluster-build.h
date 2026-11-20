@@ -16,9 +16,9 @@
  * They are mutually recursive, so a small forward-declaration block precedes
  * the definitions.
  *
- * #included after ft-mutation-node.h (the builders call the node set_nth /
- * recompact ops) and before ft-insert.h (their first user); graft and merge
- * reach them from further down the translation unit.
+ * #included after ft-mutation-node.h, because the builders call the node
+ * set_nth / recompact ops.  #included before ft-insert.h, their first user.
+ * Graft and merge reach them from further down the translation unit.
  *
  * Implementation unit: #included once into the fractal-trie.c translation unit
  * (preserves cross-module inlining).  Not a standalone header.
@@ -52,11 +52,14 @@ static struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
  * flagged node, or NULL on allocation failure.
  *
  * @glue: when non-NULL (graft build-invisible mode), @leaf is LIVE
- * payload data: its back-pointer into the bottom branch node is deferred
- * to the post-sync commit, every fresh branch node is tracked in @glue,
- * and on OOM the function returns NULL WITHOUT freeing -- the caller's
- * ft_glue_abort reclaims the tracked nodes.  When NULL, the legacy
- * immediate path runs (leaf back-pointer set now, self-free on OOM).
+ * payload data:
+ *  - its back-pointer into the bottom branch node is deferred to the
+ *    post-sync commit;
+ *  - every fresh branch node is tracked in @glue;
+ *  - on OOM the function returns NULL WITHOUT freeing.  The caller's
+ *    ft_glue_abort reclaims the tracked nodes.
+ * When NULL, the legacy immediate path runs (leaf back-pointer set now,
+ * self-free on OOM).
  */
 static
 struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
@@ -80,9 +83,9 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 		return leaf;	/* path_len == 0. */
 
 	/*
-	 * Try compression over [compress_start, end).  Floor is len 1:
-	 * a 1-byte compressed under FEATURE_FT_SKIP_COMPRESSED publishes
-	 * as a SKIP_X-tagged slot pointer (free dispatch) and is the
+	 * Try compression over [compress_start, end).  Floor is len 1.
+	 * Under FEATURE_FT_SKIP_COMPRESSED a 1-byte compressed publishes
+	 * as a SKIP_X-tagged slot pointer (free dispatch).  It is the
 	 * canonical replacement for what would otherwise be a non-root
 	 * 1-child internal node.  In glue mode ft_try_compress_chain
 	 * defers the live leaf's back-pointer (and absorbs a compressed
@@ -189,11 +192,11 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 
 /*
  * Free a FRESH, never-published single-path branch built by ft_build_branch
- * (legacy glue == NULL mode) after a LATER fallible step failed: walk the
- * single-child chain from @top down to -- but not including -- @leaf (the
- * caller's payload), freeing every fresh node.  Writer-private memory, so
- * immediate frees are safe.  A skip-encoded link resolves through the leaf's
- * back-pointer, which the build wired before returning.
+ * (legacy glue == NULL mode).  Call it after a LATER fallible step failed.
+ * Walk the single-child chain from @top down to @leaf, and free every fresh
+ * node.  Do not free @leaf: it is the caller's payload.  The memory is
+ * writer-private, so immediate frees are safe.  A skip-encoded link resolves
+ * through the leaf's back-pointer, which the build wired before returning.
  */
 static
 void ft_free_branch_unpublished(struct cds_ft *ft,
@@ -233,10 +236,10 @@ void ft_free_branch_unpublished(struct cds_ft *ft,
  * ft_compress_single_child_if_needed: convert a 1-child internal node
  * (no external_nodes) to a compressed/skip-encoded node when the trie
  * group has skip-compressed enabled.  Used at graft sites where a
- * moved root (which was an internal at trie-root position) is being
- * placed at a non-root position: under skip mode, non-root 1-child
- * internals without external_nodes must be a compressed (chain-
- * compress invariant).
+ * moved root is being placed at a non-root position.  The moved root
+ * was an internal at trie-root position.  Under skip mode, a non-root
+ * 1-child internal without external_nodes must be a compressed
+ * (chain-compress invariant).
  *
  * Two cases on the single child:
  *  - non-compressed:    build a 1-byte cn(byte) -> single_child.
@@ -255,9 +258,9 @@ void ft_free_branch_unpublished(struct cds_ft *ft,
  *   - @child has more than one child,
  *   - @child has external_nodes attached,
  *   - chain-merge length would overflow FT_SKIP_LEN_MAX.
- * Returns (void *)(long)-ENOMEM on allocation failure: conversion WAS
- * required (a non-root 1-child internal) but could not be done, so the
- * caller must NOT publish @child non-canonically -- it must fail the
+ * Returns (void *)(long)-ENOMEM on allocation failure.  Conversion WAS
+ * required (a non-root 1-child internal) but could not be done.  So the
+ * caller must NOT publish @child non-canonically: it must fail the
  * mutation.  @child is left untouched in that case (nothing freed), so
  * the caller can still roll it back.
  *
@@ -265,9 +268,11 @@ void ft_free_branch_unpublished(struct cds_ft *ft,
  * only (mutex held); the caller is the sole owner of @child.
  *
  * @glue: when non-NULL, build-invisible mode for the graft transaction.
- * The wrapper @cn is built but its re-parent of the live @cn->child, and
- * the frees of the old internal and any absorbed sub-cn, are DEFERRED to
- * the post-sync commit (recorded in @glue) rather than performed here.
+ * The wrapper @cn is built, but these steps are DEFERRED to the post-sync
+ * commit (recorded in @glue) rather than performed here:
+ *  - the re-parent of the live @cn->child;
+ *  - the free of the old internal;
+ *  - the free of any absorbed sub-cn.
  * The wrapper is tracked in @glue so an OOM elsewhere in the build frees
  * it.  When NULL, the legacy immediate path runs (caller has already
  * drained the source).
@@ -304,19 +309,20 @@ struct cds_ft_inode_flag *ft_compress_single_child_if_needed(struct cds_ft *ft,
 
 	/*
 	 * Find the single set byte.  ft_node_get_minmax returns the
-	 * resolved child (skip-encoded -> compressed flag); but we
-	 * need the raw slot value to preserve any skip encoding when
+	 * resolved child (skip-encoded -> compressed flag).  But we
+	 * need the raw slot value, to preserve any skip encoding when
 	 * placing it as cn->child.  Walk via the low-level get_ith.
 	 */
 	switch (type->type_class) {
 	case FT_POPCOUNT:
 	{
 		/*
-		 * The first NON-NULL position, not position 0: a bitmap bit
-		 * stays set over a soft-deleted slot (the in-place delete tier
-		 * NULLs the slot and decrements nr_child, never clears the bit),
-		 * so position 0 can be a hole while the one child @nr_child
-		 * counts sits further on.  The pointer is the source of truth.
+		 * The first NON-NULL position, not position 0.  A bitmap bit
+		 * stays set over a soft-deleted slot: the in-place delete
+		 * tier NULLs the slot and decrements nr_child, and never
+		 * clears the bit.  So position 0 can be a hole while the one
+		 * child @nr_child counts sits further on.  The pointer is the
+		 * source of truth.
 		 */
 		unsigned int i, pc = ft_popcount_node_get_nr_child(type, node);
 
@@ -352,7 +358,7 @@ struct cds_ft_inode_flag *ft_compress_single_child_if_needed(struct cds_ft *ft,
 
 	/*
 	 * Chain-merge when the single child is itself a compressed
-	 * (or skip-encoded) cn: absorb its path bytes so the result
+	 * (or skip-encoded) cn.  Absorb its path bytes, so the result
 	 * is one compressed spanning [byte ++ single_cn->key_bytes]
 	 * -> single_cn->child.  Preserves the "no two adjacent
 	 * compresseds" invariant.
@@ -388,10 +394,10 @@ struct cds_ft_inode_flag *ft_compress_single_child_if_needed(struct cds_ft *ft,
 		/*
 		 * Build-invisible path (graft transaction).  @node and
 		 * @single_cn are LIVE source data that must survive an OOM
-		 * elsewhere in the build, and @cn->child's back-pointer must
-		 * not be flipped until the post-sync commit.  Defer all three;
-		 * track @cn so the abort path frees it.  The deferred edge
-		 * records the PLAIN @cflag -- ft_set_parent recovers @cn
+		 * elsewhere in the build.  @cn->child's back-pointer must
+		 * not be flipped until the post-sync commit.  Defer all three.
+		 * Track @cn so the abort path frees it.  The deferred edge
+		 * records the PLAIN @cflag: ft_set_parent recovers @cn
 		 * directly and records its skip_slot at commit.
 		 */
 		ft_glue_track(glue, cflag);
@@ -400,25 +406,25 @@ struct cds_ft_inode_flag *ft_compress_single_child_if_needed(struct cds_ft *ft,
 		if (single_cn)
 			ft_glue_defer_free(glue, single_cn, true);
 		/*
-		 * Return the PLAIN flag, NOT the skip form: @cn->child's
+		 * Return the PLAIN flag, NOT the skip form.  @cn->child's
 		 * back-pointer is deferred, so a skip pointer would not yet
-		 * resolve (ft_skip_to_compressed recovers @cn via that stale
-		 * back-pointer).  The caller installs @cn directly (chain-merge
-		 * recovers it via ft_compressed_node_ptr) and re-encodes the
-		 * holding slot to the skip form before publish -- same dance as
-		 * the split's suffix.
+		 * resolve: ft_skip_to_compressed recovers @cn via that stale
+		 * back-pointer.  The caller installs @cn directly
+		 * (chain-merge recovers it via ft_compressed_node_ptr).  It
+		 * re-encodes the holding slot to the skip form before
+		 * publish.  This is the same sequence as the split's suffix.
 		 */
 		return cflag;
 	}
 	ft_set_parent(ft, cn->child, cflag, &cn->child);
 	/*
-	 * Legacy immediate path: the caller has already unlinked @node
+	 * Legacy immediate path.  The caller has already unlinked @node
 	 * from src and waited a grace period (cds_ft_graft / graft_swap
-	 * protocol); @node has not been published to dst.  No reader can
-	 * be inside it, so the immediate-free path is safe -- saves a grace
-	 * period of deferred-free pressure.  Same applies to single_cn
-	 * (the compressed sub-node we just absorbed): it was reachable
-	 * only via @node, which is itself unpublished here.
+	 * protocol).  @node has not been published to dst.  No reader can
+	 * be inside it, so the immediate-free path is safe.  It saves a
+	 * grace period of deferred-free pressure.  The same applies to
+	 * single_cn (the compressed sub-node we just absorbed): it was
+	 * reachable only via @node, which is itself unpublished here.
 	 */
 	free_cds_ft_node_unpublished(ft, node);
 	if (single_cn)
@@ -438,7 +444,7 @@ struct cds_ft_inode_flag *ft_compress_single_child_if_needed(struct cds_ft *ft,
  * pointer on allocation failure.
  *
  * @glue: when non-NULL (graft build-invisible mode), the live child's
- * back-pointer is recorded as a deferred edge rather than set now, and an
+ * back-pointer is recorded as a deferred edge rather than set now.  An
  * absorbed compressed @child (a fresh canonicalization wrapper) is
  * untracked from the glue as it is freed during the merge.
  */
@@ -462,9 +468,9 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 
 	/*
 	 * Length-1 compressed nodes are canonical under
-	 * FEATURE_FT_SKIP_COMPRESSED: the publish wraps cn into a
-	 * SKIP_X-tagged slot pointer, dispatching for free relative to
-	 * the 1-child internal node it replaces.
+	 * FEATURE_FT_SKIP_COMPRESSED.  The publish wraps cn into a
+	 * SKIP_X-tagged slot pointer.  That pointer dispatches for free
+	 * relative to the 1-child internal node it replaces.
 	 */
 	if (path_len < 1)
 		return NULL;
@@ -491,12 +497,12 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 		/*
 		 * Cap the fused path at what one compressed node can hold: its
 		 * uint8_t len field (FT_CN_LEN_MAX), with or without
-		 * skip-compression.  The merged node need NOT stay skip-encodable
-		 * -- ft_publish_compressed publishes a longer run through a plain
-		 * compressed flag -- and capping at FT_SKIP_LEN_MAX left two
-		 * adjacent compresseds for every longer run (cds_ft_graft and
-		 * cds_ft_graft_swap on keys of up to 250 bytes), the invariant this
-		 * fuse exists to keep.
+		 * skip-compression.  The merged node need NOT stay
+		 * skip-encodable.  ft_publish_compressed publishes a longer run
+		 * through a plain compressed flag.  Capping at FT_SKIP_LEN_MAX
+		 * left two adjacent compresseds for every longer run
+		 * (cds_ft_graft and cds_ft_graft_swap on keys of up to 250
+		 * bytes).  That broke the invariant this fuse exists to keep.
 		 */
 		if ((unsigned int) path_len + child_len > FT_CN_LEN_MAX) {
 			/* Overflow: leave adjacency in place. */
@@ -507,29 +513,33 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 	/*
 	 * ☠ FENCE A LIVE NODE BEFORE READING ITS BYTES INTO THE RUN.
 	 *
-	 * @child_cn is now final, and when it is LIVE this build is about to copy
+	 * @child_cn is now final.  When it is LIVE, this build is about to copy
 	 * its run into @cn and RETIRE it.  Two things require a lock over that:
-	 * the read window (a peer mutating @child_cn between the copy and the
-	 * commit is retired with it -- ft_glue_defer_free_fenced's own header), and
-	 * the retire's RECORD, because a committer that fuses its free list parks
-	 * the tombstone SW, which the STATE-WORD PROTOCOL permits for step 2 only
-	 * because step 1 took the word.
+	 *  - the read window.  A peer that mutates @child_cn between the copy
+	 *    and the commit is retired with it (see the header of
+	 *    ft_glue_defer_free_fenced).
+	 *  - the retire's RECORD.  A committer that fuses its free list parks
+	 *    the tombstone SW.  The STATE-WORD PROTOCOL permits that for step 2
+	 *    only because step 1 took the word.
 	 *
-	 * HERE, and not at the retire below: this is the last point before any
-	 * allocation, so a miss returns with NOTHING to unwind.  @record_only is
-	 * the gate because it names exactly the callers whose commit is still
-	 * AHEAD of this build -- for them an unfenced retire is also a ONE-WAY
-	 * mark an aborting attempt leaves behind, which ft_dlm_lock then refuses
-	 * forever.  Every other caller keeps its existing unfenced retire.
+	 * Take the lock HERE, and not at the retire below.  This is the last
+	 * point before any allocation.  So a miss returns with NOTHING to
+	 * unwind.  @record_only is the gate.  It names exactly the callers
+	 * whose commit is still AHEAD of this build.  For them, an unfenced
+	 * retire is also a ONE-WAY mark that an aborting attempt leaves
+	 * behind.  ft_dlm_lock then refuses that word forever.  Every other
+	 * caller keeps its existing unfenced retire.
 	 *
-	 * ☞ TWO WAYS TO GET THE DEPTH, and the caller-supplied one is not
-	 * redundant.  @absorb_node means the caller already took this fence with a
-	 * depth it alone could compute -- a node on the op's SRC path, which
-	 * @glue's descent does not describe -- and handing that over is the only
-	 * thing that keeps such a site from missing forever.  Where the node IS on
-	 * the descent's path, FT_DEPTH_FROM_DESCENT lets the acquire date it
-	 * itself, and a lookup miss is the same clean re-descend a contended
-	 * acquire already produces.
+	 * ☞ TWO WAYS TO GET THE DEPTH.  The caller-supplied one is not
+	 * redundant.
+	 *  - @absorb_node means the caller already took this fence.  It used a
+	 *    depth that only it could compute: a node on the op's SRC path,
+	 *    which @glue's descent does not describe.  Handing that fence over
+	 *    is the only thing that keeps such a site from missing forever.
+	 *  - Where the node IS on the descent's path, FT_DEPTH_FROM_DESCENT
+	 *    lets the acquire compute the depth itself.  A lookup miss is then
+	 *    the same clean re-descend that a contended acquire already
+	 *    produces.
 	 */
 	if (child_cn && glue && glue->record_only &&
 			!ft_glue_is_fresh(ft, glue,
@@ -539,11 +549,11 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 			absorb_fenced = true;
 			/*
 			 * CONSUMED: this function owns the mark from here, and
-			 * the retire below files it.  Clearing the hand-off is
-			 * what tells ft_glue_clear_fenced NOT to release it a
-			 * second time -- and, symmetrically, what lets it release
-			 * a fence the caller took on a build that then bailed
-			 * before ever reaching this absorb.
+			 * the retire below files it.  Clearing the hand-off
+			 * tells ft_glue_clear_fenced NOT to release it a second
+			 * time.  Symmetrically, the hand-off left set lets it
+			 * release a fence the caller took on a build that
+			 * bailed before it reached this absorb.
 			 */
 			glue->absorb_node = NULL;
 		} else {
@@ -568,20 +578,21 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 		/*
 		 * ☠ THE ONLY EXIT BETWEEN THE FENCE AND THE RETIRE THAT FILES IT.
 		 * Until ft_glue_defer_free_fenced below hands the mark to the glue,
-		 * no choke point owns it -- ft_glue_abort's ft_glue_clear_fenced
-		 * sweeps free-list entries, and this one does not exist yet -- so
-		 * bailing here would leave the word LOCKED with nothing left to
-		 * release it, and ft_dlm_lock refuses a locked word: the node would
-		 * be unmutable for the life of the trie.  Release it by hand.
+		 * no choke point owns it.  ft_glue_abort's ft_glue_clear_fenced
+		 * sweeps free-list entries, and this entry does not exist yet.
+		 * So bailing here would leave the word LOCKED with nothing left
+		 * to release it.  ft_dlm_lock refuses a locked word.  So the
+		 * node would be unmutable for the life of the trie.  Release it
+		 * by hand.
 		 *
-		 * A SHARED anchor took nothing and owes nothing: the acquire that
-		 * first took that word owns its release, exactly as
+		 * A SHARED anchor took nothing and owes nothing.  The acquire
+		 * that first took that word owns its release, exactly as
 		 * ft_glue_clear_fenced reasons.
 		 */
 		/*
-		 * STRICT: the paragraph above is the ownership proof -- no
-		 * choke point owns this mark yet, so nothing of ours can have
-		 * consumed it and no peer can have taken it while we hold it.
+		 * STRICT: the paragraph above is the ownership proof.  No
+		 * choke point owns this mark yet.  So nothing of ours can have
+		 * consumed it, and no peer can have taken it while we hold it.
 		 */
 		if (absorb_fenced && !absorb_held.shared && absorb_held.lock)
 			ft_meta_lock_release(absorb_held.lock);
@@ -606,24 +617,27 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 
 		if (glue) {
 			/*
-			 * Build-invisible (graft): cn->child is LIVE -- either
-			 * the merged-away child_cn's grandchild or the leaf
-			 * itself.  Record its back-pointer for the post-sync
-			 * commit instead of flipping it now.
+			 * Build-invisible (graft): cn->child is LIVE.  It is
+			 * either the merged-away child_cn's grandchild or the
+			 * leaf itself.  Record its back-pointer for the
+			 * post-sync commit instead of flipping it now.
 			 *
-			 * The absorbed child_cn is freed one of two ways: a fresh
-			 * canonicalization wrapper (tracked in @glue) is dropped
-			 * from tracking and freed here, so the abort path cannot
-			 * double-free it; a LIVE compressed leaf (a re-rooted-in-
-			 * place merge source absorbed into the branch run, never
-			 * tracked) is still reader-reachable until the commit, so
-			 * its free is DEFERRED past the grace period instead.
+			 * The absorbed child_cn is freed in one of two ways:
+			 *  - a fresh canonicalization wrapper (tracked in
+			 *    @glue) is dropped from tracking and freed here.
+			 *    So the abort path cannot double-free it.
+			 *  - a LIVE compressed leaf is never tracked.  It is a
+			 *    re-rooted-in-place merge source absorbed into the
+			 *    branch run.  It stays reader-reachable until the
+			 *    commit, so its free is DEFERRED past the grace
+			 *    period instead.
 			 *
-			 * Track the PLAIN @cflag (not the skip form returned to
-			 * the caller): the abort path resolves a tracked node
-			 * via ft_compressed_node_ptr, so it must not depend on
-			 * cn->child's still-deferred back-pointer (which is how
-			 * a skip pointer recovers its compressed node).
+			 * Track the PLAIN @cflag, not the skip form returned to
+			 * the caller.  The abort path resolves a tracked node
+			 * via ft_compressed_node_ptr.  So it must not depend on
+			 * cn->child's back-pointer, which is still deferred.  A
+			 * skip pointer recovers its compressed node through
+			 * that back-pointer.
 			 */
 			ft_glue_defer_edge(ft, glue, cn->child, cflag,
 				&cn->child);
@@ -651,10 +665,10 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 			}
 			ft_glue_track(glue, cflag);
 			/*
-			 * Emit the creation trace but return the PLAIN flag:
-			 * the caller installs @cn directly and resolves it via
-			 * ft_compressed_node_ptr (cn->child's back-pointer is
-			 * deferred, so the skip form would not yet resolve).
+			 * Emit the creation trace but return the PLAIN flag.
+			 * The caller installs @cn directly and resolves it via
+			 * ft_compressed_node_ptr.  cn->child's back-pointer is
+			 * deferred, so the skip form would not yet resolve.
 			 * The caller re-encodes the holding slot to skip before
 			 * publish.
 			 */
@@ -663,18 +677,20 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 		}
 		/*
 		 * HIDDEN, and the @glue branch above is what proves it.  A LIVE
-		 * @cn->child is the GLUE case -- it says so ("cn->child is LIVE
-		 * ... Record its back-pointer for the post-sync commit instead
-		 * of flipping it now") -- and that branch RETURNS, so this line
-		 * runs only with @glue == NULL.  The absorb fence is likewise
+		 * @cn->child is the GLUE case.  That branch says so: "cn->child
+		 * is LIVE ... Record its back-pointer for the post-sync commit
+		 * instead of flipping it now".  That branch RETURNS, so this
+		 * line runs only with @glue == NULL.  The absorb fence is also
 		 * gated on @glue, so no live child_cn reaches here either.
 		 *
-		 * With @glue NULL there are exactly two entry paths, and both
-		 * carry an unpublished child: ft_attach_node passes the cluster
-		 * it is building from the caller's new external node, and
-		 * ft_build_branch(glue == NULL) -- whose contract says the live
-		 * leaf is the non-NULL-glue mode -- has a single such caller,
-		 * ft_insert_compressed_past_child, passing the fresh @node.
+		 * With @glue NULL there are exactly two entry paths.  Both
+		 * carry an unpublished child:
+		 *  - ft_attach_node passes the cluster it is building from the
+		 *    caller's new external node;
+		 *  - ft_build_branch(glue == NULL) has a single such caller,
+		 *    ft_insert_compressed_past_child, which passes the fresh
+		 *    @node.  ft_build_branch's contract says that the live leaf
+		 *    is the non-NULL-glue mode.
 		 */
 		ft_set_parent_excl(ft, cn->child, cflag, &cn->child,
 			FT_EXCL_HIDDEN);
@@ -701,26 +717,28 @@ struct cds_ft_inode_flag *ft_try_compress_chain(
 
 /*
  * Root-cluster builders: assemble a fresh root internal node from a glue
- * transaction -- used by the graft_swap re-root and by ft-detach when a detach
- * re-roots the trie.  ft_make_root_internal_glue layers over
+ * transaction.  The graft_swap re-root uses them.  ft-detach uses them when a
+ * detach re-roots the trie.  ft_make_root_internal_glue layers over
  * ft_build_extracted_root_glue, so the latter precedes it.
  */
 /*
  * Build (invisibly) a swap_ft root node holding the extracted subtree
  *   @first_byte ++ @rest[0 .. @rest_len-1]  ->  @child
- * i.e. an internal root whose @first_byte slot leads (via a fresh compressed
- * suffix when @rest_len >= 1) to the LIVE @child.  Used (via
- * ft_make_root_internal_glue) by the extract side of cds_ft_graft_swap and by
- * ft_detach_keylen's pre-publish root materialization.
+ * That is an internal root whose @first_byte slot leads to the LIVE @child.
+ * When @rest_len >= 1, it leads there via a fresh compressed suffix.  Used
+ * (via ft_make_root_internal_glue) by the extract side of cds_ft_graft_swap
+ * and by ft_detach_keylen's pre-publish root materialization.
  *
- * @child is LIVE data relocated into swap_ft: its back-pointer is recorded as
- * a deferred edge in @glue rather than flipped now, and every fresh node is
- * tracked so an OOM elsewhere in the swap build frees the cluster (both tries
- * pristine, nothing published).  Nothing is freed here.
+ * @child is LIVE data relocated into swap_ft:
+ *  - its back-pointer is recorded as a deferred edge in @glue rather than
+ *    flipped now;
+ *  - every fresh node is tracked.  So an OOM elsewhere in the swap build
+ *    frees the cluster (both tries pristine, nothing published).
+ * Nothing is freed here.
  *
- * @child is always a plain (internal / external) node -- a compressed node's
- * child is plain by the chain-merge invariant, and the suffix path is held by
- * the fresh compressed @rest -- so no chain-merge is needed.
+ * @child is always a plain (internal / external) node.  A compressed node's
+ * child is plain by the chain-merge invariant.  The suffix path is held by
+ * the fresh compressed @rest.  So no chain-merge is needed.
  *
  * Returns the new internal-tagged root flag, or (void *)(long)-ENOMEM.
  */
@@ -766,23 +784,25 @@ struct cds_ft_inode_flag *ft_build_extracted_root_glue(struct cds_ft *ft,
 		return (struct cds_ft_inode_flag *) (long) -ENOMEM;
 	dest = ft_node_flag(root_node, 0);
 	/*
-	 * @root_node is a BUILD node, and the set says so (@cluster_leaf true):
-	 * the store lands in place, and the child's back-pointer is this
-	 * frame's -- deferred below when @child is live (rest_len == 0), set
-	 * explicitly below when the slot holds the fresh new_cn (a fresh-to-
-	 * fresh edge, safe during the build).
+	 * @root_node is a BUILD node, and the set says so (@cluster_leaf true).
+	 * So the store lands in place.  The child's back-pointer is this
+	 * frame's job:
+	 *  - deferred below when @child is live (rest_len == 0);
+	 *  - set explicitly below when the slot holds the fresh new_cn.  That
+	 *    is a fresh-to-fresh edge, safe during the build.
 	 *
-	 * ☠ IT USED TO SAY "live" FOR rest_len >= 1, and a first occupancy on a
-	 * live popcount node is not stored in place: ft_node_set_nth
-	 * recompacted the empty root into a fresh copy (ADD_SAME) and handed the
-	 * displaced body to nobody (@old_node_ret NULL) -- ONE INTERNAL NODE
-	 * LEAKED per cds_ft_graft_swap / cds_ft_detach whose extracted run was
-	 * two bytes or longer.  MEASURED with the group node balance: the
-	 * six-node "internal node leak" ft_inv's inv_ordered_bulk_consistency
-	 * reported on every DEBUG_COUNTERS run was exactly its six swaps, and a
-	 * one-shot swap or detach of a two-byte run leaks one.  Every other
-	 * fresh-node set_nth in the tree either starts from a NULL target (no
-	 * body to displace) or hands the old body back and frees it.
+	 * ☠ IT USED TO SAY "live" FOR rest_len >= 1.  A first occupancy on a
+	 * live popcount node is not stored in place.  ft_node_set_nth
+	 * recompacted the empty root into a fresh copy (ADD_SAME).  It handed
+	 * the displaced body to nobody (@old_node_ret NULL).  So ONE INTERNAL
+	 * NODE LEAKED per cds_ft_graft_swap / cds_ft_detach whose extracted run
+	 * was two bytes or longer.  MEASURED with the group node balance.
+	 * ft_inv's inv_ordered_bulk_consistency reported a six-node "internal
+	 * node leak" on every DEBUG_COUNTERS run.  That was exactly its six
+	 * swaps.  A one-shot swap or detach of a two-byte run leaks one.
+	 * Every other fresh-node set_nth in the tree does one of two things.
+	 * It starts from a NULL target (no body to displace).  Or it hands
+	 * the old body back and frees it.
 	 */
 	ret = ft_node_set_nth(ft, &dest, first_byte, slot_value,
 			NULL, root_meta, 0, true /* cluster_leaf: build node */);
@@ -800,9 +820,10 @@ struct cds_ft_inode_flag *ft_build_extracted_root_glue(struct cds_ft *ft,
 		/*
 		 * HIDDEN: this arm's @slot_value is the FRESH compressed node
 		 * allocated above for the remaining run.  The LIVE case is the
-		 * OTHER branch and the code labels it there -- slot_value =
-		 * child, marked LIVE with its back-pointer deferred -- routing
-		 * it to ft_glue_defer_edge instead of here.
+		 * OTHER branch, and the code labels it there.  In that branch
+		 * slot_value = child is marked LIVE, with its back-pointer
+		 * deferred.  That branch routes it to ft_glue_defer_edge
+		 * instead of here.
 		 */
 		ft_set_parent_excl(ft, slot_value, dest, slot,
 			FT_EXCL_HIDDEN);
@@ -815,17 +836,20 @@ struct cds_ft_inode_flag *ft_build_extracted_root_glue(struct cds_ft *ft,
  * invariant that the root pointer always tags an internal node (never
  * compressed, never skip-compressed).  Used by cds_ft_graft_swap's extract
  * side and by ft_detach_keylen.  Materializes an internal-node root from the
- * LIVE displaced @old_child without publishing or mutating live data: fresh nodes are tracked in @glue, the moved grandchild's
- * back-pointer is deferred, and the peeled-away compressed node is recorded for
- * deferred free.  Nothing is freed here.
+ * LIVE displaced @old_child.  It neither publishes nor mutates live data:
+ *  - fresh nodes are tracked in @glue;
+ *  - the moved grandchild's back-pointer is deferred;
+ *  - the peeled-away compressed node is recorded for deferred free.
+ * Nothing is freed here.
  *
  *   - @old_child internal:    returned unchanged (already a valid internal
  *                             root; the caller clears its parent at commit).
  *                             No glue node, no deferred edge.
  *   - @old_child compressed:  peel the first path byte into a fresh internal
- *                             root, the rest (if any) into a fresh compressed
- *                             node; defer the live grandchild's back-pointer;
- *                             record the old compressed node for deferred free.
+ *                             root.  Peel the rest (if any) into a fresh
+ *                             compressed node.  Defer the live grandchild's
+ *                             back-pointer.  Record the old compressed node
+ *                             for deferred free.
  *
  * External @old_child must be filtered by the caller (externals attach as
  * external_nodes, not via this helper).
