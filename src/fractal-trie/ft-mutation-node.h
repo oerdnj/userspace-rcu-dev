@@ -5,18 +5,22 @@
 /*
  * src/fractal-trie/ft-mutation-node.h
  *
- * Userspace RCU library - Fractal Trie: node-structure WRITE operations -- the
- * high-level child-slot mutators built on the popcount / pigeon bitmap layout.
- * ft_node_set_nth / ft_node_replace_ptr and their per-class dispatchers
- * (ft_popcount_node_set_nth, ft_pigeon_node_set_nth, the *_replace_ptr pair),
- * plus ft_node_recompact which grows or shrinks a node to the next layout
- * class.  The read accessors and the per-class bitmap layout they all share --
- * including the per-class LOW-level set_nth -- live in ft-lookup-node.h.
+ * Userspace RCU library - Fractal Trie: node-structure WRITE operations.
+ * These are the high-level child-slot mutators built on the popcount / pigeon
+ * bitmap layout:
+ *   - ft_node_set_nth and ft_node_replace_ptr;
+ *   - their per-class dispatchers: ft_popcount_node_set_nth,
+ *     ft_pigeon_node_set_nth and the *_replace_ptr pair;
+ *   - ft_node_recompact, which grows or shrinks a node to the next layout
+ *     class.
+ * The read accessors and the per-class bitmap layout they all share live in
+ * ft-lookup-node.h.  That includes the per-class LOW-level set_nth.
  *
- * Split out of ft-lookup-node.h and #included after ft-mutation-helpers.h so
- * ft_set_parent_raw (the deferred parent back-pointer store) is already
- * defined: in ft-lookup-node.h this cluster sat ahead of that definition and
- * had to forward-declare it.
+ * This file was split out of ft-lookup-node.h.  It is #included after
+ * ft-mutation-helpers.h, so ft_set_parent_raw is already defined.
+ * ft_set_parent_raw is the deferred parent back-pointer store.  In
+ * ft-lookup-node.h this cluster sat ahead of that definition and had to
+ * forward-declare it.
  *
  * Implementation unit: #included once into the fractal-trie.c translation unit
  * (preserves cross-module inlining).  Not a standalone header.
@@ -29,44 +33,48 @@
  * Insert (or replace) child_node_flag at byte n within an FT_POPCOUNT
  * node.  Three outcome paths:
  *
- *   - is_init: caller-promised first set_nth on a freshly-allocated
- *     (unpublished) node; call the layout's helper directly with
- *     is_init=true to set up the bitmap and pointer array from
- *     scratch.
+ *   - is_init: the caller promises that this is the first set_nth on a
+ *     freshly-allocated (unpublished) node.  Call the layout's helper
+ *     directly with is_init=true.  It sets up the bitmap and the
+ *     pointer array from scratch.
  *
  *   - non-init, key already present: in-place pointer replace
  *     (single-slot RCU-safe write).
  *
  *   - non-init, key not present, "no existing bit lies above n":
- *     safe-append.  Setting bit n does not shift any existing
- *     pointer's popcount-rank, so the new pointer can be written at
- *     the (current) end-of-array slot and the new bit then published.
- *     Reader sees either the old state, an "appendinflight" state
- *     that returns NULL (legitimate), or the fully-published new
- *     entry.  See the publish-stores below for the detailed ordering
- *     reasoning (release on the new pointer, relaxed on each bitmap
- *     publish; reader's address-dependency from bitmap-derived index
- *     to pointer load keeps the loads ordered on weakly-ordered
- *     architectures).
+ *     safe-append.  Setting bit n does not shift the popcount-rank of
+ *     any existing pointer.  So the new pointer can be written at the
+ *     (current) end-of-array slot, and the new bit is then published.
+ *     A reader sees one of:
+ *       - the old state;
+ *       - an "appendinflight" state that returns NULL (legitimate);
+ *       - the fully-published new entry.
+ *     See the publish-stores below for the detailed ordering
+ *     reasoning.  The new pointer store is a release.  Each bitmap
+ *     publish is relaxed.  The reader derives its index from the
+ *     bitmap, then loads the pointer.  That address dependency keeps
+ *     the loads ordered on weakly-ordered architectures.
  *
  *   - otherwise: -ERANGE, forcing the caller to recompact.
  */
 /*
- * Apply the nr_child++ that an OCCUPANCY-ADDING set_nth owes, either in place or
- * by handing it to the caller's commit.
+ * Apply the nr_child++ that an OCCUPANCY-ADDING set_nth owes.  Do it in
+ * place, or hand it to the caller's commit.
  *
  * @deferred_count NULL (every build-path caller): increment in place.  On a
- * build-invisible node that is correct by construction -- the count is part of
+ * build-invisible node that is correct by construction.  The count is part of
  * the node's initial image and publishes wholesale with it.
  *
  * @deferred_count non-NULL: the caller opted in to PUBLISHING the increment
- * itself, as an edge in the same commit as the structural publish
- * (ft_flip_txn_record_nr_child_inc, which carries the full rationale).  Only a
- * LIVE-node store needs that -- a build-invisible one (@defer_parent) is rolled
- * back wholesale with its fresh node -- so the deferral is keyed on the node
- * being live, and the flag reports back that the caller now owes the edge.
- * Never cleared here: the caller inits it false, and an -ERANGE/-ENOSPC retry
- * through ft_node_recompact builds its count on the FRESH copy, leaving it false.
+ * itself.  The increment is then an edge in the same commit as the
+ * structural publish.  ft_flip_txn_record_nr_child_inc carries the full
+ * rationale.  Only a LIVE-node store needs that.  A build-invisible store
+ * (@defer_parent) is rolled back wholesale with its fresh node.  So the
+ * deferral is keyed on the node being live.  The flag reports back that the
+ * caller now owes the edge.
+ * The flag is never cleared here.  The caller inits it false.  An -ERANGE or
+ * -ENOSPC retry through ft_node_recompact builds its count on the FRESH copy.
+ * That leaves the flag false.
  */
 static inline
 void ft_node_count_add(struct cds_ft_metadata *metadata, bool defer_parent,
@@ -95,13 +103,16 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 	assert(ft_type_is_popcount(type->type_class));
 
 	/*
-	 * Parent-first: wire the (fresh, not-yet-published) child's parent
-	 * back-pointer before any in-place store below, so a reader that
-	 * descends to it and walks back up never observes a NULL/stale parent.
-	 * Skipped when @defer_parent: a recompact child-copy (new node is
-	 * unpublished, reparented post-assembly) or a build-invisible cluster-
-	 * leaf (mutator wires parents at publish).  skip_slot is still set by
-	 * the wrapper's post-store ft_set_parent.
+	 * Parent-first: wire the child's parent back-pointer before any
+	 * in-place store below.  The child is fresh and not yet published.
+	 * A reader that descends to it and walks back up then never observes
+	 * a NULL/stale parent.
+	 * Skipped when @defer_parent, which is one of:
+	 *   - a recompact child-copy: the new node is unpublished and is
+	 *     reparented post-assembly;
+	 *   - a build-invisible cluster-leaf: the mutator wires parents at
+	 *     publish.
+	 * skip_slot is still set by the wrapper's post-store ft_set_parent.
 	 */
 	if (!defer_parent)
 		ft_set_parent_raw(ft, child_node_flag, node_flag);
@@ -132,20 +143,22 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 
 		/* Recompact-on-insert: a new bitmap occupancy must not be set in
 		 * place on a LIVE node.  Report -ERANGE so the wrapper routes
-		 * through ft_node_recompact(ADD_SAME), exactly as a non-tail
-		 * (Case 3) insert already does; a replace at an already-occupied
-		 * slot (Case 1) stays in place (no bitmap change).  @defer_parent
-		 * means the target is an unpublished build node (recompact
-		 * child-copy / cluster-leaf) -- build-invisible, so keep the
-		 * in-place store.  See FEATURE_FT_INSERT_IN_PLACE. */
+		 * through ft_node_recompact(ADD_SAME).  A non-tail (Case 3)
+		 * insert already does exactly that.  A replace at an
+		 * already-occupied slot (Case 1) stays in place (no bitmap
+		 * change).  @defer_parent means the target is an unpublished
+		 * build node (recompact child-copy / cluster-leaf).  That
+		 * node is build-invisible, so keep the in-place store.  See
+		 * FEATURE_FT_INSERT_IN_PLACE. */
 		if (!in_place && !defer_parent &&
 		    !((qp_root >> qp_hi & 1U) && ((qp_bms >> qp_p) & 1ULL))) {
 			/*
-			 * @in_place is the CALLER's vouch that it holds this node
-			 * (ft_in_place_ok's header).  A caller that declines the tier -- a
-			 * bulk reserve, the build-path wrapper -- lands here and recompacts;
-			 * the audit still declares LOCKED on this refused arm so that
-			 * population stays measurable.
+			 * @in_place is the CALLER's vouch that it holds this
+			 * node (ft_in_place_ok's header).  A caller that
+			 * declines the tier lands here and recompacts.
+			 * Examples: a bulk reserve, the build-path wrapper.
+			 * The audit still declares LOCKED on this refused
+			 * arm, so that population stays measurable.
 			 */
 			ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED,
 			FT_CH_TXN_USE);
@@ -163,22 +176,23 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 				if (qp_pointers[qp_ptr_idx]) {
 					/*
 					 * FENCED ADD, in-place mirror (see the
-					 * same check in ft_node_recompact): a
-					 * LIVE-node RESERVE (@child_node_flag
-					 * NULL) whose byte is no longer free.  A
-					 * peer COMMITTED a child at @n between
-					 * this op's descent -- which read the byte
-					 * as absent, or the caller would not be
-					 * reserving it -- and this store.  The
-					 * blind store below would not replace a
-					 * pointer, it would CLEAR that live child
-					 * and orphan its whole subtree.  Bail
-					 * -EAGAIN so the op re-descends and dives
-					 * into the peer's child instead; the
-					 * insert's pre-commit conflict path
-					 * already routes -EAGAIN to
-					 * restart_attempt.  Never fires under a
-					 * single writer (the descent's read holds).
+					 * same check in ft_node_recompact).
+					 * This is a LIVE-node RESERVE
+					 * (@child_node_flag NULL) whose byte is
+					 * no longer free.  This op's descent
+					 * read the byte as absent.  Otherwise
+					 * the caller would not be reserving it.
+					 * Since then, a peer COMMITTED a child
+					 * at @n.  The blind store below would
+					 * not replace a pointer.  It would
+					 * CLEAR that live child and orphan its
+					 * whole subtree.  Bail -EAGAIN so the
+					 * op re-descends and dives into the
+					 * peer's child instead.  The insert's
+					 * pre-commit conflict path already
+					 * routes -EAGAIN to restart_attempt.
+					 * This never fires under a single
+					 * writer (the descent's read holds).
 					 */
 					if (!defer_parent && !child_node_flag)
 						return -EAGAIN;
@@ -186,38 +200,45 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					 * CONTRACT (audited 2026-07-27): a
 					 * REPLACE at an already-occupied slot
 					 * stores straight into the LIVE pointer
-					 * array -- no node lock, no txn
-					 * record.  That is sound only on a
-					 * build-invisible node, which is the
-					 * only way this arm is reachable today:
-					 * every internal caller is
-					 * ft_node_recompact building @new_node
-					 * (@defer_parent true), and every
-					 * external caller passes a NULL child
-					 * for an UNOCCUPIED slot -- insert
-					 * guards it with `if (!old_node_flag)`
-					 * precisely because a NULL store here
-					 * would drop a live external before the
-					 * commit.  Assert it so the convention
-					 * is a checked contract: a future caller
-					 * reaching this arm on a reachable node
-					 * would get an untransacted live-node
-					 * store, the exact class
-					 * recompact-on-insert exists to remove.
+					 * array.  It takes no node lock and
+					 * makes no txn record.  That is sound
+					 * only on a build-invisible node.  This
+					 * arm is reachable in no other way
+					 * today:
+					 *   - every internal caller is
+					 *     ft_node_recompact building
+					 *     @new_node (@defer_parent true);
+					 *   - every external caller passes a
+					 *     NULL child for an UNOCCUPIED
+					 *     slot.
+					 * Insert guards the latter with
+					 * `if (!old_node_flag)`, because a NULL
+					 * store here would drop a live external
+					 * before the commit.  The assert makes
+					 * the convention a checked contract.
+					 * A future caller reaching this arm on
+					 * a reachable node would get an
+					 * untransacted live-node store.
+					 * Recompact-on-insert exists to remove
+					 * exactly that class.
 					 */
 					assert(defer_parent);
 					if (_replace_old_ptr)
 						*_replace_old_ptr = true;
 				} else {
 					/*
-					 * Recompact-on-insert (tier off): refilling a
-					 * soft-deleted hole (bit sticky-set, slot NULL)
-					 * bumps this LIVE node's nr_child -- report
-					 * -ERANGE so the wrapper routes through
-					 * ft_node_recompact(ADD_SAME) (the fresh copy
-					 * drops the NULL hole and re-adds byte n).
-					 * @defer_parent = build-invisible node: keep in
-					 * place (also avoids recompact-within-recompact).
+					 * Recompact-on-insert (tier off): a
+					 * soft-deleted hole has its bit
+					 * sticky-set and its slot NULL.
+					 * Refilling it bumps this LIVE node's
+					 * nr_child.  Report -ERANGE so the
+					 * wrapper routes through
+					 * ft_node_recompact(ADD_SAME).  The
+					 * fresh copy drops the NULL hole and
+					 * re-adds byte n.
+					 * @defer_parent = build-invisible node:
+					 * keep in place.  This also avoids
+					 * recompact-within-recompact.
 					 */
 					if (!in_place && !defer_parent)
 						return -ERANGE;
@@ -328,17 +349,18 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 
 		/* Recompact-on-insert (see FEATURE_FT_INSERT_IN_PLACE): a new
 		 * bitmap occupancy on a live node (!defer_parent) routes to
-		 * ADD_SAME via -ERANGE; a replace at an occupied slot, and a
-		 * build-into-unpublished-node insert (defer_parent), stay in
-		 * place. */
+		 * ADD_SAME via -ERANGE.  Two stores stay in place:
+		 *   - a replace at an occupied slot;
+		 *   - a build-into-unpublished-node insert (defer_parent). */
 		if (!in_place && !defer_parent &&
 		    !(((qp_root >> qp_hi) & 1ULL) && ((qp_bms >> qp_p) & 1ULL))) {
 			/*
-			 * @in_place is the CALLER's vouch that it holds this node
-			 * (ft_in_place_ok's header).  A caller that declines the tier -- a
-			 * bulk reserve, the build-path wrapper -- lands here and recompacts;
-			 * the audit still declares LOCKED on this refused arm so that
-			 * population stays measurable.
+			 * @in_place is the CALLER's vouch that it holds this
+			 * node (ft_in_place_ok's header).  A caller that
+			 * declines the tier lands here and recompacts.
+			 * Examples: a bulk reserve, the build-path wrapper.
+			 * The audit still declares LOCKED on this refused
+			 * arm, so that population stays measurable.
 			 */
 			ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED,
 			FT_CH_TXN_USE);
@@ -356,22 +378,23 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 				if (qp_pointers[qp_ptr_idx]) {
 					/*
 					 * FENCED ADD, in-place mirror (see the
-					 * same check in ft_node_recompact): a
-					 * LIVE-node RESERVE (@child_node_flag
-					 * NULL) whose byte is no longer free.  A
-					 * peer COMMITTED a child at @n between
-					 * this op's descent -- which read the byte
-					 * as absent, or the caller would not be
-					 * reserving it -- and this store.  The
-					 * blind store below would not replace a
-					 * pointer, it would CLEAR that live child
-					 * and orphan its whole subtree.  Bail
-					 * -EAGAIN so the op re-descends and dives
-					 * into the peer's child instead; the
-					 * insert's pre-commit conflict path
-					 * already routes -EAGAIN to
-					 * restart_attempt.  Never fires under a
-					 * single writer (the descent's read holds).
+					 * same check in ft_node_recompact).
+					 * This is a LIVE-node RESERVE
+					 * (@child_node_flag NULL) whose byte is
+					 * no longer free.  This op's descent
+					 * read the byte as absent.  Otherwise
+					 * the caller would not be reserving it.
+					 * Since then, a peer COMMITTED a child
+					 * at @n.  The blind store below would
+					 * not replace a pointer.  It would
+					 * CLEAR that live child and orphan its
+					 * whole subtree.  Bail -EAGAIN so the
+					 * op re-descends and dives into the
+					 * peer's child instead.  The insert's
+					 * pre-commit conflict path already
+					 * routes -EAGAIN to restart_attempt.
+					 * This never fires under a single
+					 * writer (the descent's read holds).
 					 */
 					if (!defer_parent && !child_node_flag)
 						return -EAGAIN;
@@ -379,38 +402,45 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					 * CONTRACT (audited 2026-07-27): a
 					 * REPLACE at an already-occupied slot
 					 * stores straight into the LIVE pointer
-					 * array -- no node lock, no txn
-					 * record.  That is sound only on a
-					 * build-invisible node, which is the
-					 * only way this arm is reachable today:
-					 * every internal caller is
-					 * ft_node_recompact building @new_node
-					 * (@defer_parent true), and every
-					 * external caller passes a NULL child
-					 * for an UNOCCUPIED slot -- insert
-					 * guards it with `if (!old_node_flag)`
-					 * precisely because a NULL store here
-					 * would drop a live external before the
-					 * commit.  Assert it so the convention
-					 * is a checked contract: a future caller
-					 * reaching this arm on a reachable node
-					 * would get an untransacted live-node
-					 * store, the exact class
-					 * recompact-on-insert exists to remove.
+					 * array.  It takes no node lock and
+					 * makes no txn record.  That is sound
+					 * only on a build-invisible node.  This
+					 * arm is reachable in no other way
+					 * today:
+					 *   - every internal caller is
+					 *     ft_node_recompact building
+					 *     @new_node (@defer_parent true);
+					 *   - every external caller passes a
+					 *     NULL child for an UNOCCUPIED
+					 *     slot.
+					 * Insert guards the latter with
+					 * `if (!old_node_flag)`, because a NULL
+					 * store here would drop a live external
+					 * before the commit.  The assert makes
+					 * the convention a checked contract.
+					 * A future caller reaching this arm on
+					 * a reachable node would get an
+					 * untransacted live-node store.
+					 * Recompact-on-insert exists to remove
+					 * exactly that class.
 					 */
 					assert(defer_parent);
 					if (_replace_old_ptr)
 						*_replace_old_ptr = true;
 				} else {
 					/*
-					 * Recompact-on-insert (tier off): refilling a
-					 * soft-deleted hole (bit sticky-set, slot NULL)
-					 * bumps this LIVE node's nr_child -- report
-					 * -ERANGE so the wrapper routes through
-					 * ft_node_recompact(ADD_SAME) (the fresh copy
-					 * drops the NULL hole and re-adds byte n).
-					 * @defer_parent = build-invisible node: keep in
-					 * place (also avoids recompact-within-recompact).
+					 * Recompact-on-insert (tier off): a
+					 * soft-deleted hole has its bit
+					 * sticky-set and its slot NULL.
+					 * Refilling it bumps this LIVE node's
+					 * nr_child.  Report -ERANGE so the
+					 * wrapper routes through
+					 * ft_node_recompact(ADD_SAME).  The
+					 * fresh copy drops the NULL hole and
+					 * re-adds byte n.
+					 * @defer_parent = build-invisible node:
+					 * keep in place.  This also avoids
+					 * recompact-within-recompact.
 					 */
 					if (!in_place && !defer_parent)
 						return -ERANGE;
@@ -510,9 +540,9 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 
 		/* Recompact-on-insert (see FEATURE_FT_INSERT_IN_PLACE): a new
 		 * bitmap occupancy on a live node (!defer_parent) routes to
-		 * ADD_SAME via -ERANGE; a replace at an occupied slot, and a
-		 * build-into-unpublished-node insert (defer_parent), stay in
-		 * place. */
+		 * ADD_SAME via -ERANGE.  Two stores stay in place:
+		 *   - a replace at an occupied slot;
+		 *   - a build-into-unpublished-node insert (defer_parent). */
 		if (!in_place && !defer_parent) {
 			bool qp_present = false;
 
@@ -523,11 +553,13 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 			}
 			if (!qp_present) {
 				/*
-				 * @in_place is the CALLER's vouch that it holds this node
-				 * (ft_in_place_ok's header).  A caller that declines the tier -- a
-				 * bulk reserve, the build-path wrapper -- lands here and recompacts;
-				 * the audit still declares LOCKED on this refused arm so that
-				 * population stays measurable.
+				 * @in_place is the CALLER's vouch that it
+				 * holds this node (ft_in_place_ok's header).
+				 * A caller that declines the tier lands here
+				 * and recompacts.  Examples: a bulk reserve,
+				 * the build-path wrapper.  The audit still
+				 * declares LOCKED on this refused arm, so
+				 * that population stays measurable.
 				 */
 				ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED,
 			FT_CH_TXN_USE);
@@ -558,22 +590,23 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 				if (qp_pointers[qp_ptr_idx]) {
 					/*
 					 * FENCED ADD, in-place mirror (see the
-					 * same check in ft_node_recompact): a
-					 * LIVE-node RESERVE (@child_node_flag
-					 * NULL) whose byte is no longer free.  A
-					 * peer COMMITTED a child at @n between
-					 * this op's descent -- which read the byte
-					 * as absent, or the caller would not be
-					 * reserving it -- and this store.  The
-					 * blind store below would not replace a
-					 * pointer, it would CLEAR that live child
-					 * and orphan its whole subtree.  Bail
-					 * -EAGAIN so the op re-descends and dives
-					 * into the peer's child instead; the
-					 * insert's pre-commit conflict path
-					 * already routes -EAGAIN to
-					 * restart_attempt.  Never fires under a
-					 * single writer (the descent's read holds).
+					 * same check in ft_node_recompact).
+					 * This is a LIVE-node RESERVE
+					 * (@child_node_flag NULL) whose byte is
+					 * no longer free.  This op's descent
+					 * read the byte as absent.  Otherwise
+					 * the caller would not be reserving it.
+					 * Since then, a peer COMMITTED a child
+					 * at @n.  The blind store below would
+					 * not replace a pointer.  It would
+					 * CLEAR that live child and orphan its
+					 * whole subtree.  Bail -EAGAIN so the
+					 * op re-descends and dives into the
+					 * peer's child instead.  The insert's
+					 * pre-commit conflict path already
+					 * routes -EAGAIN to restart_attempt.
+					 * This never fires under a single
+					 * writer (the descent's read holds).
 					 */
 					if (!defer_parent && !child_node_flag)
 						return -EAGAIN;
@@ -581,38 +614,45 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					 * CONTRACT (audited 2026-07-27): a
 					 * REPLACE at an already-occupied slot
 					 * stores straight into the LIVE pointer
-					 * array -- no node lock, no txn
-					 * record.  That is sound only on a
-					 * build-invisible node, which is the
-					 * only way this arm is reachable today:
-					 * every internal caller is
-					 * ft_node_recompact building @new_node
-					 * (@defer_parent true), and every
-					 * external caller passes a NULL child
-					 * for an UNOCCUPIED slot -- insert
-					 * guards it with `if (!old_node_flag)`
-					 * precisely because a NULL store here
-					 * would drop a live external before the
-					 * commit.  Assert it so the convention
-					 * is a checked contract: a future caller
-					 * reaching this arm on a reachable node
-					 * would get an untransacted live-node
-					 * store, the exact class
-					 * recompact-on-insert exists to remove.
+					 * array.  It takes no node lock and
+					 * makes no txn record.  That is sound
+					 * only on a build-invisible node.  This
+					 * arm is reachable in no other way
+					 * today:
+					 *   - every internal caller is
+					 *     ft_node_recompact building
+					 *     @new_node (@defer_parent true);
+					 *   - every external caller passes a
+					 *     NULL child for an UNOCCUPIED
+					 *     slot.
+					 * Insert guards the latter with
+					 * `if (!old_node_flag)`, because a NULL
+					 * store here would drop a live external
+					 * before the commit.  The assert makes
+					 * the convention a checked contract.
+					 * A future caller reaching this arm on
+					 * a reachable node would get an
+					 * untransacted live-node store.
+					 * Recompact-on-insert exists to remove
+					 * exactly that class.
 					 */
 					assert(defer_parent);
 					if (_replace_old_ptr)
 						*_replace_old_ptr = true;
 				} else {
 					/*
-					 * Recompact-on-insert (tier off): refilling a
-					 * soft-deleted hole (bit sticky-set, slot NULL)
-					 * bumps this LIVE node's nr_child -- report
-					 * -ERANGE so the wrapper routes through
-					 * ft_node_recompact(ADD_SAME) (the fresh copy
-					 * drops the NULL hole and re-adds byte n).
-					 * @defer_parent = build-invisible node: keep in
-					 * place (also avoids recompact-within-recompact).
+					 * Recompact-on-insert (tier off): a
+					 * soft-deleted hole has its bit
+					 * sticky-set and its slot NULL.
+					 * Refilling it bumps this LIVE node's
+					 * nr_child.  Report -ERANGE so the
+					 * wrapper routes through
+					 * ft_node_recompact(ADD_SAME).  The
+					 * fresh copy drops the NULL hole and
+					 * re-adds byte n.
+					 * @defer_parent = build-invisible node:
+					 * keep in place.  This also avoids
+					 * recompact-within-recompact.
 					 */
 					if (!in_place && !defer_parent)
 						return -ERANGE;
@@ -713,16 +753,17 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 
 		/* Recompact-on-insert (see FEATURE_FT_INSERT_IN_PLACE): a new
 		 * bitmap occupancy on a live node (!defer_parent) routes to
-		 * ADD_SAME via -ERANGE; a replace at an occupied slot, and a
-		 * build-into-unpublished-node insert (defer_parent), stay in
-		 * place. */
+		 * ADD_SAME via -ERANGE.  Two stores stay in place:
+		 *   - a replace at an occupied slot;
+		 *   - a build-into-unpublished-node insert (defer_parent). */
 		if (!in_place && !defer_parent && !(word & bit)) {
 			/*
-			 * @in_place is the CALLER's vouch that it holds this node
-			 * (ft_in_place_ok's header).  A caller that declines the tier -- a
-			 * bulk reserve, the build-path wrapper -- lands here and recompacts;
-			 * the audit still declares LOCKED on this refused arm so that
-			 * population stays measurable.
+			 * @in_place is the CALLER's vouch that it holds this
+			 * node (ft_in_place_ok's header).  A caller that
+			 * declines the tier lands here and recompacts.
+			 * Examples: a bulk reserve, the build-path wrapper.
+			 * The audit still declares LOCKED on this refused
+			 * arm, so that population stays measurable.
 			 */
 			ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED,
 			FT_CH_TXN_USE);
@@ -740,30 +781,37 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					word & (bit - 1ULL));
 			if (bp_pointers[ptr_idx]) {
 				/*
-				 * FENCED ADD, in-place mirror: a LIVE-node RESERVE
-				 * (NULL child) whose byte a peer filled between this
-				 * op's descent and this store -- the blind store would
-				 * CLEAR the peer's live child.  Bail -EAGAIN to
-				 * re-descend.  See the long note on the 2L arms.
+				 * FENCED ADD, in-place mirror: a LIVE-node
+				 * RESERVE (NULL child).  A peer filled its
+				 * byte between this op's descent and this
+				 * store.  The blind store would CLEAR the
+				 * peer's live child.  Bail -EAGAIN to
+				 * re-descend.  See the long note on the 2L
+				 * arms.
 				 */
 				if (!defer_parent && !child_node_flag)
 					return -EAGAIN;
-				/* Same checked contract as the other Case-1 arms: an
-				 * occupied-slot replace stores into the LIVE pointer array
-				 * with no lock and no txn, so it is sound only on a
-				 * build-invisible node.  See the long note above. */
+				/* Same checked contract as the other Case-1
+				 * arms.  An occupied-slot replace stores into
+				 * the LIVE pointer array with no lock and no
+				 * txn.  So it is sound only on a
+				 * build-invisible node.  See the long note
+				 * above. */
 				assert(defer_parent);
 				if (_replace_old_ptr)
 					*_replace_old_ptr = true;
 			} else {
 				/*
-				 * Recompact-on-insert (tier off): refilling a
-				 * soft-deleted hole (bit sticky-set, slot NULL) bumps
-				 * this LIVE node's nr_child -- report -ERANGE so the
-				 * wrapper routes through ft_node_recompact(ADD_SAME)
-				 * (the fresh copy drops the NULL hole and re-adds byte
-				 * n).  @defer_parent = build-invisible node: keep in
-				 * place (also avoids recompact-within-recompact).
+				 * Recompact-on-insert (tier off): a
+				 * soft-deleted hole has its bit sticky-set
+				 * and its slot NULL.  Refilling it bumps
+				 * this LIVE node's nr_child.  Report -ERANGE
+				 * so the wrapper routes through
+				 * ft_node_recompact(ADD_SAME).  The fresh
+				 * copy drops the NULL hole and re-adds byte
+				 * n.  @defer_parent = build-invisible node:
+				 * keep in place.  This also avoids
+				 * recompact-within-recompact.
 				 */
 				if (!in_place && !defer_parent)
 					return -ERANGE;
@@ -784,10 +832,10 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		}
 
 		/*
-		 * Case 2: try safe-append.  Condition is "no existing
-		 * bit at a position > n" -- evaluated as "no bit
-		 * above bit_idx in word_idx, AND no bit set in any
-		 * higher word".
+		 * Case 2: try safe-append.  The condition is "no existing
+		 * bit at a position > n".  It is evaluated in two parts:
+		 *   - no bit above bit_idx in word_idx;
+		 *   - AND no bit set in any higher word.
 		 */
 		{
 			bool safe_append;
@@ -809,16 +857,16 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		if (ptr_idx >= type->max_child)
 			return -ENOSPC;
 		/*
-		 * Pointer store carries a release: the next-level child
-		 * node's contents (initialized by the caller before this
-		 * set_nth) must be visible to readers that follow the
-		 * pointer (matching acquire on the scanner's pointer load).
+		 * Pointer store carries a release.  The caller initialized
+		 * the next-level child node's contents before this set_nth.
+		 * They must be visible to readers that follow the pointer.
+		 * The matching acquire is on the scanner's pointer load.
 		 *
 		 * Bitmap bit set is relaxed: it is only a reachability flag
-		 * for this slot.  If a reader observes the bit set but the
-		 * pointer-store is not yet visible (still NULL), the lookup
-		 * returns NULL -- a legitimate not-found result for an
-		 * append that hasn't fully propagated.  No reader can
+		 * for this slot.  A reader may observe the bit set while the
+		 * pointer-store is not yet visible (still NULL).  The lookup
+		 * then returns NULL.  That is a legitimate not-found result
+		 * for an append that hasn't fully propagated.  No reader can
 		 * compute ptr_idx == this new slot without also seeing the
 		 * bit set, so the slot is invisible until the bit is.
 		 */
@@ -853,52 +901,61 @@ int ft_pigeon_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 	ptr = &((struct cds_ft_inode_flag **) node->data)[n];
 	/*
 	 * Recompact-on-insert (see FEATURE_FT_INSERT_IN_PLACE): retire the
-	 * in-place occupancy-bitmap set on a LIVE pigeon by reporting -ERANGE
-	 * for a new occupancy, so the wrapper rebuilds the node via
-	 * ft_node_recompact(ADD_SAME) (uniform with popcount).  A replace at
-	 * an occupied slot, and a build-into-unpublished-node insert
-	 * (defer_parent), stay in place; pigeon has no reserved-byte state,
-	 * so an empty slot is a genuinely new key.
+	 * in-place occupancy-bitmap set on a LIVE pigeon.  Report -ERANGE
+	 * for a new occupancy.  The wrapper then rebuilds the node via
+	 * ft_node_recompact(ADD_SAME) (uniform with popcount).  Two stores
+	 * stay in place:
+	 *   - a replace at an occupied slot;
+	 *   - a build-into-unpublished-node insert (defer_parent).
+	 * Pigeon has no reserved-byte state, so an empty slot is a genuinely
+	 * new key.
 	 *
 	 * NOTE (future, not done -- kept simple for now): a pigeon slot is
-	 * direct-indexed, so the pointer store is already a clean flip edge
-	 * and the bitmap is only an occupancy HINT (point lookups read the
-	 * slot; iteration rescans past a set bit whose slot is NULL).  So the
-	 * whole-node recompact is avoidable for pigeon: make the bitmap a
-	 * STICKY hint instead -- set with an atomic OR, never cleared in
-	 * place (a delete leaves the bit; only a recompact rebuilds a clean
-	 * bitmap), optionally triggering a cleanup recompact once stale bits
-	 * (set bit over NULL slot = popcount(bitmap) - nr_child) get high.
-	 * That keeps pigeon's O(1) insert/delete; deferred to avoid bundling
-	 * too many changes here (it also needs the verify cross-check and the
-	 * delete bit-clear relaxed for the sticky semantics).
+	 * direct-indexed.  So the pointer store is already a clean flip
+	 * edge, and the bitmap is only an occupancy HINT.  Point lookups
+	 * read the slot.  Iteration rescans past a set bit whose slot is
+	 * NULL.  So the whole-node recompact is avoidable for pigeon: make
+	 * the bitmap a STICKY hint instead.
+	 *   - Set the bit with an atomic OR.
+	 *   - Never clear it in place.  A delete leaves the bit.  Only a
+	 *     recompact rebuilds a clean bitmap.
+	 *   - Optionally trigger a cleanup recompact once stale bits get
+	 *     high.  A stale bit is a set bit over a NULL slot.  Their
+	 *     number is popcount(bitmap) - nr_child.
+	 * That keeps pigeon's O(1) insert/delete.  It is deferred to avoid
+	 * bundling too many changes here.  It also needs the verify
+	 * cross-check and the delete bit-clear relaxed for the sticky
+	 * semantics.
 	 *
 	 * ☠☠ AND IT WOULD BREAK THE IN-TRIE MOVE'S READER COHERENCE, WHICH
 	 * NOTHING HERE SAYS.  The -ERANGE below reads as a purely local
-	 * torn-read concern (bitmap vs nr_child), but a same-trie rekey leans
-	 * on it for something else entirely: the coherent reader validates a
-	 * lookup by running TWO descents and comparing a fold of the node
-	 * ADDRESSES it visited (ft_lookup_two_descents, ft-lookup.h; the folds
-	 * at ft-descent.h).  That is sound only because every move perturbs
-	 * that fold -- and what guarantees the perturbation is THIS arm: the
-	 * destination attach parent gains an occupancy, so it relocates.  Make
-	 * the bitmap sticky and a move whose dst parent is a pigeon node can
-	 * publish no fresh address anywhere on the graft arm, and a torn
-	 * descent becomes indistinguishable from a clean one.
+	 * torn-read concern (bitmap vs nr_child).  A same-trie rekey also
+	 * relies on it, for a different reason.  The coherent reader
+	 * validates a lookup by running TWO descents.  It compares a fold of
+	 * the node ADDRESSES it visited (ft_lookup_two_descents,
+	 * ft-lookup.h; the folds at ft-descent.h).  That is sound only
+	 * because every move perturbs that fold.  THIS arm guarantees the
+	 * perturbation: the destination attach parent gains an occupancy,
+	 * so it relocates.  Suppose the bitmap were sticky.  A move whose
+	 * dst parent is a pigeon node could then publish no fresh address
+	 * anywhere on the graft arm.  A torn descent could not be told from
+	 * a clean one.
 	 *
 	 * ★ AND IN-PLACE IS RE-ALLOWED for the POINT ops on every trie type
-	 * (ft_in_place_ok), so this arm is exactly where the move's coherence
-	 * had to stop free-riding.  It does so by SITE, not by predicate: the
-	 * bulk reserves (a graft's / rekey's dst attach parent,
-	 * ft_store_at_graft_point_prepare) and the bulk detaches pass
-	 * ft_in_place_excl_ok -- false on any trie with readers -- so a move's
-	 * dst attach parent still RELOCATES there while a point insert next to
-	 * it appends in place.  The destination attach parent is the
-	 * load-bearing one (the src side relocates too but is not what the
-	 * witness needs), and on the merge arm the carrier is ft_merge_build's
-	 * fresh union node.  ft_rekey_graft_simple_attempt's publish-time
-	 * assert (FT_REKEY_DST_FRESH_REACH) is what turns a silent witness loss
-	 * into a loud one should a bulk caller ever start vouching @in_place.
+	 * (ft_in_place_ok).  So this arm is exactly where the move's
+	 * coherence had to stop free-riding.  It does so by SITE, not by
+	 * predicate.  The bulk reserves and the bulk detaches pass
+	 * ft_in_place_excl_ok, which is false on any trie with readers.
+	 * The bulk reserves are a graft's / rekey's dst attach parent
+	 * (ft_store_at_graft_point_prepare).  So a move's dst attach parent
+	 * still RELOCATES there, while a point insert next to it appends in
+	 * place.  The destination attach parent is the load-bearing one.
+	 * The src side relocates too, but it is not what the witness needs.
+	 * On the merge arm the carrier is ft_merge_build's fresh union
+	 * node.  ft_rekey_graft_simple_attempt has a publish-time assert
+	 * (FT_REKEY_DST_FRESH_REACH).  Should a bulk caller ever start
+	 * vouching @in_place, that assert turns a silent witness loss into
+	 * a loud one.
 	 *
 	 * The delete side carries the same dependency
 	 * (ft_popcount_node_replace_ptr / ft_pigeon_node_replace_ptr, -EFBIG),
@@ -909,10 +966,10 @@ int ft_pigeon_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 	if (!in_place && !defer_parent && !*ptr) {
 		/*
 		 * @in_place is the CALLER's vouch that it holds this node
-		 * (ft_in_place_ok's header).  A caller that declines the tier -- a
-		 * bulk reserve, the build-path wrapper -- lands here and recompacts;
-		 * the audit still declares LOCKED on this refused arm so that
-		 * population stays measurable.
+		 * (ft_in_place_ok's header).  A caller that declines the tier
+		 * lands here and recompacts.  Examples: a bulk reserve, the
+		 * build-path wrapper.  The audit still declares LOCKED on
+		 * this refused arm, so that population stays measurable.
 		 */
 		ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED,
 			FT_CH_TXN_USE);
@@ -923,19 +980,21 @@ int ft_pigeon_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		FT_CH_TXN_USE);
 	if (*ptr) {
 		/*
-		 * FENCED ADD, in-place mirror -- the check the popcount and
-		 * bitmap arms carry and this one lacked.  A LIVE-node RESERVE
-		 * (NULL child) whose byte a peer filled between this op's
-		 * descent and this store would CLEAR the peer's live child:
-		 * the store below writes NULL over it, the count is left alone
-		 * (replace, not add), and this op then publishes its own node
-		 * into the slot.  The peer's key is gone from the trie while
-		 * its ordered cell stays in the list.
+		 * FENCED ADD, in-place mirror.  The popcount and bitmap arms
+		 * carry this check, and this arm lacked it.  This is a
+		 * LIVE-node RESERVE (NULL child).  A peer filled its byte
+		 * between this op's descent and this store.  Without the
+		 * check, the store would CLEAR the peer's live child:
+		 *   - the store below writes NULL over it;
+		 *   - the count is left alone (replace, not add);
+		 *   - this op then publishes its own node into the slot.
+		 * The peer's key is gone from the trie while its ordered cell
+		 * stays in the list.
 		 * MEASURED: two concurrent inserts of the same absent key both
-		 * returned OK (cds_ft_insert_unique included), each holding the
-		 * attach node's lock in turn (REGISTERED, in-place new-byte arm,
-		 * 1-8 us apart) -- a 256-key pool keeps the attach node a
-		 * pigeon, and a stop-the-world cds_ft_verify every 2 ms found
+		 * returned OK (cds_ft_insert_unique included).  Each held the
+		 * attach node's lock in turn (REGISTERED, in-place new-byte
+		 * arm, 1-8 us apart).  A 256-key pool keeps the attach node a
+		 * pigeon.  A stop-the-world cds_ft_verify every 2 ms found
 		 * "ord-cell order mismatch" in 100% of runs within 200 ms.
 		 * Bail -EAGAIN to re-descend: the retry finds the peer's child.
 		 */
@@ -972,7 +1031,7 @@ int ft_pigeon_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
  *     right after this returns, since @node is already published
  *     and fully valid.
  *   - Recompact child-copy: new_node is UNPUBLISHED and being built
- *     slot by slot; linking children's parent pointers to new_node
+ *     slot by slot.  Linking children's parent pointers to new_node
  *     mid-build would expose transient nr_child < min_child to
  *     parent-pointer readers.  Recompact's post-copy reparent loop
  *     performs ft_set_parent after the whole new_node is assembled.
@@ -1035,21 +1094,26 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 		/*
 		 * Recompact-on-remove (the build without
 		 * FEATURE_FT_INSERT_IN_PLACE): EVERY delete rebuilds the node
-		 * fresh (FT_RECOMPACT_DEL, dropping child n) so a consistent
-		 * (bitmap, nr_child) is published in ONE pointer swap.
+		 * fresh (FT_RECOMPACT_DEL, dropping child n).  A consistent
+		 * (bitmap, nr_child) is then published in ONE pointer swap.
 		 *
 		 * The in-place tier (@in_place, the caller's vouch -- see
-		 * ft_in_place_ok) stores NULL into the child slot and decrements
-		 * nr_child on the LIVE node, and it is sound against readers
-		 * because the bitmap bit stays STICKY: popcount(bitmap) never
-		 * shrinks, so ft_popcount_node_get_ith_pos's bound cannot be
-		 * over-run from either side, and a reader reaching the NULLed
-		 * slot answers "not present" as it does for any reserved hole.
-		 * Against writers it is not a raw store at all: with @pub armed
-		 * both words are RECORDS in the detach commit, so the slot flip
-		 * and the fused nr_child-- are arbitrated on the holder's state
-		 * word (ft_detach_node's pub-armed arm).  Only a delete that
-		 * would shrink the holder below min_child recompacts.
+		 * ft_in_place_ok) stores NULL into the child slot and
+		 * decrements nr_child on the LIVE node.
+		 *
+		 * It is sound against readers because the bitmap bit stays
+		 * STICKY.  popcount(bitmap) never shrinks.  So the bound of
+		 * ft_popcount_node_get_ith_pos cannot be over-run from either
+		 * side.  A reader reaching the NULLed slot answers "not
+		 * present", as it does for any reserved hole.
+		 *
+		 * Against writers it is not a raw store at all.  With @pub
+		 * armed, both words are RECORDS in the detach commit.  So the
+		 * slot flip and the fused nr_child-- are arbitrated on the
+		 * holder's state word (ft_detach_node's pub-armed arm).
+		 *
+		 * In this tier, only a delete that would shrink the holder
+		 * below min_child recompacts.
 		 */
 		if (!in_place ||
 		    ft_meta_nr_child_load(metadata) <= type->min_child)
@@ -1065,15 +1129,17 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 	 */
 	assert(node_flag_expected != NULL);
 	/*
-	 * Fusion armed: DEFER the forward store into @pub so ft_detach_node
-	 * commits it in one flip with the dead head cell's unsplice.  A delete
-	 * (NULL newptr) stores NULL and decrements nr_child in place
-	 * (reader-invisible for navigation); an external promote (non-NULL
-	 * newptr) replaces the child with the external chain head -- its
-	 * back-pointer re-parent is CAPTURED into @pub and committed with the
-	 * forward flip (an arm-time store survived a commit ABORT torn, with
-	 * the retrying remove leaving the still-chained head pointing at the
-	 * holder).  nr_child unchanged for a promote.
+	 * Fusion armed: DEFER the forward store into @pub.  ft_detach_node
+	 * then commits it in one flip with the dead head cell's unsplice.
+	 *   - A delete (NULL newptr) stores NULL and decrements nr_child in
+	 *     place (reader-invisible for navigation).
+	 *   - An external promote (non-NULL newptr) replaces the child with
+	 *     the external chain head.  Its back-pointer re-parent is
+	 *     CAPTURED into @pub and committed with the forward flip.
+	 *     nr_child is unchanged for a promote.
+	 * An arm-time store of the re-parent survived a commit ABORT torn:
+	 * the retrying remove left the still-chained head pointing at the
+	 * holder.
 	 */
 	if (pub) {
 		if (newptr) {
@@ -1085,12 +1151,12 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 				(struct cds_ft_inode_flag **) &en->prev;
 			pub->head_parent_old = *pub->head_parent_field;
 			/*
-			 * An external PROMOTE moves the head into @node_flag's
-			 * child SLOT @node_flag_ptr, so it is a SLOT head:
-			 * clear any prefix-head answer it carried at its old
-			 * home (FT_PARENT_PREFIX_HEAD).  The non-fused arm
-			 * below reaches the same value through ft_set_parent's
-			 * non-NULL @slot.
+			 * An external PROMOTE moves the head into
+			 * @node_flag's child SLOT @node_flag_ptr.  So it is
+			 * a SLOT head: clear any prefix-head answer it
+			 * carried at its old home (FT_PARENT_PREFIX_HEAD).
+			 * The non-fused arm below reaches the same value
+			 * through ft_set_parent's non-NULL @slot.
 			 */
 			pub->head_parent_new = ft_head_parent_word(node_flag,
 				/*prefix=*/ false);
@@ -1101,25 +1167,30 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 		/*
 		 * ☠ THE EXPECTED-OLD IS THE PLAN'S VALUE, NEVER A RE-READ OF THE
 		 * SLOT.  @node_flag_expected is the child the caller's climb
-		 * condemned (ft_detach_node's @plan_old_child, enforced against
-		 * its own re-read pre-fence); it is what "this delete drops
-		 * THAT subtree" means, so it is the only value whose mismatch at
-		 * commit says "a peer republished this slot since the plan".
+		 * condemned.  It is ft_detach_node's @plan_old_child, enforced
+		 * against its own re-read pre-fence.  It is what "this delete
+		 * drops THAT subtree" means.  So it is the only value whose
+		 * mismatch at commit says "a peer republished this slot since
+		 * the plan".
 		 *
-		 * A raw `*node_flag_ptr` here is a SECOND, unheld read of a word
-		 * the in-place tier leaves contended: a peer's in-place delete of
-		 * the same chain NULLs it, and the raw value then RE-PLANS this
-		 * op onto the peer's outcome -- {NULL -> NULL} on the slot with a
-		 * fresh nr_child-- fused on top (the chain freeze's derived NULL
-		 * is what aborted that commit, by accident of the freeze's own
-		 * arbitration, not by design of this one).  A peer's commit in
-		 * flight parks a flip-proxy there instead, and the raw value hands
-		 * the engine a proxy as expected-old (rcu-txn-mcas.h's
-		 * `!urcu_txn_is_proxy` assert -- MEASURED alongside the NULL, on
-		 * inv_concurrent_remove_all_nolist).  The recompacting tier read
-		 * the slot under the {C,P,GP} lock, where the two values could not
-		 * differ; the in-place tier has no such lock, and the plan value
-		 * is the one the commit must speak.
+		 * A raw `*node_flag_ptr` here is a SECOND, unheld read of a
+		 * word the in-place tier leaves contended.  Two cases:
+		 *   - A peer's in-place delete of the same chain NULLs it.
+		 *     The raw value then RE-PLANS this op onto the peer's
+		 *     outcome: {NULL -> NULL} on the slot, with a fresh
+		 *     nr_child-- fused on top.  The chain freeze's derived
+		 *     NULL is what aborted that commit.  That was an accident
+		 *     of the freeze's own arbitration, not the design of this
+		 *     one.
+		 *   - A peer's commit in flight parks a flip-proxy there.
+		 *     The raw value then hands the engine a proxy as
+		 *     expected-old (rcu-txn-mcas.h's `!urcu_txn_is_proxy`
+		 *     assert).
+		 * Both were MEASURED on inv_concurrent_remove_all_nolist.
+		 *
+		 * The recompacting tier read the slot under the {C,P,GP} lock.
+		 * There the two values could not differ.  The in-place tier
+		 * has no such lock, so the commit must use the plan value.
 		 */
 		FT_DT_INC(ft_dt_arm_reach);
 		if (*node_flag_ptr != node_flag_expected) {
@@ -1172,10 +1243,10 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 	if (!newptr) {
 		/*
 		 * Recompact-on-remove (default, concurrent-safe): rebuild the
-		 * node fresh rather than soft-deleting the slot and decrementing
-		 * nr_child IN PLACE on the LIVE node -- a concurrent lookup reads
-		 * the nr_child change torn against the pointer/bitmap state.  See
-		 * the popcount variant for the full rationale.
+		 * node fresh.  Do not soft-delete the slot and decrement
+		 * nr_child IN PLACE on the LIVE node.  A concurrent lookup
+		 * reads the nr_child change torn against the pointer/bitmap
+		 * state.  See the popcount variant for the full rationale.
 		 */
 		if (!in_place ||
 		    ft_meta_nr_child_load(metadata) <= type->min_child)
@@ -1185,17 +1256,22 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 	/* The plan's value, not a raw re-read: see the popcount variant. */
 	assert(node_flag_expected != NULL);
 	/*
-	 * Fusion armed: DEFER the forward store into @pub (committed in one flip
-	 * with the dead head cell's unsplice).  A DELETE (NULL newptr) fuses its
-	 * nr_child-- into the commit flip (via @state_meta) and leaves the
-	 * occupancy bitmap bit SET -- a sticky soft-delete hint, never cleared in
-	 * place: the pointer load is the source of truth (ft_pigeon_node_get_nth
-	 * reads node->data[n] directly and the directional scan rescans past a set
-	 * bit over a NULL slot), and a later recompact rebuilds a clean bitmap from
-	 * the occupied slots.  An external PROMOTE (non-NULL newptr) captures the
-	 * promoted external's back-pointer re-parent into @pub -- committed WITH
-	 * the forward flip, not stored at arm time (see the popcount variant) --
-	 * and leaves the slot occupied and nr_child unchanged.
+	 * Fusion armed: DEFER the forward store into @pub (committed in one
+	 * flip with the dead head cell's unsplice).
+	 *
+	 * A DELETE (NULL newptr) fuses its nr_child-- into the commit flip
+	 * (via @state_meta).  It leaves the occupancy bitmap bit SET.  The
+	 * bit is a sticky soft-delete hint, never cleared in place.  The
+	 * pointer load is the source of truth:
+	 *   - ft_pigeon_node_get_nth reads node->data[n] directly;
+	 *   - the directional scan rescans past a set bit over a NULL slot.
+	 * A later recompact rebuilds a clean bitmap from the occupied slots.
+	 *
+	 * An external PROMOTE (non-NULL newptr) captures the promoted
+	 * external's back-pointer re-parent into @pub.  The re-parent is
+	 * committed WITH the forward flip, not stored at arm time (see the
+	 * popcount variant).  The promote leaves the slot occupied and
+	 * nr_child unchanged.
 	 */
 	if (pub) {
 		if (newptr) {
@@ -1207,12 +1283,12 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 				(struct cds_ft_inode_flag **) &en->prev;
 			pub->head_parent_old = *pub->head_parent_field;
 			/*
-			 * An external PROMOTE moves the head into @node_flag's
-			 * child SLOT @node_flag_ptr, so it is a SLOT head:
-			 * clear any prefix-head answer it carried at its old
-			 * home (FT_PARENT_PREFIX_HEAD).  The non-fused arm
-			 * below reaches the same value through ft_set_parent's
-			 * non-NULL @slot.
+			 * An external PROMOTE moves the head into
+			 * @node_flag's child SLOT @node_flag_ptr.  So it is
+			 * a SLOT head: clear any prefix-head answer it
+			 * carried at its old home (FT_PARENT_PREFIX_HEAD).
+			 * The non-fused arm below reaches the same value
+			 * through ft_set_parent's non-NULL @slot.
 			 */
 			pub->head_parent_new = ft_head_parent_word(node_flag,
 				/*prefix=*/ false);
@@ -1242,11 +1318,12 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 	ft_node_child_edge_flip(ft, node_flag_ptr, *node_flag_ptr, newptr);
 	if (!newptr) {
 		/*
-		 * Soft-delete: the slot is NULLed (the flip above), nr_child
-		 * decrements as a committed flip, and the occupancy bitmap bit
-		 * is left SET -- a sticky hint, never cleared in place (the
-		 * pointer load is the source of truth; recompact rebuilds it
-		 * clean), exactly as the popcount layout already does.
+		 * Soft-delete: the slot is NULLed (the flip above) and
+		 * nr_child decrements as a committed flip.  The occupancy
+		 * bitmap bit is left SET.  It is a sticky hint, never cleared
+		 * in place.  The pointer load is the source of truth, and
+		 * recompact rebuilds the bitmap clean.  The popcount layout
+		 * already does exactly this.
 		 */
 		ft_meta_nr_child_dec_flip(metadata);
 	}
@@ -1308,13 +1385,15 @@ unsigned int find_nearest_type_index(unsigned int type_index,
 	}
 	for (;;) {
 		/*
-		 * Bound the search against ft_types[] (Phase 4.3 defense): a
-		 * garbage @nr_nodes -- e.g. a raw read of a node whose state word a
-		 * peer parked with a re-home proxy, before the ft_meta_nr_child_load
-		 * callers -- would otherwise walk @type_index off the end of the
-		 * table (unbounded ++), reading junk min/max_child and spinning
-		 * (the FT_INV_MW hang) or faulting.  With the resolving loads this
-		 * never fires; keep it so no future raw read can wedge the trie.
+		 * Bound the search against ft_types[] (Phase 4.3 defense).
+		 * A garbage @nr_nodes would otherwise walk @type_index off
+		 * the end of the table (unbounded ++).  It would read junk
+		 * min/max_child, then spin (the FT_INV_MW hang) or fault.
+		 * Example of garbage: a raw read of a node whose state word a
+		 * peer parked with a re-home proxy.  That was possible before
+		 * the callers used ft_meta_nr_child_load.  With the resolving
+		 * loads this never fires.  Keep it so no future raw read can
+		 * wedge the trie.
 		 */
 		assert(type_index < FT_TYPE_MAX_NR);
 		type = &ft_types[type_index];
@@ -1329,39 +1408,46 @@ unsigned int find_nearest_type_index(unsigned int type_index,
 }
 
 /*
- * ft_node_nonnull_child_count: how many children a recompaction's copy loop
- * will actually PLACE into the replacement node -- this node's NON-NULL child
- * pointers.
+ * ft_node_nonnull_child_count: return the number of NON-NULL child pointers
+ * of this node.  That is how many children a recompaction's copy loop will
+ * actually PLACE into the replacement node.
  *
- * ☠ NOT the state word's nr_child, and that distinction is the whole point.
- * The copy loops below iterate the BITMAP (for FT_POPCOUNT the loop bound IS
- * ft_popcount_node_get_nr_child, a popcount over the occupancy bitmap; the
- * FT_PIGEON loop scans every slot) and skip a slot whose pointer reads NULL.
- * So what they place is the non-NULL count, while the capacity was chosen from
- * the state word -- the node's SIZE and its CONTENTS answering two different
- * questions.
+ * ☠ This is NOT the state word's nr_child.  That distinction is the whole
+ * point.  The copy loops below iterate the BITMAP and skip a slot whose
+ * pointer reads NULL:
+ *   - for FT_POPCOUNT the loop bound IS ft_popcount_node_get_nr_child, a
+ *     popcount over the occupancy bitmap;
+ *   - the FT_PIGEON loop scans every slot.
+ * So what they place is the non-NULL count, while the capacity was chosen
+ * from the state word.  The node's SIZE and its CONTENTS answer two
+ * different questions.
  *
- * The two agree at rest and diverge in exactly the windows this trie is built
- * out of.  A reserve leaves a bit-set + NULL hole that the bitmap counts and
- * neither the state word nor the copy does.  The in-place tiers leave the
- * mirror image: a slot holding a child the state word does not (or no longer)
- * count, because the pointer and the count go live on different edges.
+ * The two agree at rest.  They diverge in exactly the windows this trie is
+ * built out of:
+ *   - A reserve leaves a bit-set + NULL hole.  The bitmap counts it.  The
+ *     state word and the copy do not.
+ *   - The in-place tiers leave the mirror image: a slot holding a child that
+ *     the state word does not count, or no longer counts.  The pointer and
+ *     the count go live on different edges.
  *
- * UNDER-SIZING IS FATAL, and it is what the state word produces: the copy fills
- * the replacement to its max_child and the ADD tail then trips
+ * UNDER-SIZING IS FATAL, and it is what the state word produces.  The copy
+ * fills the replacement to its max_child.  The ADD tail then trips
  * ft_popcount_2l_node_set_nth's `nr_child < max_lc`.  MEASURED on
- * inv_concurrent_remove_all_nolist at per-node spacing -- a max_child=3 node
- * whose bitmap popcount was 3 with all three pointers live and whose state word
- * read 2, so the replacement was sized for 3 and asked to hold 4.
+ * inv_concurrent_remove_all_nolist at per-node spacing, on a max_child=3
+ * node.  Its bitmap popcount was 3, all three pointers were live, and its
+ * state word read 2.  So the replacement was sized for 3 and asked to hold 4.
  *
- * OVER-SIZING IS MERELY A DENSITY LOSS (the tiers deliberately overlap, so a
- * node below its tier's min_child is legal and the next delete recompacts it
- * down).  Asymmetric costs, so the capacity is derived from the count the copy
- * itself uses and from nothing else.
+ * OVER-SIZING IS MERELY A DENSITY LOSS.  The tiers deliberately overlap.  So
+ * a node below its tier's min_child is legal, and the next delete recompacts
+ * it down.  The costs are asymmetric.  So the capacity is derived from the
+ * count the copy itself uses and from nothing else.
  *
- * ☞ It is a BOUND, not a prediction: the copy can place fewer (a peer's child
- * resolved away, a DEL's drop, a folded pending delete).  It can never place
- * more, because every placement comes from a slot counted here.
+ * ☞ It is a BOUND, not a prediction.  The copy can place fewer:
+ *   - a peer's child resolved away;
+ *   - a DEL's drop;
+ *   - a folded pending delete.
+ * It can never place more, because every placement comes from a slot counted
+ * here.
  */
 static
 unsigned int ft_node_nonnull_child_count(const struct cds_ft_type *type,
@@ -1406,13 +1492,14 @@ unsigned int ft_node_nonnull_child_count(const struct cds_ft_type *type,
  */
 static __thread struct cds_ft_inode_flag *ft_dt_last_reserve_nf;
 /*
- * @expect: the count the node SHOULD carry, relative to its NON-NULL child
- * pointers (count - nonnull).  A bit-set+NULL hole (soft delete, in-flight
- * reserve) is counted by neither, so a LIVE node reads 0; a FRESH node whose
- * ADD tail placed a NULL reserve reads +1 (set_nth counted it in place).
- * The count is read on BOTH sides of the walk and the sample is dropped when
- * the two disagree: a peer committed on this node mid-walk, and a torn pair
- * would read as a skew of the probe's own making.
+ * @expect_ct_minus_nonnull: the count the node SHOULD carry, relative to its
+ * NON-NULL child pointers (count - nonnull).  A bit-set+NULL hole (soft
+ * delete, in-flight reserve) is counted by neither.  So a LIVE node reads 0.
+ * A FRESH node whose ADD tail placed a NULL reserve reads +1 (set_nth counted
+ * it in place).
+ * The count is read on BOTH sides of the walk.  The sample is dropped when
+ * the two reads disagree: a peer committed on this node mid-walk.  A torn
+ * pair would read as a skew of the probe's own making.
  */
 static
 void ft_dt_check_node(const char *site, int expect_ct_minus_nonnull,
@@ -1458,38 +1545,42 @@ void ft_dt_check_flag(const char *site, int expect_ct_minus_nonnull,
  * Return 0 on success or negative error value on error.
  *
  * @cluster_leaf: when true, the target node sits at the lower boundary of an
- * as-yet-unpublished cluster (a cluster-leaf): its children point at live
- * nodes from the old structure, and the mutator wires every one of those
+ * as-yet-unpublished cluster (a cluster-leaf).  Its children point at live
+ * nodes from the old structure.  The mutator wires every one of those
  * back-pointers itself at publish time.  Children are still copied into the
  * new node's slots, but the re-parent loop is skipped entirely.  See
  * ft_node_set_nth and the rcu-mutation build-invisible pattern.
  *
- * @nullify_expected (FT_RECOMPACT_DEL only): the child the CALLER's plan drops,
- * sampled from @nullify_node_flag_ptr when that plan was built.  The DEL arm
- * identifies its victim by re-reading the slot under the F2 fence, so without
- * this expected-old it drops whatever the slot holds THEN -- which, after a peer
- * republished the slot between the plan and the fence, is the peer's freshly
- * published subtree, silently dropping keys the plan never covered.  Mismatch is
- * a stale plan: -EAGAIN, re-descend.
+ * @nullify_expected (FT_RECOMPACT_DEL only): the child the CALLER's plan
+ * drops, sampled from @nullify_node_flag_ptr when that plan was built.  The
+ * DEL arm identifies its victim by re-reading the slot under the F2 fence.
+ * Without this expected-old it drops whatever the slot holds THEN.  A peer
+ * may have republished the slot between the plan and the fence.  The slot
+ * then holds the peer's freshly published subtree.  The DEL arm would
+ * silently drop keys the plan never covered.  Mismatch is a stale plan:
+ * -EAGAIN, re-descend.
  *
  * @rec: the accumulator for reader-visible forward stores.
- *  - The forward publish into @old_node_flag_ptr is recorded into @rec ONLY for
- *    FT_RECOMPACT_RELOCATE, where @old_node_flag_ptr is the LIVE slot and the
- *    caller (ft_compact_relocate_at) commits @rec.  For the ADD/SAME/DEL
- *    mutators @old_node_flag_ptr is a LOCAL out-param re-published by the
- *    caller, so the forward stays a bare store into that local.
+ *  - The forward publish into @old_node_flag_ptr is recorded into @rec ONLY
+ *    for FT_RECOMPACT_RELOCATE.  There @old_node_flag_ptr is the LIVE slot
+ *    and the caller (ft_compact_relocate_at) commits @rec.  For the
+ *    ADD/SAME/DEL mutators @old_node_flag_ptr is a LOCAL out-param
+ *    re-published by the caller, so the forward stays a bare store into that
+ *    local.
  *  - A compressed parent's SKIP_X dual (the live grandparent skip slot) is
- *    recorded into @rec whenever @rec is non-NULL: for RELOCATE, AND for an
- *    ADD/SAME relocation whose LIVE caller threads its own commit rec so the
- *    dual flips ATOMICALLY with that caller's forward publish (else the dual
- *    would be a bare store ordered BEFORE the deferred forward).  @rec == NULL
- *    keeps the bare SKIP_X store for build-invisible ADD recompacts.
- *  - FT_RECOMPACT_DEL is the exception: it reaches here with @rec == NULL but
- *    its node is LIVE, so a bare SKIP_X store would be the same premature
- *    non-atomic window.  Its caller (ft_detach_node) republishes the forward
- *    via _ft_publish_to_parent(parent_nf = the compressed parent), which RECORDS
- *    this SKIP_X dual itself, so DEL defers the dual entirely (records nothing
- *    here -- see the inline note at the skip slot).
+ *    recorded into @rec whenever @rec is non-NULL.  That covers RELOCATE.
+ *    It also covers an ADD/SAME relocation whose LIVE caller threads its own
+ *    commit rec.  The dual then flips ATOMICALLY with that caller's forward
+ *    publish.  Otherwise the dual would be a bare store ordered BEFORE the
+ *    deferred forward.  @rec == NULL keeps the bare SKIP_X store for
+ *    build-invisible ADD recompacts.
+ *  - FT_RECOMPACT_DEL is the exception.  It reaches here with @rec == NULL,
+ *    but its node is LIVE.  So a bare SKIP_X store would be the same
+ *    premature non-atomic window.  Its caller (ft_detach_node) republishes
+ *    the forward via _ft_publish_to_parent(parent_nf = the compressed
+ *    parent).  That call RECORDS this SKIP_X dual itself.  So DEL defers the
+ *    dual entirely: it records nothing here (see the inline note at the skip
+ *    slot).
  */
 static
 #ifdef FT_DEBUG_DUAL_SITE
@@ -1499,12 +1590,12 @@ unsigned long ft_rc_hint_held, ft_rc_hint_unheld, ft_rc_res_held,
 /*
  * ☞ THE THIRD QUESTION: is the dual's derived owner a member of THIS
  * recompact's OWN lock-set, acquired at the top?  ft_lock_ctx_holds cannot
- * answer it -- ft_dlm_acquire_set_at takes @ctx as a const pointer and so
- * cannot register anything into ctx->held; the acquire's marks live in the
- * function-local @rel_held[] until the commit registers them (which happens
- * BELOW this site).  So a "0 held" from the ctx registry says nothing about
- * whether the word is locked; it says the registry was never told.  Count the
- * direct comparison against @rel_held before believing the ctx answer.
+ * answer it.  ft_dlm_acquire_set_at takes @ctx as a const pointer, so it
+ * cannot register anything into ctx->held.  The acquire's marks live in the
+ * function-local @rel_held[] until the commit registers them.  That happens
+ * BELOW this site.  So a "0 held" from the ctx registry says nothing about
+ * whether the word is locked.  It says the registry was never told.  Count
+ * the direct comparison against @rel_held before believing the ctx answer.
  */
 unsigned long ft_rc_rel_match, ft_rc_rel_shared, ft_rc_rel_miss, ft_rc_rel_none;
 unsigned long ft_rc_plan_same, ft_rc_plan_taken, ft_rc_plan_diff;
@@ -1575,37 +1666,44 @@ int ft_node_recompact(enum ft_recompact mode,
 	 */
 	bool new_init_done = false;
 	/*
-	 * ONE resolved snapshot of the old node's external-head word: the
-	 * word itself is flip-managed (a key-disappearing remove parks its
-	 * proxy there), so a raw multi-read could inherit a latch or tear
-	 * across a peer's head swap.  Captured latch-checked below; every
-	 * later use (Phase-1 metadata, back-channel derive, deferred plain
-	 * publish) goes through this snapshot.  Non-NULL also flags the
-	 * deferred plain-store arm (build-invisible / no-txn): its Phase-2
-	 * prev publish moves to after the copy loops so the copied-slot
-	 * latch bail point has no reader-visible effect; the retire_txn arm
-	 * records the edge into the commit instead.
+	 * ONE resolved snapshot of the old node's external-head word.  The
+	 * word itself is flip-managed: a key-disappearing remove parks its
+	 * proxy there.  A raw multi-read could inherit a latch, or tear
+	 * across a peer's head swap.  The snapshot is captured latch-checked
+	 * below.  Every later use goes through it:
+	 *  - the Phase-1 metadata;
+	 *  - the back-channel derive;
+	 *  - the deferred plain publish.
+	 *
+	 * Non-NULL also flags the deferred plain-store arm (build-invisible /
+	 * no-txn).  Its Phase-2 prev publish moves to after the copy loops.
+	 * The copied-slot latch bail point then has no reader-visible effect.
+	 * The retire_txn arm records the edge into the commit instead.
 	 */
 	struct cds_ft_node *ext_snapshot = NULL;
 	bool bc_plain = false;
 	/*
 	 * DEL: the to-remove slot's value, captured ONCE (latch-checked at
 	 * capture).  The copy loops compare child VALUES against this stable
-	 * capture -- re-reading *nullify_node_flag_ptr per iteration could
-	 * see a peer's latch park between reads and silently COPY the child
-	 * being removed.  A child flag appears in exactly one slot, so the
-	 * value compare is exact AGAINST THIS CAPTURE; it does NOT detect a
-	 * peer's clean republish of the slot (old -> fresh copy) in the
-	 * capture->copy window -- that stale-plan window is closed by the F2
-	 * node lock (the mark precedes the capture), not here.
+	 * capture.  Re-reading *nullify_node_flag_ptr per iteration could see
+	 * a peer's latch park between reads.  The loop would then silently
+	 * COPY the child being removed.
+	 *
+	 * A child flag appears in exactly one slot, so the value compare is
+	 * exact AGAINST THIS CAPTURE.  It does NOT detect a peer's clean
+	 * republish of the slot (old -> fresh copy) in the capture->copy
+	 * window.  The F2 node lock closes that stale-plan window, not this
+	 * compare: the mark precedes the capture.
 	 */
 	struct cds_ft_inode_flag *nullify_val = NULL;
 	/*
 	 * F2 node lock state: set when this recompact retires a LIVE
-	 * published node (@retire_txn arm).  @c_held names BOTH words a coarse
-	 * spacing splits apart: the one the acquire CAS'd, and C's own clean
-	 * pre-mark state word -- the ONE snapshot the whole copy plan (type
-	 * sizing, tombstone expected-old) derives from.
+	 * published node (@retire_txn arm).  A coarse spacing splits two
+	 * words apart, and @c_held names BOTH:
+	 *  - the word the acquire CAS'd;
+	 *  - C's own clean pre-mark state word.
+	 * The second is the ONE snapshot the whole copy plan derives from
+	 * (type sizing, tombstone expected-old).
 	 */
 	struct ft_held_anchor c_held = { 0 };
 	/* The prefix head's back edge, recorded at skip_copy (see there). */
@@ -1613,54 +1711,59 @@ int ft_node_recompact(enum ft_recompact mode,
 	struct cds_ft_inode_flag *bc_rec_old = NULL;
 	bool fenced = false;
 	/*
-	 * §9.3 LOCK_FINE lock-set, RELEASE half: the members this recompact locks
-	 * that SURVIVE the commit -- P (the parent whose slot the fresh copy is
-	 * published into) and, when P is a compressed node whose SKIP_X dual this
-	 * recompact re-encodes, GP (whose slot that dual writes).  C -- the node
-	 * copied away -- is the RETIRE half (@fenced / @c_held above); the two
-	 * halves differ only in the terminal they record at commit.
+	 * §9.3 LOCK_FINE lock-set, RELEASE half.  These are the members this
+	 * recompact locks that SURVIVE the commit:
+	 *  - P, the parent whose slot the fresh copy is published into;
+	 *  - GP, when P is a compressed node whose SKIP_X dual this recompact
+	 *    re-encodes.  That dual writes a slot of GP.
+	 * C, the node copied away, is the RETIRE half (@fenced / @c_held
+	 * above).  The two halves differ only in the terminal they record at
+	 * commit.
 	 *
 	 * Held only under FINE: COARSE derives no lock-set (§10.5, one FT-wide
-	 * lock).  (The OPTIMISTIC arm this also described -- "keeps its §4.B
-	 * guards, which the release record would poison" -- is gone with the
-	 * strategy; see ft_flip_txn_record_release_lock.)
+	 * lock).  This comment also described an OPTIMISTIC arm: "keeps its
+	 * §4.B guards, which the release record would poison".  That arm is
+	 * gone with the strategy; see ft_flip_txn_record_release_lock.
 	 */
 	struct ft_held_anchor rel_held[2];
 	unsigned int nr_rel = 0, ri;
 	/*
-	 * ☞ THE THIRD MEMBER, REMEMBERED BY IDENTITY.  set[2] is GP -- acquired
-	 * whenever P is compressed, which is exactly the shape the SKIP_X dual
-	 * re-encode below runs in -- and the dual publish must answer "does this
-	 * op hold the word it is writing?".  It cannot ask @ctx: the lock-set is
-	 * taken through ft_dlm_acquire_set_at, which receives @ctx as a CONST
-	 * pointer and so can register nothing into ctx->held; the marks live in
+	 * ☞ THE THIRD MEMBER, REMEMBERED BY IDENTITY.  set[2] is GP.  It is
+	 * acquired whenever P is compressed.  That is exactly the shape the
+	 * SKIP_X dual re-encode below runs in.  The dual publish must answer
+	 * "does this op hold the word it is writing?".
+	 *
+	 * It cannot ask @ctx.  The lock-set is taken through
+	 * ft_dlm_acquire_set_at, which receives @ctx as a CONST pointer.  So
+	 * it can register nothing into ctx->held.  The marks live in
 	 * @rel_held until the commit below hands them to @retire_txn.  A
 	 * ft_lock_ctx_holds() miss here therefore says the registry was never
-	 * told, NEVER that the word is unheld (the note at ft_lock_ctx_holds
-	 * says to read a miss exactly that way).
+	 * told.  It NEVER says that the word is unheld.  The note at
+	 * ft_lock_ctx_holds says to read a miss exactly that way.
 	 *
-	 * Held by NODE identity rather than by scanning @rel_held, because
-	 * @rel_held carries the ANCHOR: at a coarse spacing the acquired member
-	 * is an ancestor and a pointer compare against @rel_held[].lock would
-	 * miss a word the op genuinely holds.  Spacing-independent: "set[2]
-	 * named this node and took a lock that protects it".
+	 * The member is remembered by NODE identity, not found by scanning
+	 * @rel_held, because @rel_held carries the ANCHOR.  At a coarse
+	 * spacing the acquired member is an ancestor.  A pointer compare
+	 * against @rel_held[].lock would miss a word the op genuinely holds.
+	 * Node identity is spacing-independent: "set[2] named this node and
+	 * took a lock that protects it".
 	 */
 	struct cds_ft_metadata *acq_gp_meta = NULL;
 	/*
-	 * The PARENT member this op actually acquired, recorded by NODE identity
-	 * for the same reason @acq_gp_meta is: @rel_held[].lock is the LOCK WORD,
-	 * which a coarse spacing maps to an ANCHOR ANCESTOR, so comparing a
-	 * holder against it answers no on every trie above per-node -- a blind
-	 * query, not an absent hold.
+	 * The PARENT member this op actually acquired, recorded by NODE
+	 * identity for the same reason @acq_gp_meta is.  @rel_held[].lock is
+	 * the LOCK WORD, which a coarse spacing maps to an ANCHOR ANCESTOR.
+	 * Comparing a holder against it answers no on every trie above
+	 * per-node.  That is a blind query, not an absent hold.
 	 */
 	struct cds_ft_metadata *acq_p_meta = NULL;
 #ifdef FT_DEBUG_DUAL_SITE
 	/*
 	 * ☞ The GP the PLAN named at the top, and whether set[2] actually took
-	 * it.  Compared by IDENTITY against the dual site's derived owner below:
-	 * @rel_held carries the ANCHOR (an ancestor under a coarse spacing), so
-	 * a rel_held miss is not by itself "different node" -- this pair says
-	 * which of the two it is.
+	 * it.  The pair is compared by IDENTITY against the dual site's derived
+	 * owner below.  @rel_held carries the ANCHOR (an ancestor under a
+	 * coarse spacing), so a rel_held miss is not by itself "different
+	 * node".  This pair says which of the two it is.
 	 */
 	struct cds_ft_metadata *dbg_acq_gp = NULL;
 	bool dbg_acq_gp_taken = false;
@@ -1668,30 +1771,41 @@ int ft_node_recompact(enum ft_recompact mode,
 
 	/*
 	 * F2 node lock, MARK (doc at ft_meta_lock_acquire): a live-retire
-	 * locks the old node BEFORE any body/state read below -- the
-	 * sizing nr_child loads, the (parent, offset) inherit, the external-
-	 * head snapshot, and the copy loops all read under the fence, and the
-	 * commit's state record {LOCK|s -> TOMBSTONE|s} pins the word so a
-	 * peer publish that slips a state change under the fence aborts one of
-	 * the two.  A dirty mark (peer proxy / concurrent copier / real
-	 * retire) bails to the op's retry before anything is allocated.  The
-	 * build-invisible (@cluster_leaf) and legacy no-txn arms copy nodes no
-	 * peer publishes into (unpublished cluster / retained exclusion), so
-	 * they stay unfenced.
+	 * locks the old node BEFORE any body/state read below.  These all
+	 * read under the fence:
+	 *  - the sizing nr_child loads;
+	 *  - the (parent, offset) inherit;
+	 *  - the external-head snapshot;
+	 *  - the copy loops.
+	 * The commit's state record {LOCK|s -> TOMBSTONE|s} pins the word.  A
+	 * peer publish that slips a state change under the fence then aborts
+	 * one of the two.  A dirty mark (peer proxy / concurrent copier /
+	 * real retire) bails to the op's retry before anything is allocated.
+	 *
+	 * The build-invisible (@cluster_leaf) and legacy no-txn arms copy
+	 * nodes no peer publishes into (unpublished cluster / retained
+	 * exclusion), so they stay unfenced.
 	 */
 	/*
 	 * DLM Step 1 (see doc/design/mw-writer-lock-escalation-model.md):
-	 * acquire the WHOLE lock-set
-	 * {C, P, (GP)} in ONE all-or-none MCAS up front, replacing the incremental
-	 * marks (C here, P at the inherit, GP at the skip-dual).  §9.3: P is resolved
-	 * from C and validated -- the read-set guard C.parent==P (and P.parent==GP)
-	 * rides the SAME commit, so a re-home between the racy plan read and the
-	 * acquire aborts it -> re-plan.  Populates the same @fenced / @c_held /
-	 * @rel_held / @nr_rel the incremental scheme does, so the build, the commit
-	 * terminals (retire C via @c_held, release P/GP via @rel_held), and the
-	 * abandon_fresh unwind are all unchanged below.  Only the
-	 * LOCK_FINE retire arm hoists; the universal F2 lock (non-lock_fine /
-	 * flag-off) keeps its single mark.
+	 * acquire the WHOLE lock-set {C, P, (GP)} in ONE all-or-none MCAS up
+	 * front.  This replaces the incremental marks (C here, P at the
+	 * inherit, GP at the skip-dual).
+	 *
+	 * §9.3: P is resolved from C and validated.  The read-set guard
+	 * C.parent==P (and P.parent==GP) rides the SAME commit.  So a re-home
+	 * between the racy plan read and the acquire aborts it -> re-plan.
+	 *
+	 * The acquire populates the same @fenced / @c_held / @rel_held /
+	 * @nr_rel as the incremental scheme does.  So these are all unchanged
+	 * below:
+	 *  - the build;
+	 *  - the commit terminals (retire C via @c_held, release P/GP via
+	 *    @rel_held);
+	 *  - the abandon_fresh unwind.
+	 *
+	 * Only the LOCK_FINE retire arm hoists.  The universal F2 lock
+	 * (non-lock_fine / flag-off) keeps its single mark.
 	 */
 	if (ft->lock_fine && retire_txn && !cluster_leaf && metadata && old_node) {
 		struct cds_ft_inode_flag *pf_p = NULL, *pf_gp = NULL;
@@ -1710,12 +1824,13 @@ int ft_node_recompact(enum ft_recompact mode,
 			p_slot = ft_resolve_parent_slot(metadata, ft, &pf_p);
 		}
 		/*
-		 * ☞ NO P, BECAUSE C IS THE ROOT: the slot P would own is &ft->root,
-		 * and @root_lock is ITS lock -- so it is P's member of this sorted
-		 * set, taken exactly as P's node lock would be (MATHIEU: a lock
-		 * like any node lock, no class).  Keyed on the resolved SLOT being
-		 * THIS trie's root, so a cross-trie hint naming another trie's
-		 * root is not given this trie's lock.
+		 * ☞ NO P, BECAUSE C IS THE ROOT.  The slot P would own is
+		 * &ft->root, and @root_lock is ITS lock.  So @root_lock is
+		 * P's member of this sorted set.  It is taken exactly as P's
+		 * node lock would be (MATHIEU: a lock like any node lock, no
+		 * class).  The test is keyed on the resolved SLOT being THIS
+		 * trie's root.  A cross-trie hint naming another trie's root
+		 * is then not given this trie's lock.
 		 */
 		p_root = !pf_p && p_slot == &ft->root;
 		if (pf_p) {
@@ -1733,36 +1848,48 @@ int ft_node_recompact(enum ft_recompact mode,
 		}
 
 		/*
-		 * FOLD (parent_held): P is already LOCK-held by an earlier step of
-		 * the SAME op (a same-trie rekey's graft locked the shared spine), so
-		 * do NOT re-lock it (a second ft_dlm_lock would abort -EAGAIN) and do
-		 * NOT add it to @rel_held below (the holder owns its release).  P stays
-		 * the republish target; only C (and, if present, GP) are acquired here.
+		 * FOLD (parent_held): P is already LOCK-held by an earlier
+		 * step of the SAME op (a same-trie rekey's graft locked the
+		 * shared spine).  So:
+		 *  - do NOT re-lock it: a second ft_dlm_lock would abort
+		 *    -EAGAIN;
+		 *  - do NOT add it to @rel_held below: the holder owns its
+		 *    release.
+		 * P stays the republish target.  Only C (and, if present, GP)
+		 * are acquired here.
 		 *
-		 * The guard is NOT skipped with the lock: @pf_p is then the CALLER's
-		 * held-node identity, and the reuse is only sound while C really hangs
-		 * off it, so C.parent == P rides this same acquire commit.  It makes the
-		 * fold VALIDATE at commit what it would otherwise assume from a
-		 * descent-time relationship, rather than park an SW store into a word it
-		 * does not hold.  HONEST SCOPE (measured: 0 mismatches in 5525 folds):
-		 * under the fold's OWN precondition it cannot fire -- re-homing C means
-		 * rewriting P's child set, which needs P's LOCK, which the holder has
-		 * for the whole window, and a re-home that happened EARLIER tombstoned
-		 * the old P so the holder's own ft_dlm_lock(P) aborted first.  Its value
-		 * is the shapes the precondition does not cover (a climbing detach, where
-		 * C is a higher ancestor than the hint's slot names) and any future
-		 * relaxation of the driver's shape gate -- i.e. it keeps the invariant
-		 * checked by the machine instead of by a comment.
+		 * The guard is NOT skipped with the lock.  @pf_p is then the
+		 * CALLER's held-node identity.  The reuse is only sound while
+		 * C really hangs off it, so C.parent == P rides this same
+		 * acquire commit.  The fold then VALIDATES at commit what it
+		 * would otherwise assume from a descent-time relationship.
+		 * It does not park an SW store into a word it does not hold.
+		 *
+		 * HONEST SCOPE (measured: 0 mismatches in 5525 folds): under
+		 * the fold's OWN precondition the guard cannot fire.
+		 * Re-homing C means rewriting P's child set.  That needs P's
+		 * LOCK, which the holder has for the whole window.  A re-home
+		 * that happened EARLIER tombstoned the old P, so the holder's
+		 * own ft_dlm_lock(P) aborted first.
+		 *
+		 * The guard's value is in what the precondition does not
+		 * cover:
+		 *  - a climbing detach, where C is a higher ancestor than the
+		 *    hint's slot names;
+		 *  - any future relaxation of the driver's shape gate.
+		 * It keeps the invariant checked by the machine instead of by
+		 * a comment.
 		 */
 		bool p_held = inh_hint && inh_hint->parent_held;
 
 		/*
-		 * A held P also SKIPS the GP lock below, but the SKIP_X dual re-encode
-		 * asserts GP was acquired whenever P is compressed -- so the fold must
-		 * never be entered with a compressed P.  The only producer (the same-trie
-		 * rekey driver) rejects compressed nodes at every descent level, and
-		 * FT_RECOMPACT_DEL defers the dual; fail the acquire rather than trust
-		 * that if a future caller breaks it.
+		 * A held P also SKIPS the GP lock below.  But the SKIP_X dual
+		 * re-encode asserts GP was acquired whenever P is compressed.
+		 * So the fold must never be entered with a compressed P.  The
+		 * only producer (the same-trie rekey driver) rejects
+		 * compressed nodes at every descent level, and
+		 * FT_RECOMPACT_DEL defers the dual.  If a future caller
+		 * breaks that, fail the acquire rather than trust it.
 		 */
 		if (p_held && gp_meta)
 			return -EAGAIN;
@@ -1770,12 +1897,13 @@ int ft_node_recompact(enum ft_recompact mode,
 		/*
 		 * P and GP were reached through a back-pointer or a caller's
 		 * hint, so neither carries a depth.  Each is dated from the node
-		 * BELOW it -- C by @node_depth, P by C -- with the descent's
-		 * window answering directly whenever it describes the member:
-		 * the window holds the last four nodes the descent passed, and a
-		 * three-ancestor set whose C already sits at the third slot runs
-		 * off it.  A member neither source can date is one this plan
-		 * cannot anchor: re-plan rather than borrow another node's depth.
+		 * BELOW it: C by @node_depth, P by C.  The descent's window
+		 * answers directly whenever it describes the member.  The
+		 * window holds the last four nodes the descent passed.  A
+		 * three-ancestor set whose C already sits at the third slot
+		 * runs off it.  A member neither source can date is one this
+		 * plan cannot anchor.  Re-plan rather than borrow another
+		 * node's depth.
 		 */
 		if ((p_meta && !ft_lock_ctx_depth_of_parent(ft, ctx, pf_p,
 					node_depth, &p_depth)) ||
@@ -1787,12 +1915,15 @@ int ft_node_recompact(enum ft_recompact mode,
 		 * ACQUIRE {C, (P), (GP)} + read-set guards in one MCAS.
 		 *
 		 * C's guard validates the plan's racy read of its parent.  With
-		 * a hint the parent identity is the CALLER's, and an ordinary
-		 * hint user does NOT want it validated against C's lazily-updated
-		 * back-pointer (see ft_parent_hint) -- only a caller that asks
-		 * for it (@parent_guard: the rekey fold's non-held src junction,
-		 * whose republish parks SW into @parent's slot) gets it, and the
-		 * FOLD arm gets it unconditionally because its lock is skipped.
+		 * a hint the parent identity is the CALLER's.  An ordinary
+		 * hint user does NOT want it validated against C's
+		 * lazily-updated back-pointer (see ft_parent_hint).  Only two
+		 * users get the guard:
+		 *  - a caller that asks for it with @parent_guard.  That is
+		 *    the rekey fold's non-held src junction, whose republish
+		 *    parks SW into @parent's slot;
+		 *  - the FOLD arm, unconditionally, because its lock is
+		 *    skipped.
 		 */
 		set[0] = (struct ft_dlm_member){
 			.nf = *old_node_flag_ptr, .node = metadata,
@@ -1817,13 +1948,13 @@ int ft_node_recompact(enum ft_recompact mode,
 		/*
 		 * ☠ THE SEAM MUST SIT ON THE UNLOCKED SIDE OF THE ACQUIRE.  A
 		 * delay placed AFTER this call cannot widen anything a peer
-		 * could exploit -- the acquire is what EXCLUDES the peer, so
-		 * past it the node is frozen and the injection only slows this
-		 * op down (MEASURED: armed after the acquire, the ablated
-		 * NODE_INDEX_NULL crash went from 4 per 100 runs to 0, i.e. the
-		 * instrument SUPPRESSED its own target).  The window that
-		 * matters is between the caller's routing sample and this lock,
-		 * so the delay belongs HERE, immediately before it.
+		 * could exploit.  The acquire is what EXCLUDES the peer.  Past
+		 * it the node is frozen and the injection only slows this op
+		 * down.  MEASURED: armed after the acquire, the ablated
+		 * NODE_INDEX_NULL crash went from 4 per 100 runs to 0.  The
+		 * instrument SUPPRESSED its own target.  The window that
+		 * matters is between the caller's routing sample and this
+		 * lock.  So the delay belongs HERE, immediately before it.
 		 */
 		ft_delay_seam(FT_DELAY_SITE_RECOMPACT);
 		dret = ft_dlm_acquire_set(ft, ctx, set, 3);
@@ -1854,9 +1985,10 @@ int ft_node_recompact(enum ft_recompact mode,
 			 * ☠ THEN RE-VALIDATE THE PLAN'S ROOT UNDER THE LOCK.  C's
 			 * back-edge guard is what validates P for a node parent,
 			 * and a root C has none (@guard_pf is NULL).  The publish
-			 * this lock licenses parks SW -- a BLIND store -- so a
-			 * root that moved between the racy plan read and the
-			 * acquire must re-plan here, not be overwritten.
+			 * this lock licenses parks SW, which is a BLIND store.
+			 * So a root that moved between the racy plan read and
+			 * the acquire must re-plan here.  It must not be
+			 * overwritten.
 			 */
 			rel_held[nr_rel++] = set[1].held;
 			if (rcu_dereference(ft->root) != set[0].nf) {
@@ -1878,20 +2010,21 @@ int ft_node_recompact(enum ft_recompact mode,
 #ifdef FT_DEBUG_DEL_TOMB
 	/*
 	 * THE NODE INVARIANT, checked on the LIVE node this recompaction is
-	 * about to copy: the state word's nr_child must equal the number of
+	 * about to copy.  The state word's nr_child must equal the number of
 	 * NON-NULL child pointers.  A bit-set+NULL hole is counted by neither,
-	 * so the two agree at rest, and under the FT-wide writer lock no peer
+	 * so the two agree at rest.  Under the FT-wide writer lock no peer
 	 * can be mid-reserve here.  A divergence means some earlier mutation
-	 * left a pointer this node does not count -- exactly what makes the
-	 * copy loop overrun a node sized from the count.
+	 * left a pointer this node does not count.  That is exactly what
+	 * makes the copy loop overrun a node sized from the count.
 	 */
 	if (old_node && old_type->type_class == FT_POPCOUNT && metadata) {
 		unsigned int pc = ft_popcount_node_get_nr_child(old_type, old_node);
 		unsigned int nonnull = 0, holes = 0, dead = 0, i;
 		/*
-		 * ☠ THE RESOLVING LOAD, not ft_meta_nr_child: a peer mid-commit
-		 * parks a flip proxy on this word, and the raw read then returns
-		 * the DESCRIPTOR's bits as a child count (measured: 384 and 464
+		 * ☠ THE RESOLVING LOAD, not ft_meta_nr_child.  A peer
+		 * mid-commit parks a flip proxy on this word.  The raw read
+		 * then returns the DESCRIPTOR's bits as a child count
+		 * (measured: 384 and 464
 		 * on a max_child=3 node).  Every skew this probe reports would
 		 * otherwise be the instrument's own torn read.
 		 */
@@ -1914,9 +2047,9 @@ int ft_node_recompact(enum ft_recompact mode,
 		}
 		FT_DT_INC(ft_dt_rc_entry);
 		/*
-		 * ONLY the fatal direction, and capped: `ct > nonnull` is the
-		 * benign in-flight reserve and fires ~1e6 times a run (it is
-		 * present on the GREEN exponential leg too).  `ct < nonnull` is
+		 * ONLY the fatal direction, and capped.  `ct > nonnull` is the
+		 * benign in-flight reserve.  It fires ~1e6 times a run, and is
+		 * present on the GREEN exponential leg too.  `ct < nonnull` is
 		 * a node holding a child it does not count.
 		 */
 		if (nonnull > ct &&
@@ -1935,33 +2068,37 @@ int ft_node_recompact(enum ft_recompact mode,
 	/*
 	 * THE REPLACEMENT'S CAPACITY COMES FROM THE COUNT THE COPY USES.
 	 *
-	 * ft_node_nonnull_child_count carries the full argument: the copy loops
-	 * below place this node's NON-NULL children, so sizing from the STATE
-	 * word asked the capacity and the contents two different questions, and
-	 * an under-size is an assertion failure in the ADD tail rather than a
-	 * density loss.  ☞ A BOUND, not a prediction -- the copy may place
-	 * fewer (a resolved-away child, the DEL's own drop, a folded pending
-	 * delete), never more.
+	 * ft_node_nonnull_child_count carries the full argument.  The copy
+	 * loops below place this node's NON-NULL children.  Sizing from the
+	 * STATE word asked the capacity and the contents two different
+	 * questions.  An under-size is an assertion failure in the ADD tail,
+	 * not a density loss.
 	 *
-	 * ☠ NOT hoisted above the fence: this walk must observe the node the
+	 * ☞ A BOUND, not a prediction.  The copy never places more.  It may
+	 * place fewer:
+	 *  - a resolved-away child;
+	 *  - the DEL's own drop;
+	 *  - a folded pending delete.
+	 *
+	 * ☠ NOT hoisted above the fence.  This walk must observe the node the
 	 * copy will read, so it belongs on the same side of the acquire.
 	 */
 	/*
 	 * THE ACQUIRE SEAM (-DFT_DELAY_INJECT, FT_DELAY_MODE=acquire).  The
-	 * caller chose this recompaction -- and its MODE -- from a count read
-	 * before the fence above; the walk on the next line is the re-read that
-	 * supersedes it.  Injecting here lets a peer drop another child in the
-	 * gap, which is exactly what turns a DEL the caller routed here into one
-	 * whose last child is its own target (the NODE_INDEX_NULL refusal
-	 * below).  Inert in every build that does not ask for it.
+	 * caller chose this recompaction, and its MODE, from a count read
+	 * before the fence above.  The walk on the next line is the re-read
+	 * that supersedes it.  Injecting here lets a peer drop another child
+	 * in the gap.  That turns a DEL the caller routed here into one whose
+	 * last child is its own target (the NODE_INDEX_NULL refusal below).
+	 * Inert in every build that does not ask for it.
 	 */
 	ft_delay_seam(FT_DELAY_SITE_POSTLOCK);
 	nr_copy_child = ft_node_nonnull_child_count(old_type, old_node);
 
 	/*
-	 * Need to find nearest type index even for ADD_SAME, so that
-	 * recompaction can promote/demote across tier boundaries
-	 * (e.g. a popcount node that no longer fits its current tier).
+	 * Find the nearest type index even for ADD_SAME.  Recompaction
+	 * can then promote/demote across tier boundaries (e.g. a popcount
+	 * node that no longer fits its current tier).
 	 */
 	switch (mode) {
 	case FT_RECOMPACT_ADD_SAME:
@@ -1986,10 +2123,11 @@ int ft_node_recompact(enum ft_recompact mode,
 		 * The drop is one of the counted children (its slot is the
 		 * plan's @nullify_expected, validated non-NULL below), so the
 		 * copy places @nr_copy_child - 1.  A ZERO here is a plan naming
-		 * a child this node does not hold: it sizes to NODE_INDEX_NULL
-		 * and the assert below names it, exactly as a 1-child node has
-		 * always done (a node emptying its last child routes through
-		 * ft_detach_node, never through a DEL recompaction).
+		 * a child this node does not hold.  It sizes to
+		 * NODE_INDEX_NULL and the NODE_INDEX_NULL refusal below
+		 * catches it, exactly as it does for a 1-child node.  A node
+		 * emptying its last child routes through ft_detach_node,
+		 * never through a DEL recompaction.
 		 */
 		new_type_index = find_nearest_type_index(old_type_index,
 			nr_copy_child ? nr_copy_child - 1 : 0, is_root);
@@ -2005,9 +2143,9 @@ int ft_node_recompact(enum ft_recompact mode,
 
 	/*
 	 * SIZE -> COPY window (-DFT_DELAY_INJECT only).  The replacement node's
-	 * type was just chosen from a live count read; the copy loop below then
-	 * skips any source child a peer has removed in between.  Widen the gap
-	 * so that skip actually happens under test.
+	 * type was just chosen from a live count read.  The copy loop below
+	 * then skips any source child a peer has removed in between.  Widen
+	 * the gap so that skip actually happens under test.
 	 */
 #ifndef FT_DELAY_SITE_A_ONLY
 	ft_delay_writer();
@@ -2038,13 +2176,13 @@ int ft_node_recompact(enum ft_recompact mode,
 					3 * (ft_meta_nr_child_load(metadata) + 1)
 					+ 1 + (ft->lock_fine ? 2 : 0)
 					+ 1 /* the fresh copy's born-lock release */)) {
-			/* Release the WHOLE lock set, not just C: the up-front
-			 * acquire took P (and GP) into @rel_held, and this bail is
-			 * before the txn registry takes ownership of them, so they
-			 * are still ours to clear.  Missing this left P/GP LOCK
-			 * for good -- structurally invisible (the trie is
-			 * byte-for-byte intact) and fatal to every later op that
-			 * needs them. */
+			/* Release the WHOLE lock set, not just C.  The up-front
+			 * acquire took P (and GP) into @rel_held.  This bail is
+			 * before the txn registry takes ownership of them, so
+			 * they are still ours to clear.  Missing this left P/GP
+			 * LOCK for good.  That is structurally invisible (the
+			 * trie is byte-for-byte intact) and fatal to every
+			 * later op that needs them. */
 			ft_unlock_held(rel_held, nr_rel);
 			if (fenced && !c_held.shared)
 				ft_meta_lock_release(c_held.lock);
@@ -2070,10 +2208,12 @@ int ft_node_recompact(enum ft_recompact mode,
 				 * §11 cross-trie graft: the caller's reanchoring
 				 * descent captured (parent, slot) coherently at the
 				 * LIVE level (d->ppnf, d->pnfp).  Use it verbatim
-				 * instead of ft_resolve_parent_slot(@metadata), which
-				 * reads @metadata's own back-pointer -- stale, and
-				 * once a shared-spine peer frees the old parent it
-				 * dangles to a reclaimed node (Defect C).  A NULL
+				 * instead of
+				 * ft_resolve_parent_slot(@metadata).  That
+				 * call reads @metadata's own back-pointer,
+				 * which is stale.  Once a shared-spine peer
+				 * frees the old parent, it dangles to a
+				 * reclaimed node (Defect C).  A NULL
 				 * hint->parent is a publish into &ft->root.
 				 */
 				inh_parent = ft_parent_node(inh_hint->parent);
@@ -2085,25 +2225,27 @@ int ft_node_recompact(enum ft_recompact mode,
 
 			/*
 			 * Inherit the retired node's (parent, offset) as ONE
-			 * CONSISTENT snapshot (Phase 4.3 atomic re-home): a peer
-			 * that re-homes @metadata's node commits its parent and
-			 * state-word offset atomically, so copying them via two raw
-			 * reads could tear -- the fresh copy would then invert its
-			 * publish slot against the wrong parent and fault
-			 * ft_slot_to_byte.  ft_resolve_parent_slot recovers the pair
-			 * from a single MCAS status snapshot (a plain read when no
-			 * re-home is in flight, so single-writer is unchanged).
+			 * CONSISTENT snapshot (Phase 4.3 atomic re-home).  A
+			 * peer that re-homes @metadata's node commits its
+			 * parent and state-word offset atomically.  So
+			 * copying them via two raw reads could tear.  The
+			 * fresh copy would then invert its publish slot
+			 * against the wrong parent and fault
+			 * ft_slot_to_byte.  ft_resolve_parent_slot recovers
+			 * the pair from a single MCAS status snapshot.  That
+			 * is a plain read when no re-home is in flight, so
+			 * single-writer is unchanged.
 			 */
 			new_metadata->parent_word = ft_parent_word(ft, inh_parent);
 			/* The retyped node keeps its own incoming edge byte. */
 			new_metadata->incoming_byte = metadata->incoming_byte;
 			/*
 			 * Set the offset on EVERY build: it is no longer
-			 * skip-specific -- it backs the parent-pointer backtrack's
-			 * O(1) slot recovery for plain-internal nodes too.  It must
-			 * come from @inh_slot (the coherent snapshot above), never
-			 * from a second raw read of the state word, which would tear
-			 * against @inh_parent.
+			 * skip-specific.  It also backs the parent-pointer
+			 * backtrack's O(1) slot recovery for plain-internal
+			 * nodes.  It must come from @inh_slot (the coherent
+			 * snapshot above).  A second raw read of the state
+			 * word would tear against @inh_parent.
 			 */
 			ft_meta_parent_slot_offset_set(new_metadata, inh_parent ?
 				(unsigned int) ((char *) inh_slot -
@@ -2157,12 +2299,14 @@ int ft_node_recompact(enum ft_recompact mode,
 				/*
 				 * Live retire: the external head's back-channel
 				 * (cell->parent / head->prev) re-points to the
-				 * fresh node ATOMICALLY with the forward publish
-				 * -- a RECORDED edge riding @retire_txn (+1
-				 * reserved above), not an early plain store a
-				 * peer observes against the not-yet-published
-				 * copy, and discarded coherently on ABORT or on
-				 * the copied-slot latch bail below.  A peer
+				 * fresh node ATOMICALLY with the forward
+				 * publish.  It is a RECORDED edge riding
+				 * @retire_txn
+				 * (+1 reserved above).  It is not an early
+				 * plain store, which a peer would observe
+				 * against the not-yet-published copy.  It is
+				 * discarded coherently on ABORT or on the
+				 * copied-slot latch bail below.  A peer
 				 * latch already parked on the back-channel word
 				 * (concurrent head re-home) aborts this attempt
 				 * up front.
@@ -2186,19 +2330,22 @@ int ft_node_recompact(enum ft_recompact mode,
 					return -EAGAIN;
 				}
 				/*
-				 * @ext_snapshot is the node's external_nodes,
-				 * installed as @new_node_flag's own a few lines
-				 * above (ft_metadata_set_external_nodes), so the
-				 * word this edge flips is a PREFIX-HEAD one --
-				 * the recorded twin of the plain-store arm's
+				 * @ext_snapshot is the node's external_nodes.
+				 * It was installed as @new_node_flag's own a
+				 * few lines above
+				 * (ft_metadata_set_external_nodes).  So the
+				 * word this edge flips is a PREFIX-HEAD one.
+				 * This is the recorded twin of the
+				 * plain-store arm's
 				 * ft_publish_external_nodes_prev below.
 				 */
 #ifndef FT_DEBUG_RECOMPACT_BC_EARLY
 				/*
-				 * RECORDED AT skip_copy, where C is covered: the
-				 * word is C's (FT-SLOT-3) and C is fenced, so it
-				 * cannot move from this read to the commit, and the
-				 * check above stays here.  Recorded now it was an
+				 * RECORDED AT skip_copy, where C is covered.
+				 * The word is C's (FT-SLOT-3) and C is
+				 * fenced, so it cannot move from this read
+				 * to the commit.  The check above stays
+				 * here.  Recorded now it was an
 				 * MW record (C not yet owned by @retire_txn).
 				 */
 				bc_rec_slot = bc_slot;
@@ -2214,13 +2361,17 @@ int ft_node_recompact(enum ft_recompact mode,
 			} else {
 				/*
 				 * Build-invisible / legacy no-txn arm: the
-				 * back-channel prev publish stays a plain store,
-				 * DEFERRED to after the copy loops (the helper's
-				 * contract only needs it at-or-just-before the
-				 * forward publish, and new_metadata->parent is
-				 * already inherited above) so the copied-slot
-				 * latch bail point has zero reader-visible
-				 * effects to undo.
+				 * back-channel prev publish stays a plain
+				 * store.  It is DEFERRED to after the copy
+				 * loops.
+				 * The copied-slot latch bail point then has
+				 * zero reader-visible effects to undo.  The
+				 * deferral is allowed for two reasons:
+				 *  - the helper's contract only needs the
+				 *    store at-or-just-before the forward
+				 *    publish;
+				 *  - new_metadata->parent_word is already
+				 *    inherited above.
 				 */
 				bc_plain = ext_snapshot != NULL;
 			}
@@ -2239,36 +2390,39 @@ int ft_node_recompact(enum ft_recompact mode,
 		 * ☠ A DEL THAT PRUNES TO NODE_INDEX_NULL IS A STALE ROUTE, AND
 		 * UNDER CONCURRENCY IT IS REACHABLE.
 		 *
-		 * This was an assert -- "the remove paths route a node emptying
+		 * This was an assert: "the remove paths route a node emptying
 		 * its last child through ft_detach_node (which unlinks the whole
 		 * branch) instead of a DEL recompact, so @new_node is non-NULL
 		 * whenever the copy/parent-inherit tail dereferences it".  That
-		 * invariant holds for the ROUTING DECISION, which the caller made
-		 * from a count read BEFORE the acquire.  @nr_copy_child above is
-		 * deliberately re-read AFTER it ("NOT hoisted above the fence"),
-		 * and a peer that drops another child in between turns the
-		 * 2-child node the caller routed here into a 1-child node whose
-		 * last child is this plan's own target.  Sizing then asks for
-		 * zero children, find_nearest_type_index answers NODE_INDEX_NULL,
-		 * and the invariant the assert states is simply false.
+		 * invariant holds for the ROUTING DECISION.  The caller made
+		 * that decision from a count read BEFORE the acquire.
+		 * @nr_copy_child above is deliberately re-read AFTER it ("NOT
+		 * hoisted above the fence").  A peer can drop another child
+		 * in between.  The 2-child node the caller routed here is
+		 * then a 1-child node whose last child is this plan's own
+		 * target.  Sizing then asks for zero children, and
+		 * find_nearest_type_index answers NODE_INDEX_NULL.  The
+		 * invariant the assert states is then false.
 		 *
 		 * ☠ AND -DNDEBUG DELETES THE ASSERT.  In a release build the
-		 * pruned-away copy fell through as @new_node_flag == NULL, was
-		 * written back through the caller's in/out @old_node_flag_ptr,
-		 * and ft_detach_node dereferenced it -- MEASURED: SIGSEGV in
-		 * cds_ft_item_to_metadata at si_addr 0x200010 (the NULL page base
-		 * plus the range's metadata offset), release only, on
-		 * inv_concurrent_remove_all_list and _nolist at all three
-		 * spacings.  The debug gate stayed green because the assert that
+		 * pruned-away copy fell through as @new_node_flag == NULL.
+		 * It was written back through the caller's in/out
+		 * @old_node_flag_ptr, and ft_detach_node dereferenced it.
+		 * MEASURED: SIGSEGV in cds_ft_item_to_metadata at si_addr
+		 * 0x200010 (the NULL page base plus the range's metadata
+		 * offset).  It was seen in release builds only, on
+		 * inv_concurrent_remove_all_list and _nolist, at all three
+		 * spacings.  The debug gate stayed green: the assert that
 		 * would have named it is not compiled in the build that races.
 		 *
 		 * So answer it the way the two plan checks just below answer
-		 * their own stale samples: nothing is published, nothing is
-		 * recorded, the fresh body (if any) never escaped -- bail through
-		 * the same unwind and let the op re-descend.  The retry re-reads
-		 * the count and routes the emptying node to ft_detach_node, which
-		 * is where it belonged; @nr_copy_child == 0 (a plan naming a
-		 * child this node no longer holds) converges the same way.
+		 * their own stale samples.  Nothing is published, nothing is
+		 * recorded, and the fresh body (if any) never escaped.  Bail
+		 * through the same unwind and let the op re-descend.  The
+		 * retry re-reads the count and routes the emptying node to
+		 * ft_detach_node, where it belonged.  @nr_copy_child == 0 (a
+		 * plan naming a child this node no longer holds) converges
+		 * the same way.
 		 */
 		if (caa_unlikely(new_type_index == NODE_INDEX_NULL)) {
 			FT_DT_INC(ft_dt_del_prune_null);
@@ -2283,15 +2437,18 @@ int ft_node_recompact(enum ft_recompact mode,
 		/*
 		 * PLAN EXPECTED-OLD (@nullify_expected, header): the caller
 		 * named a subtree to drop; this read only names the slot.  A
-		 * peer that republished the slot between the two -- an insert
-		 * splitting the compressed chain here, say, whose fresh junction
-		 * carries the caller's target AND the peer's own key -- makes
-		 * the two differ, and copying "every child except this slot"
-		 * then drops the peer's subtree whole.  The F2 fence does not
-		 * cover it: the peer's publish is serialized correctly, BEFORE
-		 * the mark, so the mark's snapshot already contains it.  A stale
-		 * plan cannot be repaired here (the caller's orphan set and
-		 * count fold derive from the same sample), so bail to the op's
+		 * peer may have republished the slot between the two.  For
+		 * example, an insert splits the compressed chain here, and
+		 * its fresh junction carries the caller's target AND the
+		 * peer's own key.  The two values then differ.  Copying
+		 * "every child except this slot" would then drop the peer's
+		 * subtree whole.
+		 *
+		 * The F2 fence does not cover it.  The peer's publish is
+		 * serialized correctly, BEFORE the mark.  So the mark's
+		 * snapshot already contains it.  A stale plan cannot be
+		 * repaired here: the caller's orphan set and count fold
+		 * derive from the same sample.  So bail to the op's
 		 * re-descend.
 		 */
 		if (caa_unlikely(nullify_val != nullify_expected)) {
@@ -2364,19 +2521,20 @@ int ft_node_recompact(enum ft_recompact mode,
 					continue;
 				/*
 				 * FOLD the op's own pending slot drop into the
-				 * copy (see @pending_del_slot): this recompaction
-				 * supersedes the node the drop targets, so the
-				 * copy must be born WITHOUT the child.  Applied
-				 * BY IDENTITY on the slot, like the nullify above
-				 * and the publish below.
+				 * copy (see @pending_del_slot).  This
+				 * recompaction supersedes the node the drop
+				 * targets.  So the copy must be born WITHOUT
+				 * the child.  Applied BY IDENTITY on the slot,
+				 * like the nullify above and the publish below.
 				 */
 				if (retire_txn && retire_txn->pending_del_slot &&
 						src_slot == retire_txn->pending_del_slot) {
 					/*
 					 * PLAN EXPECTED-OLD, for the reason
-					 * @nullify_expected states: a peer that
-					 * republished this slot since the plan was
-					 * built holds a subtree "copy all but this
+					 * @nullify_expected states.  A peer may
+					 * have republished this slot since the
+					 * plan was built.  The slot then holds
+					 * a subtree that "copy all but this
 					 * slot" would drop whole.  A parked flip
 					 * proxy fails the compare too.
 					 */
@@ -2388,22 +2546,23 @@ int ft_node_recompact(enum ft_recompact mode,
 					retire_txn->pending_del_folded = true;
 					/*
 					 * ...OR A SUBSTITUTION.  The same edit on
-					 * the same slot, one field apart: a detach
-					 * whose target is left childless but KEYED
-					 * publishes the promoted key chain INTO this
-					 * slot rather than clearing it, and folding
-					 * that here is what stops it publishing into
+					 * the same slot, one field apart.  A
+					 * detach can leave its target childless
+					 * but KEYED.  It then publishes the
+					 * promoted key chain INTO this slot
+					 * rather than clearing it.  Folding
+					 * that here stops it publishing into
 					 * the body this recompaction supersedes.
 					 *
 					 * ☠ @pending_pub_slot CANNOT EXPRESS IT.
 					 * The NOSPLIT graft already announces its own
 					 * forward publish there (ft-graft.h), so a
 					 * second announcer silently overwrites the
-					 * first -- measured: the fold rode the
+					 * first.  Measured: the fold rode the
 					 * GRAFT's slot and the op's own edit was
-					 * dropped on the floor, and the op then
-					 * refused itself.  This arm reuses the drop's
-					 * VALIDATED expected-old instead of adding a
+					 * dropped.  The op then refused itself.
+					 * This arm reuses the drop's VALIDATED
+					 * expected-old instead of adding a
 					 * second unchecked announcement.
 					 */
 					if (!retire_txn->pending_del_replace)
@@ -2424,13 +2583,14 @@ int ft_node_recompact(enum ft_recompact mode,
 				}
 				/*
 				 * FOLD the op's own pending forward publish
-				 * into the copy (see @pending_pub_slot): this
-				 * recompaction is replacing the very node the
-				 * publish targets, so the copy must be born
-				 * holding the new child.  Applied BY IDENTITY
-				 * on the slot, like the nullify above -- the
-				 * resolve deliberately reads COMMITTED values,
-				 * and must keep doing so for every other slot.
+				 * into the copy (see @pending_pub_slot).
+				 * This recompaction is replacing the very
+				 * node the publish targets.  So the copy must
+				 * be born holding the new child.  Applied BY
+				 * IDENTITY on the slot, like the nullify
+				 * above.  The resolve deliberately reads
+				 * COMMITTED values, and must keep doing so
+				 * for every other slot.
 				 */
 				if (!substituted && retire_txn &&
 						retire_txn->pending_dual_slot &&
@@ -2438,10 +2598,11 @@ int ft_node_recompact(enum ft_recompact mode,
 					/*
 					 * FOLD THE PUBLISH'S SKIP_X DUAL, for the
 					 * same reason and by the same rule as the
-					 * publish below: the refreshed skip word was
-					 * recorded against the node THIS recompaction
-					 * supersedes, so the copy must be born holding
-					 * it or the live trie keeps the stale one.
+					 * publish below.  The refreshed skip
+					 * word was recorded against the node
+					 * THIS recompaction supersedes.  So the
+					 * copy must be born holding it, or the
+					 * live trie keeps the stale one.
 					 * ☞ @pending_dual_slot.
 					 */
 					iter = retire_txn->pending_dual_val;
@@ -2452,11 +2613,12 @@ int ft_node_recompact(enum ft_recompact mode,
 					retire_txn->pending_pub_folded = true;
 					/*
 					 * NAME THE SURVIVOR.  The publish is now
-					 * live in THIS copy, so anything the op
-					 * still owes the published-into node --
-					 * the order-statistics delta above all --
-					 * owes it HERE, not to the copy this
-					 * commit retires.
+					 * live in THIS copy.  So anything the
+					 * op still owes the published-into
+					 * node, it owes HERE.  It does not owe
+					 * it to the copy this commit retires.
+					 * The main such debt is the
+					 * order-statistics delta.
 					 */
 					retire_txn->pending_pub_node =
 						new_node_flag;
@@ -2465,23 +2627,24 @@ int ft_node_recompact(enum ft_recompact mode,
 				/*
 				 * Build-invisible / no-txn arm: no peer publishes
 				 * into this unpublished node, so a proxy is
-				 * unexpected -- bail defensively (the live-retire
-				 * arm above documents the copy-a-latch hazard).
+				 * unexpected.  Bail defensively.  The
+				 * live-retire arm above documents the
+				 * copy-a-latch hazard.
 				 */
 				ret = -EAGAIN;
 				goto abandon_fresh;
 			}
 			/*
 			 * Fenced ADD: the descent chose @n because the old
-			 * node had no child there -- a live child at @n now
+			 * node had no child there.  A live child at @n now
 			 * means a peer COMMITTED an insert at this byte
-			 * between the descent's read and the fence mark (the
-			 * one window the state pin cannot cover: the mark
-			 * snapshot already includes the peer's count).  The
-			 * blind set_nth below would overwrite the peer's
-			 * whole subtree; re-descend and dive into it instead.
-			 * Never fires single-writer (the descent's read
-			 * holds).
+			 * between the descent's read and the fence mark.
+			 * That is the one window the state pin cannot cover:
+			 * the mark snapshot already includes the peer's
+			 * count.  The blind set_nth below would overwrite
+			 * the peer's whole subtree.  Re-descend and dive
+			 * into it instead.  Never fires single-writer (the
+			 * descent's read holds).
 			 */
 			if (caa_unlikely(fenced &&
 					(mode == FT_RECOMPACT_ADD_NEXT ||
@@ -2519,14 +2682,17 @@ int ft_node_recompact(enum ft_recompact mode,
 		unsigned int i;
 
 		/*
-		 * Adding to a pigeon SOURCE happens only under recompact-on-
-		 * insert -- the build without FEATURE_FT_INSERT_IN_PLACE, or a
-		 * caller that declined the in-place tier (@in_place false: a
-		 * bulk reserve on a shared trie, the build-path wrapper): a new
-		 * key for a live pigeon routes here as ADD_SAME to retire the
-		 * in-place bitmap set.  A new-key insert never fills the pigeon
-		 * (an occupied byte is a replace, not an insert), so
-		 * find_nearest_type_index stays within the pigeon tier.
+		 * Adding to a pigeon SOURCE happens only under
+		 * recompact-on-insert.  That is one of:
+		 *  - the build without FEATURE_FT_INSERT_IN_PLACE;
+		 *  - a caller that declined the in-place tier (@in_place
+		 *    false: a bulk reserve on a shared trie, the build-path
+		 *    wrapper).
+		 * A new key for a live pigeon then routes here as ADD_SAME,
+		 * to retire the in-place bitmap set.  A new-key insert never
+		 * fills the pigeon (an occupied byte is a replace, not an
+		 * insert), so find_nearest_type_index stays within the
+		 * pigeon tier.
 		 */
 		assert(mode == FT_RECOMPACT_DEL ||
 			mode == FT_RECOMPACT_RELOCATE ||
@@ -2556,19 +2722,20 @@ int ft_node_recompact(enum ft_recompact mode,
 					continue;
 				/*
 				 * FOLD the op's own pending slot drop into the
-				 * copy (see @pending_del_slot): this recompaction
-				 * supersedes the node the drop targets, so the
-				 * copy must be born WITHOUT the child.  Applied
-				 * BY IDENTITY on the slot, like the nullify above
-				 * and the publish below.
+				 * copy (see @pending_del_slot).  This
+				 * recompaction supersedes the node the drop
+				 * targets.  So the copy must be born WITHOUT
+				 * the child.  Applied BY IDENTITY on the slot,
+				 * like the nullify above and the publish below.
 				 */
 				if (retire_txn && retire_txn->pending_del_slot &&
 						src_slot == retire_txn->pending_del_slot) {
 					/*
 					 * PLAN EXPECTED-OLD, for the reason
-					 * @nullify_expected states: a peer that
-					 * republished this slot since the plan was
-					 * built holds a subtree "copy all but this
+					 * @nullify_expected states.  A peer may
+					 * have republished this slot since the
+					 * plan was built.  The slot then holds
+					 * a subtree that "copy all but this
 					 * slot" would drop whole.  A parked flip
 					 * proxy fails the compare too.
 					 */
@@ -2580,22 +2747,23 @@ int ft_node_recompact(enum ft_recompact mode,
 					retire_txn->pending_del_folded = true;
 					/*
 					 * ...OR A SUBSTITUTION.  The same edit on
-					 * the same slot, one field apart: a detach
-					 * whose target is left childless but KEYED
-					 * publishes the promoted key chain INTO this
-					 * slot rather than clearing it, and folding
-					 * that here is what stops it publishing into
+					 * the same slot, one field apart.  A
+					 * detach can leave its target childless
+					 * but KEYED.  It then publishes the
+					 * promoted key chain INTO this slot
+					 * rather than clearing it.  Folding
+					 * that here stops it publishing into
 					 * the body this recompaction supersedes.
 					 *
 					 * ☠ @pending_pub_slot CANNOT EXPRESS IT.
 					 * The NOSPLIT graft already announces its own
 					 * forward publish there (ft-graft.h), so a
 					 * second announcer silently overwrites the
-					 * first -- measured: the fold rode the
+					 * first.  Measured: the fold rode the
 					 * GRAFT's slot and the op's own edit was
-					 * dropped on the floor, and the op then
-					 * refused itself.  This arm reuses the drop's
-					 * VALIDATED expected-old instead of adding a
+					 * dropped.  The op then refused itself.
+					 * This arm reuses the drop's VALIDATED
+					 * expected-old instead of adding a
 					 * second unchecked announcement.
 					 */
 					if (!retire_txn->pending_del_replace)
@@ -2616,13 +2784,14 @@ int ft_node_recompact(enum ft_recompact mode,
 				}
 				/*
 				 * FOLD the op's own pending forward publish
-				 * into the copy (see @pending_pub_slot): this
-				 * recompaction is replacing the very node the
-				 * publish targets, so the copy must be born
-				 * holding the new child.  Applied BY IDENTITY
-				 * on the slot, like the nullify above -- the
-				 * resolve deliberately reads COMMITTED values,
-				 * and must keep doing so for every other slot.
+				 * into the copy (see @pending_pub_slot).
+				 * This recompaction is replacing the very
+				 * node the publish targets.  So the copy must
+				 * be born holding the new child.  Applied BY
+				 * IDENTITY on the slot, like the nullify
+				 * above.  The resolve deliberately reads
+				 * COMMITTED values, and must keep doing so
+				 * for every other slot.
 				 */
 				if (!substituted && retire_txn &&
 						retire_txn->pending_dual_slot &&
@@ -2630,10 +2799,11 @@ int ft_node_recompact(enum ft_recompact mode,
 					/*
 					 * FOLD THE PUBLISH'S SKIP_X DUAL, for the
 					 * same reason and by the same rule as the
-					 * publish below: the refreshed skip word was
-					 * recorded against the node THIS recompaction
-					 * supersedes, so the copy must be born holding
-					 * it or the live trie keeps the stale one.
+					 * publish below.  The refreshed skip
+					 * word was recorded against the node
+					 * THIS recompaction supersedes.  So the
+					 * copy must be born holding it, or the
+					 * live trie keeps the stale one.
 					 * ☞ @pending_dual_slot.
 					 */
 					iter = retire_txn->pending_dual_val;
@@ -2644,11 +2814,12 @@ int ft_node_recompact(enum ft_recompact mode,
 					retire_txn->pending_pub_folded = true;
 					/*
 					 * NAME THE SURVIVOR.  The publish is now
-					 * live in THIS copy, so anything the op
-					 * still owes the published-into node --
-					 * the order-statistics delta above all --
-					 * owes it HERE, not to the copy this
-					 * commit retires.
+					 * live in THIS copy.  So anything the
+					 * op still owes the published-into
+					 * node, it owes HERE.  It does not owe
+					 * it to the copy this commit retires.
+					 * The main such debt is the
+					 * order-statistics delta.
 					 */
 					retire_txn->pending_pub_node =
 						new_node_flag;
@@ -2689,8 +2860,8 @@ int ft_node_recompact(enum ft_recompact mode,
 	default:
 		/*
 		 * Statically unreachable (every ft_types entry is POPCOUNT /
-		 * PIGEON / NULL), but route through abandon_fresh anyway: it is
-		 * the one failure arm past the lock acquire, and `goto end`
+		 * PIGEON / NULL), but route through abandon_fresh anyway.  It
+		 * is the one failure arm past the lock acquire.  A `goto end`
 		 * here would leak both the fresh node and the fence if a new
 		 * type class ever forgot to extend this switch.
 		 */
@@ -2701,18 +2872,21 @@ int ft_node_recompact(enum ft_recompact mode,
 skip_copy:
 	/*
 	 * ☞ THE SWEEP'S RECORDS ARE C'S WORDS, AND C IS HELD.  The child
-	 * re-parent sweep below records each child's back edge; for an
+	 * re-parent sweep below records each child's back edge.  For an
 	 * external head that word belongs to the parent whose slot names it
-	 * (FT-SLOT-3), i.e. to C, which the acquire above fenced.  But C is
-	 * REGISTERED on @retire_txn only after the sweep (its terminal, below),
-	 * so ft_flip_txn_owns answered no and every head back edge committed as
-	 * a CAS (FT_DEBUG_MW_KEPT: HEAD_BACK, ~310k per ft_unit run, the
-	 * compaction relocations).  COVER it here: owns() then answers yes and
-	 * nothing gains a release duty.  No bail follows this point (the
-	 * sweep is the point of no return), so a covered record always reaches
-	 * the commit, by which C is registered and held until the release after
-	 * it.  A SHARED take (held through another frame) is left uncovered,
-	 * as its registration below skips it.
+	 * (FT-SLOT-3).  That parent is C, which the acquire above fenced.
+	 *
+	 * But C is REGISTERED on @retire_txn only after the sweep (its
+	 * terminal, below).  So ft_flip_txn_owns answered no, and every head
+	 * back edge committed as a CAS.  (FT_DEBUG_MW_KEPT: HEAD_BACK, ~310k
+	 * per ft_unit run, the compaction relocations.)
+	 *
+	 * COVER it here: owns() then answers yes and nothing gains a release
+	 * duty.  No bail follows this point: the sweep is the point of no
+	 * return.  So a covered record always reaches the commit.  By then C
+	 * is registered, and it is held until the release after the commit.
+	 * A SHARED take (held through another frame) is left uncovered, as
+	 * its registration below skips it.
 	 * -DFT_DEBUG_RECOMPACT_SWEEP_UNCOVERED keeps those records MW.
 	 */
 #ifndef FT_DEBUG_RECOMPACT_SWEEP_UNCOVERED
@@ -2720,9 +2894,9 @@ skip_copy:
 		ft_flip_txn_cover_member(retire_txn, c_held.lock);
 #endif
 	/*
-	 * The external prefix head's back edge, read and checked when the copy
-	 * took @external_nodes above: recorded here, after the last bail and
-	 * with C covered, so it parks like the sweep's records.
+	 * The external prefix head's back edge.  It was read and checked when
+	 * the copy took @external_nodes above.  It is recorded here, after the
+	 * last bail and with C covered, so it parks like the sweep's records.
 	 */
 	if (bc_rec_slot)
 		ft_flip_txn_record_head_back_edge_owned(retire_txn,
@@ -2813,8 +2987,8 @@ skip_copy:
 #ifdef FT_DEBUG_DEL_TOMB
 		/*
 		 * THE BUILD INVARIANT, checked where it is still cheap to name
-		 * the producer: a build-invisible fresh node applies every
-		 * nr_child in place, so its state count must equal its bitmap
+		 * the producer.  A build-invisible fresh node applies every
+		 * nr_child in place.  So its state count must equal its bitmap
 		 * popcount at every step.  Snapshot both across the ADD.
 		 */
 		unsigned int dbg_pc_before = (new_node && new_type->type_class == FT_POPCOUNT) ?
@@ -2864,8 +3038,8 @@ skip_copy:
 
 	/*
 	 * Deferred Phase-2 back-channel publish (plain-store arm only; the
-	 * retire_txn arm recorded it above): past the copy loops the attempt
-	 * can no longer bail, so this is the first moment the fresh node may
+	 * retire_txn arm recorded it above).  Past the copy loops the attempt
+	 * can no longer bail.  So this is the first moment the fresh node may
 	 * become peer-visible.
 	 */
 	if (bc_plain)
@@ -2891,22 +3065,28 @@ skip_copy:
 		/*
 		 * F1 discipline on the BACK-EDGE: never clone a peer's parked flip
 		 * proxy into the fresh copy's parent.  The peer's txn record names
-		 * the OLD node's &meta->parent, so a cloned proxy at the fresh
-		 * copy's meta->parent is owned by nobody and is NEVER settled: it
-		 * outlives the owner's reclaim (its rcu_head is already queued),
-		 * so ft_resolve_parent_slot() either spins forever in its
-		 * unbounded for(;;) -- the "parent parked but offset settled" arm,
-		 * observed as a 1-core MW livelock -- or later resolves through
-		 * freed descriptor memory (the CORE_682870 dangling-proxy UAF).
+		 * the OLD node's &meta->parent.  So a cloned proxy at the fresh
+		 * copy's meta->parent is owned by nobody and is NEVER
+		 * settled.  It outlives the owner's reclaim (its rcu_head is
+		 * already queued).  ft_resolve_parent_slot() then fails in
+		 * one of two ways:
+		 *  - it spins forever in its unbounded for(;;).  This is the
+		 *    "parent parked but offset settled" arm, observed as a
+		 *    1-core MW livelock;
+		 *  - it later resolves through freed descriptor memory (the
+		 *    CORE_682870 dangling-proxy UAF).
 		 *
 		 * Resolving is exact, not just a fresher guess, because a
 		 * parked @meta->parent here is always a DOOMED peer.  The only
 		 * writer that parks it is ft_reparent_record_meta(), which ALWAYS
-		 * records the &meta->state edge alongside it.  So either the peer
-		 * parked before our ft_meta_lock_acquire(), which then observed
-		 * FT_STATE_PROXY and bailed -EAGAIN (we never reach here), or it
-		 * parks after, and its state-word install fails against the word
-		 * the fence pinned to {LOCK|s -> TOMBSTONE|s}, aborting it.
+		 * records the &meta->state edge alongside it.  So there are
+		 * two cases:
+		 *  - the peer parked before our ft_meta_lock_acquire().  The
+		 *    acquire then observed FT_STATE_PROXY and bailed -EAGAIN,
+		 *    and we never reach here;
+		 *  - the peer parks after.  Its state-word install then fails
+		 *    against the word the fence pinned to
+		 *    {LOCK|s -> TOMBSTONE|s}, which aborts it.
 		 * Either way ft_resolve_flip_proxy() returns old_ptr == the true
 		 * current parent.  (A peer that COMMITTED before the mark leaves a
 		 * plain, coherent new parent; the caller's ft_get_parent_slot()
@@ -2921,16 +3101,17 @@ skip_copy:
 		 */
 		/*
 		 * §11 cross-trie graft (Defect C): the SKIP_X dual re-encode
-		 * below rewrites the GRANDPARENT's skip pointer, so it must name
-		 * the SAME coherent grandparent the forward publish uses -- the
-		 * LIVE reanchored @inh_hint->parent (== d->ppnf) -- NOT
-		 * old_meta->parent, which is the very stale/dangling back-pointer
-		 * the hint exists to avoid.  Without this the SKIP_X store lands
-		 * in a relocated (or freed/reclaimed) grandparent: the wild store
-		 * merely moves from the forward slot to the dual slot.  @inh_hint
-		 * is supplied only for a LIVE-node recompact (metadata == old_meta);
-		 * the build-invisible arm parks no back-edge, so it keeps the
-		 * identity read.
+		 * below rewrites the GRANDPARENT's skip pointer.  So it must
+		 * name the SAME coherent grandparent the forward publish
+		 * uses.  That is the LIVE reanchored @inh_hint->parent
+		 * (== d->ppnf).  It is NOT old_meta->parent, which is the
+		 * very stale/dangling back-pointer the hint exists to avoid.
+		 * Without this the SKIP_X store lands in a relocated (or
+		 * freed/reclaimed) grandparent: the wild store merely moves
+		 * from the forward slot to the dual slot.  @inh_hint is
+		 * supplied only for a LIVE-node recompact
+		 * (metadata == old_meta).  The build-invisible arm parks no
+		 * back-edge, so it keeps the identity read.
 		 */
 		struct cds_ft_inode_flag *old_parent = inh_hint ?
 			inh_hint->parent :
@@ -2938,22 +3119,25 @@ skip_copy:
 				rcu_dereference(old_meta->parent_word));
 
 		/*
-		 * Inherit (parent, offset) ONLY for a dest with no @metadata --
-		 * a build-invisible node (fresh cluster/junction) that no peer can
-		 * reach, so nothing parks its back-edge and the raw pair below is
-		 * trivially coherent.
+		 * Inherit (parent, offset) ONLY for a dest with no @metadata.
+		 * That is a build-invisible node (fresh cluster/junction)
+		 * that no peer can reach.  Nothing parks its back-edge, so
+		 * the raw pair below is trivially coherent.
 		 *
 		 * A LIVE node (@metadata set) already got its (parent, offset)
 		 * from the ONE coherent ft_resolve_parent_slot() snapshot above.
-		 * Re-deriving them here from two raw reads would TEAR against that
-		 * snapshot if a peer re-homed the node in between: the parent
-		 * pointer and the state-word offset flip as a co-committed PAIR
-		 * (ft_reparent_record_meta), and only ft_resolve_parent_slot's
-		 * same-mcas + stability re-read recovers them atomically.  It is
-		 * currently a same-value rewrite because the node lock keeps
-		 * a peer from parking either edge -- but relying on the fence for
-		 * COHERENCE (as opposed to for the resolve's exactness below) is
-		 * an invariant this code should not have to know.
+		 * Re-deriving them here from two raw reads would TEAR against
+		 * that snapshot if a peer re-homed the node in between.  The
+		 * parent pointer and the state-word offset flip as a
+		 * co-committed PAIR (ft_reparent_record_meta).  Only
+		 * ft_resolve_parent_slot's same-mcas + stability re-read
+		 * recovers them atomically.
+		 *
+		 * It is currently a same-value rewrite, because the node lock
+		 * keeps a peer from parking either edge.  But relying on the
+		 * fence for COHERENCE (as opposed to for the resolve's
+		 * exactness below) is an invariant this code should not have
+		 * to know.
 		 */
 		assert(!metadata || metadata == old_meta);
 		if (!metadata) {
@@ -2974,10 +3158,12 @@ skip_copy:
 			 * slot is a slot in cn's parent (the great-grandparent).
 			 * ft_get_parent_slot(cn_meta) recovers it from cn's OWN raw
 			 * back-pointer, which dangles to a freed great-grandparent
-			 * once a peer relocates it (lazy reanchor).  When the caller
-			 * supplied a descent hint, use its coherent slot (d->ppnfp),
-			 * captured by navigating the CURRENT tree -- the live
-			 * relocated great-grandparent, not cn's stale back-edge.
+			 * once a peer relocates it (lazy reanchor).  When the
+			 * caller supplied a descent hint, use its coherent
+			 * slot (d->ppnfp).  The descent captured it by
+			 * navigating the CURRENT tree.  It names the live
+			 * relocated great-grandparent, not cn's stale
+			 * back-edge.
 			 */
 			struct cds_ft_inode_flag **skip_slot = inh_hint ?
 				inh_hint->gp_slot :
@@ -3003,15 +3189,17 @@ skip_copy:
 				 */
 				/*
 				 * @new_node gates the lock so that "locked" implies
-				 * "reserved": the +2 widen for these two release
-				 * records lives in the new_type_index != NULL arm
-				 * above, which is also the only arm that produces a
-				 * fresh copy.  A DEL that shrinks its node away
-				 * entirely (NULL type = prune) allocates no copy, so
-				 * it re-encodes no dual here -- there is nothing to
-				 * point GP's SKIP_X at -- and the prune's own edges
-				 * belong to the caller's lock-set (remove, step 5),
-				 * not to this atom.
+				 * "reserved".  The +2 widen for these two
+				 * release records lives in the
+				 * new_type_index != NULL arm above.  That is
+				 * also the only arm that produces a fresh
+				 * copy.  A DEL that shrinks its node away
+				 * entirely (NULL type = prune) allocates no
+				 * copy.  So it re-encodes no dual here:
+				 * there is nothing to point GP's SKIP_X at.
+				 * The prune's own edges belong to the
+				 * caller's lock-set (remove, step 5), not to
+				 * this atom.
 				 */
 				if (ft->lock_fine && fenced && new_node) {
 					struct cds_ft_inode_flag *gp_parent;
@@ -3020,9 +3208,11 @@ skip_copy:
 					 * Same §11 coherence: the great-grandparent
 					 * to node lock is cn's parent.  Prefer the
 					 * hint's LIVE reanchored great-grandparent
-					 * (d->pppnf) over ft_resolve_parent_slot(cn_meta),
-					 * which reads cn's stale back-pointer and would
-					 * false-succeed the lock on a reclaimed node.
+					 * (d->pppnf) over
+					 * ft_resolve_parent_slot(cn_meta).
+					 * That call reads cn's stale
+					 * back-pointer.  It would false-succeed
+					 * the lock on a reclaimed node.
 					 * NULL @gp (cn at the root: dual lives in
 					 * &ft->root) skips the lock, as the raw NULL did.
 					 */
@@ -3037,17 +3227,19 @@ skip_copy:
 				}
 				/*
 				 * FT_RECOMPACT_DEL relocates the rebuilt
-				 * (smaller) node into a LOCAL out-param that
-				 * ft_detach_node republishes via
+				 * (smaller) node into a LOCAL out-param.
+				 * ft_detach_node republishes it via
 				 * _ft_publish_to_parent(parent_nf = this very
-				 * compressed parent), which RECORDS this SKIP_X
-				 * dual into the op's commit rec so it flips
-				 * ATOMICALLY with the forward cn->child store.
-				 * Performing (or recording) it here too would be
-				 * a premature store ordered BEFORE that deferred
-				 * forward -- a non-atomic window where a candidate
-				 * reader follows the skip to the new node while an
-				 * exact reader following cn->child still sees the
+				 * compressed parent).  That call RECORDS
+				 * this SKIP_X dual into the op's commit rec,
+				 * so it flips ATOMICALLY with the forward
+				 * cn->child store.  Performing (or
+				 * recording) it here too would be a
+				 * premature store, ordered BEFORE that
+				 * deferred forward.  In that non-atomic
+				 * window a candidate reader follows the
+				 * skip to the new node, while an exact
+				 * reader following cn->child still sees the
 				 * old.  Defer it entirely to the caller's publish.
 				 * (DEL is the lone live-slot mutator reaching here
 				 * with rec == NULL; the other rec == NULL cases are
@@ -3060,10 +3252,11 @@ skip_copy:
 					/*
 					 * @skip_slot is a slot in GP (see above),
 					 * and §8.2 puts a node's body under its
-					 * own lock -- so GP owns this edge.  Taken
-					 * from the descent hint when there is one,
-					 * for the same reason @skip_slot itself is:
-					 * cn's back edge can be stale.
+					 * own lock.  So GP owns this edge.  The
+					 * owner is taken from the descent hint
+					 * when there is one, for the same
+					 * reason @skip_slot itself is: cn's
+					 * back edge can be stale.
 					 */
 					struct cds_ft_inode_flag *skip_owner_nf =
 						NULL;
@@ -3363,11 +3556,11 @@ skip_copy:
 	 * freed after a grace period.  ft_set_parent updates both
 	 * parent and skip_slot in one call.
 	 *
-	 * Skip this entirely for a cluster-leaf node: it sits at the
-	 * lower boundary of an as-yet-unpublished cluster, its children
-	 * point at live nodes, and the mutator wires every one of those
-	 * back-pointers itself at publish time.  Re-parenting any of them
-	 * here would expose the unpublished cluster from below.
+	 * Skip this entirely for a cluster-leaf node.  It sits at the
+	 * lower boundary of an as-yet-unpublished cluster, and its
+	 * children point at live nodes.  The mutator wires every one of
+	 * those back-pointers itself at publish time.  Re-parenting any
+	 * of them here would expose the unpublished cluster from below.
 	 */
 	if (!cluster_leaf) {
 		switch (new_type->type_class) {
@@ -3390,39 +3583,43 @@ skip_copy:
 						&slot, v, FT_PF_NONE);
 				if (retire_txn) {
 					/*
-					 * No per-slot COPY_SLOT freeze: the node-level
-					 * node lock (ft_meta_lock_acquire, set before
-					 * the copy loop) already froze every source slot
-					 * of the retiring node against a peer republish --
-					 * a peer's §4.B clean-LIVE guard fails against the
-					 * LOCK bit -- and the child value was copied
-					 * into @new_node above.  Only the live re-parent
-					 * edge remains to record.
+					 * No per-slot COPY_SLOT freeze.  The
+					 * node-level node lock
+					 * (ft_meta_lock_acquire, set before the
+					 * copy loop) already froze every source
+					 * slot of the retiring node against a
+					 * peer republish.  A peer's §4.B
+					 * clean-LIVE guard fails against the
+					 * LOCK bit.  The child value was copied
+					 * into @new_node above.  Only the live
+					 * re-parent edge remains to record.
 					 */
 					/*
 					 * The DLM acquire locks {C,P,(GP)}
-					 * only -- C's CHILDREN are never in
-					 * it -- so the §4.B guard must
-					 * VALIDATE, not park.
+					 * only.  C's CHILDREN are never in it.
+					 * So the §4.B guard must VALIDATE, not
+					 * park.
 					 *
 					 * ☠ THAT IS TRUE OF THIS RECOMPACTION
 					 * AND FALSE OF THE OP.  A second
 					 * subsystem in the same op can hold one
-					 * of C's children: an atomic rekey whose
-					 * source junction is at depth 1 makes C
-					 * the ROOT, and its merge arm holds the
-					 * publish parent, which is a root child.
-					 * The validate expects the word CLEAN,
-					 * the word carries the op's OWN LOCK, so
-					 * the install CAS can never match and
-					 * every attempt aborts -- a livelock
-					 * with no contention.
+					 * of C's children.  An atomic rekey
+					 * whose source junction is at depth 1
+					 * makes C the ROOT.  Its merge arm
+					 * holds the publish parent, which is a
+					 * root child.  The validate expects the
+					 * word CLEAN, but the word carries the
+					 * op's OWN LOCK.  So the install CAS
+					 * can never match and every attempt
+					 * aborts: a livelock with no
+					 * contention.
 					 *
 					 * So hand the recorder @ctx, the op's
 					 * whole held set, and let it answer the
 					 * question this site cannot see.  A
-					 * child found there takes NO state edge:
-					 * this sweep is never the acquirer, so
+					 * child found there takes NO state
+					 * edge.  This sweep is never the
+					 * acquirer, so
 					 * the step that took the word still owes
 					 * its release.
 					 */
@@ -3430,13 +3627,16 @@ skip_copy:
 						iter == retire_txn->pending_pub_val) {
 					/*
 					 * THE FOLDED PUBLISH IS A GLUE-BUILT WRAPPER
-					 * in its skip form (@pending_pub_plain): an
-					 * unpublished node, so its back edge is a
-					 * plain store -- through the PLAIN flag,
-					 * because the skip word inverts through the
-					 * spliced head's back-pointer, which still
-					 * names the run this wrapper replaces until
-					 * the commit flips (the parked child_ident
+					 * in its skip form
+					 * (@pending_pub_plain).
+					 * It is an unpublished node, so its
+					 * back edge is a plain store.  The
+					 * store goes through the PLAIN flag.
+					 * The skip word inverts through the
+					 * spliced head's back-pointer.  Until
+					 * the commit flips, that back-pointer
+					 * still names the run this wrapper
+					 * replaces (the parked child_ident
 					 * shape: seed 2069).  The slot keeps the
 					 * skip word the fold put there.
 					 */
@@ -3446,7 +3646,7 @@ skip_copy:
 						retire_txn->pending_del_replace &&
 						iter == retire_txn->pending_del_replace) {
 					/*
-					 * ☠ A SUBSTITUTED FRESH CLUSTER -- and
+					 * ☠ A SUBSTITUTED FRESH CLUSTER.
 					 * @pending_del_replace_fresh is what says
 					 * so, because the FOLD'S OTHER modes
 					 * substitute values that are NOT fresh
@@ -3457,17 +3657,19 @@ skip_copy:
 					 * it until this copy is published, and the txn
 					 * publishes REACHABILITY, not interiors.  A
 					 * recorded re-parent would plant an MW
-					 * parent+PSO pair on a node the same commit's
-					 * free list also settles -- the rule
-					 * ft-remove.h's fused collapse states for its
-					 * own @pending_child.
+					 * parent+PSO pair on a node the same
+					 * commit's free list also settles.
+					 * ft-remove.h's fused collapse states
+					 * this rule for its own @pending_child.
 					 *
 					 * Then the slot takes the CANONICAL word.
-					 * ft_set_parent has just given the fresh run
-					 * its parent and slot offset, which is what a
-					 * skip form is DERIVED through, so the
-					 * re-encode is correct only in this order.  An
-					 * interior write into an unpublished body:
+					 * ft_set_parent has just given the
+					 * fresh run its parent and slot
+					 * offset.  A skip form is DERIVED
+					 * through those, so the re-encode is
+					 * correct only in this order.  This
+					 * is an interior write into an
+					 * unpublished body, so there is
 					 * nothing to record.
 					 */
 					ft_set_parent(ft, iter, new_node_flag, slot);
@@ -3485,14 +3687,14 @@ skip_copy:
 					 * this loop already sits inside.  The
 					 * loop runs only for !cluster_leaf, and
 					 * cluster_leaf is set by EVERY caller
-					 * that puts a LIVE child into the node
-					 * -- ft_build_branch states the rule
-					 * ("Higher internals and the
+					 * that puts a LIVE child into the node.
+					 * ft_build_branch states the rule:
+					 * "Higher internals and the
 					 * compressed-wrapping case have only
 					 * fresh children, whose back-pointers
-					 * are safe to set during the build"),
-					 * and the insert/merge/graft builders
-					 * follow it: the live old child makes
+					 * are safe to set during the build".
+					 * The insert/merge/graft builders
+					 * follow it.  The live old child makes
 					 * suffix_len == 0, which IS
 					 * branch_cluster_leaf / jct_cluster_leaf.
 					 * So every @iter reached here is fresh.
@@ -3522,22 +3724,26 @@ skip_copy:
 					 * fence covers every source slot.  See the
 					 * popcount sweep above. */
 					/*
-					 * @ctx for the reason the popcount sweep
-					 * above spells out: "C's children are
-					 * never in the DLM set" is true of this
-					 * recompaction and false of the op.
+					 * @ctx is passed for the reason the
+					 * popcount sweep above spells out.
+					 * "C's children are never in the DLM
+					 * set" is true of this recompaction and
+					 * false of the op.
 					 */
 				if (retire_txn->pending_pub_plain &&
 						iter == retire_txn->pending_pub_val) {
 					/*
 					 * THE FOLDED PUBLISH IS A GLUE-BUILT WRAPPER
-					 * in its skip form (@pending_pub_plain): an
-					 * unpublished node, so its back edge is a
-					 * plain store -- through the PLAIN flag,
-					 * because the skip word inverts through the
-					 * spliced head's back-pointer, which still
-					 * names the run this wrapper replaces until
-					 * the commit flips (the parked child_ident
+					 * in its skip form
+					 * (@pending_pub_plain).
+					 * It is an unpublished node, so its
+					 * back edge is a plain store.  The
+					 * store goes through the PLAIN flag.
+					 * The skip word inverts through the
+					 * spliced head's back-pointer.  Until
+					 * the commit flips, that back-pointer
+					 * still names the run this wrapper
+					 * replaces (the parked child_ident
 					 * shape: seed 2069).  The slot keeps the
 					 * skip word the fold put there.
 					 */
@@ -3547,7 +3753,7 @@ skip_copy:
 						retire_txn->pending_del_replace &&
 						iter == retire_txn->pending_del_replace) {
 					/*
-					 * ☠ A SUBSTITUTED FRESH CLUSTER -- and
+					 * ☠ A SUBSTITUTED FRESH CLUSTER.
 					 * @pending_del_replace_fresh is what says
 					 * so, because the FOLD'S OTHER modes
 					 * substitute values that are NOT fresh
@@ -3558,17 +3764,19 @@ skip_copy:
 					 * it until this copy is published, and the txn
 					 * publishes REACHABILITY, not interiors.  A
 					 * recorded re-parent would plant an MW
-					 * parent+PSO pair on a node the same commit's
-					 * free list also settles -- the rule
-					 * ft-remove.h's fused collapse states for its
-					 * own @pending_child.
+					 * parent+PSO pair on a node the same
+					 * commit's free list also settles.
+					 * ft-remove.h's fused collapse states
+					 * this rule for its own @pending_child.
 					 *
 					 * Then the slot takes the CANONICAL word.
-					 * ft_set_parent has just given the fresh run
-					 * its parent and slot offset, which is what a
-					 * skip form is DERIVED through, so the
-					 * re-encode is correct only in this order.  An
-					 * interior write into an unpublished body:
+					 * ft_set_parent has just given the
+					 * fresh run its parent and slot
+					 * offset.  A skip form is DERIVED
+					 * through those, so the re-encode is
+					 * correct only in this order.  This
+					 * is an interior write into an
+					 * unpublished body, so there is
 					 * nothing to record.
 					 */
 					ft_set_parent(ft, iter, new_node_flag, slot);
@@ -3596,18 +3804,23 @@ skip_copy:
 		(int) new_type_index);
 
 	/*
-	 * Return the new recompacted node through old_node_flag_ptr.  For the
-	 * ADD/SAME/DEL mutators this is a LOCAL out-param re-published by the
-	 * caller, so the forward is a bare store into that local; only
-	 * FT_RECOMPACT_RELOCATE passes the LIVE slot (&ft->root, a parent child
-	 * slot, &cn->child) and never re-publishes, so its store IS the
-	 * reader-visible publication and is RECORDED into @rec to commit through a
-	 * flip descriptor together with the SKIP_X dual above (keyed on the mode,
-	 * not on @rec being set -- an ADD/SAME/DEL relocation may now carry a @rec
-	 * for the SKIP_X dual alone while its forward stays local).  For the
-	 * local-out-param callers the bare release store orders the node-body and
-	 * metadata stores above it (a plain store would let a weakly-ordered
-	 * architecture expose an unwired copy).
+	 * Return the new recompacted node through old_node_flag_ptr.
+	 *
+	 * For the ADD/SAME/DEL mutators this is a LOCAL out-param, which the
+	 * caller re-publishes.  So the forward is a bare store into that
+	 * local.
+	 *
+	 * Only FT_RECOMPACT_RELOCATE passes the LIVE slot (&ft->root, a
+	 * parent child slot, &cn->child) and never re-publishes.  So its
+	 * store IS the reader-visible publication.  It is RECORDED into
+	 * @rec, to commit through a flip descriptor together with the SKIP_X
+	 * dual above.  This is keyed on the mode, not on @rec being set.  An
+	 * ADD/SAME/DEL relocation may now carry a @rec for the SKIP_X dual
+	 * alone, while its forward stays local.
+	 *
+	 * For the local-out-param callers the bare release store orders the
+	 * node-body and metadata stores above it.  A plain store would let a
+	 * weakly-ordered architecture expose an unwired copy.
 	 */
 	if (mode == FT_RECOMPACT_RELOCATE) {
 		/* SW compaction: *slot == plan old.  Relocating the ROOT node
@@ -3618,9 +3831,10 @@ skip_copy:
 
 		/*
 		 * The holder slot lives in @metadata's PARENT (§8.2: a node's
-		 * body is its own), so that is the word that owns this edge --
-		 * resolved rather than assumed, because a root relocation has no
-		 * owning node and takes the always-MW route through @root.
+		 * body is its own), so that is the word that owns this edge.
+		 * It is resolved rather than assumed, because a root
+		 * relocation has no owning node and takes the always-MW
+		 * route through @root.
 		 */
 		if (old_node_flag_ptr != &ft->root)
 			(void) ft_resolve_parent_slot(metadata, ft, &holder_nf);
@@ -3628,42 +3842,43 @@ skip_copy:
 		 * ☑ THE FRAME CAN VOUCH AFTER ALL -- ASK ITS OWN SET.
 		 *
 		 * This said "not held -- MW (ft-compact's relocation lane is
-		 * FT_OWNER_UNPLUMBED)", and it was a BLIND QUERY, not an absent
-		 * lock: @holder_nf is @metadata's PARENT, and a relocation
+		 * FT_OWNER_UNPLUMBED)".  That was a BLIND QUERY, not an absent
+		 * lock.  @holder_nf is @metadata's PARENT.  A relocation
 		 * reaches here only through ft_node_recompact's own up-front
-		 * ft_dlm_acquire_set, whose {C, P, GP} took exactly that parent
+		 * ft_dlm_acquire_set.  Its {C, P, GP} took exactly that parent
 		 * as its P member.  The marks live in the function-local
-		 * @rel_held[] until the commit hands them to @retire_txn -- which
-		 * is PAST this point -- so every registry-shaped question
-		 * answers no here however firmly the op holds the word.
+		 * @rel_held[] until the commit hands them to @retire_txn,
+		 * which is PAST this point.  So every registry-shaped question
+		 * answers no here, however firmly the op holds the word.
 		 *
 		 * ☠ SO COMPARE BY NODE IDENTITY, NOT BY LOCK WORD.  @acq_p_meta
-		 * records the NODE set[1] named; @rel_held[].lock is the word it
-		 * locked, which ft_anchor_meta maps to an ANCHOR ANCESTOR under
-		 * any spacing coarser than per-node -- comparing against that
-		 * answers no on exactly the tries this conversion is for.
+		 * records the NODE set[1] named.  @rel_held[].lock is the word
+		 * it locked.  ft_anchor_meta maps that word to an ANCHOR
+		 * ANCESTOR under any spacing coarser than per-node.  Comparing
+		 * against it answers no on exactly the tries this conversion
+		 * is for.
 		 *
 		 * MEASURED before flipping (FT RELOC-HOLD, -DFT_DEBUG_DUAL_SITE):
 		 * match_P=64 match_C=0 MISS=0 noset=0, identical at per-node AND
 		 * exponential.  Every non-root relocation publish holds its
 		 * holder's parent.
 		 *
-		 * @root keeps MW regardless: ft_pub_slot_excluded's own
-		 * `slot != &ft->root` sees to it, because &ft->root lives in no
-		 * node and there is nothing to have taken.
+		 * @root keeps MW regardless.  ft_pub_slot_excluded's own
+		 * `slot != &ft->root` sees to it: &ft->root lives in no node,
+		 * so there is nothing to have taken.
 		 */
 		holder_held = holder_nf && acq_p_meta &&
 			ft_flag_to_metadata(ft, holder_nf) == acq_p_meta;
 #ifdef FT_DEBUG_DUAL_SITE
 		/*
 		 * ☞ THE WITNESS FOR @holder_held, kept after the flip rather
-		 * than deleted with it.  It is what established that the old
-		 * hardcoded false was a BLIND QUERY and not an absent lock (the
-		 * @2562d77b shape), and it is now the regression alarm: a
+		 * than deleted with it.  It established that the old hardcoded
+		 * false was a BLIND QUERY and not an absent lock (the
+		 * @2562d77b shape).  It is now the regression alarm.  A
 		 * non-zero MISS here means a relocation reached the publish
-		 * WITHOUT its holder in the acquired set, i.e. the flip above
-		 * started vouching for a word the op does not hold.  The
-		 * no-match bucket is split by cause so a one-bucket zero can
+		 * WITHOUT its holder in the acquired set.  The flip above
+		 * then started vouching for a word the op does not hold.  The
+		 * no-match bucket is split by cause, so a one-bucket zero can
 		 * never be read as "the op does not hold it".
 		 */
 		{
@@ -3695,31 +3910,35 @@ skip_copy:
 
 
 	/*
-	 * The old node is RETIRED: the fresh copy is fully wired above and the
-	 * caller publishes it into @old_node's slot and frees @old_node after a
-	 * grace period.  Mark it DEAD (§4.B freeze-on-free, @metadata is the old
-	 * node's metadata): a no-op store under one writer (nothing reads the
-	 * bit; the arena re-zeroes metadata on reallocation), the freeze mark a
-	 * concurrent MCAS writer validates under multi-writer.  Covers every
-	 * recompact retire -- recompact-on-insert, delete shrink (DEL), and
-	 * cds_ft_compact relocation.
+	 * The old node is RETIRED.  The fresh copy is fully wired above.  The
+	 * caller publishes it into @old_node's slot and frees @old_node after
+	 * a grace period.  Mark the old node DEAD (§4.B freeze-on-free;
+	 * @metadata is the old node's metadata):
+	 *  - under one writer this is a no-op store: nothing reads the bit,
+	 *    and the arena re-zeroes metadata on reallocation;
+	 *  - under multi-writer it is the freeze mark a concurrent MCAS
+	 *    writer validates.
+	 * This covers every recompact retire: recompact-on-insert, delete
+	 * shrink (DEL), and cds_ft_compact relocation.
 	 *
-	 * @retire_txn set: record the tombstone INTO the caller's commit txn so it
-	 * flips atomically with the publish that unlinks @old_node (atomic detach,
-	 * §4.B) instead of an early standalone flip; NULL keeps the lone-edge flip
-	 * (a fresh build-invisible recompaction that never publishes @old_node, or
-	 * a caller not yet routing its retire through a txn).
+	 * @retire_txn set: record the tombstone INTO the caller's commit txn.
+	 * It then flips atomically with the publish that unlinks @old_node
+	 * (atomic detach, §4.B), instead of an early standalone flip.  NULL
+	 * keeps the lone-edge flip.  That is a fresh build-invisible
+	 * recompaction that never publishes @old_node, or a caller not yet
+	 * routing its retire through a txn.
 	 */
 	if (old_node && metadata) {
 		if (fenced) {
 			/*
 			 * Fenced retire: the tombstone's expected old is the
-			 * MARK snapshot -- the commit ratifies exactly the
-			 * state the copy was planned against -- and the fence
-			 * hands its outcome to @retire_txn (commit OK consumes
-			 * it via the {LOCK|s -> TOMBSTONE|s} transition;
-			 * every other terminal outcome clears it through the
-			 * wrapper's registry).
+			 * MARK snapshot.  The commit ratifies exactly the
+			 * state the copy was planned against.  The fence
+			 * hands its outcome to @retire_txn:
+			 *  - commit OK consumes it via the
+			 *    {LOCK|s -> TOMBSTONE|s} transition;
+			 *  - every other terminal outcome clears it through
+			 *    the wrapper's registry.
 			 */
 			if (!c_held.shared) {
 				ft_flip_txn_lock_register_held(retire_txn,
@@ -3735,19 +3954,22 @@ skip_copy:
 			ft_meta_tombstone_set_flip(metadata);
 	}
 	/*
-	 * §9.3 LOCK_FINE, the RELEASE half of the lock-set: {P} (+ {GP} when P is
-	 * compressed) are EDITED, not retired, so their locks resolve through the
-	 * other terminal -- {LOCK|s -> s}, dropped atomically with the publish
-	 * that flips their slots.  Expected old is each member's MARK snapshot, so
-	 * a peer state change on a locked node between the mark and the commit
-	 * aborts this recompact rather than committing a plan derived from a world
-	 * that moved (the same contract the retire half carries).
+	 * §9.3 LOCK_FINE, the RELEASE half of the lock-set.  {P} (+ {GP} when
+	 * P is compressed) are EDITED, not retired.  So their locks resolve
+	 * through the other terminal: {LOCK|s -> s}, dropped atomically with
+	 * the publish that flips their slots.  Expected old is each member's
+	 * MARK snapshot.  So a peer state change on a locked node between the
+	 * mark and the commit aborts this recompact.  It does not commit a
+	 * plan derived from a world that moved.  The retire half carries the
+	 * same contract.
 	 *
-	 * Registering them hands the unlock to @retire_txn exactly like the retire
-	 * half: commit OK consumes each lock through its recorded transition, and
-	 * every other terminal (ABORT / MEMORY_ERROR / a caller's pre-commit bail)
-	 * CAS-clears it through the registry.  Past this point the local bails
-	 * below must NOT unlock them -- the txn owns them.
+	 * Registering them hands the unlock to @retire_txn exactly like the
+	 * retire half:
+	 *  - commit OK consumes each lock through its recorded transition;
+	 *  - every other terminal (ABORT / MEMORY_ERROR / a caller's
+	 *    pre-commit bail) CAS-clears it through the registry.
+	 * Past this point the local bails below must NOT unlock them: the txn
+	 * owns them.
 	 */
 	for (ri = 0; ri < nr_rel; ri++) {
 		if (rel_held[ri].shared)
@@ -3758,12 +3980,12 @@ skip_copy:
 	}
 	/*
 	 * ☞ AND THE FRESH COPY IS PUBLISHED LOCKED (ft_flip_txn_lock_born).
-	 * The sweep above re-homed every surviving child into it, and those
-	 * back edges settle only after this commit's decide: the fresh copy
+	 * The sweep above re-homed every surviving child into it.  Those back
+	 * edges settle only after this commit's decide, so the fresh copy
 	 * must not be lockable before then.  Its lock word is its OWN exactly
-	 * when C's was (same position, same depth); under a coarser spacing it
-	 * is the ancestor anchor C already shares, held above until the late
-	 * pass.
+	 * when C's was (same position, same depth).  Under a coarser spacing
+	 * it is the ancestor anchor C already shares, held above until the
+	 * late pass.
 	 */
 	if (fenced && new_node_flag && c_held.lock == metadata) {
 		ft_flip_txn_lock_born(retire_txn, new_metadata);
@@ -3774,12 +3996,12 @@ skip_copy:
 #ifdef FT_DEBUG_HIDDEN_FILL
 	/*
 	 * ITEM 4, MEASURED FIRST.  A fresh node is built while HIDDEN, so its
-	 * own slots want PLAIN stores; a slot filled by a RECORD in the
+	 * own slots want PLAIN stores.  A slot filled by a RECORD in the
 	 * publishing commit is the acceptable-but-not-preferred form (MATHIEU,
-	 * 09-22) and costs a descriptor entry per fill.  Register the body and
-	 * let the COMMIT do the counting: a fill added after this function
-	 * returns, by the caller that owns the commit, is exactly the record-0
-	 * shape, and a scan here would miss it.
+	 * 09-22).  It costs a descriptor entry per fill.  Register the body
+	 * and let the COMMIT do the counting.  A fill may be added after this
+	 * function returns, by the caller that owns the commit.  That is
+	 * exactly the record-0 shape, and a scan here would miss it.
 	 */
 	if (new_node && new_type)
 		ft_hidden_fill_register(retire_txn, new_node, new_type->order);
@@ -3796,27 +4018,32 @@ end:
 abandon_fresh:
 	/*
 	 * Latch bail (copied slot, DEL-target capture, or a fenced ADD's
-	 * occupied byte): the fresh body never became peer-visible -- nothing
-	 * recorded into @rec, forward slot untouched, the retire_txn arm's
-	 * back-channel edge is a RECORD discarded with the abandoned attempt,
-	 * and the plain-store arm's prev publish is deferred past this point.
-	 * Reclaim the never-escaped copy immediately and lift the whole lock-set
-	 * -- the retire half (@fenced) and the release half (@rel_held), neither
-	 * yet registered with @retire_txn (registration happens only on the
-	 * success path above); -EAGAIN re-descends after the peer settles.
+	 * occupied byte): the fresh body never became peer-visible.
+	 *  - Nothing was recorded into @rec.
+	 *  - The forward slot is untouched.
+	 *  - The retire_txn arm's back-channel edge is a RECORD, discarded
+	 *    with the abandoned attempt.
+	 *  - The plain-store arm's prev publish is deferred past this point.
+	 * Reclaim the never-escaped copy immediately and lift the whole
+	 * lock-set: the retire half (@fenced) and the release half
+	 * (@rel_held).  Neither is registered with @retire_txn yet:
+	 * registration happens only on the success path above.  -EAGAIN
+	 * re-descends after the peer settles.
 	 */
 	/*
 	 * ☠ THE FOLD DID NOT HAPPEN, so un-say it.  The copy loop may have
-	 * folded the op's pending publish into this body on an EARLIER slot and
-	 * only then hit the latch bail on a later one -- and the body is freed
-	 * on the next line.  Leaving @pending_pub_node set would hand
-	 * ft_glue_txn_commit_edges a pointer into reclaimed memory to bake the
-	 * order-statistics delta into, and leaving @pending_pub_folded set would
-	 * make it skip a forward publish that never took effect.
+	 * folded the op's pending publish into this body on an EARLIER slot.
+	 * It may only then have hit the latch bail on a later one.  The body
+	 * is freed on the next line.  So two fields are cleared:
+	 *  - @pending_pub_node: left set, it would hand
+	 *    ft_glue_txn_commit_edges a pointer into reclaimed memory to
+	 *    bake the order-statistics delta into;
+	 *  - @pending_pub_folded: left set, it would make it skip a forward
+	 *    publish that never took effect.
 	 *
-	 * Cleared BY IDENTITY, never unconditionally: another recompaction in
-	 * this same transaction may legitimately own a fold of its own, and this
-	 * bail must not speak for it.
+	 * Cleared BY IDENTITY, never unconditionally.  Another recompaction
+	 * in this same transaction may legitimately own a fold of its own,
+	 * and this bail must not speak for it.
 	 */
 	if (retire_txn && new_node_flag &&
 			retire_txn->pending_pub_node == new_node_flag) {
@@ -3831,11 +4058,14 @@ abandon_fresh:
 }
 
 /*
- * The metadata whose STATE WORD carries a child's parent_slot_offset -- the word
- * an SW re-parent pso edge parks and that ft_meta_nr_child_inc CASes.  NULL for
- * an external head (its back-edge is a plain parent pointer with no state word)
- * and for a flip proxy (a resolved child is never one).  Mirrors
- * ft_reparent_record's child-kind dispatch so the mark set matches the edges.
+ * Return the metadata whose STATE WORD carries a child's parent_slot_offset.
+ * That is the word an SW re-parent pso edge parks and that
+ * ft_meta_nr_child_inc CASes.  Return NULL for:
+ *  - an external head: its back-edge is a plain parent pointer with no
+ *    state word;
+ *  - a flip proxy: a resolved child is never one.
+ * This mirrors ft_reparent_record's child-kind dispatch, so the mark set
+ * matches the edges.
  */
 static
 struct cds_ft_metadata *ft_child_state_meta(struct cds_ft *ft,
@@ -3860,17 +4090,18 @@ struct cds_ft_metadata *ft_child_state_meta(struct cds_ft *ft,
 /*
  * Return 0 on success or negative error value on error.
  *
- * @cluster_leaf: when true, the target node is a cluster-leaf -- the lower
+ * @cluster_leaf: when true, the target node is a cluster-leaf: the lower
  * boundary of an as-yet-unpublished cluster (rcu-mutation build-invisible
- * pattern).  Its children are live nodes also still reachable through the old
- * structure, so writing their back-pointers to this unpublished node would
- * expose the cluster from below and, on a later allocation failure, leave a
- * dangling back-pointer.  The forward slot is still set, but NO child's
- * back-pointer is written here (neither in-place nor through recompaction);
- * the mutator wires every child of the node itself at publish time, using the
- * final node flag it tracks across recompactions.  Callers building such a
- * node must pass true for ALL of its set_nth calls (no per-child exception).
- * false for the ordinary published-node case.
+ * pattern).  Its children are live nodes, also still reachable through the
+ * old structure.  Writing their back-pointers to this unpublished node
+ * would expose the cluster from below.  On a later allocation failure it
+ * would also leave a dangling back-pointer.  So the forward slot is still
+ * set, but NO child's back-pointer is written here (neither in-place nor
+ * through recompaction).  The mutator wires every child of the node itself
+ * at publish time, using the final node flag it tracks across
+ * recompactions.  Callers building such a node must pass true for ALL of
+ * its set_nth calls (no per-child exception).  Pass false for the ordinary
+ * published-node case.
  */
 static
 int ft_node_set_nth_rec(struct cds_ft *ft,
@@ -3916,31 +4147,35 @@ int ft_node_set_nth_rec(struct cds_ft *ft,
 		 * target is already fully valid to readers.
 		 *
 		 * Fetch the parent's child slot for both SKIP_X and plain
-		 * COMPRESSED children: ft_set_parent's compressed branches
-		 * use it to record parent_slot_offset, which chain-merge
-		 * canonicalization (ft_detach_node) recovers via
-		 * ft_get_parent_slot to publish the replacement at the same
-		 * slot.  Without it, plain-COMPRESSED children (the path
-		 * taken when CDS_FT_FLAG_SKIP_COMPRESSED is unset on the
-		 * group) leave parent_slot_offset == 0 -- a latent gap that
-		 * trips chain-merge with parent-cn=plain-COMPRESSED.
+		 * COMPRESSED children.  ft_set_parent's compressed branches
+		 * use it to record parent_slot_offset.  Chain-merge
+		 * canonicalization (ft_detach_node) recovers that offset via
+		 * ft_get_parent_slot, to publish the replacement at the same
+		 * slot.  Without it, plain-COMPRESSED children leave
+		 * parent_slot_offset == 0.  That is the path taken when
+		 * CDS_FT_FLAG_SKIP_COMPRESSED is unset on the group.  It is
+		 * a latent gap that trips chain-merge with
+		 * parent-cn=plain-COMPRESSED.
 		 */
 		struct cds_ft_inode_flag **slot_ptr = NULL;
 
 		if (cluster_leaf)
 			break;	/* child back-pointers set by mutator at publish */
 		/*
-		 * Fetch the parent's child slot for EVERY child: ft_set_parent
-		 * records a non-external child's slot offset so the
-		 * parent-pointer backtrack can recover it, and an EXTERNAL
-		 * head's parent word carries FT_PARENT_PREFIX_HEAD, which a
-		 * NULL slot answers "prefix" (ft_head_parent_word_slot).  A
-		 * head installed in a body slot is not a prefix head: skipping
-		 * the fetch for externals ("they carry no metadata / offset",
-		 * true before the bit) stamped every such head as one --
-		 * cds_ft_verify red on an EXCLUSIVE trie's split insert, the
-		 * only trie this in-place arm serves, and carried along by a
-		 * later merge_at of that trie (measured: {baaacc, bc}).
+		 * Fetch the parent's child slot for EVERY child, for two
+		 * reasons:
+		 *  - ft_set_parent records a non-external child's slot offset,
+		 *    so the parent-pointer backtrack can recover it;
+		 *  - an EXTERNAL head's parent word carries
+		 *    FT_PARENT_PREFIX_HEAD, which a NULL slot answers "prefix"
+		 *    (ft_head_parent_word_slot).
+		 * A head installed in a body slot is not a prefix head.
+		 * Skipping the fetch for externals ("they carry no metadata /
+		 * offset", true before the bit) stamped every such head as
+		 * one.  cds_ft_verify was red on an EXCLUSIVE trie's split
+		 * insert, the only trie this in-place arm serves.  A later
+		 * merge_at of that trie carried the stamp along (measured:
+		 * {baaacc, bc}).
 		 */
 #ifndef FT_DEBUG_SETNTH_EXT_NOSLOT
 		ft_node_get_nth_skip(*node_flag, &slot_ptr, n, FT_PF_NONE);
@@ -3978,13 +4213,13 @@ int ft_node_set_nth_rec(struct cds_ft *ft,
 /*
  * The ordinary published-node set_nth: a build-invisible or non-relocating
  * publish with no SKIP_X-dual to fuse, so it passes @rec == NULL.  The live
- * one-commit insert reserve (ft_attach_node) calls ft_node_set_nth_rec directly
- * with its commit rec so a recompact-relocation's compressed-parent SKIP_X dual
- * flips atomically with the forward publish.
+ * one-commit insert reserve (ft_attach_node) calls ft_node_set_nth_rec
+ * directly with its commit rec.  A recompact-relocation's compressed-parent
+ * SKIP_X dual then flips atomically with the forward publish.
  *
  * No lock is derived here, so this wrapper stands on the EXCLUSIVE-only
- * in-place tier (ft_in_place_excl_ok): on a shared trie a new occupancy always
- * recompacts, exactly as before the point-op tier was widened.
+ * in-place tier (ft_in_place_excl_ok).  On a shared trie a new occupancy
+ * always recompacts, exactly as before the point-op tier was widened.
  */
 static
 int ft_node_set_nth(struct cds_ft *ft,
@@ -4007,12 +4242,15 @@ int ft_node_set_nth(struct cds_ft *ft,
 /*
  * Return 0 on success or negative error value on error.
  *
- * @node_flag_expected: the child value @node_flag_ptr held when the CALLER built
- * its plan -- the subtree this replace drops (delete) or displaces (external
- * promote).  Threaded to ft_node_recompact's DEL arm as its plan expected-old
- * (see its header), AND to the in-place arm as the deferred store's expected-old
- * (@pub->old_val): a peer republish of the slot since the plan is -EAGAIN on
- * both, and never a value this op adopts from a raw re-read of the slot.
+ * @node_flag_expected: the child value @node_flag_ptr held when the CALLER
+ * built its plan.  It is the subtree this replace drops (delete) or
+ * displaces (external promote).  It is threaded to two places:
+ *  - ft_node_recompact's DEL arm, as its plan expected-old (see its
+ *    header);
+ *  - the in-place arm, as the deferred store's expected-old
+ *    (@pub->old_val).
+ * A peer republish of the slot since the plan is -EAGAIN on both.  It is
+ * never a value this op adopts from a raw re-read of the slot.
  */
 static
 int ft_node_replace_ptr(struct cds_ft *ft,
@@ -4038,21 +4276,22 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 
 	/*
 	 * @pub is NOT optional here, and the external-PROMOTE arm below depends
-	 * on it: with @pub the promote's single reader-visible forward store is
-	 * DEFERRED into it and committed after the §4.B acquire of the holder
-	 * (ft-remove.h, `!boundary_fused && pub && pub->armed`); without it that
-	 * arm stores into the LIVE holder immediately, i.e. mutates before
-	 * acquiring, which is what the acquire exists to prevent -- a peer that
-	 * recompacts the holder through its grandparent slot leaves the value
-	 * intact in the retired copy, so the CAS still matches and the promoted
-	 * head is published into a reclaimed node.
+	 * on it.  With @pub, the promote's single reader-visible forward store
+	 * is DEFERRED into it.  It is committed after the §4.B acquire of the
+	 * holder (ft-remove.h, `!boundary_fused && pub && pub->armed`).
+	 * Without @pub, that arm stores into the LIVE holder immediately.  It
+	 * then mutates before acquiring, which is what the acquire exists to
+	 * prevent.  A peer that recompacts the holder through its grandparent
+	 * slot leaves the value intact in the retired copy.  So the CAS still
+	 * matches, and the promoted head is published into a reclaimed node.
 	 *
-	 * The invariant holds structurally, not by convention: ft_detach_node is
-	 * this family's ONLY caller, and it substitutes its own @local_pub for a
-	 * NULL argument (ft-remove.h) before reaching here -- so a list-off
-	 * caller passing NULL still arrives with @pub set.  Asserted rather than
-	 * left implicit because the failure is silent: the pub-less arm compiles,
-	 * runs, and corrupts only under a concurrent recompaction.
+	 * The invariant holds structurally, not by convention.  ft_detach_node
+	 * is this family's ONLY caller.  It substitutes its own @local_pub for
+	 * a NULL argument (ft-remove.h) before reaching here.  So a list-off
+	 * caller passing NULL still arrives with @pub set.  It is asserted
+	 * rather than left implicit because the failure is silent.  The
+	 * pub-less arm compiles, runs, and corrupts only under a concurrent
+	 * recompaction.
 	 */
 	assert(pub != NULL);
 
@@ -4067,21 +4306,23 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 			in_place, pub);
 	if (ret == -EFBIG) {
 		/*
-		 * FOLD (@held_hint): a same-trie rekey folds this delete-recompaction
-		 * of the src junction into a commit the folded graft also records
-		 * into.  The hint carries the CALLER's junction-parent IDENTITY (and
-		 * the recompacted node's slot in it) -- NOT a fresh resolve of this
-		 * node's current parent, which would be a racy read: if a peer
-		 * re-homed the node since the caller's descent, its current parent is
-		 * NOT the node the caller planned against, and the recompaction would
-		 * park an SW store into a slot that no longer holds it.  Either way
-		 * the identity is VALIDATED by a C.parent == @held_hint->parent
-		 * read-set guard riding the recompaction's own acquire commit, so a
-		 * re-home aborts -> re-descend.  Two shapes:
+		 * FOLD (@held_hint): a same-trie rekey folds this
+		 * delete-recompaction of the src junction into a commit the
+		 * folded graft also records into.  The hint carries the
+		 * CALLER's junction-parent IDENTITY, and the recompacted
+		 * node's slot in it.  It is NOT a fresh resolve of this
+		 * node's current parent, which would be a racy read.  If a
+		 * peer re-homed the node since the caller's descent, its
+		 * current parent is NOT the node the caller planned against.
+		 * The recompaction would then park an SW store into a slot
+		 * that no longer holds it.  Either way the identity is
+		 * VALIDATED by a C.parent == @held_hint->parent read-set
+		 * guard.  The guard rides the recompaction's own acquire
+		 * commit, so a re-home aborts -> re-descend.  Two shapes:
 		 *  - @parent_held: the graft already holds the lock that parent (the
-		 *    two junctions share it), so this recompaction must REUSE the held
-		 *    lock -- a second ft_dlm_lock would abort -EAGAIN -- and must not
-		 *    record a second release.
+		 *    two junctions share it).  So this recompaction must REUSE
+		 *    the held lock: a second ft_dlm_lock would abort -EAGAIN.
+		 *    It must not record a second release.
 		 *  - @parent_guard: the junctions do NOT share a parent, so this
 		 *    recompaction acquires (and releases) it itself, guarded.
 		 * NULL for every ordinary recompaction (it acquires + releases the
