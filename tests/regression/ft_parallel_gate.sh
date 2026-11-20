@@ -306,9 +306,9 @@ ALL_CONFIGS=(
 	# reporting "no moves (livelock?)" because cds_ft_rekey_graft answered
 	# NOT_SUPPORTED on this arm.  It should not have: an empty destination is
 	# a GRAFT, not a union, and none of the merge subsystem is on its path.
-	# The entry point was gated anyway, contradicting both its own public
-	# contract and the comment on ft_rekey_spine_copy.  Un-gated; these seven
-	# are the only thing that checks it stays that way.
+	# The entry point was gated anyway, contradicting its own public
+	# contract.  Un-gated; these seven are the only thing that checks it
+	# stays that way.
 	"nomerge|-DNO_FEATURE_FT_MERGE|u ion ioff imw"
 	# ★ THE TRACING BUILD.  -DFT_ENABLE_TRACING was compiled by NO CONFIGURATION
 	# AT ALL, and the cost of that is measured: the flight-recorder mis-wire

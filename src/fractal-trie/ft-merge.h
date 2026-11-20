@@ -96,6 +96,7 @@ enum ft_graft_swap_case ft_merge_descend(struct cds_ft *ft,
 	return kase;
 }
 
+#ifdef FEATURE_FT_MERGE
 /*
  * Unlink the EXACT subtree at @src_key from @src_ft IN PLACE.  Keep the
  * subtree node, because the spine-copy merge still references it.  The commit
@@ -217,7 +218,6 @@ int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
 	return 0;
 }
 
-#ifdef FEATURE_FT_MERGE
 
 
 /*
@@ -1152,8 +1152,8 @@ struct ft_merge_src_cap {
 /*
  * ☠ THE SPINE-COPY CAPTURE'S BOUNDS ARE A PREMISE, NOT A DEBUG CHECK.
  *
- * The capture loops (ft_merge_spine_copy, ft_rekey_spine_copy) walk the src
- * run from its first head to its last.  The walk is sized by @cnt_src.  The
+ * The capture loop of ft_merge_spine_copy walks the src run from its first
+ * head to its last.  The walk is sized by @cnt_src.  The
  * loops trust three facts:
  *   - the walk reaches @slast before the list ends;
  *   - every head's key is at least @src_key_len long;
@@ -3626,9 +3626,8 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	/*
 	 * The STAGED rekey lived here.  It was a detach of @src_key's subtree
 	 * into a transient trie, then a merge of that trie back in at @dst_key.
-	 * The argument checks that only it needed lived here too.  It moved to
-	 * ft_rekey_at_inner (ft-rekey.h) with the rest of the same-trie writer.
-	 * So this worker is now CROSS-TRIE ONLY and no longer recursive: the
+	 * The argument checks that only it needed lived here too.  They moved
+	 * to ft_rekey_refuse_uncovered (ft-rekey.h).  So this worker is now CROSS-TRIE ONLY and no longer recursive: the
 	 * recursive ft_merge_at_inner() call was inside that block.
 	 */
 

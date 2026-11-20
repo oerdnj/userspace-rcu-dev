@@ -3212,11 +3212,10 @@ extern unsigned long ft_probe_rspin_x[3], ft_probe_rspin_n[3];
  * So a zero there cannot distinguish "the loop is never entered
  * off-contract" from "the loop is never entered AT ALL".  Both read as
  * offc=0.  The second is a statement about reachability, not about the
- * contract.  So count TOTAL entries per SITE, split by @cond.  A per-slot
- * number cannot say which function ran: slot 0 is shared by
- * ft_merge_graft_subpos_inplace and ft_rekey_subpos_inplace.
+ * contract.  So count TOTAL entries per SITE, split by @cond.
  *   [site][0] = entries with cond FALSE, [site][1] = entries with cond TRUE
- *   site 0 = merge subpos, site 1 = rekey subpos, site 2 = graft_swap
+ *   site 0 = merge subpos, site 1 = unused (was the staged rekey's subpos),
+ *   site 2 = graft_swap
  */
 extern unsigned long ft_probe_rspin_e[3][2];
 #define RSPIN_SITE_ENTER(site, v, cond)					\

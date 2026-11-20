@@ -22158,10 +22158,7 @@ enum urcu_txn_status ft_ord_cell_flip_rec_replace(struct cds_ft *ft,
 /* Max edges a run-unlink commits: the two boundary back-edges. */
 #define FT_ORD_CELL_RUN_UNLINK_MAX_EDGES	2
 
-/*
- * ★ NOT PART OF THE MERGE FEATURE: a generic ordered-run unlink, called by the
- * rekey paths that survive -DNO_FEATURE_FT_MERGE.
- */
+#ifdef FEATURE_FT_MERGE	/* only the merge calls it */
 static
 void ft_ord_cell_run_unlink(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_node *first_head, struct cds_ft_node *last_head)
@@ -22197,6 +22194,7 @@ void ft_ord_cell_run_unlink(struct cds_ft *ft, struct ft_flip_txn *txn,
 	/* Bulk op, not yet MW-hardened: ABORT unreachable under its exclusion. */
 	(void) ft_ord_cell_flip_into(ft, txn, edges, n);
 }
+#endif /* FEATURE_FT_MERGE */
 
 #ifdef FEATURE_FT_MERGE
 #endif /* FEATURE_FT_MERGE */
@@ -28047,31 +28045,20 @@ unsigned long ft_ss_store_all, ft_ss_store_wlock, ft_ss_store_bulk,
  */
 unsigned long ft_ss_run_all, ft_ss_run_wlock, ft_ss_run_bulk, ft_ss_run_excl;
 /*
- * ☠ PER CALL SITE.  ft_glue_record_splices has THREE callers -- the merge, the
- * same-trie ATOMIC rekey and the cross-trie STAGED rekey -- and only the staged
- * one has a ft_writer_lock_gp_wait anywhere under it (ft-rekey.h:9376, :9902,
- * both on @src_ft).  An aggregate "IN-WINDOW=0" that never ran the staged path
- * is a wrong zero about the only path that could have been non-zero.
+ * ☠ PER CALL SITE.  ft_glue_record_splices has two callers: the merge and the
+ * same-trie ATOMIC rekey.
  */
-unsigned long ft_ss_site_merge, ft_ss_site_rekey_atomic, ft_ss_site_rekey_staged;
+unsigned long ft_ss_site_merge, ft_ss_site_rekey_atomic;
 /*
- * ☠ AND COUNT THE CALLS SEPARATELY FROM THE COLLISIONS.  "rekey_staged=0" has
- * two causes that are not the same finding:
+ * ☠ AND COUNT THE CALLS SEPARATELY FROM THE COLLISIONS.  A zero has two
+ * causes that are not the same finding:
  *   - the path never RAN;
  *   - it ran and no key COLLIDED (nr_splices == 0, nothing recorded, no
  *     window opened).
- * Only the first makes the in-window zero a wrong zero.
  */
-unsigned long ft_ss_site_merge_calls, ft_ss_site_rekey_atomic_calls,
-	ft_ss_site_rekey_staged_calls;
-/*
- * ft_rekey_spine_copy ENTRIES, and the two ft_writer_lock_gp_wait sites of
- * ft-rekey.h by site.  The staged path's seam (ft-rekey.h:9376) sits BEFORE its
- * ft_glue_record_splices (:9532) in the SAME function; the entry counter is what
- * says whether that straight-line order was ever actually walked.
- */
-unsigned long ft_ss_spine_entry, ft_ss_seam_spine, ft_ss_seam_subpos,
-	ft_ss_at_inner, ft_ss_spine_gate;
+unsigned long ft_ss_site_merge_calls, ft_ss_site_rekey_atomic_calls;
+/* Rekeys refused because the atomic writer's cut did not cover them. */
+unsigned long ft_ss_rekey_uncovered;
 static void ft_ss_report(void) __attribute__((destructor));
 static void ft_ss_report(void)
 {
@@ -28090,21 +28077,13 @@ static void ft_ss_report(void)
 		uatomic_read(&ft_ss_run_bulk),
 		uatomic_read(&ft_ss_run_excl));
 	fprintf(stderr, "FT SPLICE-SEAM sites (collided/called): merge=%lu/%lu "
-		"rekey_atomic=%lu/%lu rekey_staged=%lu/%lu\n",
+		"rekey_atomic=%lu/%lu\n",
 		uatomic_read(&ft_ss_site_merge),
 		uatomic_read(&ft_ss_site_merge_calls),
 		uatomic_read(&ft_ss_site_rekey_atomic),
-		uatomic_read(&ft_ss_site_rekey_atomic_calls),
-		uatomic_read(&ft_ss_site_rekey_staged),
-		uatomic_read(&ft_ss_site_rekey_staged_calls));
-	fprintf(stderr, "FT SPLICE-SEAM spine_entry=%lu seam_spine=%lu "
-		"seam_subpos=%lu\n",
-		uatomic_read(&ft_ss_spine_entry),
-		uatomic_read(&ft_ss_seam_spine),
-		uatomic_read(&ft_ss_seam_subpos));
-	fprintf(stderr, "FT SPLICE-SEAM at_inner=%lu spine_gate=%lu\n",
-		uatomic_read(&ft_ss_at_inner),
-		uatomic_read(&ft_ss_spine_gate));
+		uatomic_read(&ft_ss_site_rekey_atomic_calls));
+	fprintf(stderr, "FT SPLICE-SEAM rekey_uncovered=%lu\n",
+		uatomic_read(&ft_ss_rekey_uncovered));
 }
 #endif
 
@@ -28434,23 +28413,6 @@ void ft_glue_record_splices(struct cds_ft *ft, struct ft_glue *g,
 		 * duplicate chain.  It covers 5,382 more stores: occupied_dst
 		 * 2571, compressed_dst 2206 and rootchurn 605.  Again they are
 		 * 100% wlock + bulk with IN-WINDOW=0.
-		 *
-		 * ☠ ONE ZERO IN THAT REPORT IS A WRONG ZERO, and the probe
-		 * says so itself.  ft_rekey_spine_copy is the ONLY caller with
-		 * a ft_writer_lock_gp_wait anywhere under it.  It is never
-		 * ENTERED by ANY test in the tree (spine_entry=0 across
-		 * ft_unit and every rekey oracle).  Its enclosing staged
-		 * fallback ft_rekey_at_inner IS reached, 3 times in ft_unit.
-		 * But each of those returns BEFORE the occupied-dst gate
-		 * (spine_gate=0).  The staged OCCUPIED-DESTINATION rekey has
-		 * NO coverage at all.
-		 *
-		 * For that path the argument is therefore still STATIC.  But
-		 * it is now LOCAL rather than a claim about the call graph.
-		 * Its seam sits ABOVE its ft_glue_record_splices call in the
-		 * same function.  The only thing between that call and
-		 * ft_flip_txn_commit is ft_flip_txn_record_count_parent, which
-		 * records and does not wait.
 		 *
 		 * The MW record used to catch a peer WRITE to its prev:
 		 * - a src-side recompaction re-homing it;

@@ -2014,6 +2014,7 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 	return cst;
 }
 
+#ifdef FEATURE_FT_MERGE	/* only the merge calls it */
 /*
  * Combined NOSPLIT store: run prepare, then commit, back to back.  The
  * callers run it after the source-root unlink and the drain.
@@ -2112,6 +2113,7 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 	}
 	return CDS_FT_STATUS_OK;
 }
+#endif /* FEATURE_FT_MERGE */
 
 /*
  * Outcome of ft_graft_build's build-invisible prep descent.
