@@ -65,10 +65,13 @@ traversal (see API for details).
 
 ### `urcu/lfstack.h`
 
-Stack with lock-free push, lock-free pop, wait-free pop\_all,
-wait-free traversal. Various synchronization techniques can be
-used to deal with pop ABA. Those are detailed in the API.
-This stack does _not_ specifically rely on RCU.
+Stack with these operations:
+  - lock-free push and lock-free pop;
+  - wait-free pop\_all and wait-free traversal.
+
+Various synchronization techniques can be used to deal with pop ABA.
+Those are detailed in the API. This stack does _not_ specifically rely
+on RCU.
 
   - Note: deprecates `urcu/rculfstack.h`.
 
@@ -94,10 +97,14 @@ elements is supported. See the API for more details.
 
 RCU ordered map from opaque variable-length byte keys to
 application-owned nodes. RCU used to provide existence guarantees.
-Provides wait-free read-side point lookups, range / inequality
-lookups, rank and skip queries, and ordered (key-sorted) forward
-and reverse traversal; updates are serialized by a caller-provided
-mutex. Unique and duplicate keys are supported. Provides bulk
-sub-trie operations (graft, graft-swap, detach, merge) that move
-or combine whole key ranges between tries of a group atomically
-with respect to readers. See the API for more details.
+It provides these wait-free read-side operations:
+  - point lookups;
+  - range / inequality lookups;
+  - rank and skip queries;
+  - ordered (key-sorted) forward and reverse traversal.
+
+Updates are serialized by a caller-provided mutex. Unique and
+duplicate keys are supported. It provides bulk sub-trie operations:
+graft, graft-swap, detach and merge. They move or combine whole key
+ranges between tries of a group. Each one is atomic with respect to
+readers. See the API for more details.
