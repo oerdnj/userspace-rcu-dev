@@ -5,7 +5,8 @@
 /*
  * src/fractal-trie/ft-remove.h
  *
- * Userspace RCU library - Fractal Trie: remove / remove_all and the detach-node recompaction.
+ * Userspace RCU library - Fractal Trie: remove / remove_all and the
+ * detach-node recompaction.
  *
  * Implementation unit: #included once by fractal-trie.c, in dependency
  * order, into a single translation unit (preserves cross-module inlining).
@@ -20,24 +21,24 @@
  * ft_detach_node: detach a node from the trie and prune empty
  * single-child ancestors above it.
  *
- * Walks upward from the parent of the detached node via
- * metadata->parent pointers.  Prunes single-child ancestors until
- * reaching a node with multiple children, external nodes, or the
- * root.  The pruned branch is replaced by the topmost external
- * nodes found during the walk (or NULL).
+ * Walk upward from the parent of the detached node through the
+ * metadata->parent pointers.  Prune single-child ancestors.  Stop at
+ * a node with multiple children, at external nodes, or at the root.
+ * Replace the pruned branch with the topmost external nodes found
+ * during the walk (or NULL).
  *
  * @detach_node_flag_ptr: slot in parent pointing to the detached node.
  * @detach_parent_flag_ptr: slot in grandparent pointing to the parent.
  * @detach_depth: trie depth of the detached node.
- * @fuse_cell: when a key-disappearing remove has the ordered list on, the
- *   dead head's ord cell to unsplice ATOMICALLY with the structural unlink;
- *   NULL otherwise (move/merge callers, or list off).
- * @pub: armed by the in-place (no-recompaction) leaf delete so the forward
- *   NULL store is deferred and committed in one flip with @fuse_cell's
+ * @fuse_cell: the dead head's ord cell, when a key-disappearing remove has
+ *   the ordered list on.  It is unspliced atomically with the structural
+ *   unlink.  NULL otherwise (move/merge callers, or list off).
+ * @pub: armed by the in-place (no-recompaction) leaf delete.  The forward
+ *   NULL store is then deferred and committed in one flip with @fuse_cell's
  *   unsplice (ft_remove_one_commit).  On return, @pub->armed tells the caller
- *   whether the unsplice was fused here (true) or must be done separately
- *   (false: recompaction or compressed-parent shape, still two-commit).  Both
- *   NULL for non-fusing callers.
+ *   whether the unsplice was fused here.  True means fused.  False means the
+ *   caller must do it separately (recompaction or compressed-parent shape,
+ *   still two-commit).  Both are NULL for non-fusing callers.
  */
 
 /*
@@ -46,30 +47,31 @@
  *
  * Two sub-cases:
  *
- *   - The detached child carried external_nodes that must be
- *     promoted to the compressed node's child slot
- *     (@topmost_external_nodes != NULL): keep the compressed node
- *     (its path is needed for lookups) and replace cn->child with
- *     the external chain head.
+ *   - @topmost_external_nodes != NULL: the detached child carried
+ *     external_nodes that must be promoted to the compressed node's
+ *     child slot.  Keep the compressed node (its path is needed for
+ *     lookups).  Replace cn->child with the external chain head.
  *
  *   - Otherwise: the compressed parent is no longer needed.
- *     Allocate a fresh empty internal, inherit parent + skip slot
- *     metadata, publish it in place of the compressed node, and
- *     free the compressed.  Returns -ENOMEM if the fresh
- *     allocation failed.
+ *     Allocate a fresh empty internal.  It inherits the parent and
+ *     skip slot metadata.  Publish it in place of the compressed
+ *     node, and free the compressed node.  Returns -ENOMEM if the
+ *     fresh allocation failed.
  */
 /*
- * @iter_depth is the byte-depth of @iter_node_flag, and @ctx the op's lock
- * context: both acquires below are lock-set members, and a member's acquire
- * goes to its ANCHOR (doc/design/ft-dlm-lock-coarseness.md §2).
+ * @iter_depth is the byte-depth of @iter_node_flag.  @ctx is the op's lock
+ * context.  Both acquires below are lock-set members, and a member's acquire
+ * goes to its anchor (doc/design/ft-dlm-lock-coarseness.md §2).
  *
  * @freeze_leaf (@freeze_len entries), when set, is the removed external leaf
- * whose chain freezes in @txn.  It is recorded HERE, after each arm's acquire,
- * because its chain's holder can be @iter_node_flag itself -- a leaf straight
- * under the compressed parent -- which only these acquires take.  The caller
- * used to record it first: -DFT_DEBUG_CHAIN_HOLD read it holding nothing
- * 4 / 19 / 1 times per ft_inv leg (per-node / exponential / root-only), all
- * in the retiring arm below.
+ * whose chain freezes in @txn.  It is recorded here, after each arm's
+ * acquire.  The reason: its chain's holder can be @iter_node_flag itself (a
+ * leaf straight under the compressed parent), and only these acquires take
+ * that node.
+ *
+ * History: the caller used to record it first.  -DFT_DEBUG_CHAIN_HOLD then
+ * read it holding nothing 4 / 19 / 1 times per ft_inv leg (per-node /
+ * exponential / root-only), all in the retiring arm below.
  */
 static
 int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
@@ -89,48 +91,58 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		unsigned int freeze_len)
 {
 	/*
-	 * Does the op hold the SKIP_X dual's derived grandparent?  ANSWERED BY
-	 * THE ACQUIRE at each of the three publishes below -- the return of
-	 * ft_lock_skip_dual_gp, which is REGISTERED-or-SHARED, i.e. the
-	 * assert's own predicate.
+	 * Does the op hold the SKIP_X dual's derived grandparent?  The acquire
+	 * answers this at each of the three publishes below.  The answer is
+	 * the return value of ft_lock_skip_dual_gp.  It is true for REGISTERED
+	 * or SHARED, which is the assert's own predicate.
 	 *
-	 * ☠ NOT by ft_skip_dual_gp_held.  That helper asks @ctx, and a
-	 * ft_owner_ctx_holds() miss means "the registry cannot see this hold",
-	 * never "the op does not hold it": an acquire taken through
-	 * ft_dlm_acquire_set_at registers into NO ctx at all (it receives the
-	 * ctx as a const pointer), so its marks are invisible to the ask until
-	 * the owner's commit hands them to a txn.  That is exactly how
-	 * ft_node_recompact's dual site came to record "0 held of 805202" about
-	 * a word it holds on every fine-trie publish.  The ask is kept below as
-	 * a MEASUREMENT of that registry, and its answer must not be wired to a
-	 * record kind.
+	 * ☠ Do not answer it with ft_skip_dual_gp_held.  That helper asks
+	 * @ctx.  A ft_owner_ctx_holds() miss means "the registry cannot see
+	 * this hold".  It never means "the op does not hold it".  An acquire
+	 * taken through ft_dlm_acquire_set_at registers into no ctx at all,
+	 * because it receives the ctx as a const pointer.  Its marks are
+	 * invisible to the ask until the owner's commit hands them to a txn.
+	 * This is how ft_node_recompact's dual site came to record "0 held of
+	 * 805202" about a word it holds on every fine-trie publish.  The ask
+	 * is kept below as a measurement of that registry.  Its answer must
+	 * not be wired to a record kind.
 	 */
 	bool dual_gp_held = false;
 
 	/*
-	 * @txn is created and reserved by the caller (ft_detach_node), sized for
-	 * this publish's structural edges PLUS one freeze-on-free tombstone per
-	 * node in the orphaned chain the caller collected below -- so the
-	 * sub-case-2 retire here and the caller's entire orphan set freeze
-	 * ATOMICALLY with the publish that unlinks them (atomic detach, §4.B).
-	 * The caller reserves it before any side-effect (its orphan walk is
-	 * read-only), so the pre-flip ft_set_parent here still reaches an
-	 * allocation-free point of no return, committing through
-	 * ft_ord_cell_flip_into (infallible).  On any failure below the caller
-	 * destroys @txn.
+	 * @txn is created and reserved by the caller (ft_detach_node).  It is
+	 * sized for two things:
+	 *  - this publish's structural edges;
+	 *  - one freeze-on-free tombstone per node in the orphaned chain the
+	 *    caller collected below.
+	 * So the sub-case-2 retire here and the caller's entire orphan set
+	 * freeze atomically with the publish that unlinks them (atomic detach,
+	 * §4.B).
+	 *
+	 * The caller reserves @txn before any side-effect (its orphan walk is
+	 * read-only).  So the pre-flip ft_set_parent here still reaches an
+	 * allocation-free point of no return.  It commits through
+	 * ft_ord_cell_flip_into, which cannot fail.  On any failure below the
+	 * caller destroys @txn.
 	 */
 	/*
-	 * Resolve the retired compressed node ONCE via the shared read-side
-	 * reanchor (MW convergence): @iter_node_flag is a raw slot value that may
-	 * be SKIP-compressed, and ft_compressed_node_ptr does NOT strip the skip
-	 * high bits -- a raw ft_compressed_node_ptr(iter_node_flag) fed to
-	 * cds_ft_item_to_metadata() faults on the skip_len bits (the ft-remove.h
-	 * detach segv).  @src_cn is the LIVE compressed node the deref sites
-	 * (src_meta, the tombstone freeze, the free) must use; the raw
-	 * @iter_node_flag is kept only for the forward CAS expected-old (it must
-	 * match the SKIP_X stored in the grandparent slot).  A rewind > 0 (a peer
-	 * chain-merge moved the encoded position shallower) means the detach
-	 * premise is stale -- bail before any build so the caller re-descends.
+	 * Resolve the retired compressed node once, through the shared
+	 * read-side reanchor (MW convergence).
+	 *
+	 * @iter_node_flag is a raw slot value that may be SKIP-compressed.
+	 * ft_compressed_node_ptr does not strip the skip high bits.  A raw
+	 * ft_compressed_node_ptr(iter_node_flag) fed to
+	 * cds_ft_item_to_metadata() faults on the skip_len bits (the
+	 * ft-remove.h detach segv).
+	 *
+	 * @src_cn is the live compressed node.  The deref sites (src_meta, the
+	 * tombstone freeze, the free) must use it.  The raw @iter_node_flag is
+	 * kept only as the expected-old of the forward CAS: it must match the
+	 * SKIP_X stored in the grandparent slot.
+	 *
+	 * A rewind > 0 means that a peer chain-merge moved the encoded
+	 * position shallower.  The detach premise is then stale.  Bail before
+	 * any build, so that the caller re-descends.
 	 */
 	unsigned int iter_rewind;
 	struct cds_ft_compressed_node *src_cn = ft_compressed_node_ptr(
@@ -138,11 +150,12 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 
 	if (caa_unlikely(iter_rewind)) {
 		/*
-		 * @txn is caller-owned and already holds the orphan freeze-on-free
-		 * tombstones; the caller's cleanup does NOT destroy on -EAGAIN (it
-		 * assumes a commit consumed it), so a PRE-commit -EAGAIN must destroy
-		 * it here or leak the descriptor.  (Pre-existing on this rewind bail;
-		 * the DLM acquire-miss bails below share the same contract.)
+		 * @txn is caller-owned and already holds the orphan
+		 * freeze-on-free tombstones.  The caller's cleanup does not
+		 * destroy it on -EAGAIN: it assumes a commit consumed it.  So
+		 * a pre-commit -EAGAIN must destroy it here, or the descriptor
+		 * leaks.  (Pre-existing on this rewind bail.  The DLM
+		 * acquire-miss bails below share the same contract.)
 		 */
 		if (!record_only)
 			ft_flip_txn_destroy(txn);
@@ -163,48 +176,57 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			ft_glue_that_split(ctx, cn) : NULL;
 
 		/*
-		 * ☠ @cn IS A NODE THIS VERY COMMIT DESTROYS -- so do not write it.
+		 * ☠ This very commit destroys @cn, so do not write it.
 		 *
-		 * A same-trie rekey whose graft SPLIT @cn arrives here with @cn on
-		 * the glue's retire list and @cn's one live child @cn_child already
-		 * re-homed, by a deferred edge, into the fresh cluster the forward
-		 * publish installs.  The promote below would then write @cn twice
-		 * over: into @cn->child, a body nothing will read after the flip;
-		 * and, through _ft_publish_to_parent's SKIP_X arm, into @cn's own
-		 * home slot -- which is the WORD THE GLUE'S PUBLISH REPOINTS.  Two
-		 * records on one word whose expected-olds disagree: the dual chains
-		 * {skip(cn_child) -> skip(head)} and the glue then chains
-		 * {skip(cn_child) -> top}, urcu_txn_record_chain finds
-		 * r->new_ptr != old_ptr, POISONS the descriptor, the commit aborts
-		 * and the op re-plans the identical shape.  MEASURED on the
-		 * shipping build: 310,024 poisons in 40 s on one such shape, a
-		 * fresh cluster allocated per attempt.
+		 * A same-trie rekey whose graft split @cn arrives here in this
+		 * state:
+		 *  - @cn is on the glue's retire list;
+		 *  - @cn's one live child @cn_child is already re-homed, by a
+		 *    deferred edge, into the fresh cluster that the forward
+		 *    publish installs.
 		 *
-		 * ☠ AND CURING ONLY THAT COLLISION COMMITS A WRONG TRIE.  MEASURED
-		 * with the collision cured (a read-your-own-writes expected-old on
-		 * the glue's publish): the call returns, cds_ft_verify is RED --
-		 * "head cell {parent <cn>} != expected {owner <branch>}" -- and the
-		 * next insert wedges.  The glue's build wired the branch's old
-		 * direction to @cn_child, believing it survives; the promote
-		 * DISSOLVES @cn_child and puts the external head in its place.  So
-		 * the two steps disagree about what lives under that branch, and
-		 * the collision is the first SYMPTOM of that disagreement, not the
-		 * defect.
+		 * The promote below would then write @cn twice:
+		 *  - into @cn->child, a body nothing will read after the flip;
+		 *  - through _ft_publish_to_parent's SKIP_X arm, into @cn's own
+		 *    home slot.  That is the word the glue's publish repoints.
 		 *
-		 * RE-HOME instead of publishing: hand the promoted head to the
-		 * deferred edge that was going to move @cn_child, and store it into
-		 * the fresh cluster's own slot.  The edge is where BOTH of the
-		 * promote's writes belong once @cn is retired -- the forward one
-		 * because the fresh slot is @cn->child's successor, and the head's
-		 * back-edge because ft_reparent_record records it against the fresh
-		 * owner with a read-your-own-writes expected-old, atomically with
-		 * the publish.  @cn's home slot is then written ONCE, by the glue,
-		 * and its raw expected-old is correct because nothing else touched
-		 * the word.
+		 * This gives two records on one word whose expected-olds
+		 * disagree.  The dual chains {skip(cn_child) -> skip(head)}.
+		 * The glue then chains {skip(cn_child) -> top}.
+		 * urcu_txn_record_chain finds r->new_ptr != old_ptr and poisons
+		 * the descriptor.  The commit aborts and the op re-plans the
+		 * identical shape.  Measured on the shipping build: 310,024
+		 * poisons in 40 s on one such shape, with a fresh cluster
+		 * allocated per attempt.
 		 *
-		 * The store into the fresh slot is a PLAIN one: that cluster is
-		 * build-invisible until the forward publish, and the txn publishes
-		 * reachability, not interiors.
+		 * ☠ Curing only that collision commits a wrong trie.  Measured
+		 * with the collision cured (a read-your-own-writes expected-old
+		 * on the glue's publish): the call returns, and cds_ft_verify
+		 * is red with
+		 * "head cell {parent <cn>} != expected {owner <branch>}".
+		 * The next insert then wedges.  The glue's build wired the
+		 * branch's old direction to @cn_child, believing it survives.
+		 * The promote dissolves @cn_child and puts the external head in
+		 * its place.  So the two steps disagree about what lives under
+		 * that branch.  The collision is the first symptom of that
+		 * disagreement, not the defect.
+		 *
+		 * Re-home instead of publishing.  Hand the promoted head to the
+		 * deferred edge that was going to move @cn_child, and store it
+		 * into the fresh cluster's own slot.  Once @cn is retired, both
+		 * of the promote's writes belong to that edge:
+		 *  - the forward write, because the fresh slot is the successor
+		 *    of @cn->child;
+		 *  - the head's back-edge, because ft_reparent_record records
+		 *    it against the fresh owner with a read-your-own-writes
+		 *    expected-old, atomically with the publish.
+		 * @cn's home slot is then written once, by the glue.  Its raw
+		 * expected-old is correct because nothing else touched the
+		 * word.
+		 *
+		 * The store into the fresh slot is a plain one.  That cluster
+		 * is build-invisible until the forward publish, and the txn
+		 * publishes reachability, not interiors.
 		 */
 		if (split_g) {
 			struct ft_glue *g = (struct ft_glue *) split_g;
@@ -212,33 +234,40 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 
 			/*
 			 * The drop-old-direction arm leaves the caller no detach
-			 * to run (@old_dir_dropped), so reaching here with it set
-			 * would mean two steps both claiming the old direction.
+			 * to run (@old_dir_dropped).  Reaching here with it set
+			 * would mean that two steps both claim the old
+			 * direction.
 			 */
 			urcu_assert_debug(!g->old_dir_dropped);
 			/*
-			 * ...AND THE SAME FOR A SUBSTITUTED OLD DIRECTION.  Two of
-			 * the three substitutions leave @old_dir_deferred at -1 and
-			 * are caught by the refusal below; the PROMOTE arm defers a
-			 * LIVE head and so hands back a VALID index, which this
-			 * frame would clobber with its own promoted chain.  The
-			 * caller that arms @old_dir_replace runs no detach (the
-			 * `!done` guard at its step 3), so this is unreachable --
-			 * asserted rather than assumed, because the refusal below
-			 * cannot see it.
+			 * The same holds for a substituted old direction.  Two
+			 * of the three substitutions leave @old_dir_deferred at
+			 * -1, and the refusal below catches them.  The PROMOTE
+			 * arm defers a live head, so it hands back a valid
+			 * index.  This frame would clobber that index with its
+			 * own promoted chain.  The caller that arms
+			 * @old_dir_replace runs no detach (the `!done` guard at
+			 * its step 3), so this is unreachable.  It is asserted,
+			 * not assumed, because the refusal below cannot see
+			 * it.
 			 */
 			urcu_assert_debug(!g->old_dir_replace.done);
 			/*
-			 * REFUSE, do not guess, on every shape the re-home is not
-			 * written for: a re-home through a fresh suffix node
-			 * (whose parent slot holds a SKIP form this frame cannot
-			 * re-encode), a build that re-homed nothing, a rank-stats
-			 * trie (the fresh cluster was sized with @cn_child's key
-			 * count, which the promote changes), and the fused arm
-			 * (its cell unsplice rides the publish we are removing).
-			 * Terminal -- the shape is deterministic, so -EAGAIN would
-			 * spin -- and BEFORE ANY SIDE-EFFECT: nothing is acquired,
-			 * recorded or stored above this point.
+			 * Refuse every shape the re-home is not written for.
+			 * Do not guess.  The shapes are:
+			 *  - a re-home through a fresh suffix node, whose
+			 *    parent slot holds a SKIP form this frame cannot
+			 *    re-encode;
+			 *  - a build that re-homed nothing;
+			 *  - a rank-stats trie: the fresh cluster was sized
+			 *    with @cn_child's key count, which the promote
+			 *    changes;
+			 *  - the fused arm: its cell unsplice rides the
+			 *    publish we are removing.
+			 * The refusal is terminal: the shape is deterministic,
+			 * so -EAGAIN would spin.  It comes before any
+			 * side-effect: nothing is acquired, recorded or stored
+			 * above this point.
 			 */
 			if (g->old_dir_via_suffix || idx < 0 || ft->rank_stats ||
 					count_delta || fuse_cell || run)
@@ -260,11 +289,13 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			return 0;
 		}
 		/*
-		 * DLM Step 1: @cn is the value-swap RELEASE target this external-
-		 * promote publishes into (its child slot); acquire it (hard, no guard-
-		 * fallback) up front and record its {LOCK|s -> s} release, so both
-		 * publish arms below skip their lock_or_guard.  -EAGAIN before any edge
-		 * is recorded -> caller destroys @txn and re-descends.
+		 * DLM Step 1: @cn is the value-swap RELEASE target.  This
+		 * external-promote publishes into its child slot.  Acquire @cn
+		 * up front (hard, no guard-fallback) and record its
+		 * {LOCK|s -> s} release.  Both publish arms below then skip
+		 * their lock_or_guard.  An -EAGAIN here comes before any edge
+		 * is recorded.  This function then destroys @txn (unless
+		 * @record_only) and the caller re-descends.
 		 */
 		if (ft->lock_fine) {
 			struct ft_held_anchor cn_held;
@@ -281,9 +312,9 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				return -EAGAIN;
 			}
 			/*
-			 * A member the op ALREADY held rode an earlier acquire,
-			 * which recorded its release; a second record would settle
-			 * the single word twice.
+			 * A member the op already held rode an earlier acquire,
+			 * and that acquire recorded its release.  A second
+			 * record would settle the single word twice.
 			 */
 			if (!cn_held.shared) {
 				ft_flip_txn_lock_register_held(txn, &cn_held);
@@ -291,14 +322,15 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 					cn_held.lock_snap);
 			}
 			/*
-			 * ☠ @elevated_old_child IS A PLAN READ of cn->child,
-			 * taken before this lock, and the publish below records
-			 * it as the expected-old of a word the op now HOLDS --
-			 * a blind SW store (ft_flip_txn_record_tag's held_sw)
-			 * that pins nothing.  A peer insert of a longer key
-			 * republishes cn->child IN PLACE under this very word
-			 * (ft_insert_compressed_past_child) without moving
-			 * cn's state: re-read it here, under the lock.
+			 * ☠ @elevated_old_child is a plan read of cn->child,
+			 * taken before this lock.  The publish below records
+			 * it as the expected-old of a word the op now holds.
+			 * That is a blind SW store (ft_flip_txn_record_tag's
+			 * held_sw): it pins nothing.  A peer insert of a
+			 * longer key republishes cn->child in place under
+			 * this very word (ft_insert_compressed_past_child),
+			 * without moving cn's state.  So re-read cn->child
+			 * here, under the lock.
 			 */
 #ifndef FT_DEBUG_NO_CN_CHILD_RECHECK
 			if (!record_only &&
@@ -314,18 +346,26 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		if (freeze_leaf) {
 			ft_ch_audit_ctx(ft, txn, ctx, freeze_leaf);
 			/*
-			 * ★ VALIDATE THE PLAN UNDER THE LOCK -- see
-			 * ft_chain_compress_fused's twin.  @freeze_leaf's holder
-			 * is held: @cn itself when no climb happened, else an
-			 * orphan below it that ft_detach_node's orphan walk locked
-			 * and holds until its `end:` sweep.  @freeze_len was derived before the acquire, and
-			 * the chain parks SW: a duplicate appended in between
-			 * would be frozen over BLIND and lost.  The note that
-			 * stood here ("MEASURED ... never stale, 0 of 65,434")
-			 * was a fact about unpreempted load; the chain_compress
-			 * twin went stale 9 times in ~6M once the remover was
-			 * preempted.  Nothing recorded or stored yet on this
-			 * path; same unwind as the acquire's bail above.
+			 * ★ Validate the plan under the lock.  See the twin
+			 * in ft_chain_compress_fused.
+			 *
+			 * @freeze_leaf's holder is held.  It is @cn itself
+			 * when no climb happened.  Otherwise it is an orphan
+			 * below @cn that ft_detach_node's orphan walk locked
+			 * and holds until its `end:` sweep.
+			 *
+			 * @freeze_len was derived before the acquire, and the
+			 * chain parks SW.  A duplicate appended in between
+			 * would be frozen over blind and lost.
+			 *
+			 * History: a note here said "MEASURED ... never
+			 * stale, 0 of 65,434".  That was a fact about
+			 * unpreempted load.  The chain_compress twin went
+			 * stale 9 times in ~6M once the remover was
+			 * preempted.
+			 *
+			 * Nothing is recorded or stored yet on this path.
+			 * The unwind is the same as the acquire's bail above.
 			 */
 			if (ft->lock_fine && !record_only &&
 					!ft_hlist_chain_plan_ok(ft,
@@ -343,18 +383,23 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				freeze_leaf, freeze_len);
 		}
 		/*
-		 * Fold the external head's back-edge -- cell->parent (list on) or
-		 * its prev (list off) -- INTO @txn so it commits ATOMICALLY with
-		 * cn->child below, rather than as a bare store racing ahead of the
-		 * publish.  A skip pointer at cn's grandparent slot resolves through
-		 * cn->child = topmost_external_nodes, and ft_skip_to_compressed walks
-		 * topmost->prev to recover cn; the atomic commit means skip-recovery
-		 * never observes cn->child = topmost while topmost's back-edge still
-		 * names the about-to-be-detached old holder.  Both slots resolve a
-		 * flip-proxy on the read side (cell->parent via ft_resolve_head_prev,
-		 * prev via ft_dereference_prev_resolved), so the folded descriptor is
-		 * concurrent-reader-safe.  The +1 edge was reserved by the caller
-		 * (ft_detach_node) when topmost_external_nodes is set.
+		 * Fold the external head's back-edge into @txn.  The back-edge
+		 * is cell->parent (list on) or the head's prev (list off).  It
+		 * then commits atomically with cn->child below, and not as a
+		 * bare store racing ahead of the publish.
+		 *
+		 * A skip pointer at cn's grandparent slot resolves through
+		 * cn->child = topmost_external_nodes, and ft_skip_to_compressed
+		 * walks topmost->prev to recover cn.  With the atomic commit,
+		 * skip-recovery never observes cn->child = topmost while
+		 * topmost's back-edge still names the old holder that is about
+		 * to be detached.
+		 *
+		 * Both slots resolve a flip-proxy on the read side:
+		 * cell->parent through ft_resolve_head_prev, and prev through
+		 * ft_dereference_prev_resolved.  So the folded descriptor is
+		 * safe for concurrent readers.  The caller (ft_detach_node)
+		 * reserved the +1 edge when topmost_external_nodes is set.
 		 */
 		{
 			struct cds_ft_inode_flag *cn_flag =
@@ -379,24 +424,27 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			}
 		}
 		/*
-		 * nr_keys fold (LEAF Increment 2): the removed leaf's -1 walk from
-		 * the kept compressed node @cn (which STAYS in place; its subtree
-		 * loses the disappearing key) up to root rides THIS promote commit
-		 * atomically -- recorded before the publish dispatch below so both
-		 * commit arms carry it.  Reserved by the caller's count_reserve; a
-		 * no-op (and skipped) for a count-neutral move detach / !rank_stats.
+		 * nr_keys fold (LEAF Increment 2).  The kept compressed node
+		 * @cn stays in place, and its subtree loses the disappearing
+		 * key.  The removed leaf's -1 walk goes from @cn up to root and
+		 * rides this promote commit atomically.  It is recorded before
+		 * the publish dispatch below, so both commit arms carry it.
+		 * The caller's count_reserve reserved it.  It is a no-op (and
+		 * skipped) for a count-neutral move detach / !rank_stats.
 		 */
 		if (count_delta)
 			ft_flip_txn_record_count_parent(ft, txn,
 				ft_compressed_node_flag(cn), count_delta);
 		/*
-		 * External-promote publish into cn->child (the moment the
-		 * removed leaf key disappears for an exact reader, which
-		 * descends through cn->child).  When fusion is requested, record
-		 * the publish's reader-visible edges (cn->child, plus cn's
-		 * grandparent SKIP_X dual) and commit them in ONE flip with the
-		 * dead head cell's unsplice -- every cn->child reader resolves a
-		 * flip proxy now -- and signal it via pub->armed.
+		 * External-promote publish into cn->child.  This is the moment
+		 * the removed leaf key disappears for an exact reader, which
+		 * descends through cn->child.
+		 *
+		 * When fusion is requested, record the publish's
+		 * reader-visible edges: cn->child, plus cn's grandparent SKIP_X
+		 * dual.  Commit them in one flip with the dead head cell's
+		 * unsplice.  Every cn->child reader resolves a flip proxy now.
+		 * Signal the fusion through pub->armed.
 		 */
 		if ((fuse_cell || run) && pub && !pub->armed) {
 			struct ft_pub_rec rec = { .ctx = ctx, .n = 0,
@@ -412,21 +460,24 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				ft_flip_txn_lock_or_guard_parent(ft, txn, ctx,
 					ft_compressed_node_flag(cn), iter_depth);
 			/*
-			 * ☠ §9.3's THIRD MEMBER IS **NOT** TAKEN HERE, and the
-			 * attempt HANGS.  This publish parent IS a compressed
-			 * node, so the republish does emit a SKIP_X dual into
-			 * cn's own parent -- exactly the shape the other four
-			 * producers now acquire.  Adding
-			 * ft_lock_skip_dual_gp here wedges
-			 * test_rekey_same_path_atomic_or_refused: "child killed
-			 * by signal 14 (HANG -- the same-path move did not
-			 * return)", 2 of 2, standalone, where HEAD is 2 of 2
-			 * green.  Bisected to THESE TWO CALLS: the other three
-			 * acquires are green with this one removed, and red with
-			 * it alone.
+			 * ☠ History: §9.3's third member was at first not
+			 * taken here, because the attempt hung.  It is taken
+			 * now: the next comment gives the real cause.
 			 *
-			 * The mechanism is the one the choke-point note at
-			 * ft_flip_txn_lock_or_guard_parent already names -- "an
+			 * This publish parent is a compressed node, so the
+			 * republish does emit a SKIP_X dual into cn's own
+			 * parent.  That is exactly the shape the other four
+			 * producers now acquire.  Adding ft_lock_skip_dual_gp
+			 * here wedged test_rekey_same_path_atomic_or_refused:
+			 * "child killed by signal 14 (HANG -- the same-path
+			 * move did not return)", 2 of 2, standalone, where
+			 * HEAD was 2 of 2 green.  It was bisected to these two
+			 * calls: the other three acquires were green with
+			 * this one removed, and red with it alone.
+			 *
+			 * The mechanism named then is the one in the
+			 * choke-point note at ft_flip_txn_lock_or_guard_parent
+			 * -- "an
 			 * op can arrive here holding this publish target's lock
 			 * already, taken for a DIFFERENT member of its own set.
 			 * Re-acquiring then misses against the op's OWN hold,
@@ -434,44 +485,47 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * caller retries into the identical shape: the op waits
 			 * on itself, forever."  The line just above says cn's
 			 * lock was "acquired + recorded up front under
-			 * lock_fine", so this frame is precisely an op that
-			 * arrives holding part of the set.
+			 * lock_fine".  So this frame is an op that arrives
+			 * holding part of the set.
 			 *
-			 * ☠ AND "THE OP ALREADY HOLDS IT" MEASURED 0 held of
-			 * 40894 across all 153 inv rows (ft_skip_dual_gp_held) --
-			 * but READ THAT NUMBER AS A REGISTRY ANSWER, NOT AS A
-			 * LOCK ANSWER.  The ask consults @ctx, and an acquire
-			 * taken through ft_dlm_acquire_set_at registers into no
-			 * ctx at all, so a hold that lives in a caller's local
-			 * anchor array is invisible to it.  The identical 100%/0%
-			 * split at ft_node_recompact's dual site was exactly that
-			 * -- 0 of 805202 through @ctx, 490411 of 490411 asked of
-			 * the set the function actually took.  The reading here
-			 * (that ft_detach_node's {C, P, GP} names the grandparent
-			 * of the op's ITERATION parent, a different node from the
-			 * dual's back-pointer-derived owner) may still be right;
-			 * it is simply not what this instrument measured.
+			 * ☠ "The op already holds it" measured 0 held of 40894
+			 * across all 153 inv rows (ft_skip_dual_gp_held).  Read
+			 * that number as a registry answer, not as a lock
+			 * answer.  The ask consults @ctx.  An acquire taken
+			 * through ft_dlm_acquire_set_at registers into no ctx
+			 * at all.  So a hold that lives in a caller's local
+			 * anchor array is invisible to the ask.  The identical
+			 * 100%/0% split at ft_node_recompact's dual site was
+			 * exactly that: 0 of 805202 through @ctx, and 490411 of
+			 * 490411 asked of the set the function actually took.
 			 *
-			 * It does not matter for the KIND, because the ACQUIRE
-			 * below answers the question properly -- REGISTERED or
-			 * SHARED, the assert's own predicate -- and that is what
-			 * @dual_gp_held now carries.  The ask stays as a
-			 * measurement of the registry's reach.
+			 * One reading here may still be right.
+			 * ft_detach_node's {C, P, GP} names the grandparent of
+			 * the op's iteration parent.  That is a different node
+			 * from the dual's owner, which is derived from the
+			 * back-pointer.  This instrument did not measure that
+			 * reading.
+			 *
+			 * It does not matter for the kind.  The acquire below
+			 * answers the question properly: REGISTERED or SHARED,
+			 * the assert's own predicate.  @dual_gp_held now
+			 * carries that answer.  The ask stays as a measurement
+			 * of the registry's reach.
 			 */
 			(void) ft_skip_dual_gp_held(ft, ctx,
 				ft_compressed_node_flag(cn),
 				txn ? txn->mtxn : NULL);	/* measurement */
 			/*
-			 * §9.3's THIRD MEMBER, taken here at last.  It used to
-			 * HANG -- and the cause was never this site: on a COARSE
-			 * trie ft_lock_skip_dual_gp acquired nothing yet still
-			 * fell through to ft_flip_txn_lock_or_guard_parent's
-			 * `guard:` tail and planted a §4.B guard the commit could
-			 * not satisfy, so every attempt aborted and the caller
-			 * retried forever (measured: 8,427,520 calls, ALL
-			 * FT_LOG_EXIT_NOT_FINE, while the row never returned).
-			 * With the helper's coarse early-out the same call is
-			 * green.
+			 * §9.3's third member, taken here at last.  It used to
+			 * hang, and the cause was never this site.  On a
+			 * coarse trie, ft_lock_skip_dual_gp acquired nothing.
+			 * It still fell through to the `guard:` tail of
+			 * ft_flip_txn_lock_or_guard_parent, and planted a §4.B
+			 * guard that the commit could not satisfy.  So every
+			 * attempt aborted and the caller retried forever.
+			 * Measured: 8,427,520 calls, all FT_LOG_EXIT_NOT_FINE,
+			 * while the row never returned.  With the helper's
+			 * coarse early-out the same call is green.
 			 */
 			dual_gp_held = ft_lock_skip_dual_gp(ft, ctx, txn,
 				ft_compressed_node_flag(cn),
@@ -490,13 +544,16 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				.mtxn = txn ? txn->mtxn : NULL };
 
 			/*
-			 * Non-fused external-promote (no cell to unsplice -- list
-			 * off, or fusion not requested / already armed): still route
-			 * the publish through the op flip-txn so the forward slot AND
-			 * a compressed grandparent's SKIP_X dual flip atomically (no
-			 * torn forward/skip window).  A lone edge reduces to a single
-			 * release store (ft_ord_cell_flip_one), so this stays allocation-
-			 * free and infallible for the common plain-parent case.
+			 * Non-fused external-promote.  There is no cell to
+			 * unsplice: the list is off, or fusion is not
+			 * requested / already armed.  Still route the publish
+			 * through the op flip-txn.  The forward slot and a
+			 * compressed grandparent's SKIP_X dual then flip
+			 * atomically, with no torn forward/skip window.  A
+			 * lone edge reduces to a single release store
+			 * (ft_ord_cell_flip_one).  So this stays
+			 * allocation-free and cannot fail for the common
+			 * plain-parent case.
 			 */
 			/* VALIDATE (§4.B): guard the LIVE kept compressed node cn.
 			 * DLM: cn's RELEASE was acquired + recorded up front under
@@ -505,21 +562,24 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				ft_flip_txn_lock_or_guard_parent(ft, txn, ctx,
 					ft_compressed_node_flag(cn), iter_depth);
 			/*
-			 * ☠ §9.3's THIRD MEMBER IS **NOT** TAKEN HERE, and the
-			 * attempt HANGS.  This publish parent IS a compressed
-			 * node, so the republish does emit a SKIP_X dual into
-			 * cn's own parent -- exactly the shape the other four
-			 * producers now acquire.  Adding
-			 * ft_lock_skip_dual_gp here wedges
-			 * test_rekey_same_path_atomic_or_refused: "child killed
-			 * by signal 14 (HANG -- the same-path move did not
-			 * return)", 2 of 2, standalone, where HEAD is 2 of 2
-			 * green.  Bisected to THESE TWO CALLS: the other three
-			 * acquires are green with this one removed, and red with
-			 * it alone.
+			 * ☠ History: §9.3's third member was at first not
+			 * taken here, because the attempt hung.  It is taken
+			 * now: the next comment gives the real cause.
 			 *
-			 * The mechanism is the one the choke-point note at
-			 * ft_flip_txn_lock_or_guard_parent already names -- "an
+			 * This publish parent is a compressed node, so the
+			 * republish does emit a SKIP_X dual into cn's own
+			 * parent.  That is exactly the shape the other four
+			 * producers now acquire.  Adding ft_lock_skip_dual_gp
+			 * here wedged test_rekey_same_path_atomic_or_refused:
+			 * "child killed by signal 14 (HANG -- the same-path
+			 * move did not return)", 2 of 2, standalone, where
+			 * HEAD was 2 of 2 green.  It was bisected to these two
+			 * calls: the other three acquires were green with
+			 * this one removed, and red with it alone.
+			 *
+			 * The mechanism named then is the one in the
+			 * choke-point note at ft_flip_txn_lock_or_guard_parent
+			 * -- "an
 			 * op can arrive here holding this publish target's lock
 			 * already, taken for a DIFFERENT member of its own set.
 			 * Re-acquiring then misses against the op's OWN hold,
@@ -527,44 +587,47 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * caller retries into the identical shape: the op waits
 			 * on itself, forever."  The line just above says cn's
 			 * lock was "acquired + recorded up front under
-			 * lock_fine", so this frame is precisely an op that
-			 * arrives holding part of the set.
+			 * lock_fine".  So this frame is an op that arrives
+			 * holding part of the set.
 			 *
-			 * ☠ AND "THE OP ALREADY HOLDS IT" MEASURED 0 held of
-			 * 40894 across all 153 inv rows (ft_skip_dual_gp_held) --
-			 * but READ THAT NUMBER AS A REGISTRY ANSWER, NOT AS A
-			 * LOCK ANSWER.  The ask consults @ctx, and an acquire
-			 * taken through ft_dlm_acquire_set_at registers into no
-			 * ctx at all, so a hold that lives in a caller's local
-			 * anchor array is invisible to it.  The identical 100%/0%
-			 * split at ft_node_recompact's dual site was exactly that
-			 * -- 0 of 805202 through @ctx, 490411 of 490411 asked of
-			 * the set the function actually took.  The reading here
-			 * (that ft_detach_node's {C, P, GP} names the grandparent
-			 * of the op's ITERATION parent, a different node from the
-			 * dual's back-pointer-derived owner) may still be right;
-			 * it is simply not what this instrument measured.
+			 * ☠ "The op already holds it" measured 0 held of 40894
+			 * across all 153 inv rows (ft_skip_dual_gp_held).  Read
+			 * that number as a registry answer, not as a lock
+			 * answer.  The ask consults @ctx.  An acquire taken
+			 * through ft_dlm_acquire_set_at registers into no ctx
+			 * at all.  So a hold that lives in a caller's local
+			 * anchor array is invisible to the ask.  The identical
+			 * 100%/0% split at ft_node_recompact's dual site was
+			 * exactly that: 0 of 805202 through @ctx, and 490411 of
+			 * 490411 asked of the set the function actually took.
 			 *
-			 * It does not matter for the KIND, because the ACQUIRE
-			 * below answers the question properly -- REGISTERED or
-			 * SHARED, the assert's own predicate -- and that is what
-			 * @dual_gp_held now carries.  The ask stays as a
-			 * measurement of the registry's reach.
+			 * One reading here may still be right.
+			 * ft_detach_node's {C, P, GP} names the grandparent of
+			 * the op's iteration parent.  That is a different node
+			 * from the dual's owner, which is derived from the
+			 * back-pointer.  This instrument did not measure that
+			 * reading.
+			 *
+			 * It does not matter for the kind.  The acquire below
+			 * answers the question properly: REGISTERED or SHARED,
+			 * the assert's own predicate.  @dual_gp_held now
+			 * carries that answer.  The ask stays as a measurement
+			 * of the registry's reach.
 			 */
 			(void) ft_skip_dual_gp_held(ft, ctx,
 				ft_compressed_node_flag(cn),
 				txn ? txn->mtxn : NULL);	/* measurement */
 			/*
-			 * §9.3's THIRD MEMBER, taken here at last.  It used to
-			 * HANG -- and the cause was never this site: on a COARSE
-			 * trie ft_lock_skip_dual_gp acquired nothing yet still
-			 * fell through to ft_flip_txn_lock_or_guard_parent's
-			 * `guard:` tail and planted a §4.B guard the commit could
-			 * not satisfy, so every attempt aborted and the caller
-			 * retried forever (measured: 8,427,520 calls, ALL
-			 * FT_LOG_EXIT_NOT_FINE, while the row never returned).
-			 * With the helper's coarse early-out the same call is
-			 * green.
+			 * §9.3's third member, taken here at last.  It used to
+			 * hang, and the cause was never this site.  On a
+			 * coarse trie, ft_lock_skip_dual_gp acquired nothing.
+			 * It still fell through to the `guard:` tail of
+			 * ft_flip_txn_lock_or_guard_parent, and planted a §4.B
+			 * guard that the commit could not satisfy.  So every
+			 * attempt aborted and the caller retried forever.
+			 * Measured: 8,427,520 calls, all FT_LOG_EXIT_NOT_FINE,
+			 * while the row never returned.  With the helper's
+			 * coarse early-out the same call is green.
 			 */
 			dual_gp_held = ft_lock_skip_dual_gp(ft, ctx, txn,
 				ft_compressed_node_flag(cn),
@@ -591,47 +654,55 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		src_meta = cds_ft_item_to_metadata(
 			(struct cds_ft_inode *) src_cn);
 		/*
-		 * Recover the grandparent (parent, slot) as ONE coherent snapshot
-		 * from src_meta, exactly as the chain-compress publishes do -- never
-		 * pair the descent-captured @detach_parent_flag_ptr with a fresh
-		 * src_meta->parent.  A peer that recompacts the grandparent to a larger
-		 * node type (or re-homes it, Phase 4.3) between the descent and here
-		 * leaves the captured slot pointing into the OLD, now-replaced parent
-		 * body while src_meta->parent already names the NEW one; pairing the
-		 * stale slot with the fresh parent indexes the new parent's bitmap out
-		 * of bounds (ft_slot_to_byte OOB assert).  ft_resolve_parent_slot
-		 * computes the slot as parent_body + offset, so it is in-bounds by
-		 * construction; the txn guard + forward CAS + tombstone freeze below
-		 * abort a commit if the grandparent or src_cn raced after this snapshot.
+		 * Recover the grandparent (parent, slot) as one coherent
+		 * snapshot from src_meta, exactly as the chain-compress
+		 * publishes do.  Never pair the descent-captured
+		 * @detach_parent_flag_ptr with a fresh src_meta->parent.
+		 *
+		 * Between the descent and here, a peer can recompact the
+		 * grandparent to a larger node type.  Or it can re-home it
+		 * (Phase 4.3).  The captured slot then points into the old
+		 * parent body, which is now replaced.  But src_meta->parent
+		 * already names the new one.  Pairing the stale slot with the
+		 * fresh parent indexes the new parent's bitmap out of bounds
+		 * (ft_slot_to_byte OOB assert).
+		 *
+		 * ft_resolve_parent_slot computes the slot as parent_body +
+		 * offset, so it is in-bounds by construction.  If the
+		 * grandparent or src_cn raced after this snapshot, the txn
+		 * guard, the forward CAS and the tombstone freeze below abort
+		 * the commit.
 		 */
 		struct cds_ft_inode_flag *pub_parent;
 		struct cds_ft_inode_flag **pub_slot =
 			ft_resolve_parent_slot(src_meta, ft, &pub_parent);
 
 		/*
-		 * The fresh replacement is EMPTY -- nothing below sets a child on
-		 * it -- and this sub-case exists for the ROOT: "a compressed root
-		 * from detach/graft_swap must remain internal" (the header above).
-		 * An empty internal AT THE ROOT is the empty trie, which is legal.
+		 * The fresh replacement is empty: nothing below sets a child
+		 * on it.  This sub-case exists for the root: "a compressed
+		 * root from detach/graft_swap must remain internal" (the
+		 * header above).  An empty internal at the root is the empty
+		 * trie, which is legal.
 		 *
 		 * Reached with a non-NULL parent, the same publish wires a
-		 * childless internal into a live parent slot, and that node stays
-		 * there: correctly counted (0), correctly back-pointered, of the
-		 * smallest type, holding nothing.  It is the "dead interior node"
-		 * cds_ft_verify names, and it breaks ordered navigation -- the
-		 * empty-subtree arm of the inequality descent is justified by the
-		 * premise that a slot-emptied internal is never left in place, so
-		 * a walk that reaches it either re-enters the branch forever or
-		 * climbs out and skips the remaining subtree.  Exact-key lookup
-		 * still finds every stranded key, which is why nothing else
-		 * reported it.
+		 * childless internal into a live parent slot, and that node
+		 * stays there.  Each of its fields is valid: a count of 0, a
+		 * correct back-pointer, the smallest type.  It holds nothing.
+		 * It is the "dead interior node" that cds_ft_verify names, and
+		 * it breaks ordered navigation.  The empty-subtree arm of the
+		 * inequality descent rests on the premise that a slot-emptied
+		 * internal is never left in place.  So a walk that reaches it
+		 * either re-enters the branch forever, or climbs out and skips
+		 * the remaining subtree.  Exact-key lookup still finds every
+		 * stranded key, which is why nothing else reported it.
 		 *
-		 * The plan that led here is stale rather than the tree being
-		 * broken, so bail and let the caller re-descend, exactly as the
-		 * rewind and DLM acquire-miss bails above do.  PRE-commit: free
-		 * the unpublished node and destroy the caller-owned txn (the
-		 * caller skips the destroy on -EAGAIN, assuming a commit consumed
-		 * it), leaving the structure byte-for-byte as it was.
+		 * The plan that led here is stale; the tree is not broken.  So
+		 * bail and let the caller re-descend, exactly as the rewind
+		 * and DLM acquire-miss bails above do.  This is pre-commit.
+		 * Free the unpublished node and destroy the caller-owned txn.
+		 * (The caller skips the destroy on -EAGAIN: it assumes a
+		 * commit consumed it.)  The structure is left byte-for-byte as
+		 * it was.
 		 */
 		if (pub_parent != NULL) {
 			free_cds_ft_node_unpublished(ft, fresh);
@@ -642,13 +713,15 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 
 		fresh_meta->parent_word = ft_parent_word(ft, pub_parent);
 		/*
-		 * DLM Step 1: acquire {src_cn (RETIRE), pub_parent (RELEASE)} in ONE
-		 * MCAS up front (guard src_cn.parent==pub_parent), replacing the
-		 * pub_parent lock_or_guard + the PLAIN src_cn tombstone (a peer state
-		 * change under the fence now aborts).  This compressed->fresh-internal
-		 * sub-case is test-under-covered, so it mirrors the chain-compress
-		 * pattern exactly.  pub_parent NULL (compressed ROOT retire) => the
-		 * set is {src_cn} only.
+		 * DLM Step 1: acquire {src_cn (RETIRE), pub_parent (RELEASE)}
+		 * in one MCAS up front, with the guard
+		 * src_cn.parent==pub_parent.  This replaces the pub_parent
+		 * lock_or_guard and the plain src_cn tombstone: a peer state
+		 * change under the fence now aborts.  This
+		 * compressed->fresh-internal sub-case is test-under-covered,
+		 * so it mirrors the chain-compress pattern exactly.  With
+		 * pub_parent NULL (compressed root retire), the set is
+		 * {src_cn} only.
 		 */
 		struct cds_ft_metadata *src_cn_meta_a =
 			cds_ft_item_to_metadata((struct cds_ft_inode *) src_cn);
@@ -658,9 +731,9 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 
 		/*
 		 * @pub_parent came from src_cn's back-pointer, which carries no
-		 * depth; the descent's window is what dates it.  A parent this
-		 * descent never passed cannot be anchored here at all -- re-plan
-		 * rather than anchor it by another node's depth.
+		 * depth.  The descent's window is what dates it.  A parent this
+		 * descent never passed cannot be anchored here at all.  Re-plan
+		 * in that case; do not anchor it by another node's depth.
 		 */
 		if (pub_parent && !ft_lock_ctx_depth_of(ft, ctx, pub_parent,
 				&pp_depth)) {
@@ -687,9 +760,10 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			if (dret) {
 				free_cds_ft_node_unpublished(ft, fresh);
 				/*
-				 * Pre-commit bail: on -EAGAIN the caller-owned txn is
-				 * NOT destroyed by the caller, so destroy it here; on
-				 * -ENOMEM the caller destroys it (its != -EAGAIN arm).
+				 * Pre-commit bail.  On -EAGAIN the caller does
+				 * not destroy the caller-owned txn, so destroy
+				 * it here.  On -ENOMEM the caller destroys it
+				 * (its != -EAGAIN arm).
 				 */
 				if (dret == -EAGAIN)
 					if (!record_only)
@@ -698,28 +772,34 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			}
 			src_held = set[0].held;
 			/*
-			 * Coarsening put src_cn's lock on an ANCESTOR that
-			 * SURVIVES this retire, so the fused
-			 * {LOCK|s -> TOMBSTONE|s} splits: the ancestor is
-			 * released here (before any guard lands on it -- the
-			 * ordering rule), the node tombstoned below.  A no-op
-			 * where the two words coincide.
+			 * Coarsening put src_cn's lock on an ancestor that
+			 * survives this retire.  So the fused
+			 * {LOCK|s -> TOMBSTONE|s} splits.  The ancestor is
+			 * released here, before any guard lands on it (the
+			 * ordering rule).  The node is tombstoned below.  This
+			 * is a no-op where the two words coincide.
 			 */
 			/*
-			 * ☠ NOT FOR A SHARED HOLD.  set[0] dedupes onto a word
-			 * this op already holds -- at root-only, an orphan whose
-			 * anchor is the root, which on this arm IS src_cn -- and
-			 * ft_detach_freeze_one has then already registered that
-			 * word in the orphan txn.  Registering it again here had
-			 * every pre-commit terminal release ONE word TWICE
-			 * (ft_flip_txn_lock_release_all does not dedupe): the
+			 * ☠ Not for a shared hold.  set[0] dedupes onto a word
+			 * this op already holds.  At root-only, that is an
+			 * orphan whose anchor is the root, and on this arm the
+			 * root is src_cn.  ft_detach_freeze_one has then
+			 * already registered that word in the orphan txn.
+			 *
+			 * Registering it again here made every pre-commit
+			 * terminal release one word twice:
+			 * ft_flip_txn_lock_release_all does not dedupe.  The
 			 * second release clears a peer's fence if the root was
-			 * re-taken in between.  The helper's own contract says
-			 * callers gate on @shared (its assert), exactly as set[1]
-			 * below does; the retire below handles @shared itself.
-			 * Found by the adversarial review of an under-lock plan
-			 * check for this arm's freeze, whose -EAGAIN bail reaches
-			 * this terminal on every stale plan.
+			 * re-taken in between.
+			 *
+			 * The helper's own contract says callers gate on
+			 * @shared (its assert), exactly as set[1] below does.
+			 * The retire below handles @shared itself.
+			 *
+			 * History: the adversarial review of an under-lock
+			 * plan check for this arm's freeze found this.  The
+			 * -EAGAIN bail of that check reaches this terminal on
+			 * every stale plan.
 			 */
 			if (!src_held.shared) {
 				ft_flip_txn_lock_register_held(txn, &src_held);
@@ -733,10 +813,10 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			}
 			dlm_a2 = true;
 			/*
-			 * The same plan read as the topmost arm's, and nothing
-			 * here records cn->child at all: retiring src_cn for an
-			 * EMPTY fresh node is only right while its child is
-			 * still the one the climb condemned.
+			 * This is the same plan read as the topmost arm's.
+			 * Nothing here records cn->child at all.  Retiring
+			 * src_cn for an empty fresh node is only right while
+			 * its child is still the one the climb condemned.
 			 */
 #ifndef FT_DEBUG_NO_CN_CHILD_RECHECK
 			if (!record_only &&
@@ -756,11 +836,11 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		if (freeze_leaf) {
 			ft_ch_audit_ctx(ft, txn, ctx, freeze_leaf);
 			/*
-			 * ★ VALIDATE THE PLAN UNDER THE LOCK -- same reason,
-			 * same holder argument and same disposition as the
-			 * promote arm above.  Only the
-			 * unpublished @fresh exists; same unwind as the acquire's
-			 * bail above.
+			 * ★ Validate the plan under the lock.  The reason, the
+			 * holder argument and the disposition are the same as
+			 * in the promote arm above.  Only the unpublished
+			 * @fresh exists.  The unwind is the same as the
+			 * acquire's bail above.
 			 */
 			if (ft->lock_fine && !record_only &&
 					!ft_hlist_chain_plan_ok(ft,
@@ -778,13 +858,15 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				freeze_leaf, freeze_len);
 		}
 		/*
-		 * nr_keys fold (LEAF Increment 2): the fresh internal REPLACES the
-		 * retired compressed node, so it carries the retired node's
-		 * post-removal count (get(src) + count_delta, i.e. src - 1 when this
-		 * detach retires a key -- typically 0, a compressed root emptied of
-		 * its lone leaf).  A build-invisible plain store on the not-yet-
-		 * published fresh node; a no-op when !rank_stats.  The -1 walk from
-		 * the fresh node's stable parent rides the publish below.
+		 * nr_keys fold (LEAF Increment 2).  The fresh internal replaces
+		 * the retired compressed node, so it carries the retired node's
+		 * post-removal count.  That count is get(src) + count_delta,
+		 * i.e. src - 1 when this detach retires a key.  It is
+		 * typically 0: a compressed root emptied of its lone leaf.
+		 * The store is plain and build-invisible, on the fresh node
+		 * that is not published yet.  It is a no-op when !rank_stats.
+		 * The -1 walk from the fresh node's stable parent rides the
+		 * publish below.
 		 */
 		if (count_delta)
 			ft_nr_keys_store(ft, fresh_meta,
@@ -798,21 +880,23 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				.mtxn = txn ? txn->mtxn : NULL };
 
 			/*
-			 * Compressed -> fresh-internal recompaction publish: route
-			 * the forward slot (+ a compressed grandparent's SKIP_X dual)
-			 * through the op flip-txn so they flip atomically; lone edge
-			 * stays a single release store.
+			 * Compressed -> fresh-internal recompaction publish.
+			 * Route the forward slot (and a compressed
+			 * grandparent's SKIP_X dual) through the op flip-txn,
+			 * so that they flip atomically.  A lone edge stays a
+			 * single release store.
 			 */
 			/* VALIDATE (§4.B): lock (or guard-fallback) the
-			 * coherently-resolved grandparent -- value-swap target (§10.5).
-			 * DLM: pub_parent's RELEASE was acquired up front under lock_fine. */
+			 * coherently-resolved grandparent, which is the
+			 * value-swap target (§10.5).  DLM: pub_parent's
+			 * RELEASE was acquired up front under lock_fine. */
 			if (!ft->lock_fine)
 				ft_flip_txn_lock_or_guard_parent(ft, txn, ctx,
 					pub_parent, pp_depth);
 			/*
-			 * §9.3's THIRD MEMBER: @pub_parent may be compressed, in
-			 * which case this publish also emits its SKIP_X dual into
-			 * a grandparent the op holds nothing of.  Acquire it from
+			 * §9.3's third member.  @pub_parent may be compressed.
+			 * This publish then also emits its SKIP_X dual into a
+			 * grandparent the op holds nothing of.  Acquire it from
 			 * the same derivation the record names.  (Kind still
 			 * false -- the eight producers flip TOGETHER; see
 			 * ft_node_recompact's dual site, where the last of them
@@ -825,19 +909,26 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				ft_node_flag(fresh, 0),
 				*pub_slot, &rec, dual_gp_held);
 			/*
-			 * Freeze the retired compressed node dead (§4.B freeze-on-
-			 * free): this compressed->fresh-internal recompaction retires
-			 * the old compressed node like every other retire.  Record the
-			 * tombstone INTO @txn so it flips ATOMICALLY with the publish
-			 * that unlinks it -- an aborted publish leaves it live (atomic
-			 * detach).  This detach sub-case is not reached by the current
-			 * test suite (verified: zero hits across ft_unit + ft_inv both
-			 * list modes), so the freeze-on-free audit never exercises it.
-			 * DLM: src_cn was LOCK-acquired up front, so record the FENCED
-			 * terminal (a peer state change aborts) -- fused with the
-			 * release where the acquire took src_cn's own word, plain
-			 * against its clean word where coarsening sent the lock to a
-			 * surviving ancestor.
+			 * Freeze the retired compressed node dead (§4.B
+			 * freeze-on-free).  This compressed->fresh-internal
+			 * recompaction retires the old compressed node like
+			 * every other retire.  Record the tombstone into @txn,
+			 * so that it flips atomically with the publish that
+			 * unlinks the node.  An aborted publish leaves the
+			 * node live (atomic detach).
+			 *
+			 * The current test suite does not reach this detach
+			 * sub-case (verified: zero hits across ft_unit +
+			 * ft_inv, both list modes).  So the freeze-on-free
+			 * audit never exercises it.
+			 *
+			 * DLM: src_cn was LOCK-acquired up front, so record
+			 * the fenced terminal: a peer state change aborts.
+			 * The terminal has two forms:
+			 *  - fused with the release, where the acquire took
+			 *    src_cn's own word;
+			 *  - plain against src_cn's clean word, where
+			 *    coarsening sent the lock to a surviving ancestor.
 			 */
 			if (dlm_a2)
 				ft_flip_txn_record_retire_anchored(txn, ctx,
@@ -846,11 +937,12 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				ft_flip_txn_record_tombstone(txn, cds_ft_item_to_metadata(
 					(struct cds_ft_inode *) src_cn));
 			/*
-			 * nr_keys fold (LEAF Increment 2): the removed leaf's -1
-			 * walk from the fresh node's stable parent up to root rides
-			 * this publish (the fresh node itself was baked above).  A
-			 * compressed ROOT retire leaves src_meta->parent == NULL, so
-			 * the walk records no ancestor edge and only the baked root
+			 * nr_keys fold (LEAF Increment 2).  The removed leaf's
+			 * -1 walk goes from the fresh node's stable parent up
+			 * to root and rides this publish.  The fresh node
+			 * itself was baked above.  A compressed root retire
+			 * leaves src_meta->parent == NULL.  The walk then
+			 * records no ancestor edge, and only the baked root
 			 * count changes.
 			 */
 			if (count_delta)
@@ -859,10 +951,10 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			if (ft_remove_commit_rec(ft, &rec, NULL, NULL, txn,
 					record_only) > 0) {
 				/*
-				 * Peer won: the fresh internal never published;
-				 * the retired compressed node stays live and
-				 * linked (its tombstone was discarded with the
-				 * aborted commit).
+				 * Peer won: the fresh internal was never
+				 * published.  The retired compressed node
+				 * stays live and linked: its tombstone was
+				 * discarded with the aborted commit.
 				 */
 				free_cds_ft_node_unpublished(ft, fresh);
 				return -EAGAIN;
@@ -876,8 +968,9 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 /*
  * ft_canonicalize_chain_compress: collapse a non-root 1-child internal
- * node with no external_nodes into a single compressed node, merging
- * with adjacent compressed parent/child via the 4-case chain-merge:
+ * node with no external_nodes into a single compressed node.  Merge it
+ * with an adjacent compressed parent/child through the 4-case
+ * chain-merge:
  *
  *  - parent non-compressed, child non-compressed:
  *      [iter_internal] -> [new_cn(1 byte)]; child preserved.
@@ -892,11 +985,12 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
  *      [new_cn(parent_cn.len + 1 + child_cn.len bytes)];
  *      new_cn.child = child_cn.child.
  *
- * Preserves the "no two adjacent compresseds" invariant by absorbing
- * adjacent compressed neighbours into the new node.  Bounded by
- * FT_SKIP_LEN_MAX (uint8_t cn->len): when the merged length would
- * exceed the bound, leaves non-canonical residue (subsequent inserts
- * may rebuild canonical form).  Allocation failure: same fallback.
+ * This preserves the "no two adjacent compresseds" invariant: the new
+ * node absorbs adjacent compressed neighbours.  The merged length is
+ * bounded by FT_SKIP_LEN_MAX (uint8_t cn->len).  When it would exceed
+ * the bound, the function leaves non-canonical residue.  Subsequent
+ * inserts may rebuild canonical form.  Allocation failure takes the
+ * same fallback.
  *
  * Preconditions (caller asserts):
  *   - iter_meta nr_child == 1
@@ -912,55 +1006,64 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 #endif	/* FEATURE_FT_SKIP_COMPRESSED */
 /*
  * Freeze-on-free (doc §4.B) for the ft_detach_node branch-2 orphan chain: mark
- * every collected orphan (+ the trailing skip-target) DEAD.  This helper is
- * config-agnostic (the branch-2 orphan chain forms with or without skip
- * compression; ft_skip_to_compressed has an unconditional non-skip stub), and
- * it is called from a path (ft_detach_node) that is reachable outside the
- * skip block, so it lives OUTSIDE the FEATURE_FT_SKIP_COMPRESSED guard.  @txn
- * non-NULL
- * records each tombstone INTO the op's commit txn so the freeze flips
- * ATOMICALLY with the flip that unlinks the chain (atomic detach); @txn NULL
- * falls back to a standalone lone-edge flip (the list-off pub-less lone-store
- * path, whose unlink is not a txn commit -- a no-op under one writer).  Node
- * resolution mirrors the branch-2 free loop.
+ * every collected orphan, and the trailing skip-target, dead.
  *
- * DLM plan-lock (lock_fine): @snaps non-NULL means
- * the caller lock-acquired each orphan at collection (parallel to @orphans, and
- * @trailing_snap for the trailing skip-target) so the collapse decision was made
- * on a frozen state word.  Record the FENCED {LOCK|s -> TOMBSTONE|s} terminal
- * from that snapshot instead of the plain RYW tombstone: a peer that grew the
- * orphan tears the fenced expected-old and ABORTS this commit (§9.2
- * orphan-chain coherence).  In practice a peer cannot even get that far:
- * ft_meta_nr_child_inc SPINS on FT_STATE_INPLACE_WAIT_MASK, which includes
- * FT_STATE_LOCK unconditionally, so it WAITS for the mark and the coherence
- * comes from EXCLUSION rather than from detect-and-abort.
- * @held NULL keeps the plain path
- * byte-identical.  Under DLM @txn is always non-NULL (commit_txn is FORCE-TXN and
- * pub is never NULL), so the fenced arm never needs the standalone fallback.
+ * This helper is config-agnostic.  The branch-2 orphan chain forms with or
+ * without skip compression, and ft_skip_to_compressed has an unconditional
+ * non-skip stub.  The helper is called from a path (ft_detach_node) that is
+ * reachable outside the skip block.  So it lives outside the
+ * FEATURE_FT_SKIP_COMPRESSED guard.
+ *
+ * @txn non-NULL records each tombstone into the op's commit txn.  The freeze
+ * then flips atomically with the flip that unlinks the chain (atomic detach).
+ * @txn NULL falls back to a standalone lone-edge flip.  That is the list-off
+ * pub-less lone-store path, whose unlink is not a txn commit; it is a no-op
+ * under one writer.  Node resolution mirrors the branch-2 free loop.
+ *
+ * DLM plan-lock (lock_fine): @held non-NULL means that the caller
+ * lock-acquired each orphan at collection, so the collapse decision was made
+ * on a frozen state word.  @held is parallel to @orphans, and @trailing_held
+ * is for the trailing skip-target.  Record the fenced
+ * {LOCK|s -> TOMBSTONE|s} terminal from that snapshot instead of the plain RYW
+ * tombstone.  A peer that grew the orphan tears the fenced expected-old and
+ * aborts this commit (§9.2 orphan-chain coherence).
+ *
+ * In practice a peer cannot even get that far.  ft_meta_nr_child_inc spins on
+ * FT_STATE_INPLACE_WAIT_MASK, which includes FT_STATE_LOCK unconditionally.
+ * So the peer waits for the mark, and the coherence comes from exclusion, not
+ * from detect-and-abort.
+ *
+ * @held NULL keeps the plain path byte-identical.  Under DLM @txn is always
+ * non-NULL (commit_txn is FORCE-TXN and pub is never NULL), so the fenced arm
+ * never needs the standalone fallback.
  */
 /*
- * Freeze ONE orphan from the acquire that protects it: lift the lock off the
- * ancestor that survives the retire (a no-op where the orphan carries its own),
- * then tombstone the orphan against ITS clean word.  A member that deduped onto
- * a word an earlier orphan took owes no release -- one word, one terminal.
+ * Freeze one orphan from the acquire that protects it.  Lift the lock off the
+ * ancestor that survives the retire (a no-op where the orphan carries its
+ * own).  Then tombstone the orphan against its own clean word.  A member that
+ * deduped onto a word an earlier orphan took owes no release: one word, one
+ * terminal.
  *
- * A SURVIVING anchor is handed to @txn outright -- release record AND registry
- * entry -- so the caller's sweep stops owning it (struct ft_held_anchor's
- * @txn_owned).  The two owners cannot be reconciled after the fact: the release
- * leaves that word clean and LIVE, a peer takes it immediately (under a coarse
- * spacing every op wants the same ancestor), and a later "release it if it is
- * still locked" then strips the PEER's mark.  Where the anchor IS the retired
- * node the fused tombstone is its terminal and the word is unlockable
- * afterwards, so that mark stays with the caller and costs no registry slot --
- * which is what keeps a FT_MAX_DEPTH orphan chain inside FT_FLIP_TXN_MAX_LOCKS,
- * and the per-node granularity byte-identical.
+ * A surviving anchor is handed to @txn outright, with its release record and
+ * its registry entry.  The caller's sweep then stops owning it (struct
+ * ft_held_anchor's @txn_owned).  The two owners cannot be reconciled after
+ * the fact:
+ *  - the release leaves that word clean and live;
+ *  - a peer takes it immediately (under a coarse spacing every op wants the
+ *    same ancestor);
+ *  - a later "release it if it is still locked" then strips the peer's mark.
  *
- * @h_dies_first: @h is in a frame that returns before @txn's terminal runs --
- * ft_detach_node's @orphan_held[] under a DEFERRED commit (@record_only: the
- * rekey commits @shared_txn after the detach has returned).  The hand-off then
- * links no silencer (ft_flip_txn_lock_own_frame): measured with
- * -DFT_DEBUG_STACK_SILENCER, the terminal otherwise wrote through a pointer
- * into the dead frame, once per ft_unit run at exponential spacing.
+ * Where the anchor is the retired node, the fused tombstone is its terminal
+ * and the word is unlockable afterwards.  So that mark stays with the caller
+ * and costs no registry slot.  This keeps a FT_MAX_DEPTH orphan chain inside
+ * FT_FLIP_TXN_MAX_LOCKS, and the per-node granularity byte-identical.
+ *
+ * @h_dies_first: @h is in a frame that returns before @txn's terminal runs.
+ * That frame is ft_detach_node's @orphan_held[] under a deferred commit
+ * (@record_only: the rekey commits @shared_txn after the detach has returned).
+ * The hand-off then links no silencer (ft_flip_txn_lock_own_frame).  Measured
+ * with -DFT_DEBUG_STACK_SILENCER: the terminal otherwise wrote through a
+ * pointer into the dead frame, once per ft_unit run at exponential spacing.
  */
 static inline
 void ft_detach_freeze_one(struct ft_flip_txn *txn,
@@ -982,31 +1085,37 @@ void ft_detach_freeze_one(struct ft_flip_txn *txn,
 			owned = true;
 		}
 		/*
-		 * The record's own early-out is the ONLY place that knows
-		 * whether this word ends RELEASED or RETIRED, and the terminal
-		 * scrub needs that answer (it cannot re-derive it from the word
-		 * afterwards without racing a peer's retire).
+		 * Only the record's own early-out knows whether this word ends
+		 * released or retired.  The terminal scrub needs that answer.
+		 * It cannot re-derive it from the word afterwards without
+		 * racing a peer's retire.
 		 */
 		retires = ft_flip_txn_record_anchor_release(txn, h, m);
 		if (owned && retires)
 			txn->locks[slot].tombstone_terminal = true;
 #ifndef FT_DEBUG_FREEZE_TOMBSTONE_MW
 		/*
-		 * ...AND WHERE THE ANCHOR IS THE ORPHAN, SAY THAT THIS TXN HOLDS
-		 * IT.  That mark stays with the caller (no registry slot, see
-		 * above), so the retire's record-time ownership question
-		 * answered NO and the fused {LOCK|s -> TOMBSTONE|s} went MW --
-		 * 1.33M records per ft_inv FT_INV_MW=1 run at per-node, every
-		 * one on a word this op itself took.  Its expected-old check was
-		 * the MW-CAS era's detect-and-abort for a peer that grew the
-		 * orphan; under the lock that peer cannot even start
-		 * (ft_meta_nr_child_inc waits on FT_STATE_LOCK), and a peer's
-		 * {live -> live} validate cannot land on a LOCKED word either.
-		 * @covered answers ft_flip_txn_owns without taking on a release
-		 * (the caller's sweep keeps that), so the terminal parks SW.  It
-		 * settles outside the registry's late pass, which is harmless for
-		 * a TOMBSTONE: the word is unlockable from the moment it lands.
-		 * A full @covered drops the entry and the record stays MW.
+		 * ...and where the anchor is the orphan, say that this txn
+		 * holds it.
+		 *
+		 * That mark stays with the caller (no registry slot, see
+		 * above).  So the retire's record-time ownership question
+		 * answered "no", and the fused {LOCK|s -> TOMBSTONE|s} went MW.
+		 * That was 1.33M records per ft_inv FT_INV_MW=1 run at
+		 * per-node, every one on a word this op itself took.
+		 *
+		 * The expected-old check of that record was the MW-CAS era's
+		 * detect-and-abort for a peer that grew the orphan.  Under the
+		 * lock that peer cannot even start: ft_meta_nr_child_inc waits
+		 * on FT_STATE_LOCK.  A peer's {live -> live} validate cannot
+		 * land on a locked word either.
+		 *
+		 * @covered answers ft_flip_txn_owns without taking on a
+		 * release (the caller's sweep keeps that), so the terminal
+		 * parks SW.  It settles outside the registry's late pass.
+		 * That is harmless for a tombstone: the word is unlockable
+		 * from the moment it lands.  A full @covered drops the entry
+		 * and the record stays MW.
 		 */
 		if (h->lock == m)
 			ft_flip_txn_cover_member(txn, m);
@@ -1032,12 +1141,12 @@ void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
 				ft_compressed_node_ptr(orphans[i]))
 			: cds_ft_item_to_metadata(ft_node_ptr(orphans[i]));
 		/*
-		 * An orphan is a LINK of the condemned chain -- keyless and
-		 * single-child, or the one junction whose head the climb
-		 * promoted -- and it is held here: a second child means the
-		 * walk that collected it left the plan, and retiring it
-		 * takes a live key with it (the phase-2 target check in
-		 * ft_detach_node is the measured instance).
+		 * An orphan is a link of the condemned chain.  It is keyless
+		 * and single-child, or it is the one junction whose head the
+		 * climb promoted.  It is held here.  A second child means that
+		 * the walk that collected it left the plan, and retiring it
+		 * takes a live key with it.  The phase-2 target check in
+		 * ft_detach_node is the measured instance.
 		 */
 		urcu_assert_debug(ft_node_compressed(orphans[i]) ||
 			ft_meta_nr_child_load(m) <= 1);
@@ -1065,17 +1174,21 @@ void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
 	}
 }
 /*
- * DLM orphan plan-lock (§9.2, lock_fine): lock acquire orphan @m at collection
- * and record it into ft_detach_node's fn-scope lock arrays (parallel to its
- * to_free[]).  @require_single_child validates the marked snapshot's
- * nr_child == 1 -- the elevated-ancestor invariant the collapse rests on -- so a
- * peer that GREW the orphan between the plan climb and this mark forces a
- * re-descend instead of a silent retire (a plain compressed node is structurally
- * single-child and skips the check; a concurrent restructure of it dirties its
- * word and fails the mark).  Returns -EAGAIN on a dirty word or a grown orphan
- * (caller: `goto end`, whose sweep releases the marks already held); 0 stores
- * {m, snap} at *n and advances it.  The snapshot feeds the fenced
- * {LOCK|s -> TOMBSTONE|s} tombstone at freeze.
+ * DLM orphan plan-lock (§9.2, lock_fine): lock-acquire orphan @m at
+ * collection.  Record it into ft_detach_node's function-scope lock arrays,
+ * which are parallel to its to_free[].
+ *
+ * @require_single_child validates that the marked snapshot has
+ * nr_child == 1.  That is the elevated-ancestor invariant the collapse rests
+ * on.  A peer that grew the orphan between the plan climb and this mark then
+ * forces a re-descend instead of a silent retire.  A plain compressed node is
+ * structurally single-child and skips the check.  A concurrent restructure of
+ * it dirties its word and fails the mark.
+ *
+ * Return -EAGAIN on a dirty word or a grown orphan.  The caller then does
+ * `goto end`, whose sweep releases the marks already held.  Return 0 after
+ * storing the hold at @locked[*n] and advancing *n.  The snapshot feeds the
+ * fenced {LOCK|s -> TOMBSTONE|s} tombstone at freeze.
  */
 /*
  * Byte-depth of @parent_nf's immediate child: one key byte past a bitmap node,
@@ -1089,16 +1202,18 @@ unsigned int ft_child_depth_of(const struct cds_ft *ft,
 }
 
 /*
- * EXTEND the descent over one step of a writer walk: position the cursor on
- * @nf at @depth, then enter it so the anchor table covers the levels its span
- * crosses.  The next node down is then anchored by plain ft_descent_anchor,
- * exactly as if the original descent had walked here.  Returns the next node's
- * byte-depth.
+ * Extend the descent over one step of a writer walk.  Position the cursor on
+ * @nf at @depth, then enter it, so that the anchor table covers the levels its
+ * span crosses.  The next node down is then anchored by plain
+ * ft_descent_anchor, exactly as if the original descent had walked here.
+ * Return the next node's byte-depth.
  *
- * A no-op where no descent ran.  ☠ NOT a no-op under per-node granularity any
- * more: ft_descent_enter_node returns early there for the ANCHOR TABLE, but the
- * ancestor-ledger push sits BEFORE that return.  So this extends the LEDGER at
- * every spacing, which is why the descent it is handed must be one that is
+ * This is a no-op where no descent ran.
+ *
+ * ☠ It is not a no-op under per-node granularity any more.
+ * ft_descent_enter_node returns early there for the anchor table, but the
+ * ancestor-ledger push sits before that return.  So this extends the ledger
+ * at every spacing.  The descent it is handed must therefore be one that is
  * allowed to write (see ft_detach_node's copy, which is not).
  */
 static inline
@@ -1120,23 +1235,26 @@ unsigned int ft_walk_extend(struct ft_descent *d, bool valid,
 }
 
 /*
- * Acquire an orphan the detach's DOWNWARD walk collected.
+ * Acquire an orphan the detach's downward walk collected.
  *
- * The walk moves BELOW the descent's cursor, so @depth comes from the walk
- * itself -- ft_walk_extend has entered every node above this one, so the anchor
- * table covers it.
+ * The walk moves below the descent's cursor, so @depth comes from the walk
+ * itself.  ft_walk_extend has entered every node above this one, so the
+ * anchor table covers it.
  *
- * ☞ AN -EAGAIN FROM HERE IS NO LONGER THE WHOLE CALL FAILING, and this comment
- * used to say it was ("remove_all has NO retry loop ... so an -EAGAIN from here
- * is the whole CALL failing and the caller's to retry").  cds_ft_remove_all now
- * loops: the refusal ages a conflict on the op's persistent txn and the attempt
- * is re-derived, so refusing here costs an ATTEMPT rather than the CALL.  It is
- * not a MEMORY_ERROR either -- the tail maps `-EAGAIN` to that retry and
- * `-ENOMEM` to MEMORY_ERROR -- which only became trustworthy once
- * @acquire_enomem gave an allocation failure inside the acquire its own channel,
- * instead of arriving as an -EAGAIN no peer produced.  Both sentences are
- * corrected rather than deleted: each read as an open bug, and sends the next
- * reader after something already fixed.
+ * ☞ An -EAGAIN from here is no longer the whole call failing.  This comment
+ * used to say it was: "remove_all has NO retry loop ... so an -EAGAIN from
+ * here is the whole CALL failing and the caller's to retry".
+ * cds_ft_remove_all now loops.  The refusal ages a conflict on the op's
+ * persistent txn and the attempt is re-derived.  So refusing here costs an
+ * attempt, not the call.
+ *
+ * It is not a MEMORY_ERROR either.  The tail maps `-EAGAIN` to that retry and
+ * `-ENOMEM` to MEMORY_ERROR.  That mapping only became trustworthy once
+ * @acquire_enomem gave an allocation failure inside the acquire its own
+ * channel.  Before, such a failure arrived as an -EAGAIN no peer produced.
+ *
+ * Both sentences are corrected, not deleted.  Each read as an open bug, and
+ * sends the next reader after something already fixed.
  */
 static inline
 int ft_detach_orphan_acquire_at(const char *fn, int line,
@@ -1153,9 +1271,10 @@ int ft_detach_orphan_acquire_at(const char *fn, int line,
 		(nf), (depth), (m), (held))
 
 /*
- * The link below orphan @nf on a detach's downward walk: a compressed node's
- * child, or an internal node's first (single) child.  Read it only once @nf is
- * marked: the value is what the walk's verdict on the NEXT link rests on.
+ * Return the link below orphan @nf on a detach's downward walk.  It is a
+ * compressed node's child, or an internal node's first (single) child.  Read
+ * it only once @nf is marked: the walk's verdict on the next link rests on
+ * this value.
  */
 static inline
 struct cds_ft_inode_flag *ft_detach_walk_next(const struct cds_ft *ft,
@@ -1195,27 +1314,30 @@ int ft_detach_orphan_planlock(const struct cds_ft *ft,
 	return 0;
 }
 /*
- * WHAT A FOLDED COLLAPSE OWES ITS CALLER.  Under @record_only the collapse is
- * RECORDED and not committed, so the chain it retires is still live and linked
+ * What a folded collapse owes its caller.  Under @record_only the collapse is
+ * recorded and not committed, so the chain it retires is still live and linked
  * when it returns.  The nodes are handed back for the caller to reclaim after
- * ITS commit lands.
+ * its own commit lands.
  *
- * ☠ DEFINED OUTSIDE the FEATURE_FT_SKIP_COMPRESSED block that holds the
- * collapse itself, because struct ft_detach_recompact_out EMBEDS it BY VALUE
- * and that struct exists in every build.  A build with skip-compression off has
+ * ☠ This is defined outside the FEATURE_FT_SKIP_COMPRESSED block that holds
+ * the collapse itself.  struct ft_detach_recompact_out embeds it by value, and
+ * that struct exists in every build.  A build with skip-compression off has
  * no collapse to run, but it still needs the type to be complete.
  */
 #ifdef FT_DBG_RA_UNSPLICE
 /*
- * ARM and YIELD for cds_ft_remove_all's TWO-COMMIT ordered-list tail, and it
- * was built because a RED CONTROL LIED.  Restoring the discarded-status form of
- * that unsplice left inv_concurrent_remove_all_list GREEN, which reads as "the
- * drive-forward buys nothing" -- and is instead "the branch never ran": every
- * removal in that row's LEAF shapes fuses the unsplice into its structural
- * flip, so @pub is always armed and the two-commit tail is dead code there.
- * Measured with this counter: two_commit_arm=0 over 150 rounds x 64 keys x 3
- * lanes.  Arm presence and arm YIELD are different facts, and only the counter
- * tells a green control apart from an unexecuted one.
+ * Arm and yield counters for cds_ft_remove_all's two-commit ordered-list
+ * tail.  They were built because a red control lied.
+ *
+ * Restoring the discarded-status form of that unsplice left
+ * inv_concurrent_remove_all_list green.  That reads as "the drive-forward
+ * buys nothing".  The truth was "the branch never ran".  Every removal in
+ * that row's leaf shapes fuses the unsplice into its structural flip.  So
+ * @pub is always armed and the two-commit tail is dead code there.  Measured
+ * with this counter: two_commit_arm=0 over 150 rounds x 64 keys x 3 lanes.
+ *
+ * Arm presence and arm yield are different facts.  Only the counter tells a
+ * green control apart from an unexecuted one.
  */
 unsigned long ft_dbg_ra_unsplice_arm, ft_dbg_ra_unsplice_abort;
 unsigned long ft_dbg_ra_unsplice_fused;
@@ -1244,12 +1366,12 @@ static void ft_dbg_ra_unsplice_report(void)
 
 #ifdef FT_ENABLE_TRACING
 /*
- * ARM YIELD, not arm presence.  "The check compiled in" and "the check ever
- * REFUSED anything" are different facts, and only the second says whether a
- * guard is doing work: the first attempt at the detach arm was armed ~100k
- * times per run and refused NOTHING, because its target had been re-read so
- * late that it was comparing a value against itself.  A guard without a yield
- * counter cannot tell that apart from a race that simply did not happen.
+ * Arm yield, not arm presence.  "The check compiled in" and "the check ever
+ * REFUSED anything" are different facts.  Only the second says whether a
+ * guard is doing work.  The first attempt at the detach arm was armed ~100k
+ * times per run and refused nothing.  Its target had been re-read so late
+ * that it was comparing a value against itself.  A guard without a yield
+ * counter cannot tell that apart from a race that did not happen.
  */
 unsigned long ft_dbg_plan_stale_ext, ft_dbg_plan_stale_detach;
 /* ...and the orphan walk's own stale-plan refusal. */
@@ -1260,38 +1382,39 @@ unsigned long ft_dbg_plan_stale_fold, ft_dbg_plan_stale_alone;
 #endif
 
 /*
- * What the OP INTENDS, as opposed to what the TRIE currently holds.
+ * What the op intends, as opposed to what the trie currently holds.
  *
- * ☠ THE DISTINCTION IS THE WHOLE POINT.  A collapse rests on a picture of the
- * boundary -- how many children it has, which one survives, whether it carries
- * an external head -- and that picture used to be read by the CALLER, before
- * the callee took the boundary's lock.  Under fine locking the mark IS the
- * exclusion, so a fact read before it is worth nothing at commit time: a peer
- * that legally holds the same lock changes the node in between, and the
- * collapse ratifies a picture that is already false.  Measured: a peer
- * published a fresh junction carrying a live key into a body slot of the
- * boundary and committed; this collapse re-entered, retired the boundary, and
- * freed the key with it.
+ * ☠ The distinction is the whole point.  A collapse rests on a picture of the
+ * boundary: how many children it has, which one survives, whether it carries
+ * an external head.  The caller used to read that picture, before the callee
+ * took the boundary's lock.  Under fine locking the mark is the exclusion, so
+ * a fact read before it is worth nothing at commit time.  A peer that legally
+ * holds the same lock changes the node in between, and the collapse ratifies
+ * a picture that is already false.  Measured: a peer published a fresh
+ * junction carrying a live key into a body slot of the boundary and
+ * committed.  This collapse re-entered, retired the boundary, and freed the
+ * key with it.
  *
- * So the callee DERIVES every trie fact under its own mark and trusts none from
- * the caller.  What it cannot derive is the op's TARGET -- you can hoist a
- * QUERY, you cannot hoist a TARGET: only the op knows which child it came to
- * remove.  That, and only that, is what this carries.
+ * So the callee derives every trie fact under its own mark and trusts none
+ * from the caller.  It cannot derive the op's target.  A query can be
+ * hoisted; a target cannot: only the op knows which child it came to remove.
+ * This struct carries the target and nothing else.
  *
  * @detach_child / @detach_byte: the body child this commit removes from the
  *   boundary, and its byte.  NULL when the op removes no body child (the
  *   post-removal collapses, whose entry is the EXTERNAL one).
  *   ★ At the SHAPE-D fold it is the climb's own @elevated_old_child with its
- *   byte @n -- the pair the climb condemned, both fixed BEFORE the boundary is
- *   acquired.  @n is set once (ft_node_find_child on @cur) after the last
- *   elevation, and @detach_node_flag_ptr is a slot INSIDE @cur throughout, so
- *   the pair names the boundary's own edge.  ☞ ft-remove.h already enforces it
- *   PRE-fence (@plan_old_child); carrying it here is that same predicate moved
- *   past the acquire, which is the only place it can speak for the commit.
- * @expect_ext: the external head the op's shape says the boundary carries --
- *   the head it is itself removing, or NULL for the callers whose gate asserts
- *   there is none.  Never a value read speculatively from the trie: each caller
- *   names the head it came to unlink.
+ *   byte @n.  That is the pair the climb condemned.  Both are fixed before
+ *   the boundary is acquired.  @n is set once (ft_node_find_child on @cur)
+ *   after the last elevation.  @detach_node_flag_ptr is a slot inside @cur
+ *   throughout.  So the pair names the boundary's own edge.
+ *   ☞ ft-remove.h already enforces it PRE-fence (@plan_old_child).  Carrying
+ *   it here is that same predicate moved past the acquire.  Only there can it
+ *   speak for the commit.
+ * @expect_ext: the external head the op's shape says the boundary carries.
+ *   It is the head the op is itself removing, or NULL for the callers whose
+ *   gate asserts there is none.  It is never a value read speculatively from
+ *   the trie: each caller names the head it came to unlink.
  */
 struct ft_chain_compress_intent {
 	struct cds_ft_inode_flag *detach_child;
@@ -1300,14 +1423,17 @@ struct ft_chain_compress_intent {
 };
 
 /*
- * The fact the collapse rests on that the boundary's own mark did not use to
- * cover: its EXTERNAL HEAD.  Read HERE, under that mark, and compared against
- * the head the op named -- never against a picture the caller took before it.
- * True == the plan no longer describes the trie, so the caller must bail.
+ * Check two facts the collapse rests on.  Return true when the plan no longer
+ * describes the trie.  The caller must then bail.
  *
- * ...and the second: the child this commit DETACHES.  A peer's publish into
- * that slot is a SAME-SLOT VALUE SWAP -- it moves neither the count nor the
- * survivor -- so this is the only word that can see it.
+ * The first fact is the boundary's external head, which the boundary's own
+ * mark did not use to cover.  It is read here, under that mark, and compared
+ * against the head the op named.  It is never compared against a picture the
+ * caller took before the mark.
+ *
+ * The second fact is the child this commit detaches.  A peer's publish into
+ * that slot is a same-slot value swap: it moves neither the count nor the
+ * survivor.  So this is the only word that can see it.
  */
 static inline
 bool ft_chain_compress_plan_stale(struct cds_ft_inode_flag *iter_node_flag,
@@ -1320,15 +1446,17 @@ bool ft_chain_compress_plan_stale(struct cds_ft_inode_flag *iter_node_flag,
 		return true;
 	}
 	/*
-	 * ☠ RAW, like for like.  @detach_child is the climb's own slot WORD
-	 * (@elevated_old_child), so it must be compared against the slot word --
-	 * ft_node_get_nth_skip, "the slot value as-is, including skip-compressed
-	 * pointers".  ft_node_get_nth RESOLVES a skip-compressed word to the
-	 * compressed node reached through its child's back-pointer, which is a
-	 * DIFFERENT address, so comparing the two forms is unequal for every
-	 * chain-shaped branch and equal for every plain one: measured 347 vs 441
-	 * per run, a shape-determined constant, i.e. a PERMANENT -EAGAIN.  That
-	 * is what wedged ft_unit at test 2 on the first attempt.
+	 * ☠ Compare raw, like for like.  @detach_child is the climb's own slot
+	 * word (@elevated_old_child), so it must be compared against the slot
+	 * word.  ft_node_get_nth_skip returns that: "the slot value as-is,
+	 * including skip-compressed pointers".
+	 *
+	 * ft_node_get_nth resolves a skip-compressed word to the compressed
+	 * node reached through its child's back-pointer.  That is a different
+	 * address.  So comparing the two forms is unequal for every
+	 * chain-shaped branch and equal for every plain one.  Measured: 347 vs
+	 * 441 per run, a shape-determined constant, i.e. a permanent -EAGAIN.
+	 * That is what wedged ft_unit at test 2 on the first attempt.
 	 */
 	if (intent->detach_child &&
 			ft_node_get_nth_skip(iter_node_flag, NULL,
@@ -1344,12 +1472,13 @@ bool ft_chain_compress_plan_stale(struct cds_ft_inode_flag *iter_node_flag,
 
 struct ft_chain_compress_reclaim {
 	/*
-	 * TWO LIFETIMES, and mixing them frees a live node.  The first three are
-	 * the RETIRED chain: the caller's commit unlinks them, so they are freed
-	 * when it SUCCEEDS.  @new_cn is the merged node this collapse built and
-	 * recorded but never published, so it is freed when the caller's commit
-	 * ABORTS -- the same split ft_detach_recompact_out draws between
-	 * @old_node and @new_flag.
+	 * Two lifetimes.  Mixing them frees a live node.
+	 *  - The first three are the retired chain.  The caller's commit
+	 *    unlinks them, so they are freed when it succeeds.
+	 *  - @new_cn is the merged node this collapse built and recorded but
+	 *    never published.  So it is freed when the caller's commit aborts.
+	 * ft_detach_recompact_out draws the same split between @old_node and
+	 * @new_flag.
 	 */
 	struct cds_ft_inode *boundary;		/* the 1-child boundary node */
 	struct cds_ft_compressed_node *parent_cn;
@@ -1360,56 +1489,69 @@ struct ft_chain_compress_reclaim {
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 /*
  * ft_chain_compress_fused: the fused-merge primitive behind the
- * chain-compress canonicalization.  Builds the merged compressed @new_cn
- * INVISIBLY (rcu-mutation build phase) from the caller-supplied surviving
- * child, then commits the whole transition -- forward slot publish + the
- * surviving child's LIVE re-parent back-edge + a compressed grandparent's
- * SKIP_X dual + @dead_cell / @run's ordered-cell unsplice -- in ONE flip.
+ * chain-compress canonicalization.
  *
- * Because the merge IS the build-invisible commit, the key-disappearing
- * removal that triggers it can publish through this single flip directly
- * (no intermediate recompacted / in-place node, no transient non-canonical
- * state ever): the merged @new_cn REPLACES the boundary node, subsuming the
- * boundary's child-slot clear (shape D) or external_nodes clear (shape P).
+ * Build the merged compressed @new_cn INVISIBLY (rcu-mutation build phase)
+ * from the surviving child the caller supplies.  Then commit the whole
+ * transition in ONE flip:
+ *  - the forward slot publish;
+ *  - the surviving child's LIVE re-parent back-edge;
+ *  - a compressed grandparent's SKIP_X dual;
+ *  - the ordered-cell unsplice of @dead_cell / @run.
+ *
+ * The merge IS the build-invisible commit.  So the key-disappearing removal
+ * that triggers it can publish through this single flip directly.  There is
+ * no intermediate recompacted or in-place node, and never a transient
+ * non-canonical state.  The merged @new_cn REPLACES the boundary node.  It
+ * subsumes the boundary's child-slot clear (shape D) or its external_nodes
+ * clear (shape P).
  *
  * @surviving_child / @surviving_byte: the boundary's sole post-removal child
- * and its incoming byte, computed by the caller from PRE-commit state (so
- * this runs as the removal's commit, not a second flip after it).  Both are
- * stable across the removal: the merge never rebuilds the parent or the
- * surviving child.
- * @plan_nr_child: the boundary's child count the caller's plan assumed (2 for
- * the shape-D fold that retires one of the two, 1 for the post-removal
- * collapses) -- re-validated against the boundary's node lock snapshot
- * together with the @surviving_byte -> @surviving_child mapping, so a peer
- * commit between the caller's derivation and the fence mark surfaces as
- * -EAGAIN instead of a merge built from a stale plan.
+ *   and its incoming byte.  The caller computes them from PRE-commit state,
+ *   so this runs as the removal's commit, not as a second flip after it.
+ *   Both are stable across the removal: the merge never rebuilds the parent
+ *   or the surviving child.
+ * @plan_nr_child: the boundary's child count that the caller's plan assumed.
+ *   It is 2 for the shape-D fold that retires one of the two, and 1 for the
+ *   post-removal collapses.  It is re-validated against the boundary's node
+ *   lock snapshot, together with the @surviving_byte -> @surviving_child
+ *   mapping.  So a peer commit between the caller's derivation and the fence
+ *   mark surfaces as -EAGAIN, instead of a merge built from a stale plan.
  * @dead_cell / @run: the dead key's ordered-list unsplice, folded into the
- * merge flip (NULL when the ordered list is off / no fusion).
- * @orphans / @nr_orphans / @trailing_orphan: an optional orphan chain the SAME
- * unlink strands (ft_detach_node's branch-2 prune); each node's freeze-on-free
- * tombstone is recorded INTO the merge flip so it freezes atomically with the
- * collapse.  Pass NULL/0/NULL for the standalone canonicalize / chain-leaf
- * callers (no extra chain retired by their flip); the txn reservation grows to
- * cover them.
+ *   merge flip.  NULL when the ordered list is off or there is no fusion.
+ * @orphans / @nr_orphans / @trailing_orphan: an optional orphan chain that
+ *   the SAME unlink strands (ft_detach_node's branch-2 prune).  Each node's
+ *   freeze-on-free tombstone is recorded INTO the merge flip, so it freezes
+ *   atomically with the collapse.  The txn reservation grows to cover them.
+ *   The standalone canonicalize and chain-leaf callers pass NULL/0/NULL:
+ *   their flip retires no extra chain.
  *
- * Returns 0 when the merge committed; -ENOMEM when the txn or @new_cn could
- * not be allocated (NOTHING was published -- the caller aborts the whole
- * removal, structure untouched); -EAGAIN on a peer conflict (a dirty LOCK
- * mark, a failed plan re-validation, a parked latch in a captured slot, or a
- * commit ABORT -- nothing installed, every fence cleared, the caller's retry
- * re-descends); a positive value when the merge does not apply because the
- * merged length would exceed the compressed-node bound (caller falls back to
- * the non-fused removal, leaving the boundary 1-child internal as before).
+ * Return:
+ *  - 0 when the merge committed.
+ *  - -ENOMEM when the txn or @new_cn could not be allocated.  NOTHING was
+ *    published.  The caller aborts the whole removal; the structure is
+ *    untouched.
+ *  - -EAGAIN on a peer conflict: a dirty LOCK mark, a failed plan
+ *    re-validation, a parked latch in a captured slot, or a commit ABORT.
+ *    Nothing is installed and every fence is cleared.  The caller's retry
+ *    re-descends.
+ *  - A positive value when the merge does not apply, because the merged
+ *    length would exceed the compressed-node bound.  The caller falls back
+ *    to the non-fused removal, which leaves the boundary a 1-child internal
+ *    as before.
+ *
  * The replaced nodes (@boundary, @parent_cn, @child_cn) are enumerated
- * explicitly at the commit so a future MCAS can fold each one's sequence
+ * explicitly at the commit.  So a future MCAS can fold each one's sequence
  * counter into the same transaction.
  */
 /*
- * Hand a chain-compress RETIRE member's acquire to the commit txn: lift the lock
- * off the ancestor that survives (a no-op where the member's own word carries
- * it) and register the word so every unwind path drains it.  A member that
- * deduped onto a word the set already took owes both to the acquire that first
- * took it.  The tombstone itself is recorded later, at the commit.
+ * Hand a chain-compress RETIRE member's acquire to the commit txn:
+ *  - lift the lock off the ancestor that survives (a no-op where the
+ *    member's own word carries it);
+ *  - register the word, so every unwind path drains it.
+ * A member that deduped onto a word the set already took owes neither.  The
+ * acquire that first took the word owes both.  The tombstone itself is
+ * recorded later, at the commit.
  */
 static inline
 void ft_chain_compress_register_retire(struct ft_flip_txn *txn,
@@ -1417,10 +1559,10 @@ void ft_chain_compress_register_retire(struct ft_flip_txn *txn,
 {
 	if (h->shared) {
 		/*
-		 * Its word was taken by an EARLIER member of this op, so it owes
-		 * no release and no terminal -- but the op DOES hold it, and the
-		 * record-time ownership question is asked against @txn.  Say so
-		 * (ft_flip_txn's @covered).
+		 * Its word was taken by an EARLIER member of this op.  So it
+		 * owes no release and no terminal.  But the op DOES hold it,
+		 * and the record-time ownership question is asked against
+		 * @txn.  Say so (ft_flip_txn's @covered).
 		 */
 		ft_flip_txn_cover_member(txn, h->member);
 		return;
@@ -1430,27 +1572,32 @@ void ft_chain_compress_register_retire(struct ft_flip_txn *txn,
 }
 
 /*
- * The DEEP pending-publish shape, asked identically by the caller's shape-D gate
- * and by the collapse itself so the two can never drift apart.
+ * Test for the DEEP pending-publish shape.  The caller's shape-D gate and the
+ * collapse itself both ask it here, so the two can never drift apart.
  *
- * The shallow shape @pending_child covers is "the BOUNDARY's own survivor slot
+ * @pending_child covers the shallow shape: "the BOUNDARY's own survivor slot
  * IS the caller txn's pending forward publish target".  This is the same
- * collision ONE COMPRESSED LEVEL DEEPER: the survivor is a compressed node whose
- * OWN child slot is that target.  The collapse absorbs that node's run into the
- * merged node, so the merged node's child is taken from @child_cn->child -- and
- * that is precisely the slot the caller's commit is about to overwrite with its
- * fresh cluster top.  Fusing around the COMMITTED occupant there builds the
- * merged run on a node the same commit retires and publishes the moved cluster
- * into a slot of the node this collapse replaces, stranding the whole moved
- * subtree (measured: rekey_merge over a multi-level survivor chain loses both
- * moved keys, and the committed occupant's re-parent collides with the glue's
- * free-list tombstone on one state word -- MW here, SW there).
+ * collision ONE COMPRESSED LEVEL DEEPER.  The survivor is a compressed node,
+ * and its OWN child slot is that target.
  *
- * Deliberately asked on the RESOLVED compressed pointer rather than on the slot
- * the boundary holds: the boundary's flag may be the skip-encoded spelling of
- * the same node, and it is the node's own child WORD ADDRESS that the caller
- * armed.  A build without FEATURE_FT_COMPRESS has no compressed survivor and so
- * never takes this arm -- which is why the ablated builds never showed the loss.
+ * The collapse absorbs that node's run into the merged node.  So the merged
+ * node's child is taken from @child_cn->child.  That is precisely the slot
+ * the caller's commit is about to overwrite with its fresh cluster top.
+ * Fusing around the COMMITTED occupant there does two wrong things:
+ *  - it builds the merged run on a node that the same commit retires;
+ *  - it publishes the moved cluster into a slot of the node this collapse
+ *    replaces.
+ * This strands the whole moved subtree.  Measured: rekey_merge over a
+ * multi-level survivor chain loses both moved keys.  And the committed
+ * occupant's re-parent collides with the glue's free-list tombstone on one
+ * state word (MW here, SW there).
+ *
+ * The test is asked on the RESOLVED compressed pointer, on purpose, not on the
+ * slot the boundary holds.  The boundary's flag may be the skip-encoded
+ * spelling of the same node.  And the caller armed the node's own child WORD
+ * ADDRESS.  A build without FEATURE_FT_COMPRESS has no compressed survivor,
+ * so it never takes this arm.  That is why the ablated builds never showed
+ * the loss.
  */
 static inline
 bool ft_chain_compress_deep_pending(struct cds_ft_inode_flag *survivor,
@@ -1467,66 +1614,79 @@ bool ft_chain_compress_deep_pending(struct cds_ft_inode_flag *survivor,
 }
 
 /*
- * @iter_depth is the boundary's byte-depth and @ctx the op's lock context: the
- * whole collapsed chain is a lock-set, and its members anchor by depth.  The set
- * straddles the boundary -- parent_CN and pp lie ABOVE it, the surviving child
- * ONE hop below -- which is exactly the shape §7.1 describes.
+ * @iter_depth is the boundary's byte-depth.  @ctx is the op's lock context.
+ * The whole collapsed chain is a lock-set, and its members anchor by depth.
+ * The set straddles the boundary: parent_CN and pp lie ABOVE it, and the
+ * surviving child lies ONE hop below.  That is exactly the shape §7.1
+ * describes.
  */
 /*
  * @shared_txn / @record_only (FOLD, for the rekey's one-decide writer): record
- * this collapse into the caller's txn instead of committing a second time.  Two
- * commits cannot be one decide, and this collapse owning its own txn is exactly
- * what confined ft_detach_node's fold to the SIMPLE shape (BP above min_child)
- * -- which is what the rekey's `nr_child < 3` gate restated.
+ * this collapse into the caller's txn instead of committing a second time.
+ * Two commits cannot be one decide.  This collapse owning its own txn is
+ * exactly what confined ft_detach_node's fold to the SIMPLE shape (BP above
+ * min_child).  The rekey's `nr_child < 3` gate restated that limit.
  * @reclaim is REQUIRED when @record_only.
  *
- * @pending_child (FOLD, pending-publish): non-NULL ONLY on the record_only fold
- * when the boundary slot @surviving_byte names is the caller txn's OWN pending
- * forward publish target (@pending_pub_slot -- armed before this fold runs by
- * ft_glue_set_publish on the GLUE and merge lanes, or directly by the NOSPLIT
- * store commit in ft-graft.h).  It is the FRESH, UNPUBLISHED cluster top that same
- * commit installs there, and it -- not the committed occupant -- is the child
- * the merged node must be built around: fusing around the committed value
- * builds new_cn on a node the same commit retires and lets the commit publish
- * the cluster into a slot of the boundary this collapse replaces, stranding
- * the whole moved subtree (the shape the sibling two-child-BP pin measures).
- * The COMMITTED value stays in @surviving_child: the plan re-validation and
- * the lock-set are about what the trie holds NOW, and the committed occupant's
- * retire belongs to the GLUE (its free list), never to this collapse -- which
- * is also what keeps the two from colliding on one state word (the measured
- * MW-PSO-vs-SW-tombstone chain conflict).  ☞ Except that @pending_child may BE
- * the committed occupant: a duplicate-chain splice publishes the dst's own
- * app-owned head back into its slot, so the pending value is live, not fresh,
- * and its back edge must be RECORDED (see @pending_top_live at the back-edge
- * arm), never stored.  The collapse then reports the fold
- * (@pending_pub_folded / @pending_pub_node) so the glue commit skips its
- * forward publish and re-bases its count delta onto the merged node.
+ * @pending_child (FOLD, pending-publish): non-NULL ONLY on the record_only
+ *   fold, when the boundary slot that @surviving_byte names is the caller
+ *   txn's OWN pending forward publish target (@pending_pub_slot).  That slot
+ *   is armed before this fold runs, in one of two ways:
+ *    - by ft_glue_set_publish, on the GLUE and merge lanes;
+ *    - directly by the NOSPLIT store commit in ft-graft.h.
+ *   @pending_child is the FRESH, UNPUBLISHED cluster top that the same commit
+ *   installs there.  The merged node must be built around it, not around the
+ *   committed occupant.  Fusing around the committed value goes wrong twice:
+ *    - it builds new_cn on a node that the same commit retires;
+ *    - it lets the commit publish the cluster into a slot of the boundary
+ *      this collapse replaces.
+ *   This strands the whole moved subtree.  The sibling two-child-BP pin
+ *   measures that shape.
+ *
+ *   The COMMITTED value stays in @surviving_child.  The plan re-validation and
+ *   the lock-set are about what the trie holds NOW.  The committed occupant's
+ *   retire belongs to the GLUE (its free list), never to this collapse.  That
+ *   also keeps the two from colliding on one state word (the measured
+ *   MW-PSO-vs-SW-tombstone chain conflict).
+ *
+ *   ☞ Except that @pending_child may BE the committed occupant.  A
+ *   duplicate-chain splice publishes the dst's own app-owned head back into
+ *   its slot.  The pending value is then live, not fresh.  Its back edge must
+ *   be RECORDED, never stored (see @pending_top_live at the back-edge arm).
+ *   The collapse then reports the fold (@pending_pub_folded /
+ *   @pending_pub_node).  So the glue commit skips its forward publish and
+ *   re-bases its count delta onto the merged node.
+ *
  * ☑ A COMPRESSED @pending_child IS ABSORBED, not refused.  The caller used to
- * turn the whole move away here on the grounds that "absorbing a fresh
+ * turn the whole move away here.  Its reason was that "absorbing a fresh
  * unpublished compressed top would retire a node that was never published and
- * re-aim its cluster's deferred edges".  The first half is the answer, not the
- * obstacle -- a node that was NEVER PUBLISHED is not retired at all: it is
- * untracked from the glue and freed outright, with no grace period, because no
- * reader ever had a path to it.  The second half holds for ONE edge: when the
- * pending top's child is the FRESH cluster node below it, its back-pointer is a
- * plain store into a private body and nothing is queued.  When that child is
- * LIVE -- the dst's own head, handed back by a duplicate-chain merge at the
- * run's end -- its back edge IS a queued glue entry naming the pending top,
- * and the back-edge arm re-aims it at the merged node (ft_glue_reaim_edge).
+ * re-aim its cluster's deferred edges".
+ *  - The first half is the answer, not the obstacle.  A node that was NEVER
+ *    PUBLISHED is not retired at all.  It is untracked from the glue and
+ *    freed outright, with no grace period, because no reader ever had a path
+ *    to it.
+ *  - The second half holds for ONE edge.  When the pending top's child is the
+ *    FRESH cluster node below it, its back-pointer is a plain store into a
+ *    private body, and nothing is queued.  The child can instead be LIVE: the
+ *    dst's own head, handed back by a duplicate-chain merge at the run's end.
+ *    Its back edge is then a queued glue entry that names the pending top.
+ *    The back-edge arm re-aims it at the merged node (ft_glue_reaim_edge).
  *
- * So the run simply grows by the pending top's bytes -- @parent_cn ++
- * @surviving_byte ++ pending->key_bytes -- and takes the pending top's CHILD.
- * That is the same absorption the DEEP fold already performs one level down,
- * and it is what keeps the canonical form: fusing AROUND a compressed pending
- * top would put two adjacent compressed nodes in the trie, which cds_ft_verify
- * rejects, and falling back to ft_node_replace_ptr would publish a one-child
- * internal, which skip mode does not allow to persist.  Both alternatives are
- * illegal; this one is the only legal product.
+ * So the run simply grows by the pending top's bytes, and takes the pending
+ * top's CHILD.  The bytes are @parent_cn ++ @surviving_byte ++
+ * pending->key_bytes.  The DEEP fold already performs the same absorption one
+ * level down.  It is what keeps the canonical form.  Both alternatives are
+ * illegal:
+ *  - fusing AROUND a compressed pending top puts two adjacent compressed
+ *    nodes in the trie, which cds_ft_verify rejects;
+ *  - falling back to ft_node_replace_ptr publishes a one-child internal,
+ *    which skip mode does not allow to persist.
+ * This one is the only legal product.
  *
- * The ONE thing that is still refused is a run that cannot be SPELLED:
- * @merged_len past FT_SKIP_LEN_MAX takes the same `return 1` every other
- * over-long merge takes, and the caller falls back.  That is a property of the
- * trie, not of this writer.
+ * The ONE thing still refused is a run that cannot be SPELLED.  An absorbing
+ * merge whose @merged_len is past FT_SKIP_LEN_MAX returns -EDOM
+ * (FT_REKEY_UNCOVERED), a terminal refusal with no fallback.  That is a
+ * property of the trie, not of this writer.
  */
 static
 int ft_chain_compress_fused(struct cds_ft *ft,
@@ -1563,57 +1723,61 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	struct cds_ft_inode_flag **publish_slot;
 	/*
 	 * The publish target is the CALLER's fresh, unpublished body (see the
-	 * arm below): the forward edge is a plain interior store, not a txn
-	 * record, and neither the §4.B guard nor the dating applies to it.
+	 * arm below).  The forward edge is then a plain interior store, not a
+	 * txn record.  Neither the §4.B guard nor the dating applies to it.
 	 */
 	bool pub_home_private = false;
 	struct cds_ft_inode_flag *publish_parent;
 	unsigned int pub_depth = 0;
 	/*
-	 * The boundary's parent and ITS parent, dated once: the acquire arm needs
-	 * both as lock-set members, and the publish below needs whichever of them
-	 * it republishes into.
+	 * The boundary's parent and ITS parent, dated once.  The acquire arm
+	 * needs both as lock-set members.  The publish below needs whichever of
+	 * them it republishes into.
 	 */
 	unsigned int parent_depth = 0, pp_depth = 0;
 	struct cds_ft_inode_flag *iter_parent;
 	struct ft_flip_txn *txn;
 	/*
 	 * The three RETIRE members of the collapsed chain.  Each names TWO words
-	 * once a coarse spacing splits them: the one its acquire took (released
-	 * at registration, since it is an ancestor that SURVIVES) and the node's
-	 * own (tombstoned at the commit, and the word every plan re-validation
-	 * below must read).
+	 * once a coarse spacing splits them:
+	 *  - the word its acquire took.  It is released at registration, since
+	 *    it is an ancestor that SURVIVES.
+	 *  - the node's own word.  It is tombstoned at the commit.  Every plan
+	 *    re-validation below must read this one.
 	 */
 	struct ft_held_anchor iter_held, pcn_held, ccn_held;
 	/*
-	 * The child the merged node is BUILT around: the pending cluster top
-	 * under the fold's substitution (see @pending_child at the header),
-	 * else the committed survivor.  Every plan-facing read (the lock-set,
-	 * the re-validation) keeps @surviving_child.
+	 * The child the merged node is BUILT around.  It is the pending cluster
+	 * top under the fold's substitution (see @pending_child at the header).
+	 * Otherwise it is the committed survivor.  Every plan-facing read (the
+	 * lock-set, the re-validation) keeps @surviving_child.
 	 */
 	struct cds_ft_inode_flag *build_child =
 		pending_child ? pending_child : surviving_child;
 	/*
 	 * The DEEP spelling of the same substitution (see
-	 * ft_chain_compress_deep_pending): set once the lock-set arm has derived
-	 * @child_cn and the plan re-validation has ratified the survivor, and
-	 * from there it steers three things -- the merged node's child value, the
-	 * PLAIN back edge that value takes, and the fold report to the glue.
+	 * ft_chain_compress_deep_pending).  It is set once the lock-set arm has
+	 * derived @child_cn and the plan re-validation has ratified the
+	 * survivor.  From there it steers three things:
+	 *  - the merged node's child value;
+	 *  - the PLAIN back edge that value takes;
+	 *  - the fold report to the glue.
 	 */
 	bool deep_fold = false;
 	/*
-	 * The pending top when it is a RUN: its bytes join the merged run and
-	 * its child becomes the merged node's.  It is FRESH and UNPUBLISHED, so
-	 * it is untracked from the glue and freed outright below -- never
-	 * retired, and never on the free list the commit drains.
+	 * The pending top when it is a RUN.  Its bytes join the merged run, and
+	 * its child becomes the merged node's child.  It is FRESH and
+	 * UNPUBLISHED.  So it is untracked from the glue and freed outright
+	 * below.  It is never retired, and never on the free list the commit
+	 * drains.
 	 */
 	struct cds_ft_compressed_node *pending_cn = NULL;
 	/* ...and the glue that BUILT it, which is the only owner that may free it. */
 	struct ft_glue *pending_glue = NULL;
 	/*
-	 * The absorbed run's CHILD is LIVE (not built by @pending_glue): its back
-	 * edge is the glue's queued entry, which names the run this fold frees.
-	 * See the back-edge arm.
+	 * The absorbed run's CHILD is LIVE (not built by @pending_glue).  Its
+	 * back edge is the glue's queued entry, which names the run this fold
+	 * frees.  See the back-edge arm.
 	 */
 	bool absorbed_child_live = false;
 
@@ -1622,32 +1786,35 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	assert(!pending_child || record_only);
 	/*
 	 * A COMPRESSED pending top is ABSORBED into the merged run (see the
-	 * header).  Recover its node from either spelling: ft_glue_set_publish
-	 * announces whatever the builder handed it, which is the PLAIN flag for
-	 * a fresh run whose child edge is still deferred, and the SKIP form once
-	 * the split re-encoded it.
+	 * header).  Recover its node from either spelling.  ft_glue_set_publish
+	 * announces whatever the builder handed it:
+	 *  - the PLAIN flag, for a fresh run whose child edge is still
+	 *    deferred;
+	 *  - the SKIP form, once the split re-encoded it.
 	 */
 	/*
 	 * ☠ NEVER THE COMMITTED OCCUPANT.  This absorption FREES the pending
-	 * top unpublished, with no grace period, on the premise that it is
-	 * fresh.  A pending value that IS the slot's committed occupant (see
-	 * @pending_top_live below) is live and published; absorbing it would
-	 * free a node readers hold.  No armer hands back a live compressed top
-	 * today (the one live-top armer requires an external head); the
-	 * identity test keeps that a property of this code, not of the callers.
+	 * top unpublished, with no grace period.  It assumes the top is fresh.
+	 * A pending value that IS the slot's committed occupant is live and
+	 * published (see @pending_top_live below).  Absorbing it would free a
+	 * node that readers hold.  No armer hands back a live compressed top
+	 * today: the one live-top armer requires an external head.  The
+	 * identity test makes that a property of this code, not of the callers.
 	 */
 	if (pending_child && pending_child != surviving_child &&
 			(ft_node_compressed(pending_child) ||
 			ft_node_skip_compressed(pending_child))) {
 		/*
 		 * ☠ THE OWNER MUST BE IN HAND BEFORE THE ABSORPTION, not looked
-		 * for afterwards.  Freeing the run without untracking it leaves it
-		 * in @built for ft_glue_abort to free a SECOND time on any later
-		 * bail.  The glue is what armed @pending_pub_slot in the first
-		 * place (ft_glue_set_publish), so it is always there for this
-		 * shape -- and if it somehow is not, the absorption does not
-		 * happen and the caller's refusal stands, which is the only answer
-		 * this frame can give without an owner.
+		 * for afterwards.  Freeing the run without untracking it
+		 * leaves it in @built.  ft_glue_abort then frees it a SECOND
+		 * time on any later bail.
+		 *
+		 * The glue armed @pending_pub_slot in the first place
+		 * (ft_glue_set_publish).  So it is always there for this shape.
+		 * If it somehow is not, the absorption does not happen and the
+		 * caller's refusal stands.  That is the only answer this frame
+		 * can give without an owner.
 		 */
 		pending_glue = ft_glue_of_ctx(ctx);
 		if (pending_glue)
@@ -1656,26 +1823,31 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 				ft_compressed_node_ptr(pending_child);
 	}
 	/*
-	 * Pre-reserve the commit flip-txn BEFORE any pre-flip side-effect.  The
-	 * surviving child's (parent, parent-slot-offset) pair is RECORDED into
-	 * @txn by ft_record_child_back_edge below (ft_reparent_record_meta: both
-	 * edges co-committed), so an aborted flip discards the pair coherently
-	 * -- no settled offset survives against the still-old parent.  With the
-	 * txn reserved the publish commits through ft_ord_cell_flip_into without
-	 * allocating, so the only OOM points are this reservation and the new_cn
-	 * allocation, both BEFORE the build's first side-effect (a concurrent-
-	 * writer ABORT surfaces as -EAGAIN with new_cn reclaimed, see the commit
-	 * site below).  Created FIRST (its sizing needs only the caller's
-	 * arguments) so the LOCK fences below can register with it: every
-	 * bail from here on is a ft_flip_txn_destroy or the commit itself, and
-	 * both terminal paths drain the fence registry -- no unwind can leak a
-	 * fence.
+	 * Pre-reserve the commit flip-txn BEFORE any pre-flip side-effect.
+	 *
+	 * ft_record_child_back_edge below RECORDS the surviving child's
+	 * (parent, parent-slot-offset) pair into @txn.  Both edges are
+	 * co-committed (ft_reparent_record_meta).  So an aborted flip discards
+	 * the pair coherently: no settled offset survives against the
+	 * still-old parent.
+	 *
+	 * With the txn reserved, the publish commits through
+	 * ft_ord_cell_flip_into without allocating.  So the only OOM points are
+	 * this reservation and the new_cn allocation.  Both come BEFORE the
+	 * build's first side-effect.  A concurrent-writer ABORT surfaces as
+	 * -EAGAIN with new_cn reclaimed (see the commit site below).
+	 *
+	 * The txn is created FIRST, since its sizing needs only the caller's
+	 * arguments.  So the LOCK fences below can register with it.  Every
+	 * bail from here on is a ft_flip_txn_destroy or the commit itself.
+	 * Both terminal paths drain the fence registry, so no unwind can leak
+	 * a fence.
 	 */
 	if (record_only) {
 		/*
-		 * FOLD: the caller's txn, which the caller pre-reserved for this
-		 * collapse's edges too.  NEVER destroyed on a bail below -- the
-		 * caller owns it and may still commit the rest of its plan.
+		 * FOLD: the caller's txn.  The caller pre-reserved it for this
+		 * collapse's edges too.  It is NEVER destroyed on a bail below:
+		 * the caller owns it and may still commit the rest of its plan.
 		 */
 		txn = shared_txn;
 	} else {
@@ -1693,24 +1865,24 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		return -ENOMEM;	/* nothing touched: caller aborts */
 #ifdef FT_COLLAPSE_CLAIM
 	/*
-	 * §4 STEP B3's DRY RUN, the a3c75659 tool aimed at the CHAIN-COMPRESS
-	 * collapse: point B0's owner assert at this txn so every record it plants
-	 * without owning is named, at an abort, on a build otherwise
-	 * byte-identical to the unarmed one.
+	 * §4 STEP B3's DRY RUN: the a3c75659 tool, aimed at the CHAIN-COMPRESS
+	 * collapse.  Point B0's owner assert at this txn.  Every record the txn
+	 * plants without owning is then named at an abort.  The build is
+	 * otherwise byte-identical to the unarmed one.
 	 *
 	 * ☞ CLAIMED AT CREATION, EARLIER THAN THE ARM WOULD BE.  A dry run has to
-	 * claim BEFORE the records it wants checked, and for this site that is
-	 * before the lock-set acquire below -- so read a miss as "this record is
-	 * planted before its owner is registered" FIRST.  That ORDERING class has
-	 * been the answer more often than a missing acquire.
+	 * claim BEFORE the records it wants checked.  For this site, that is
+	 * before the lock-set acquire below.  So first read a miss as "this
+	 * record is planted before its owner is registered".  That ORDERING
+	 * class has been the answer more often than a missing acquire.
 	 *
-	 * ☠ And read a miss as "the registry cannot SEE this hold" before "the op
-	 * does not HOLD it": where a caller's SWEEP owns the mark's clearing, the
-	 * absence is by design (ft_flip_txn_owns).
+	 * ☠ Next, read a miss as "the registry cannot SEE this hold", before
+	 * "the op does not HOLD it".  Where a caller's SWEEP owns the mark's
+	 * clearing, the absence is by design (ft_flip_txn_owns).
 	 *
-	 * ☠ @record_only hands us the CALLER's txn.  Claim it anyway -- the claim
-	 * sets no record kind, so it is behaviour-neutral, and the fold's records
-	 * are exactly the ones this step has to judge.
+	 * ☠ @record_only hands us the CALLER's txn.  Claim it anyway.  The
+	 * claim sets no record kind, so it is behaviour-neutral.  And the
+	 * fold's records are exactly the ones this step has to judge.
 	 */
 	ft_flip_txn_claim_per_op_armable(ft, txn);
 #endif
@@ -1720,27 +1892,33 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		(const void *) freeze_leaf, (const void *) dead_cell,
 		plan_nr_child, (int) record_only);
 	/*
-	 * F2 node lock (doc at ft_meta_lock_acquire): fence the whole
-	 * collapsed chain -- the boundary and the two compressed nodes whose
-	 * bodies the merged node subsumes -- BEFORE trusting any of their
-	 * mutable state.  Each mark's clean snapshot feeds that node's
-	 * tombstone expected-old at the commit, so a peer state change under
-	 * any fence aborts exactly one side.  A dirty mark (peer proxy, a
-	 * concurrent copier, a real retire -- e.g. a peer already re-published
-	 * the surviving child and tombstoned the old copy this plan captured)
-	 * bails to the caller's retry.
+	 * F2 node lock (doc at ft_meta_lock_acquire).  Fence the whole
+	 * collapsed chain BEFORE trusting any of its mutable state.  The chain
+	 * is the boundary and the two compressed nodes whose bodies the merged
+	 * node subsumes.
+	 *
+	 * Each mark's clean snapshot feeds that node's tombstone expected-old
+	 * at the commit.  So a peer state change under any fence aborts
+	 * exactly one side.  A dirty mark bails to the caller's retry.  It can
+	 * be a peer proxy, a concurrent copier, or a real retire.  For example,
+	 * a peer already re-published the surviving child and tombstoned the
+	 * old copy that this plan captured.
 	 */
 	if (ft->lock_fine) {
 		/*
-		 * Acquire the WHOLE chain-compress lock-set
-		 * {B, parent_CN, child_CN, publish_parent} in ONE all-or-none MCAS,
-		 * replacing the three incremental retire-marks + the publish_parent
-		 * lock_or_guard.  B / parent_CN / child_CN are RETIRE members (their
-		 * bodies subsume into new_cn); publish_parent is the value-swap RELEASE
-		 * target.  Guards B.parent==iter_parent and parent_CN.parent==pp ride
-		 * the same commit; child_CN needs no guard (the post-acquire
-		 * surviving_byte->surviving_child re-validation covers its position,
-		 * and a peer split retires it -> ft_dlm_lock -EAGAIN).
+		 * Acquire the WHOLE chain-compress lock-set in ONE all-or-none
+		 * MCAS: {B, parent_CN, child_CN, publish_parent}.  It replaces
+		 * the three incremental retire-marks and the publish_parent
+		 * lock_or_guard.
+		 *  - B, parent_CN and child_CN are RETIRE members: their bodies
+		 *    subsume into new_cn.
+		 *  - publish_parent is the value-swap RELEASE target.
+		 * The guards B.parent==iter_parent and
+		 * parent_CN.parent==pp ride the same commit.  child_CN needs
+		 * no guard.  The post-acquire
+		 * surviving_byte->surviving_child re-validation covers its
+		 * position.  And a peer split retires it, so ft_dlm_lock
+		 * returns -EAGAIN.
 		 */
 		struct cds_ft_metadata *parent_cn_meta_l, *child_cn_meta_l = NULL;
 		struct cds_ft_inode_flag *pp_flag = NULL;
@@ -1766,14 +1944,16 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 */
 		/*
 		 * ☠ NEVER THE PENDING TOP.  @child_cn is the LIVE run below the
-		 * boundary, and everything downstream treats it as one: a §7.1
-		 * below-pivot lock member, a retire registration, and a
-		 * @reclaim->child_cn entry the commit frees through a grace
-		 * period.  The pending top is FRESH and UNPUBLISHED -- no reader
-		 * can reach it, so there is nothing to lock, nothing to retire and
-		 * no grace period to wait; it is untracked from the glue and freed
-		 * outright where the run absorbs it.  Routing it here produces the
-		 * right STRUCTURE and the wrong OWNERSHIP.
+		 * boundary.  Everything downstream treats it as one:
+		 *  - a §7.1 below-pivot lock member;
+		 *  - a retire registration;
+		 *  - a @reclaim->child_cn entry, which the commit frees
+		 *    through a grace period.
+		 * The pending top is FRESH and UNPUBLISHED.  No reader can
+		 * reach it.  So there is nothing to lock, nothing to retire,
+		 * and no grace period to wait.  It is untracked from the glue
+		 * and freed outright where the run absorbs it.  Routing it
+		 * here produces the right STRUCTURE and the wrong OWNERSHIP.
 		 */
 		child_cn = (ft_node_compressed(build_child) &&
 				(!pending_cn ||
@@ -1790,11 +1970,13 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 
 		/*
 		 * Both members above the boundary were reached by back-pointer, so
-		 * neither carries a depth: date each from the node BELOW it -- the
-		 * boundary is at @iter_depth, and where @pp_flag is the compressed
-		 * parent's own parent it is one hop above that.  (Where there is no
-		 * compressed parent, @pp_flag IS @iter_parent and shares its depth.)
-		 * A member neither the window nor the hop can date voids the plan.
+		 * neither carries a depth.  Date each from the node BELOW it:
+		 *  - the boundary is at @iter_depth;
+		 *  - where @pp_flag is the compressed parent's own parent,
+		 *    it is one hop above that.
+		 * (Where there is no compressed parent, @pp_flag IS
+		 * @iter_parent and shares its depth.)  If neither the window
+		 * nor the hop can date a member, the plan is void.
 		 */
 		if (!ft_lock_ctx_depth_of_parent(ft, ctx, iter_parent, iter_depth,
 					&parent_depth)) {
@@ -1853,12 +2035,15 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		}
 		if (pp_flag) {
 			/*
-			 * publish_parent is the value-swap RELEASE target (survives).
-			 * Record its {LOCK|s -> s} release + register it up front with
-			 * the acquire, so the publish below skips its lock_or_guard and
-			 * every pre-publish bail's ft_flip_txn_destroy drains it -- no
-			 * separate publish_parent unwind path.  A member that deduped
-			 * onto a word the set already took owes neither.
+			 * publish_parent is the value-swap RELEASE target
+			 * (it survives).  Record its {LOCK|s -> s} release,
+			 * and register it up front with the acquire.  Then:
+			 *  - the publish below skips its lock_or_guard;
+			 *  - every pre-publish bail's ft_flip_txn_destroy
+			 *    drains it.
+			 * So there is no separate publish_parent unwind path.
+			 * A member that deduped onto a word the set already
+			 * took owes neither.
 			 */
 			if (!set[si].held.shared) {
 				ft_flip_txn_lock_register_held(txn, &set[si].held);
@@ -1881,9 +2066,9 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		}
 		ft_chain_compress_register_retire(txn, &iter_held, iter_meta);
 		/*
-		 * ONE snapshot of the boundary's parent (latch-checked): the F1
-		 * discipline -- a peer's parked flip proxy must be neither classified
-		 * nor embedded.
+		 * ONE snapshot of the boundary's parent (latch-checked).
+		 * This is the F1 discipline: a peer's parked flip proxy must
+		 * be neither classified nor embedded.
 		 */
 		iter_parent = (struct cds_ft_inode_flag *)
 			ft_parent_node(rcu_dereference(iter_meta->parent_word));
@@ -1935,29 +2120,30 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	}
 	/*
 	 * ★ THE PLAN, UNDER THE FENCE.  Everything the collapse rests on is read
-	 * HERE, on the far side of the boundary's own mark, and compared against
-	 * what the OP said it came to do (@intent) -- never against a picture the
-	 * caller took before the mark, which a peer holding the same lock is
-	 * entitled to invalidate.  Four things, and the last two are why keys
-	 * were being lost:
+	 * HERE, on the far side of the boundary's own mark.  It is compared
+	 * against what the OP said it came to do (@intent).  It is never
+	 * compared against a picture the caller took before the mark: a peer
+	 * holding the same lock is entitled to invalidate that.  Four things
+	 * are checked.  The last two are why keys were being lost:
 	 *
 	 *  1. the child COUNT (@plan_nr_child: 2 for the shape-D fold that
-	 *     retires one of the two, 1 for the post-removal collapses).  Free:
-	 *     nr_child lives inside the state word, so the acquire's own snapshot
-	 *     carries it.
+	 *     retires one of the two, 1 for the post-removal collapses).  This
+	 *     check is free: nr_child lives inside the state word, so the
+	 *     acquire's own snapshot carries it.
 	 *  2. the SURVIVOR still at @surviving_byte.  ☞ This one cannot be
-	 *     derived instead of compared: when the survivor is compressed it is
-	 *     a member of the lock-set above, so it has to be named to be locked.
-	 *     A mismatch bails, which is equivalent.
+	 *     derived instead of compared.  When the survivor is compressed, it
+	 *     is a member of the lock-set above, so it has to be named to be
+	 *     locked.  A mismatch bails, which is equivalent.
 	 *  3. the EXTERNAL HEAD.  ☠ Never checked before.  A peer's
-	 *     ft_insert_park_external_nodes writes exactly this word, under this
-	 *     same lock, and moves neither nr_child nor any slot above -- so
-	 *     (1) and (2) both pass and the collapse retires a boundary that is
-	 *     holding a live key.
-	 *  4. the child THIS COMMIT DETACHES.  ☠ Never checked before.  A peer's
-	 *     publish into that slot is a SAME-SLOT VALUE SWAP: the count does
-	 *     not move, the survivor does not move, and the collapse drops a
-	 *     freshly published subtree.  MEASURED as the loss, in the act.
+	 *     ft_insert_park_external_nodes writes exactly this word, under
+	 *     this same lock.  It moves neither nr_child nor any slot above.
+	 *     So (1) and (2) both pass, and the collapse retires a boundary
+	 *     that holds a live key.
+	 *  4. the child THIS COMMIT DETACHES.  ☠ Never checked before.  A
+	 *     peer's publish into that slot is a SAME-SLOT VALUE SWAP.  The
+	 *     count does not move and the survivor does not move.  So the
+	 *     collapse drops a freshly published subtree.  This was MEASURED as
+	 *     the loss, in the act.
 	 *
 	 * Never fires single-writer.
 	 */
@@ -1977,12 +2163,13 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		return -EAGAIN;
 	}
 	/*
-	 * Ask the DEEP shape only now: @child_cn is derived by whichever lock-set
-	 * arm ran, and the re-validation immediately above is what makes
+	 * Ask the DEEP shape only now.  @child_cn is derived by whichever
+	 * lock-set arm ran.  The re-validation just above makes
 	 * @surviving_child (hence @build_child) the value the trie still holds.
-	 * The two substitutions are mutually exclusive by construction -- one
+	 *
+	 * The two substitutions are mutually exclusive by construction.  One
 	 * pending slot cannot be both the boundary's survivor slot and the
-	 * survivor's own child slot -- and the caller gates them as one if/else.
+	 * survivor's own child slot.  The caller gates them as one if/else.
 	 */
 	deep_fold = record_only && child_cn &&
 		ft_chain_compress_deep_pending(build_child, shared_txn);
@@ -1995,57 +2182,63 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	if (merged_len > FT_SKIP_LEN_MAX) {
 		/*
 		 * ☠ AN OVER-LONG ABSORPTION HAS NO FALLBACK TO FALL BACK TO.
-		 * `return 1` means "merge does not apply, caller falls back",
-		 * and the caller's fallback is ft_node_replace_ptr -- which is
-		 * exactly the product the @pending_child contract above calls
-		 * ILLEGAL for this shape: it publishes a one-child internal that
-		 * skip mode does not allow to persist, and the run it should have
-		 * absorbed is still compressed beneath it.
+		 * `return 1` means "merge does not apply, caller falls back".
+		 * The caller's fallback is ft_node_replace_ptr.  The
+		 * @pending_child contract above calls exactly that product
+		 * ILLEGAL for this shape.  It publishes a one-child internal
+		 * that skip mode does not allow to persist.  And the run it
+		 * should have absorbed is still compressed beneath it.
 		 *
-		 * MEASURED on a release build with a 126-byte run (the boundary
-		 * is exact: merged_len 127 clean, 128 red): the op returns
-		 * SUCCESS and cds_ft_verify answers `compressed node ... node
-		 * lock set at rest (leaked lock)`.  The leaked lock is a
-		 * PRE-EXISTING defect of that fallback -- the same shape with the
-		 * dst placed elsewhere is red at the parent commit too -- but
-		 * REACHING it from here is not: before the absorption existed,
-		 * this shape took the shape-D gate's terminal refusal before any
-		 * side-effect.  A pre-existing root cause is not a
-		 * non-regression; what changed for the caller is a clean
-		 * FT_REKEY_UNCOVERED becoming SUCCESS on a corrupt trie.
+		 * MEASURED on a release build with a 126-byte run.  The
+		 * bound is exact: merged_len 127 is clean, 128 is red.  The
+		 * op returns SUCCESS, and cds_ft_verify answers `compressed
+		 * node ... node lock set at rest (leaked lock)`.
 		 *
-		 * So the absorption refuses TERMINALLY instead, which is what a
+		 * The leaked lock is a PRE-EXISTING defect of that fallback.
+		 * The same shape with the dst placed elsewhere is red at the
+		 * parent commit too.  But REACHING it from here is new.
+		 * Before the absorption existed, this shape took the shape-D
+		 * gate's terminal refusal, before any side-effect.  A
+		 * pre-existing root cause is not a non-regression.  For the
+		 * caller, a clean FT_REKEY_UNCOVERED became SUCCESS on a
+		 * corrupt trie.
+		 *
+		 * So the absorption refuses TERMINALLY instead.  That is what a
 		 * run that cannot be spelled deserves: it is a property of the
 		 * trie, not of this writer.  Only the absorbing shape takes this
 		 * exit.
 		 *
-		 * ☠ AND THE DEEP FOLD TAKES THE SAME EXIT, for the same reason.  It
-		 * was left on the fallback because its live-top case was
-		 * unreachable; the through-a-run merge arm made it reachable
-		 * ({ab, a+128*'c'}, dst the long key, src "ab": the src junction
-		 * collapses into the dst run, the merged run cannot be spelled),
-		 * and the fallback then published the one-child internal, with
-		 * the caller's subsumption reporting a fold that never happened.
-		 * MEASURED: verify RED at 128 bytes, clean at 127; refused clean
-		 * with this line.
+		 * ☠ AND THE DEEP FOLD TAKES THE SAME EXIT, for the same reason.
+		 * It was left on the fallback because its live-top case was
+		 * unreachable.  The through-a-run merge arm made it reachable:
+		 * {ab, a+128*'c'}, dst the long key, src "ab".  The src
+		 * junction collapses into the dst run, and the merged run
+		 * cannot be spelled.  The fallback then published the
+		 * one-child internal.  The caller's subsumption reported a
+		 * fold that never happened.
+		 * MEASURED: verify RED at 128 bytes, clean at 127.  With this
+		 * line, the op is refused clean.
 		 */
 		if (pending_cn || deep_fold)
 			return -EDOM;
 #ifndef FT_DEBUG_OVERLONG_COLLAPSE_FALLBACK
 		/*
 		 * ☑ AN ORDINARY OVER-LONG MERGE IS SPELLED, NOT REFUSED.  Its
-		 * fallback was never a legal product: ft_node_replace_ptr leaves
-		 * the boundary a one-child keyless internal, which cds_ft_verify
-		 * refuses in skip mode -- single-threaded, on the default build:
-		 * {ab, a+128*'c'}, remove "ab" (127 bytes clean).  But a run
-		 * longer than a skip pointer can encode is not unspellable:
-		 * cds_ft_insert builds exactly that shape for a long unique
-		 * suffix -- ONE compressed node, published through a PLAIN
-		 * compressed flag (ft_publish_compressed picks the encoding by
-		 * length), and verify accepts it.  So build the same node here
-		 * and let the publish below take the plain flag.  The only bound
-		 * left is the node's own 8-bit length, which a key of
-		 * FT_MAX_KEY_LEN bytes below a non-root boundary cannot reach.
+		 * fallback was never a legal product.  ft_node_replace_ptr
+		 * leaves the boundary a one-child keyless internal.
+		 * cds_ft_verify refuses that in skip mode, even single-threaded
+		 * on the default build: {ab, a+128*'c'}, remove "ab" (127 bytes
+		 * is clean).
+		 *
+		 * But a run longer than a skip pointer can encode is not
+		 * unspellable.  cds_ft_insert builds exactly that shape for a
+		 * long unique suffix: ONE compressed node, published through a
+		 * PLAIN compressed flag.  ft_publish_compressed picks the
+		 * encoding by length, and verify accepts it.  So build the same
+		 * node here, and let the publish below take the plain flag.
+		 * The only bound left is the node's own 8-bit length.  A key
+		 * of FT_MAX_KEY_LEN bytes below a non-root boundary cannot
+		 * reach it.
 		 */
 		if (merged_len > UINT8_MAX) {
 			if (!record_only)
@@ -2083,11 +2276,12 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 
 		/*
 		 * A peer latch parked on the boundary cn's child must not be
-		 * embedded in the merged cn (the peer settles only the
-		 * ORIGINAL slot; an embedded copy dangles into its reclaimed
-		 * descriptor -- see the recompact copy-loop bail).  Nothing
-		 * recorded into @txn yet and new_cn never published: reclaim
-		 * both and let the caller retry after the peer settles.
+		 * embedded in the merged cn.  The peer settles only the
+		 * ORIGINAL slot.  An embedded copy dangles into its reclaimed
+		 * descriptor (see the recompact copy-loop bail).  Nothing is
+		 * recorded into @txn yet, and new_cn was never published.  So
+		 * reclaim both, and let the caller retry after the peer
+		 * settles.
 		 */
 		if (caa_unlikely(ft_node_flip_proxy(child_child))) {
 			free_compressed_node_unpublished(ft, new_cn);
@@ -2097,61 +2291,68 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		}
 		/*
 		 * DEEP FOLD: @child_cn->child IS the caller's pending forward
-		 * publish target, so the value the merged node must carry is the
-		 * cluster top that commit installs there -- never @child_child,
-		 * the occupant the same commit retires.  The proxy check above is
-		 * kept unconditionally: a peer parked on this word is contention
-		 * whichever value we are about to take.
+		 * publish target.  So the merged node must carry the cluster
+		 * top that commit installs there.  It must never carry
+		 * @child_child, the occupant the same commit retires.  The
+		 * proxy check above is kept unconditionally.  A peer parked on
+		 * this word is contention, whichever value we are about to
+		 * take.
 		 */
 		new_cn->child = deep_fold ? shared_txn->pending_pub_val
 					  : child_child;
 	} else if (pending_cn) {
 		/*
-		 * ABSORBED: the merged run carries the pending top's bytes, so
-		 * the child it must hold is the pending top's OWN child -- most
-		 * often the fresh cluster node below it, which no reader can
-		 * reach yet.
+		 * ABSORBED: the merged run carries the pending top's bytes.
+		 * So the child it must hold is the pending top's OWN child.
+		 * Most often that is the fresh cluster node below it, which
+		 * no reader can reach yet.
 		 *
-		 * A fresh child needs no special back edge: @pending_child
-		 * non-NULL already routes the wiring to the PLAIN ft_set_parent
-		 * arm below, which is the right one for a fresh, unpublished
-		 * child.
+		 * A fresh child needs no special back edge.  @pending_child
+		 * non-NULL already routes the wiring to the PLAIN
+		 * ft_set_parent arm below.  That is the right arm for a
+		 * fresh, unpublished child.
 		 *
 		 * ☠ AND THE ABSORBED RUN LEAVES THE GLUE'S BUILT SET WITH IT.
-		 * It was never published, so it is not retired and owes no grace
-		 * period -- but the caller's ft_glue_abort frees everything in
-		 * @built on a bail, and this node is about to stop existing, so
-		 * it must be untracked FIRST or that abort double-frees it.  The
-		 * pair is the one ft_glue_untrack's own header names ("chain-merge
-		 * absorbs a freshly-built compressed wrapper").
+		 * It was never published, so it is not retired and owes no
+		 * grace period.  But the caller's ft_glue_abort frees
+		 * everything in @built on a bail.  This node is about to stop
+		 * existing.  So it must be untracked FIRST, or that abort
+		 * double-frees it.  ft_glue_untrack's own header names this
+		 * pair ("chain-merge absorbs a freshly-built compressed
+		 * wrapper").
 		 *
 		 * The order matters: TAKE THE CHILD FIRST, then untrack, then
-		 * free -- and all three before any later bail can run, so no path
-		 * sees the node in a half-owned state.
+		 * free.  All three run before any later bail can run.  So no
+		 * path sees the node in a half-owned state.
 		 */
 		new_cn->child = pending_cn->child;
 		/*
-		 * ☠ ...EXCEPT WHEN IT IS NOT FRESH.  A duplicate-chain merge at
-		 * the run's end (a moved key equal to a dst key) hands back the
-		 * dst's own APP-OWNED HEAD as the run's child: ft_merge_build_run
-		 * queues its back edge in the glue, aimed at the run, because it
-		 * is live.  Read here, before the run is freed.
+		 * ☠ ...EXCEPT WHEN IT IS NOT FRESH.  A duplicate-chain merge
+		 * at the run's end (a moved key equal to a dst key) hands
+		 * back the dst's own APP-OWNED HEAD as the run's child.  That
+		 * head is live, so ft_merge_build_run queues its back edge in
+		 * the glue, aimed at the run.  Read it here, before the run
+		 * is freed.
 		 */
 #ifndef FT_DEBUG_ABSORB_LIVE_CHILD_UNAIMED
 		absorbed_child_live = !ft_glue_is_fresh(ft, pending_glue,
 			new_cn->child);
 #endif
 		/*
-		 * ☠ @built IS NOT THE ONLY NAME THE GLUE KEPT.  ft_glue_set_publish
-		 * stored the same flag in @top, and the txn in @pending_pub_val;
-		 * untracking only the @built entry leaves both naming freed
-		 * memory.  Measured: on the PLAIN spelling the glue reaches
-		 * ft_glue_apply_deferred with @top dangling.  It is LATENT today
-		 * -- the forward-publish consumer is skipped by
-		 * @pending_pub_folded, and the other two consumers are reachable
-		 * only from the legacy KEY_SHORTER graft_swap -- but the fix
-		 * belongs here, beside the free, not in a caller two files away
-		 * that happens to skip the read.
+		 * ☠ @built IS NOT THE ONLY NAME THE GLUE KEPT.
+		 * ft_glue_set_publish stored the same flag in the glue's
+		 * @top and in the txn's @pending_pub_val.  Untracking only
+		 * the @built entry leaves both naming freed memory.
+		 * Measured: on the PLAIN spelling, the glue reaches
+		 * ft_glue_apply_deferred with @top dangling.
+		 *
+		 * It is LATENT today:
+		 *  - @pending_pub_folded skips the forward-publish consumer;
+		 *  - the other two consumers are reachable only from the
+		 *    legacy KEY_SHORTER graft_swap.
+		 * But the fix belongs here, beside the free.  It does not
+		 * belong in a caller two files away that happens to skip the
+		 * read.
 		 */
 		ft_glue_untrack(ft, pending_glue, pending_cn);
 		if (pending_glue->top == pending_child)
@@ -2166,19 +2367,21 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	}
 	ft_meta_nr_child_set(new_cn_meta, 1);
 	/*
-	 * Build the merged node with its POST-removal count (top + @count_delta,
-	 * i.e. top - 1 when this merge retires a key -- R3 fold): the collapsed
-	 * top node's count minus the disappearing key.  @count_delta 0 (a
-	 * count-neutral canonicalize, or a leaf-detach whose -1 the caller still
-	 * pre-decrements) copies it verbatim, as before.  No-op when !rank_stats.
+	 * Build the merged node with its POST-removal count: top + @count_delta
+	 * (R3 fold).  When this merge retires a key, that is top - 1: the
+	 * collapsed top node's count minus the disappearing key.  A
+	 * @count_delta of 0 copies the count verbatim, as before.  That is a
+	 * count-neutral canonicalize, or a leaf-detach whose -1 the caller
+	 * still pre-decrements.  No-op when !rank_stats.
 	 *
-	 * ONE OWNER EACH under the @pending_child fold: this store owns ONLY the
-	 * DETACH's side (the boundary's committed count + @count_delta, i.e.
-	 * minus the moved-out subtree), and the GLUE's count arm owns the
-	 * ATTACH's side -- it adds g->count_delta to @pending_pub_node (this
-	 * merged node) at commit-record time and walks the shared stable parent
-	 * (ft_glue_txn_commit_edges' folded-publish arm).  Baking the attach's
-	 * delta here too would double-count it.
+	 * ONE OWNER EACH under the @pending_child fold:
+	 *  - this store owns ONLY the DETACH's side: the boundary's committed
+	 *    count + @count_delta, i.e. minus the moved-out subtree;
+	 *  - the GLUE's count arm owns the ATTACH's side.  At commit-record
+	 *    time it adds g->count_delta to @pending_pub_node (this merged
+	 *    node), and walks the shared stable parent
+	 *    (ft_glue_txn_commit_edges' folded-publish arm).
+	 * Baking the attach's delta here too would double-count it.
 	 */
 	ft_nr_keys_store(ft,new_cn_meta,
 		ft_nr_keys_get(parent_cn_meta
@@ -2189,29 +2392,35 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	if (parent_cn) {
 		/*
 		 * Replace parent_cn at its own slot in the grandparent.
-		 * Inherit grandparent context from parent_cn as ONE consistent
-		 * (parent, slot) snapshot (Phase 4.3 atomic re-home): a peer
-		 * re-homing parent_cn commits its parent and state-word offset
-		 * atomically, so two raw reads could tear across that commit.
+		 * Inherit the grandparent context from parent_cn as ONE
+		 * consistent (parent, slot) snapshot (Phase 4.3 atomic
+		 * re-home).  A peer that re-homes parent_cn commits its parent
+		 * and its state-word offset atomically.  Two raw reads could
+		 * tear across that commit.
 		 */
 		/*
-		 * ☠ READ-YOUR-OWN-WRITES, and this is the whole defect when the
-		 * collapse is FOLDED into a caller's commit.  A same-trie rekey
-		 * grafts first: its ADD-recompaction rebuilds the node that holds
-		 * @parent_cn and RECORDS @parent_cn's re-home into the very txn
-		 * this collapse now publishes through.  A recorded edge is not
-		 * parked yet -- it lives only in the descriptor -- so a raw
-		 * derivation answers with the PRE-OP slot, which sits inside the
-		 * copy THIS COMMIT RETIRES.  ft_txn_parent_slot_at exists for
-		 * exactly this and its header says so.
+		 * ☠ READ-YOUR-OWN-WRITES.  This is the whole defect when the
+		 * collapse is FOLDED into a caller's commit.
 		 *
-		 * MEASURED, single-threaded, default build: the two answers
-		 * disagree ({old z, slot in old z} vs {fresh z, slot in fresh z})
-		 * and the collapse's publish landed in the retired copy -- the
-		 * live trie kept BOTH the merged node's new home and the
-		 * uncollapsed chain, one node under two parents, three tombstoned
-		 * nodes still reachable and the merged node leaked.  The op
-		 * returned OK on it.
+		 * A same-trie rekey grafts first.  Its ADD-recompaction
+		 * rebuilds the node that holds @parent_cn.  It RECORDS
+		 * @parent_cn's re-home into the very txn this collapse now
+		 * publishes through.  A recorded edge is not parked yet: it
+		 * lives only in the descriptor.  So a raw derivation answers
+		 * with the PRE-OP slot.
+		 * That slot sits inside the copy THIS COMMIT RETIRES.
+		 * ft_txn_parent_slot_at exists for exactly this, and its header
+		 * says so.
+		 *
+		 * MEASURED, single-threaded, default build.  The two answers
+		 * disagree: {old z, slot in old z} vs
+		 * {fresh z, slot in fresh z}.  The collapse's publish landed
+		 * in the retired copy.  The live trie kept BOTH the merged
+		 * node's new home and the uncollapsed chain:
+		 *   - one node under two parents;
+		 *   - three tombstoned nodes still reachable;
+		 *   - the merged node leaked.
+		 * The op returned OK on it.
 		 */
 		publish_slot = ft_txn_parent_slot_at(parent_cn_meta, ft,
 			txn ? txn->mtxn : NULL, &publish_parent);
@@ -2224,82 +2433,94 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			 * ☠ THE HOME THIS COMMIT WILL LEAVE IS A NODE NOBODY
 			 * HAS PUBLISHED YET, AND THIS COLLAPSE CANNOT PUBLISH
 			 * INTO IT.  The two answers disagree only when the
-			 * CALLER re-homed @parent_cn in this very txn -- a
-			 * same-trie rekey whose graft recompacted the node that
-			 * holds it -- so @publish_parent is the caller's FRESH,
-			 * BUILD-INVISIBLE copy.  Its slot is not a word this op
-			 * holds, and the forward edge's owner assert says so
-			 * (measured: __ft_flip_txn_record_tag_ctx's
-			 * ft_flip_txn_owns arm fires on the first attempt).  A
-			 * private home wants the PLAIN store the SKIP_X dual
-			 * arm makes for exactly this case
-			 * (ft_dual_home_is_private) -- with the §4.B guard and
-			 * the publish-parent dating dropped with it, since
-			 * neither has anything to say about a node no reader
-			 * can reach.  That publish is NOT WRITTEN YET.
+			 * CALLER re-homed @parent_cn in this very txn.  That
+			 * is a same-trie rekey whose graft recompacted the
+			 * node that holds it.  So @publish_parent is the
+			 * caller's FRESH, BUILD-INVISIBLE copy.  Its slot is
+			 * not a word this op holds.  The forward edge's owner
+			 * assert says so (measured:
+			 * __ft_flip_txn_record_tag_ctx's ft_flip_txn_owns arm
+			 * fires on the first attempt).
 			 *
-			 * Until it is, REFUSE THE MOVE TERMINALLY, with the
-			 * rekey's carve-out code and for its stated meaning
-			 * ("this writer cannot express this shape") -- never
-			 * -EAGAIN, which would spin on a deterministic shape.
+			 * A private home wants the PLAIN store that the SKIP_X
+			 * dual arm makes for exactly this case
+			 * (ft_dual_home_is_private).  The §4.B guard and the
+			 * publish-parent dating are dropped with it.  Neither
+			 * has anything to say about a node no reader can
+			 * reach.  That publish is NOT WRITTEN YET.
+			 *
+			 * Until it is, REFUSE THE MOVE TERMINALLY.  Use the
+			 * rekey's carve-out code, for its stated meaning:
+			 * "this writer cannot express this shape".  Never
+			 * return -EAGAIN, which would spin on a deterministic
+			 * shape.
 			 *
 			 * ☠ THIS IS NOT THE "BEFORE ANY SIDE-EFFECT" REFUSAL
-			 * THE TWO -EDOM ARMS IN ft_detach_node MAKE, and the
-			 * difference is worth stating rather than inheriting
-			 * their wording.  By here this collapse has ALREADY
-			 * acquired its lock set and recorded the releases into
-			 * the caller's SHARED txn -- MEASURED at this return:
-			 * 5 registered locks (every state word reading
-			 * LOCK-set) and 8 records in the descriptor.  What
-			 * makes the refusal clean is not that nothing happened
-			 * but that nothing is READER-VISIBLE and nothing is
-			 * ORPHANED: @new_cn is freed unpublished here, the
-			 * caller's ft_rekey_graft_simple_attempt detach_bail
-			 * runs ft_flip_txn_destroy on the shared txn, and that
-			 * drains the registry (ft_flip_txn_lock_release_all,
-			 * nr_locks=5) leaving every one of those words live and
-			 * unlocked -- the contract stated at
+			 * THE TWO -EDOM ARMS IN ft_detach_node MAKE.  The
+			 * difference is worth stating, rather than inheriting
+			 * their wording.  By here, this collapse has ALREADY
+			 * acquired its lock set.  It has recorded the releases
+			 * into the caller's SHARED txn.  MEASURED at this
+			 * return: 5 registered locks (every state word reading
+			 * LOCK-set) and 8 records in the descriptor.
+			 *
+			 * The refusal is clean not because nothing happened.
+			 * It is clean because nothing is READER-VISIBLE and
+			 * nothing is ORPHANED:
+			 *   - @new_cn is freed unpublished here;
+			 *   - the caller's ft_rekey_graft_simple_attempt
+			 *     detach_bail runs ft_flip_txn_destroy on the
+			 *     shared txn;
+			 *   - that drains the registry
+			 *     (ft_flip_txn_lock_release_all, nr_locks=5);
+			 *   - every one of those words is left live and
+			 *     unlocked.
+			 * That is the contract stated at
 			 * ft_flip_txn_record_release_lock.  MEASURED end to
-			 * end: 40,000 refused moves in one process move RSS by
-			 * 0 bytes, the key count is unchanged, and cds_ft_verify
-			 * is clean after each.
+			 * end: 40,000 refused moves in one process.  RSS moves
+			 * by 0 bytes.  The key count is unchanged.
+			 * cds_ft_verify is clean after each.
 			 *
 			 * ☠ WITHOUT THIS THE OP RETURNS OK ON A CORRUPT TRIE.
 			 * The raw derivation aims the publish at the copy the
-			 * same commit RETIRES, so the collapse lands in a dead
-			 * node: the live trie keeps the uncollapsed chain AND
-			 * the merged node's new home -- one node under two
-			 * parents, three tombstoned nodes still reachable, the
-			 * merged node leaked, and the next insert under that
-			 * prefix never returns.  MEASURED on 58 of 4328
-			 * enumerated shapes of this family.
+			 * same commit RETIRES.  So the collapse lands in a
+			 * dead node.  The live trie keeps both the
+			 * uncollapsed chain AND the merged node's new home:
+			 *   - one node sits under two parents;
+			 *   - three tombstoned nodes are still reachable;
+			 *   - the merged node is leaked;
+			 *   - the next insert under that prefix never returns.
+			 * MEASURED on 58 of 4328 enumerated shapes of this
+			 * family.
 			 */
 			/*
 			 * ☑ SERVED: PUBLISH INTO THE PRIVATE HOME WITH A PLAIN
 			 * STORE.  The two answers disagree exactly when the
-			 * CALLER re-homed @parent_cn in this very txn, so
-			 * @publish_parent is its FRESH, BUILD-INVISIBLE copy --
-			 * a node NO READER CAN REACH until the caller's one
-			 * commit publishes it.  The txn publishes REACHABILITY,
-			 * NOT INTERIORS: a word inside a private body is an
-			 * interior write, so it wants the bare store, and with
-			 * it the §4.B guard and the publish-parent DATING both
-			 * fall away -- neither has anything to say about a node
-			 * no reader can reach, and the dating would refuse
-			 * outright because the descent never saw it.
+			 * CALLER re-homed @parent_cn in this very txn.  Then
+			 * @publish_parent is its FRESH, BUILD-INVISIBLE copy.
+			 * NO READER CAN REACH that node until the caller's one
+			 * commit publishes it.
+			 *
+			 * The txn publishes REACHABILITY, NOT INTERIORS.  A
+			 * word inside a private body is an interior write, so
+			 * it wants the bare store.  The §4.B guard and the
+			 * publish-parent DATING both fall away with it.
+			 * Neither has anything to say about a node no reader
+			 * can reach.  The dating would also refuse outright,
+			 * because the descent never saw that node.
 			 *
 			 * ☞ THIS IS THE ANSWER THE SKIP_X DUAL ALREADY GIVES
-			 * ONE ARM OVER, and passing @rec = NULL is how it is
-			 * said: _ft_publish_to_parent_meta's forward edge and
-			 * its dual BOTH fall to their `else` store, which is
+			 * ONE ARM OVER.  Passing @rec = NULL is how it is
+			 * said.  _ft_publish_to_parent_meta's forward edge and
+			 * its dual BOTH fall to their `else` store.  That is
 			 * the same dispatch ft_dual_home_is_private makes for
 			 * the dual alone.  The refusal here was the last piece
 			 * of that argument left unwritten.
 			 *
 			 * On ABORT the caller frees the fresh copy and the
-			 * store dies with it; a RECORDED edge could not say
-			 * that -- it would aim a CAS at a word the op does not
-			 * hold, which is the owner assert this refusal was
+			 * store dies with it.  A RECORDED edge could not say
+			 * that.  It would aim a CAS at a word the op does not
+			 * hold.  That is the owner assert this refusal was
 			 * standing in front of.
 			 */
 			if (caa_unlikely(publish_parent != raw_parent)) {
@@ -2307,27 +2528,30 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			}
 			/*
 			 * ☠ THE SAME DISAGREEMENT AS THE PROMOTE ARM'S, ONE ARM
-			 * OVER.  When the caller's graft SPLIT @parent_cn, this
-			 * collapse absorbs a node that commit RETIRES and
-			 * republishes it at @parent_cn's home -- the word the
-			 * glue's forward publish repoints -- while the split has
-			 * already re-homed @parent_cn's child under its fresh
-			 * cluster.  Two steps, one word, incompatible plans.
+			 * OVER.  The case is a caller's graft that SPLIT
+			 * @parent_cn.  This collapse then absorbs a node that
+			 * commit RETIRES.  It republishes it at @parent_cn's
+			 * home, which is the word the glue's forward publish
+			 * repoints.  Meanwhile the split has already re-homed
+			 * @parent_cn's child under its fresh cluster.  Two
+			 * steps, one word, incompatible plans.
 			 *
 			 * ☠ AND --enable-rcu-debug CANNOT SEE IT HERE.  MEASURED
 			 * on a release probe build: this shape poisons the
-			 * descriptor THREE times per attempt and every one is
-			 * SW-against-SW -- the kind assert never fires, @cn's
-			 * state word is retired twice, and a {live -> live}
-			 * validate chains after a tombstone.  The livelock is the
-			 * only detector, which is why the refusal is what makes
-			 * the shape reportable at all.
+			 * descriptor THREE times per attempt.  Every one is
+			 * SW-against-SW:
+			 *   - the kind assert never fires;
+			 *   - @cn's state word is retired twice;
+			 *   - a {live -> live} validate chains after a
+			 *     tombstone.
+			 * The livelock is the only detector.  That is why the
+			 * refusal is what makes the shape reportable at all.
 			 *
 			 * Serving it needs the merged node re-based BELOW the
-			 * split point -- a different product from the one this
-			 * function builds -- so refuse terminally with the
-			 * rekey's carve-out code, exactly as the arm above does,
-			 * and for the same stated meaning.
+			 * split point.  That is a different product from the
+			 * one this function builds.  So refuse terminally with
+			 * the rekey's carve-out code, exactly as the arm above
+			 * does, and for the same stated meaning.
 			 */
 			if (caa_unlikely(ft_glue_that_split(ctx, parent_cn) !=
 					NULL)) {
@@ -2340,29 +2564,33 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		/*
 		 * Replace the boundary at its own slot in iter_parent.  Resolve
 		 * that slot COHERENTLY from iter_meta (Phase 4.3 atomic re-home),
-		 * exactly as the parent_cn arm resolves parent_cn_meta -- never
+		 * exactly as the parent_cn arm resolves parent_cn_meta.  Never
 		 * reuse a slot the caller precomputed with ft_get_parent_slot
-		 * before this op's fence.  A peer that recompacts the boundary's
-		 * parent (growing it to a larger node type) or re-homes it between
-		 * that snapshot and here leaves the precomputed slot pointing into
-		 * the OLD, now-replaced parent body, while iter_meta->parent
-		 * already names the NEW parent: pairing the stale slot with the
-		 * fresh parent indexes the new parent's bitmap with an
-		 * out-of-bounds rank (ft_slot_to_byte OOB).  Require the resolved
-		 * parent to still be the latch-checked iter_parent the plan above
-		 * was validated against; a re-home that changed it lands us on an
-		 * unvalidated parent -- reclaim the unpublished merged node and
-		 * retry.
+		 * before this op's fence.
+		 *
+		 * Between that snapshot and here, a peer can recompact the
+		 * boundary's parent (growing it to a larger node type) or
+		 * re-home it.  The precomputed slot then points into the OLD,
+		 * now-replaced parent body, while iter_meta->parent already
+		 * names the NEW parent.  Pairing the stale slot with the fresh
+		 * parent indexes the new parent's bitmap with an out-of-bounds
+		 * rank (ft_slot_to_byte OOB).
+		 *
+		 * Require the resolved parent to still be the latch-checked
+		 * iter_parent the plan above was validated against.  A re-home
+		 * that changed it lands us on an unvalidated parent: reclaim
+		 * the unpublished merged node and retry.
 		 */
 		/*
-		 * ☐ UNAUDITED, and named here rather than left silent: this arm
-		 * still derives its slot RAW, and its latch check compares
-		 * PARENTS, so a same-txn re-home to the same parent at a changed
-		 * OFFSET would pass it.  No shape reaching it through a folded
-		 * rekey has been constructed -- a skeptic built six candidates
-		 * (no run above the junction, a root-level junction) and every
-		 * one came back clean or refused-intact -- but "not reproduced"
-		 * is not "unreachable".  Same class as the parent_cn arm above.
+		 * ☐ UNAUDITED, and named here rather than left silent.  This
+		 * arm still derives its slot RAW, and its latch check compares
+		 * PARENTS.  So a same-txn re-home to the same parent at a
+		 * changed OFFSET would pass it.  No shape reaching it through
+		 * a folded rekey has been constructed.  A skeptic built six
+		 * candidates (no run above the junction, a root-level
+		 * junction).  Every one came back clean or refused-intact.
+		 * But "not reproduced" is not "unreachable".  Same class as
+		 * the parent_cn arm above.
 		 */
 		publish_slot = ft_resolve_parent_slot(iter_meta, ft,
 			&publish_parent);
@@ -2378,14 +2606,15 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			ft_parent_node(new_cn_meta->parent_word), publish_slot);
 
 	/*
-	 * The publish target is a lock-set member (the value-swap RELEASE half),
-	 * and it was resolved through a back-pointer, so the descent's window is
-	 * what dates it.  Checked here rather than at the acquire below: nothing
-	 * is reader-visible yet, so a target this descent cannot date is a clean
-	 * re-plan.  It is the parent of whichever node this publish REPLACES --
-	 * the compressed parent, else the boundary -- so the one-hop derivation
-	 * dates it where the window cannot.  Under the DLM arm the same node was
-	 * already anchored as @pp.
+	 * The publish target is a lock-set member (the value-swap RELEASE
+	 * half).  It was resolved through a back-pointer, so the descent's
+	 * window is what dates it.  The check is here rather than at the
+	 * acquire below: nothing is reader-visible yet, so a target this
+	 * descent cannot date is a clean re-plan.  The target is the parent
+	 * of whichever node this publish REPLACES: the compressed parent,
+	 * else the boundary.  So the one-hop derivation dates it where the
+	 * window cannot.  Under the DLM arm the same node was already
+	 * anchored as @pp.
 	 */
 	if (!pub_home_private &&
 			!ft_lock_ctx_depth_of_parent(ft, ctx, publish_parent,
@@ -2396,36 +2625,41 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		return -EAGAIN;
 	}
 	/*
-	 * ★ VALIDATE THE FREEZE'S PLAN UNDER THE LOCK -- the fused detach's
-	 * check (ft_detach_node), owed here since the chain parked SW.
+	 * ★ VALIDATE THE FREEZE'S PLAN UNDER THE LOCK.  This is the fused
+	 * detach's check (ft_detach_node), owed here since the chain parked SW.
 	 *
 	 * @freeze_len reached this collapse as cds_ft_remove's literal "1 =
 	 * this key's SOLE entry", derived from an UNHELD read of @succ_node.
 	 * A same-key insert can append a duplicate between that read and the
-	 * acquire above -- a remover preempted there is all it takes -- and
-	 * the freeze below would then record {NULL -> MARK(NULL)} over the
-	 * live @freeze_leaf->next.  Under MW the install CAS absorbed that
-	 * stale plan; under SW the record parks and stores BLIND, so the
-	 * appended node is dropped with the key, UNMARKED: a lost insert.
-	 * MEASURED under preemption (2 cpus, 2 competing spinners): 9 stale
-	 * plans here of ~5.9M, one per lost node, per-node and root-only;
-	 * 0 with -DNO_FEATURE_FT_CHAIN_SW.  The comment that stood at the
-	 * freeze, "MEASURED 0 of 279,029", was a fact about unpreempted load.
+	 * acquire above.  A remover preempted there is all it takes.  The
+	 * freeze below would then record {NULL -> MARK(NULL)} over the live
+	 * @freeze_leaf->next.  Under MW the install CAS absorbed that stale
+	 * plan.  Under SW the record parks and stores BLIND.  So the appended
+	 * node is dropped with the key, UNMARKED: a lost insert.
+	 *
+	 * MEASURED under preemption (2 cpus, 2 competing spinners), per-node
+	 * and root-only: 9 stale plans here of ~5.9M.  That is one per lost
+	 * node.  0 with -DNO_FEATURE_FT_CHAIN_SW.  The comment that stood at
+	 * the freeze said "MEASURED 0 of 279,029".  That was a fact about
+	 * unpreempted load.
 	 *
 	 * @freeze_leaf's chain holder is HELD here, so the word can be asked:
-	 * on the prefix arms (cds_ft_remove, cds_ft_remove_all) the leaf heads
-	 * the boundary's external chain and the holder is the boundary itself
-	 * (@iter_held, acquired above); on ft_detach_node's shape-D call the
-	 * holder is an orphan below the boundary or the trailing skip target,
-	 * which ft_detach_node locked in its orphan walk and holds until its
-	 * `end:` sweep.  Refused BEFORE any record or store: only the
-	 * unpublished @new_cn exists, and this is the same unwind as the bail
-	 * just above.  Retriable, and it terminates: the caller re-derives,
-	 * sees the successor, and takes the promote / unchain lane.
+	 *   - On the prefix arms (cds_ft_remove, cds_ft_remove_all) the leaf
+	 *     heads the boundary's external chain.  The holder is the boundary
+	 *     itself (@iter_held, acquired above).
+	 *   - On ft_detach_node's shape-D call the holder is an orphan below
+	 *     the boundary or the trailing skip target.  ft_detach_node locked
+	 *     it in its orphan walk and holds it until its `end:` sweep.
 	 *
-	 * @record_only is excluded for the txn's ownership (a caller-owned txn
-	 * must not be destroyed here), not for exclusion: no record_only caller
-	 * passes a @freeze_leaf today (the rekey fold passes NULL).
+	 * The refusal comes BEFORE any record or store.  Only the unpublished
+	 * @new_cn exists, and this is the same unwind as the bail just above.
+	 * It is retriable, and it terminates.  The caller re-derives and sees
+	 * the successor.  It then takes the promote / unchain lane.
+	 *
+	 * @record_only is excluded for the txn's ownership: a caller-owned txn
+	 * must not be destroyed here.  It is not excluded for exclusion: no
+	 * record_only caller passes a @freeze_leaf today (the rekey fold passes
+	 * NULL).
 	 */
 	if (freeze_leaf && !record_only &&
 #ifdef FT_RED_NO_CCF_PLAN_CHECK
@@ -2446,23 +2680,26 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		struct ft_pub_rec rec = { .ctx = ctx, .n = 0 };
 		struct cds_ft_inode_flag *new_cn_pub;
 		/*
-		 * Plan snapshot of publish_slot's old value: it still holds the
-		 * collapsed chain's reference (parent_cn's grandparent flag, or
-		 * @iter_node_flag) resolved just above -- nothing has been stored
-		 * yet.  The commit CAS rejects a peer that raced it (see
-		 * ft_pub_rec_add).
+		 * Plan snapshot of publish_slot's old value.  The slot still
+		 * holds the collapsed chain's reference (parent_cn's
+		 * grandparent flag, or @iter_node_flag) resolved just above:
+		 * nothing has been stored yet.  The commit CAS rejects a peer
+		 * that raced it (see ft_pub_rec_add).
 		 *
-		 * WAITING load, not a raw one: @publish_slot is recorded as an
-		 * edge of THIS txn a few lines down, so it enters the txn's own
-		 * write set and the read-policy rule is to wait out an undecided
-		 * parker.  "The commit CAS rejects a peer that raced it" holds
-		 * for a stale PLAIN value and not for a parked flip proxy: that
-		 * is a descriptor-record POINTER, and handing it to the engine as
-		 * an expected-old trips urcu_txn_add's !urcu_txn_is_proxy check
-		 * (--enable-rcu-debug; a release build POISONS the descriptor and
-		 * the retry loop absorbs it, so the arm is green and wrong).
-		 * Only a coarse spacing exposes it -- under per-node this op
-		 * holds @publish_parent's own word, so no peer can park here.
+		 * This is a WAITING load, not a raw one.  @publish_slot is
+		 * recorded as an edge of THIS txn a few lines down.  So it
+		 * enters the txn's own write set, and the read-policy rule is
+		 * to wait out an undecided parker.
+		 *
+		 * "The commit CAS rejects a peer that raced it" holds for a
+		 * stale PLAIN value and not for a parked flip proxy.  A proxy
+		 * is a descriptor-record POINTER.  Handing it to the engine
+		 * as an expected-old trips urcu_txn_add's !urcu_txn_is_proxy
+		 * check under --enable-rcu-debug.  A release build POISONS
+		 * the descriptor and the retry loop absorbs it, so the arm is
+		 * green and wrong.  Only a coarse spacing exposes it.  Under
+		 * per-node this op holds @publish_parent's own word, so no
+		 * peer can park here.
 		 */
 		struct cds_ft_inode_flag *pub_expected_old =
 			ft_txn_load(txn->mtxn, (void **) publish_slot,
@@ -2470,53 +2707,67 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 
 		/*
 		 * Chain-compress canonicalization publish: the merged compressed
-		 * node replaces the collapsed chain at publish_slot.  Fuse the
-		 * LIVE child re-parent (new_cn->child -> new_cn) with the forward
-		 * slot (+ a compressed grandparent's SKIP_X dual) into ONE flip,
-		 * so a reader never sees new_cn->child re-parented onto new_cn
-		 * while the grandparent slot still points at the collapsed chain
-		 * (or vice versa).  The back-pointer takes the PLAIN compressed
-		 * flag (as the prior bare ft_set_parent did); the forward slot
-		 * takes the published (possibly skip-encoded) flag.  Because the
-		 * back-edge is deferred, the publish takes new_cn_meta explicitly
-		 * (ft_skip_to_compressed would otherwise read the not-yet-stored
-		 * back-edge to resolve a SKIP_X forward flag).  The commit rides
-		 * the pre-reserved @txn (ft_ord_cell_flip_into), so it is
-		 * allocation-free past this point and cannot fail.
+		 * node replaces the collapsed chain at publish_slot.
+		 *
+		 * Fuse two things into ONE flip:
+		 *   - the LIVE child re-parent (new_cn->child -> new_cn);
+		 *   - the forward slot (+ a compressed grandparent's SKIP_X
+		 *     dual).
+		 * A reader then never sees new_cn->child re-parented onto
+		 * new_cn while the grandparent slot still points at the
+		 * collapsed chain (or vice versa).
+		 *
+		 * The back-pointer takes the PLAIN compressed flag (as the
+		 * prior bare ft_set_parent did).  The forward slot takes the
+		 * published (possibly skip-encoded) flag.  The back-edge is
+		 * deferred, so the publish takes new_cn_meta explicitly.
+		 * Otherwise ft_skip_to_compressed would read the
+		 * not-yet-stored back-edge to resolve a SKIP_X forward flag.
+		 *
+		 * The commit rides the pre-reserved @txn
+		 * (ft_ord_cell_flip_into).  So it is allocation-free past
+		 * this point and cannot fail.
 		 */
 		/*
-		 * ☠ THE PENDING TOP IS NOT ALWAYS FRESH.  A duplicate-chain
-		 * SPLICE -- one key on each side of a same-parent rekey_merge,
-		 * {ab, ac} + rekey_merge(dst "ac", src "ab") -- hands
-		 * ft_glue_set_publish the dst's own APP-OWNED HEAD, i.e. the
-		 * COMMITTED OCCUPANT of the slot (ft_merge_build appended the src
-		 * leaf to its dup chain and handed it back).  The fold's
-		 * substitution is then BY IDENTITY, and the node this arm wires is
-		 * LIVE: reader-reachable now, its parent word read by every
-		 * ordered up-walk.  Two things go wrong with the plain store on
-		 * it.  It is a reader-visible mutation BEFORE the commit that no
-		 * abort rolls back; and the glue could not take its fresh-child
-		 * fast path for a live top, so it QUEUED the same edge -- aimed at
-		 * the boundary this collapse retires -- and would re-apply the
-		 * dead parent over this store at the flip.  MEASURED, all four
-		 * rank/list modes: `cn->len 16` decoded off the freed boundary
-		 * through the head's back-pointer, and `head prev != owner`.
+		 * ☠ THE PENDING TOP IS NOT ALWAYS FRESH.  Take a
+		 * duplicate-chain SPLICE.  It has one key on each side of a
+		 * same-parent rekey_merge: {ab, ac} + rekey_merge(dst "ac",
+		 * src "ab").  It hands ft_glue_set_publish the dst's own
+		 * APP-OWNED HEAD.  That head is the COMMITTED OCCUPANT of the
+		 * slot: ft_merge_build appended the src leaf to its dup chain
+		 * and handed it back.  The fold's substitution is then BY
+		 * IDENTITY, and the node this arm wires is LIVE.  It is
+		 * reader-reachable now, and every ordered up-walk reads its
+		 * parent word.
+		 *
+		 * Two things go wrong with the plain store on it:
+		 *   - It is a reader-visible mutation BEFORE the commit, and
+		 *     no abort rolls it back.
+		 *   - The glue could not take its fresh-child fast path for
+		 *     a live top.  So it QUEUED the same edge, aimed at the
+		 *     boundary this collapse retires.  It would re-apply the
+		 *     dead parent over this store at the flip.
+		 * MEASURED in all four rank/list modes:
+		 *   - `cn->len 16`, decoded off the freed boundary through
+		 *     the head's back-pointer;
+		 *   - `head prev != owner`.
 		 *
 		 * A live pending top takes the RECORD arm below like every other
-		 * live child, and ft_glue_apply_deferred drops the glue's queued
+		 * live child.  ft_glue_apply_deferred drops the glue's queued
 		 * entry for it on the strength of @pending_pub_folded.  The
 		 * identity test is exact: a committed occupant is reader-reachable
 		 * and a fresh top is not, so nothing fresh can compare equal.
 		 *
 		 * ☞ ONE PRE-COMMIT STORE REMAINS, AND IT IS A NO-OP HERE.  The
 		 * record arm's external branch stamps the head's incoming byte
-		 * (ft_head_stamp_incoming_byte) before it records, and for a bare
-		 * head that store is reader-visible ahead of the publish and not
-		 * undone by an abort -- its header says so.  On this shape the
-		 * head does not move: it hangs off the same byte of the fresh run
-		 * as it did off the boundary, so the stamped value is the value
-		 * already there.  That stops being true the day this arm serves
-		 * a head that changes slot; it does not today.
+		 * (ft_head_stamp_incoming_byte) before it records.  For a
+		 * bare head that store is reader-visible ahead of the
+		 * publish, and an abort does not undo it.  Its header says
+		 * so.  On this shape the head does not move.  It hangs off
+		 * the same byte of the fresh run as it did off the boundary,
+		 * so the stamped value is the value already there.  That
+		 * stops being true the day this arm serves a head that
+		 * changes slot.  It does not today.
 		 */
 		bool pending_top_live =
 			(pending_child && pending_child == surviving_child) ||
@@ -2528,43 +2779,46 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			/*
 			 * ABSORBED RUN, LIVE CHILD: ONE OWNER, THE GLUE.  The run
 			 * this fold freed is still the PARENT of its child's
-			 * queued glue entry, and ft_glue_txn_commit_edges records
-			 * that entry into this same txn after the fold -- so left
-			 * alone it overwrote this arm's plain store and aimed a
-			 * live head's parent word at freed memory: cds_ft_verify
-			 * "skip-encoded slot slen 2 != cn->len 1" (the length read
-			 * off the freed run) and both copies of the key lost to
-			 * lookup, on the default build, single-threaded -- {cacb,
-			 * baca, ccb} + rekey_merge(dst "cc", src "cac").  The
-			 * plain store was wrong on its own too: the head is
-			 * reader-reachable until the commit, which no abort would
-			 * have rolled back.  Re-aimed at @new_cn, the entry
-			 * records the edge atomically with this publish, like
-			 * every other live dst-origin child.  (Live with no
-			 * queued entry takes the RECORD arm below.)
+			 * queued glue entry.  ft_glue_txn_commit_edges records
+			 * that entry into this same txn after the fold.  Left
+			 * alone, it overwrote this arm's plain store and
+			 * aimed a live head's parent word at freed memory.
+			 * Seen on the default build, single-threaded, with
+			 * {cacb, baca, ccb} + rekey_merge(dst "cc", src "cac"):
+			 *   - cds_ft_verify "skip-encoded slot slen 2 !=
+			 *     cn->len 1" (the length read off the freed run);
+			 *   - both copies of the key lost to lookup.
+			 * The plain store was wrong on its own too.  The head
+			 * is reader-reachable until the commit, and no abort
+			 * would have rolled the store back.  Re-aimed at
+			 * @new_cn, the entry records the edge atomically with
+			 * this publish, like every other live dst-origin
+			 * child.  (Live with no queued entry takes the RECORD
+			 * arm below.)
 			 */
 		} else if ((pending_child || deep_fold) && !pending_top_live &&
 				!absorbed_child_live) {
 			/*
 			 * FOLD substitution: the child is the FRESH, UNPUBLISHED
-			 * cluster top -- build-invisible until the caller's one
-			 * commit -- so its back edge is a PLAIN STORE, exactly
-			 * the store ft_glue_defer_edge's fresh-child fast path
-			 * made when it aimed it at the boundary this collapse
-			 * replaces (that fast path stores and does NOT queue, so
-			 * nothing re-applies the old parent over this).  A
-			 * RECORDED re-parent here would plant an MW parent+PSO
-			 * pair on a node the glue's free-list retire also
-			 * settles -- the measured record_chain collision that
+			 * cluster top.  It is build-invisible until the
+			 * caller's one commit, so its back edge is a PLAIN
+			 * STORE.  That is exactly the store
+			 * ft_glue_defer_edge's fresh-child fast path made when
+			 * it aimed it at the boundary this collapse replaces.
+			 * That fast path stores and does NOT queue, so nothing
+			 * re-applies the old parent over this.  A RECORDED
+			 * re-parent here would plant an MW parent+PSO pair on
+			 * a node the glue's free-list retire also settles.
+			 * That is the measured record_chain collision that
 			 * poisons (release) or asserts (rcu-debug).
 			 */
 			ft_set_parent(ft, new_cn->child, new_cn_flag,
 				&new_cn->child);
 		} else {
 			/*
-			 * @ctx is the op's held set, and handing it over is what
-			 * keeps this site from recording a §4.B MW validate on a
-			 * word the op already holds SW -- see the call in
+			 * @ctx is the op's held set.  Handing it over keeps
+			 * this site from recording a §4.B MW validate on a
+			 * word the op already holds SW.  See the call in
 			 * ft_record_child_back_edge for the three records that
 			 * collide without it.
 			 */
@@ -2572,11 +2826,12 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 				new_cn_flag, &new_cn->child, ctx);
 			/*
 			 * ...so @new_cn, the fresh parent that edge now names, is
-			 * published LOCKED (ft_flip_txn_lock_born_spine): the
+			 * published LOCKED (ft_flip_txn_lock_born_spine).  The
 			 * edge settles after the decide.  It starts where the
-			 * node it replaces started.  Not on the FOLD
-			 * (@record_only): that is the rekey's bulk writer, whose
-			 * FT-wide lock keeps every point writer out of the commit.
+			 * node it replaces started.  This is not done on the
+			 * FOLD (@record_only).  That is the rekey's bulk
+			 * writer, whose FT-wide lock keeps every point writer
+			 * out of the commit.
 			 */
 			if (!record_only && ft->lock_fine && !ft->exclusive) {
 				struct ft_born_spine_node sp = {
@@ -2591,9 +2846,10 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		}
 		new_cn_pub = ft_publish_compressed(ft, new_cn, new_cn_flag);
 		/* VALIDATE (§4.B): lock (or guard-fallback) the LIVE
-		 * (great-)grandparent publish_parent -- value-swap target (§10.5).
-		 * DLM: under lock_fine the whole lock-set (incl. publish_parent's
-		 * RELEASE) was acquired up front, so skip the incremental lock here. */
+		 * (great-)grandparent publish_parent.  It is the value-swap
+		 * target (§10.5).  DLM: under lock_fine the whole lock-set
+		 * (incl. publish_parent's RELEASE) was acquired up front.  So
+		 * skip the incremental lock here. */
 		if (!ft->lock_fine && !pub_home_private)
 			ft_flip_txn_lock_or_guard_parent(ft, txn, ctx,
 				publish_parent, pub_depth);
@@ -2602,19 +2858,23 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			pub_home_private ? NULL : &rec,
 			/*slot_owner_nf=*/ publish_parent, false);
 		/*
-		 * Freeze-on-free (doc §4.B, atomic detach): the collapsed chain
-		 * this commit retires -- the 1-child boundary @iter_node_flag and
-		 * the old parent/child compressed nodes new_cn merges (<=3) --
-		 * gets its one-way LIVE->DEAD tombstone RECORDED INTO @txn (the +3
-		 * reserved above), so the freeze flips ATOMICALLY with the commit
-		 * that unlinks it: an aborted commit leaves every node live.  A
-		 * no-op under one writer.  All three are FENCED (marked LOCK
-		 * above), so each expected old is its mark's clean snapshot: the
-		 * commit ratifies exactly the chain state this merge was built
-		 * from.  The fence is consumed by the fused
-		 * {LOCK|s -> TOMBSTONE|s} where the member carries its own lock,
-		 * and by the release recorded at registration where coarsening
-		 * left the lock on a surviving ancestor.
+		 * Freeze-on-free (doc §4.B, atomic detach).  This commit
+		 * retires the collapsed chain: the 1-child boundary
+		 * @iter_node_flag and the old parent/child compressed nodes
+		 * new_cn merges (<=3).  Each gets its one-way LIVE->DEAD
+		 * tombstone RECORDED INTO @txn (the +3 reserved above).  So
+		 * the freeze flips ATOMICALLY with the commit that unlinks
+		 * the chain: an aborted commit leaves every node live.  A
+		 * no-op under one writer.
+		 *
+		 * All three are FENCED (marked LOCK above), so each expected
+		 * old is its mark's clean snapshot.  The commit ratifies
+		 * exactly the chain state this merge was built from.  The
+		 * fence is consumed in one of two ways:
+		 *   - by the fused {LOCK|s -> TOMBSTONE|s}, where the member
+		 *     carries its own lock;
+		 *   - by the release recorded at registration, where coarsening
+		 *     left the lock on a surviving ancestor.
 		 */
 		ft_flip_txn_record_retire_anchored(txn, ctx, &iter_held,
 			iter_meta);
@@ -2635,41 +2895,41 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			record_only);
 		/*
 		 * PHASE B, STEP B3 -- THE ARM.  ft_detach_freeze_orphans above
-		 * holds this op's LAST ft_flip_txn_lock_register (an orphan
-		 * chain anchor, where the anchor is not the retired node
-		 * itself), and under lock_fine everything else was taken in the
-		 * ONE all-or-none acquire far above -- the incremental
-		 * lock_or_guard beside the publish is the !lock_fine arm, which
-		 * this helper refuses anyway.  So this is where
-		 * ft_flip_txn_arm_per_op's "after the op's last register"
-		 * contract puts it, and ft_remove_commit_rec below plants the
-		 * first record after it.
+		 * holds this op's LAST ft_flip_txn_lock_register.  That
+		 * register is an orphan chain anchor, where the anchor is not
+		 * the retired node itself.  Under lock_fine everything else
+		 * was taken in the ONE all-or-none acquire far above.  The
+		 * incremental lock_or_guard beside the publish is the
+		 * !lock_fine arm, which this helper refuses anyway.  So this
+		 * is where ft_flip_txn_arm_per_op's "after the op's last
+		 * register" contract puts it.  ft_remove_commit_rec below
+		 * plants the first record after it.
 		 *
 		 * ☞ READINESS: the dry run (-DFT_COLLAPSE_CLAIM) claims at txn
-		 * CREATION -- strictly earlier -- and is clean on ft_unit and
-		 * ft_inv FT_INV_MW=1 both, so every record on this txn already
-		 * passes the owner check.
+		 * CREATION, which is strictly earlier.  It is clean on both
+		 * ft_unit and ft_inv FT_INV_MW=1.  So every record on this txn
+		 * already passes the owner check.
 		 *
-		 * ☞ WHAT IT CONVERTS is the collapse's forward publish, whose
-		 * owner is @publish_parent -- a RELEASE member of the same
+		 * ☞ WHAT IT CONVERTS is the collapse's forward publish.  Its
+		 * owner is @publish_parent, a RELEASE member of the same
 		 * all-or-none lock-set.  The retires, the orphan freezes and
-		 * the child back-edge are planted ABOVE it and stay MW, which
-		 * is stricter and always sound; converting those would mean
-		 * arming before this op's own bookkeeping registers, which the
-		 * contract does not allow from here.
+		 * the child back-edge are planted ABOVE it and stay MW.  MW is
+		 * stricter and always sound.  Converting those would mean
+		 * arming before this op's own bookkeeping registers.  The
+		 * contract does not allow that from here.
 		 *
-		 * ☠ NOT on the FOLD path (@record_only): @txn is the CALLER's
-		 * and the completeness of its registry is the caller's
-		 * judgement, not this frame's.
+		 * ☠ NOT on the FOLD path (@record_only): @txn is the CALLER's.
+		 * The completeness of its registry is the caller's judgement,
+		 * not this frame's.
 		 */
 		if (!record_only)
 			ft_flip_txn_arm_per_op(ft, txn);
 		/*
-		 * The removed external leaf (a single-entry chain, so
-		 * freeze_leaf->next == NULL) freezes atomically with this same
-		 * commit that retires its holder chain (doc §4.B): one MARK(NULL)
-		 * edge, the +1 reserved above.  NULL when the caller is not
-		 * retiring a leaf through this merge.
+		 * The removed external leaf is a single-entry chain, so
+		 * freeze_leaf->next == NULL.  It freezes atomically with this
+		 * same commit that retires its holder chain (doc §4.B): one
+		 * MARK(NULL) edge, the +1 reserved above.  @freeze_leaf is NULL
+		 * when the caller is not retiring a leaf through this merge.
 		 */
 		if (freeze_leaf) {
 			ft_ch_audit_ctx(ft, txn, ctx, freeze_leaf);
@@ -2684,12 +2944,12 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 #ifdef FT_DEBUG_FREEZE_STALE_ABORT
 			/*
 			 * PROBE: the plan was checked under the lock above and
-			 * is stale NOW -- so a peer changed the chain while this
+			 * is stale NOW.  So a peer changed the chain while this
 			 * op holds what it believes is the holder.  Name the word
 			 * we hold and the chain word's raw value (a parked proxy
-			 * names the peer's descriptor), end the flight recorder
-			 * here, and die: the peer's lock take and chain store are
-			 * the last events on its cpu.
+			 * names the peer's descriptor).  Then end the flight
+			 * recorder here and die.  The peer's lock take and
+			 * chain store are the last events on its cpu.
 			 */
 			if (!record_only &&
 					!ft_hlist_chain_plan_ok(ft,
@@ -2716,11 +2976,12 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 				freeze_leaf, freeze_len);
 		}
 		/*
-		 * R3 fold: the retired key's -1 walk from the merged node's stable
-		 * parent (publish_parent) up to root rides THIS commit atomically
-		 * with the collapse (the merged node itself was built -1 above).
-		 * Reserved by @count_reserve; skipped (and a no-op) when there is no
-		 * count change.
+		 * R3 fold: the retired key's -1 walk goes from the merged
+		 * node's stable parent (publish_parent) up to root.  It rides
+		 * THIS commit atomically with the collapse (the merged node
+		 * itself was built -1 above).  It is reserved by
+		 * @count_reserve.  It is skipped (and a no-op) when there is
+		 * no count change.
 		 */
 		if (count_delta)
 			ft_flip_txn_record_count_parent(ft, txn, publish_parent,
@@ -2729,8 +2990,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * The predicate's word, re-read at the LAST instant before the
 		 * collapse commits.  A pair (chain_compress_enter.ext,
 		 * chain_compress_exit.ext_now) that DIFFERS is the stale
-		 * predicate caught in the act, in one event pair, without
-		 * having to reconstruct it from edge_records.
+		 * predicate caught in the act.  One event pair shows it,
+		 * without having to reconstruct it from edge_records.
 		 */
 		FT_TP(chain_compress_exit, (const void *) iter_node_flag,
 			(const void *) iter_meta,
@@ -2739,11 +3000,11 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		if (ft_remove_commit_rec(ft, &rec, dead_cell, run, txn,
 				record_only) > 0) {
 			/*
-			 * Peer won: NOTHING installed -- the collapsed chain
+			 * Peer won: NOTHING installed.  The collapsed chain
 			 * (boundary + parent_cn/child_cn) is still live and
-			 * linked (its tombstones, freezes, and count edges were
-			 * discarded with the aborted commit).  Only the
-			 * never-published merged node is ours to reclaim; the
+			 * linked.  Its tombstones, freezes, and count edges
+			 * were discarded with the aborted commit.  Only the
+			 * never-published merged node is ours to reclaim.  The
 			 * caller retries and re-plans against the current tree.
 			 */
 			free_compressed_node_unpublished(ft, new_cn);
@@ -2753,33 +3014,36 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 
 	if (record_only) {
 		/*
-		 * ☠ NOT FREED HERE.  Under the fold nothing has committed yet, so
-		 * this chain is still LIVE and LINKED: these frees would reclaim
-		 * nodes the caller's pending commit has not unlinked, and a reader
-		 * is entitled to be walking them.  Hand them back instead -- the
-		 * free path is the CALLER's choice (@913cf0ca).
+		 * ☠ NOT FREED HERE.  Under the fold nothing has committed
+		 * yet, so this chain is still LIVE and LINKED.  These frees
+		 * would reclaim nodes the caller's pending commit has not
+		 * unlinked, and a reader is entitled to be walking them.
+		 * Hand them back instead: the free path is the CALLER's
+		 * choice (@913cf0ca).
 		 */
 		reclaim->boundary = ft_node_ptr(iter_node_flag);
 		reclaim->parent_cn = parent_cn;
 		reclaim->child_cn = child_cn;
 		/*
-		 * The merged node is RECORDED, not published: the caller's commit
-		 * is what publishes it, so an abort leaves it ours to reclaim.
-		 * (The non-folded path cannot reach here with it unpublished --
-		 * every bail above frees it and returns.)
+		 * The merged node is RECORDED, not published.  The caller's
+		 * commit is what publishes it, so an abort leaves it ours to
+		 * reclaim.  (The non-folded path cannot reach here with it
+		 * unpublished: every bail above frees it and returns.)
 		 */
 		reclaim->new_cn = new_cn;
 		/*
-		 * REPORT THE FOLD, at the tail where nothing can bail any more:
-		 * the caller's pending forward publish is now live in the merged
-		 * node, so the glue commit must SKIP its own publish (it would
-		 * install into the boundary this collapse just recorded retired)
-		 * and must re-base its order-statistics delta onto the merged
-		 * node (@pending_pub_node; the count arm decodes it
-		 * compressed-aware).  Flags live on the caller's txn and die
-		 * with it: every abort path destroys the txn before (or with)
-		 * reclaiming @new_cn, and each retry creates a fresh txn with
-		 * these fields cleared.
+		 * REPORT THE FOLD, at the tail where nothing can bail any
+		 * more.  The caller's pending forward publish is now live in
+		 * the merged node.  So the glue commit must do two things:
+		 *   - SKIP its own publish, which would install into the
+		 *     boundary this collapse just recorded retired;
+		 *   - re-base its order-statistics delta onto the merged
+		 *     node (@pending_pub_node; the count arm decodes it
+		 *     compressed-aware).
+		 * The flags live on the caller's txn and die with it.  Every
+		 * abort path destroys the txn before (or with) reclaiming
+		 * @new_cn.  Each retry creates a fresh txn with these fields
+		 * cleared.
 		 */
 		if (pending_child || deep_fold) {
 			txn->pending_pub_folded = true;
@@ -2799,13 +3063,15 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 }
 
 /*
- * Post-removal chain-compress prune as a standalone second flip: compute the
- * surviving child from the (already-committed) 1-child boundary and fuse no
- * ordered-cell edge.  The fused-merge primitive above is the preferred path
- * (the prune rides the removal's own flip); this thin wrapper remains for the
- * out-of-bound (>FT_SKIP_LEN_MAX) residue case, where the boundary stays a
- * 1-child internal and an allocation failure is silently skipped (the prune
- * is best-effort once the removal has already published).
+ * Run the post-removal chain-compress prune as a standalone second flip.
+ * Compute the surviving child from the (already-committed) 1-child boundary
+ * and fuse no ordered-cell edge.
+ *
+ * The fused-merge primitive above is the preferred path: the prune rides
+ * the removal's own flip.  This thin wrapper remains for the out-of-bound
+ * (>FT_SKIP_LEN_MAX) residue case, where the boundary stays a 1-child
+ * internal.  An allocation failure is silently skipped: the prune is
+ * best-effort once the removal has already published.
  */
 static
 void ft_canonicalize_chain_compress(struct cds_ft *ft,
@@ -2823,10 +3089,11 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 	if (!surviving_child)
 		return;
 	/*
-	 * INTENT: this is a pure canonicalize.  It removes nothing -- the
-	 * caller's gate (ft-remove.h, the post-detach fold) has already asserted
-	 * the boundary carries NO external head, so that is what the callee must
-	 * still find under the mark, and there is no body child to detach.
+	 * INTENT: this is a pure canonicalize.  It removes nothing.  The
+	 * caller's gate (ft-remove.h, the post-detach fold) has already
+	 * asserted the boundary carries NO external head.  So that is what
+	 * the callee must still find under the mark, and there is no body
+	 * child to detach.
 	 */
 	{
 		const struct ft_chain_compress_intent intent = {
@@ -2849,14 +3116,16 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 #endif
 
 /*
- * FOLD (coherent rekey one-decide writer): the record_only detach's src-junction
- * recompaction produces two copies the CALLER must reclaim after its own commit --
- * the OLD copy (retired by the flip, freed on commit OK) and the fresh NEW copy
- * (republished by the flip, freed UNPUBLISHED if the caller's commit ABORTS).
- * ft_detach_node surfaces both here (zeroed = no recompaction happened / not
- * record_only); NULL @recompact_out means the caller does not run a record_only
- * detach.  An ELEVATING detach adds a third group with the OLD copy's lifetime:
- * the orphan chain the upward walk cleared.
+ * FOLD (coherent rekey one-decide writer): the record_only detach's
+ * src-junction recompaction produces two copies.  The CALLER must reclaim
+ * them after its own commit:
+ *   - the OLD copy, retired by the flip and freed on commit OK;
+ *   - the fresh NEW copy, republished by the flip and freed UNPUBLISHED if
+ *     the caller's commit ABORTS.
+ * ft_detach_node surfaces both here.  Zeroed means no recompaction happened,
+ * or not record_only.  A NULL @recompact_out means the caller does not run
+ * a record_only detach.  An ELEVATING detach adds a third group with the
+ * OLD copy's lifetime: the orphan chain the upward walk cleared.
  */
 struct ft_detach_recompact_out {
 	struct cds_ft_inode *old_node;		/* retired copy: free on commit OK */
@@ -2869,14 +3138,16 @@ struct ft_detach_recompact_out {
 	 */
 	struct ft_chain_compress_reclaim collapse;
 	/*
-	 * An ELEVATING detach's orphan chain: the ancestors the upward walk
-	 * cleared plus the chain below the detach target, and the trailing
-	 * skip-compressed target if there is one.  Same lifetime as @old_node --
-	 * the caller's commit is what UNLINKS them, so they are freed when it
-	 * SUCCEEDS and left alone when it aborts (nothing unlinked them; a
-	 * reader is still entitled to be walking the chain).  Their
-	 * freeze-on-free tombstones were recorded into the caller's shared txn,
-	 * so they flip with that same unlink.
+	 * An ELEVATING detach's orphan chain:
+	 *   - the ancestors the upward walk cleared;
+	 *   - the chain below the detach target;
+	 *   - the trailing skip-compressed target, if there is one.
+	 * Same lifetime as @old_node.  The caller's commit is what UNLINKS
+	 * them.  So they are freed when it SUCCEEDS, and left alone when it
+	 * aborts.  On an abort nothing unlinked them, and a reader is still
+	 * entitled to be walking the chain.  Their freeze-on-free tombstones were
+	 * recorded into the caller's shared txn, so they flip with that
+	 * same unlink.
 	 */
 	struct cds_ft_inode_flag *orphans[FT_MAX_DEPTH];
 	int nr_orphans;
@@ -2921,37 +3192,41 @@ int ft_detach_node(struct cds_ft *ft,
 	int ret, nr_metadata = 0, nr_clear = 0, nr_branch = 0;
 	uint8_t n = 0;
 	/*
-	 * THE ELEVATED CHAIN: what the climb prunes between the boundary and the
-	 * original detach target.  @nr_clear counts its KEYLESS single-child
-	 * links; @climb_promoted says whether the climb also emptied a KEYED
-	 * single-child junction and lifted its head into the boundary's slot.
-	 * That junction is unlinked by the very same publish, so it is an orphan
-	 * too, and @nr_elevated is the chain's full length -- the budget both
-	 * orphan walks below are bounded on.
+	 * THE ELEVATED CHAIN: what the climb prunes between the boundary and
+	 * the original detach target.  @nr_clear counts its KEYLESS
+	 * single-child links.  @climb_promoted says whether the climb also
+	 * emptied a KEYED single-child junction and lifted its head into the
+	 * boundary's slot.  That junction is unlinked by the very same
+	 * publish, so it is an orphan too.  @nr_elevated is the chain's full
+	 * length: the budget both orphan walks below are bounded on.
 	 */
 	bool climb_promoted = false;
 	int nr_elevated;
 	/*
-	 * Pre-reserved commit flip-txn for the plain-branch key-removal commit
-	 * (in-place delete OR recompaction publish), reserved before
-	 * ft_node_replace_ptr's pre-flip side-effects (nr_child-- / eager child
-	 * re-parent) when that commit will be multi-edge (a cell unsplice, or a
-	 * compressed-parent SKIP_X dual) -- a lone edge stays the infallible
-	 * on-stack release store.  Consumed by ft_ord_cell_flip_into at whichever
-	 * commit fires; freed at @end if reserved but unused.
+	 * Pre-reserved commit flip-txn for the plain-branch key-removal
+	 * commit (in-place delete OR recompaction publish).  It is reserved
+	 * when that commit will be multi-edge: a cell unsplice, or a
+	 * compressed-parent SKIP_X dual.  The reservation comes before
+	 * ft_node_replace_ptr's pre-flip side-effects (nr_child-- / eager
+	 * child re-parent).  A lone edge
+	 * stays the infallible on-stack release store.  The txn is consumed
+	 * by ft_ord_cell_flip_into at whichever commit fires.  It is freed
+	 * at @end if reserved but unused.
 	 */
 	struct ft_flip_txn *commit_txn = NULL;
 	bool commit_txn_used = false;
 	/*
-	 * Branch-2 (non-compressed parent) orphan chain, freed AFTER the commit
-	 * that unlinks it -- below the recompaction republish, not in the
-	 * pre-republish !ret block.  A recompaction defers its forward commit
-	 * (@commit_txn) to the parent-slot block far below, so deferring the free
-	 * to there lets every freed node's freeze-on-free tombstone (recorded INTO
-	 * @commit_txn) flip ATOMICALLY with that unlink -- and frees only after the
-	 * structural unlink, never before it.  The set is copied out of the
-	 * branch-2 to_free[] on a successful detach; @free_orphans_pending gates
-	 * the deferred walk.
+	 * Branch-2 (non-compressed parent) orphan chain.  It is freed AFTER
+	 * the commit that unlinks it: below the recompaction republish, not
+	 * in the pre-republish !ret block.  A recompaction defers its
+	 * forward commit (@commit_txn) to the parent-slot block far below.
+	 * Deferring the free to there has two effects:
+	 *   - every freed node's freeze-on-free tombstone (recorded INTO
+	 *     @commit_txn) flips ATOMICALLY with that unlink;
+	 *   - the free happens only after the structural unlink, never
+	 *     before it.
+	 * The set is copied out of the branch-2 to_free[] on a successful
+	 * detach.  @free_orphans_pending gates the deferred walk.
 	 */
 	struct cds_ft_inode_flag *orphan_free[FT_MAX_DEPTH];
 	int nr_orphan_free = 0;
@@ -2959,36 +3234,42 @@ int ft_detach_node(struct cds_ft *ft,
 	bool free_orphans_pending = false;
 	/*
 	 * THE BOUNDARY THE CLIMB ACTUALLY LANDED ON, and its slot.  A caller's
-	 * @src_held_hint describes the DETACH TARGET's junction, which stops
-	 * being the recompacted node the moment the climb ELEVATES: it then
+	 * @src_held_hint describes the DETACH TARGET's junction.  That stops
+	 * being the recompacted node the moment the climb ELEVATES.  It then
 	 * recompacts an ANCESTOR, whose parent is one level higher again.
-	 * Forwarding the caller's hint there points the republish -- and the
-	 * read-set guard that validates it -- at the wrong node.  These name
-	 * the real pair, re-derived by the climb that moved.
+	 * Forwarding the caller's hint there points the republish at the
+	 * wrong node, and the read-set guard that validates it too.  These
+	 * name the real pair, re-derived by the climb that moved.
 	 */
 	struct cds_ft_inode_flag *boundary_parent_nf = NULL;
 	bool climbed = false;
 	struct ft_parent_hint elevated_hint;
 	const struct ft_parent_hint *replace_hint = src_held_hint;
 	/*
-	 * DLM orphan plan-lock (§9.2): under
-	 * ft->lock_fine every collected orphan (Block A or Block B, both mutually
-	 * exclusive) is lock-acquired at collection so the nr_child==1 collapse
-	 * decision is made on a FROZEN state word; its clean snapshot feeds the
-	 * FENCED {LOCK|s -> TOMBSTONE|s} tombstone at freeze (a peer that grows
-	 * the orphan tears the expected-old and aborts our commit).  The marks live
-	 * in these fn-scope arrays (not the txn locks[] registry -- the chain
-	 * reaches FT_MAX_DEPTH, past FT_FLIP_TXN_MAX_LOCKS), so the op OWNS their
-	 * clearing: one unconditional ft_meta_lock_release_if_held sweep at @end
-	 * releases every held mark and no-ops on the ones a successful commit already
-	 * consumed (TOMBSTONE), needing no per-commit "consumed" bookkeeping.
+	 * DLM orphan plan-lock (§9.2).  Under ft->lock_fine, every collected
+	 * orphan is lock-acquired at collection.  (Orphans come from Block A
+	 * or Block B; the two are mutually exclusive.)  So the nr_child==1
+	 * collapse decision is made on a FROZEN state word.  Its clean
+	 * snapshot feeds the FENCED {LOCK|s -> TOMBSTONE|s} tombstone at
+	 * freeze.  A peer that grows the orphan tears the expected-old and
+	 * aborts our commit.
 	 *
-	 * Sized for the chain PLUS the trailing skip-target, which is one more
-	 * orphan and belongs in the same array: a mark kept in a variable of its
-	 * own is a mark no later acquire can see, and a coarse spacing then lands
-	 * the next member's anchor on it (the op waits on itself, and a self-refusal
-	 * is the one -EAGAIN no peer will ever clear -- so under remove_all's retry
-	 * loop it does not surface as an error at all, it SPINS).
+	 * The marks live in these fn-scope arrays, not in the txn locks[]
+	 * registry.  The chain reaches FT_MAX_DEPTH, past
+	 * FT_FLIP_TXN_MAX_LOCKS.  So the op OWNS their clearing.  One
+	 * unconditional ft_meta_lock_release_if_held sweep at @end does it:
+	 *   - it releases every held mark;
+	 *   - it no-ops on the marks a successful commit already consumed
+	 *     (TOMBSTONE).
+	 * So no per-commit "consumed" bookkeeping is needed.
+	 *
+	 * Sized for the chain PLUS the trailing skip-target, which is one
+	 * more orphan and belongs in the same array.  A mark kept in a
+	 * variable of its own is a mark no later acquire can see.  A coarse
+	 * spacing then lands the next member's anchor on it, and the op
+	 * waits on itself.  A self-refusal is the one -EAGAIN no peer will
+	 * ever clear.  So under remove_all's retry loop it does not surface
+	 * as an error at all: it SPINS.
 	 */
 	struct ft_held_anchor orphan_held[FT_MAX_DEPTH + 1];
 	int nr_orphan_locked = 0;
@@ -3001,27 +3282,29 @@ int ft_detach_node(struct cds_ft *ft,
 	bool dual_gp_held = false;
 	/*
 	 * This op's lock context: the caller's anchor source, plus the words
-	 * THIS function holds.  The orphan marks above are part of the held set
-	 * even though they sit outside any txn registry -- an acquire that
-	 * cannot see them re-takes one and waits on the op itself.  @nr_extra is
-	 * refreshed at each acquire because the orphan walk is still growing it.
+	 * THIS function holds.  The orphan marks above are part of the held
+	 * set even though they sit outside any txn registry.  An acquire
+	 * that cannot see them re-takes one and waits on the op itself.
+	 * @nr_extra is refreshed at each acquire because the orphan walk is
+	 * still growing it.
 	 */
 	struct ft_lock_ctx lctx;
 	/*
 	 * The op's descent, COPIED so the orphan walks below may EXTEND it.
 	 * Those walks move DOWN a chain past the descent's cursor, and their
-	 * nodes' depths exist nowhere else: feeding each step through
+	 * nodes' depths exist nowhere else.  Feeding each step through
 	 * ft_descent_enter_node keeps ONE depth-tracking mechanism and ONE
-	 * anchor table for the whole op, which is what agreement wants
-	 * (doc/design/ft-dlm-lock-coarseness.md §9).  A copy, not the caller's,
-	 * because the extension is this op's business alone.
+	 * anchor table for the whole op.  That is what agreement wants
+	 * (doc/design/ft-dlm-lock-coarseness.md §9).  It is a copy, not the
+	 * caller's, because the extension is this op's business alone.
 	 */
 	struct ft_descent wd;
 	bool wd_valid = false;
 	/*
-	 * The trailing skip-target's mark, IN @orphan_held (never a copy): the
-	 * held set is what the next acquire consults, and the freeze needs the
-	 * same entry the release sweep will clear.  NULL until it is taken.
+	 * The trailing skip-target's mark, IN @orphan_held (never a copy).
+	 * The held set is what the next acquire consults, and the freeze
+	 * needs the same entry the release sweep will clear.  NULL until it
+	 * is taken.
 	 */
 	struct ft_held_anchor *orphan_trailing_held = NULL;
 	bool retire_glue_fused = false;
@@ -3033,11 +3316,12 @@ int ft_detach_node(struct cds_ft *ft,
 	/*
 	 * Set when the pure-delete leaves the surviving boundary a non-root
 	 * 1-child no-external internal whose SKIP_X canonical form is a merged
-	 * compressed node: the chain-compress prune is then FUSED into the
-	 * key-removal commit (build the merged node, replace the boundary in ONE
-	 * flip), bypassing ft_node_replace_ptr and the standalone post-detach
-	 * canonicalize -- no intermediate recompacted/in-place node, no transient
-	 * non-canonical state.  See ft_chain_compress_fused.
+	 * compressed node.  The chain-compress prune is then FUSED into the
+	 * key-removal commit: build the merged node, replace the boundary in
+	 * ONE flip.  This bypasses ft_node_replace_ptr and the standalone
+	 * post-detach canonicalize.  There is no intermediate
+	 * recompacted/in-place node and no transient non-canonical state.
+	 * See ft_chain_compress_fused.
 	 */
 	bool boundary_fused = false;
 	/*
@@ -3052,46 +3336,51 @@ int ft_detach_node(struct cds_ft *ft,
 	 * Snapshot of the slot value at the detach point.  Set once the
 	 * upward walk finishes elevating @detach_node_flag_ptr, before
 	 * ft_node_replace_ptr overwrites the slot.  The free-walk below
-	 * starts from this value so it covers BOTH the elevated single-
-	 * child ancestors and the original detach target (the elevation
-	 * walk only crosses nodes with nr_child==1, so the underlying
-	 * chain reaches the original detach child).
+	 * starts from this value, so it covers BOTH the elevated
+	 * single-child ancestors and the original detach target.  (The
+	 * elevation walk only crosses nodes with nr_child==1, so the
+	 * underlying chain reaches the original detach child.)
 	 *
-	 * It is equally the PLAN EXPECTED-OLD handed to ft_node_replace_ptr:
-	 * the orphan set, the count fold and the drop all name THIS subtree,
-	 * so a DEL recompaction that finds another one at the slot is working
+	 * It is equally the PLAN EXPECTED-OLD handed to ft_node_replace_ptr.
+	 * The orphan set, the count fold and the drop all name THIS subtree.
+	 * So a DEL recompaction that finds another one at the slot is working
 	 * from a plan a peer has already invalidated (-EAGAIN, re-descend).
 	 */
 	struct cds_ft_inode_flag *elevated_old_child;
 	/*
-	 * The same slot's value as the CLIMB read it -- the plan's expected-old.
+	 * The same slot's value as the CLIMB read it: the plan's
+	 * expected-old.
 	 *
-	 * The climb decides "every level from the holder up to here holds only the
-	 * branch we are removing, so prune at this slot" from the nr_child of the
-	 * nodes it walks.  That verdict is about the SUBTREE the slot held THEN.  A
-	 * peer that republishes the slot mid-climb (an insert splitting the chain
-	 * below, whose fresh junction carries the removed key AND the peer's own)
-	 * makes the verdict false, and re-reading the slot after the climb adopts
-	 * the peer's subtree into the plan -- the prune then unlinks a live key,
-	 * silently, with a byte and a child count that are both innocent.  So the
-	 * value is captured WHERE THE CLIMB USES IT: at entry for a plan that never
-	 * elevates, and at each elevation for the level it just decided to prune.
+	 * The climb reads the nr_child of the nodes it walks.  From that it
+	 * decides "every level from the holder up to here holds only the
+	 * branch we are removing, so prune at this slot".  That verdict is
+	 * about the SUBTREE the slot held THEN.  A peer can republish the
+	 * slot mid-climb: an insert splitting the chain below, whose fresh
+	 * junction carries the removed key AND the peer's own.  That makes
+	 * the verdict false.  Re-reading the slot after the climb adopts the
+	 * peer's subtree into the plan.  The prune then unlinks a live key,
+	 * silently, with a byte and a child count that are both innocent.
+	 * So the value is captured WHERE THE CLIMB USES IT:
+	 *   - at entry, for a plan that never elevates;
+	 *   - at each elevation, for the level it just decided to prune.
 	 *
-	 * The FIRST elevation is the load-bearing one and gets its value from the
-	 * SAME load that produced @cur (@entry_holder_raw below), not from a second
-	 * read: the two are ~300 ns apart and a peer publish lands between them.
+	 * The FIRST elevation is the load-bearing one.  It gets its value
+	 * from the SAME load that produced @cur (@entry_holder_raw below),
+	 * not from a second read.  The two are ~300 ns apart and a peer
+	 * publish lands between them.
 	 *
-	 * ☠ AND SO DOES EVERY LATER ONE (@pair_held).  Each level's pair check
-	 * has just proved that the slot holding @cur resolves to @cur, and that
-	 * load -- not a re-read at the elevation -- is the level's plan.  The
-	 * re-read let a peer's commit land between the two: a remove of the
-	 * junction's prefix key collapsed the junction into a skip pointer to
-	 * its surviving leaf, the climb read the junction's external (the key
-	 * that remove had just frozen) as @topmost_external_nodes, and the
-	 * re-read then named the peer's fresh skip node -- so the orphan walk
-	 * locked the NEW chain, never the junction, and the promote published
-	 * the frozen key back into the slot (the two-writer harness:
-	 * STALE-AFTER-RM, LTTng-traced).
+	 * ☠ AND SO DOES EVERY LATER ONE (@pair_held).  Each level's pair
+	 * check has just proved that the slot holding @cur resolves to @cur.
+	 * That load is the level's plan, not a re-read at the elevation.
+	 * The re-read let a peer's commit land between the two (the
+	 * two-writer harness: STALE-AFTER-RM, LTTng-traced):
+	 *   1. A remove of the junction's prefix key collapsed the junction
+	 *      into a skip pointer to its surviving leaf.
+	 *   2. The climb read the junction's external (the key that remove
+	 *      had just frozen) as @topmost_external_nodes.
+	 *   3. The re-read then named the peer's fresh skip node.
+	 *   4. So the orphan walk locked the NEW chain, never the junction.
+	 *   5. The promote published the frozen key back into the slot.
 	 */
 	struct cds_ft_inode_flag *plan_old_child;
 	/* This level's pair-checked load of the slot holding @cur. */
@@ -3103,14 +3392,15 @@ int ft_detach_node(struct cds_ft *ft,
 	bool shape_d_plan = false;
 	/*
 	 * The detach TARGET as the entry read it (@plan_old_child before the
-	 * climb re-anchors it): the node the orphan walk must arrive at once it
-	 * has walked the @nr_elevated links the climb counted.
+	 * climb re-anchors it).  The orphan walk must arrive at this node
+	 * once it has walked the @nr_elevated links the climb counted.
 	 */
 	struct cds_ft_inode_flag *entry_target;
 	/*
-	 * The holder slot the climb starts from, and the ONE raw value it read
-	 * there -- the value @cur was resolved from.  When the climb elevates, that
-	 * slot becomes the drop target, so this pair IS its plan expected-old.
+	 * The holder slot the climb starts from, and the ONE raw value it
+	 * read there: the value @cur was resolved from.  When the climb
+	 * elevates, that slot becomes the drop target.  So this pair IS its
+	 * plan expected-old.
 	 */
 	struct cds_ft_inode_flag **entry_holder_slot;
 	struct cds_ft_inode_flag *entry_holder_raw;
@@ -3119,47 +3409,63 @@ int ft_detach_node(struct cds_ft *ft,
 	struct cds_ft_inode_flag **dbg_arg_parent_slot = detach_parent_flag_ptr;
 #endif
 	/*
-	 * Snapshot of the holder slot (@detach_parent_flag_ptr) taken BEFORE
-	 * ft_node_replace_ptr overwrites @iter_node_flag with the fresh
-	 * recompacted copy: the plan-snapshot expected-old for the forward
-	 * republish that flips the holder slot to that copy (defect #1).  In the
-	 * external-promote sub-case (no recompaction) it equals the unchanged
-	 * @iter_node_flag, so the same-value republish still holds.
+	 * Snapshot of the holder slot (@detach_parent_flag_ptr).  It is taken
+	 * BEFORE ft_node_replace_ptr overwrites @iter_node_flag with the
+	 * fresh recompacted copy.  It is the plan-snapshot expected-old for
+	 * the forward republish that flips the holder slot to that copy
+	 * (defect #1).  In the external-promote sub-case (no recompaction)
+	 * it equals the unchanged @iter_node_flag, so the same-value
+	 * republish still holds.
 	 */
 	struct cds_ft_inode_flag *holder_old_flag;
 	/*
-	 * nr_keys count fold (LEAF Increment 2): the removed leaf's @count_delta
-	 * (-1, or 0 for a count-neutral move detach) rides the SAME commit that
-	 * unlinks the leaf, rather than a standalone pre-decrement walk.  Each
-	 * per-outcome fold below records the -1 walk from that outcome's stable
-	 * base into its commit txn (in-place / recompaction: @commit_txn;
-	 * shape-D: ft_chain_compress_fused's own txn; compressed parent:
-	 * @orphan_txn) and sets @count_folded; the residual for a lone-store
-	 * (list-off pub-less) outcome that reaches no txn falls back to the
-	 * standalone walk at the end.  All no-ops when !rank_stats.
+	 * nr_keys count fold (LEAF Increment 2).  The removed leaf has a
+	 * @count_delta: -1, or 0 for a count-neutral move detach.  It rides
+	 * the SAME commit that unlinks the leaf, rather than a standalone
+	 * pre-decrement walk.  Each per-outcome fold below records the -1
+	 * walk from that outcome's stable base into its commit txn:
+	 *   - in-place / recompaction: @commit_txn;
+	 *   - shape-D: ft_chain_compress_fused's own txn;
+	 *   - compressed parent: @orphan_txn.
+	 * It then sets @count_folded.  A lone-store (list-off pub-less)
+	 * outcome reaches no txn.  Its residual falls back to the standalone
+	 * walk at the end.  All no-ops when !rank_stats.
 	 */
 	bool count_folded = false;
 	/*
-	 * Force the list-off lone forward store through a commit txn (MW safety +
-	 * nr_keys fold).  When the caller supplies no @pub (list-off: there is no
-	 * ordered-list cell to fuse), an in-place external promote would otherwise
-	 * store bare into the LIVE holder's child slot via ft_node_replace_ptr's
-	 * lone-edge arm (ft_node_child_edge_flip) -- a blind rcu_assign that under
-	 * MW resurrects a peer's relocated node / smashes a parked latch and is NOT
-	 * §4.B-guarded (the concurrent-recompaction premise requires EVERY live
-	 * child-slot mutation to be a proxy'd, holder-serialized txn).  Defer that
-	 * store into a LOCAL pub instead: the pub-armed arm below commits it via
-	 * ft_remove_one_commit through @commit_txn (holder guard + structural edge)
-	 * and -- when order statistics are on -- records the -@count_delta walk from
-	 * the surviving holder into the SAME commit, exactly as the list-on fused
-	 * path does.  This is the single choke point for every ft_detach_node caller
-	 * (leaf remove, remove_all, whole-subtree detach, merge src-unlink,
-	 * graft_swap extract): each passes pub == NULL in list-off, and each is now
-	 * routed uniformly through the txn.  A recompaction shape never arms @pub,
-	 * so it is unaffected (its rebuilt copy is published by the recompaction
-	 * path below); when !rank_stats @count_delta is 0 so the fold is a no-op and
-	 * only the guarded structural edge commits.  @local_pub outlives every use
-	 * (whole-function scope); ft_detach_node never returns @pub.
+	 * Force the list-off lone forward store through a commit txn (MW
+	 * safety + nr_keys fold).
+	 *
+	 * The caller supplies no @pub in list-off: there is no ordered-list
+	 * cell to fuse.  An in-place external promote would then store bare
+	 * into the LIVE holder's child slot, via ft_node_replace_ptr's
+	 * lone-edge arm (ft_node_child_edge_flip).  That is a blind
+	 * rcu_assign.  Under MW it resurrects a peer's relocated node or
+	 * smashes a parked latch.  It is NOT §4.B-guarded: the
+	 * concurrent-recompaction premise requires EVERY live child-slot
+	 * mutation to be a proxy'd, holder-serialized txn.
+	 *
+	 * Defer that store into a LOCAL pub instead.  The pub-armed arm
+	 * below commits it via ft_remove_one_commit through @commit_txn
+	 * (holder guard + structural edge).  With order statistics on, it
+	 * also records the -@count_delta walk from the surviving holder.
+	 * That walk goes into the SAME commit, exactly as the list-on fused
+	 * path does.
+	 *
+	 * This is the single choke point for every ft_detach_node caller:
+	 *   - leaf remove;
+	 *   - remove_all;
+	 *   - whole-subtree detach;
+	 *   - merge src-unlink;
+	 *   - graft_swap extract.
+	 * Each passes pub == NULL in list-off, and each is now routed
+	 * uniformly through the txn.
+	 *
+	 * A recompaction shape never arms @pub, so it is unaffected: its
+	 * rebuilt copy is published by the recompaction path below.  When
+	 * !rank_stats, @count_delta is 0.  The fold is then a no-op and only
+	 * the guarded structural edge commits.  @local_pub outlives every
+	 * use (whole-function scope).  ft_detach_node never returns @pub.
 	 */
 	struct ft_remove_pub local_pub = { .armed = false };
 
@@ -3170,13 +3476,14 @@ int ft_detach_node(struct cds_ft *ft,
 		wd = *ft_lock_ctx_descent(op_ctx);
 		wd_valid = true;
 		/*
-		 * ☠ A COPY MAY READ THE LEDGER, NEVER APPEND TO IT.  The orphan
-		 * walk below extends this copy (ft_walk_extend), and
-		 * ft_descent_enter_node pushes BEFORE its per-node early return
-		 * -- so a copy that kept @anc_rec would file the ORPHANED
-		 * SUBTREE onto the key path under the original generation, with
-		 * ft_anc_ledger_valid still vouching for the result.  @anc_gen
-		 * is deliberately kept: reading is exactly what a copy is for.
+		 * ☠ A COPY MAY READ THE LEDGER, NEVER APPEND TO IT.  The
+		 * orphan walk below extends this copy (ft_walk_extend).
+		 * ft_descent_enter_node pushes BEFORE its per-node early
+		 * return.  So a copy that kept @anc_rec would file the
+		 * ORPHANED SUBTREE onto the key path, under the original
+		 * generation.  ft_anc_ledger_valid would still vouch for
+		 * the result.  @anc_gen is deliberately kept: reading is
+		 * exactly what a copy is for.
 		 */
 #ifdef FT_ANC_LEDGER
 		wd.anc_rec = false;
@@ -3197,53 +3504,61 @@ int ft_detach_node(struct cds_ft *ft,
 
 	/*
 	 * Check the node being replaced (the child at detach_node_flag_ptr)
-	 * for external_nodes.  After the child's last internal child was
-	 * removed (triggering this detach), the child may still hold
-	 * variable-length key entries that must be preserved by promoting
+	 * for external_nodes.  This detach was triggered by the removal of
+	 * the child's last internal child.  The child may still hold
+	 * variable-length key entries.  They must be preserved by promoting
 	 * them to the replacement slot.
 	 *
-	 * Only for a destroy-style detach (free_detached_subtree): a
-	 * move-style detach PRESERVES the target subtree (it becomes another
-	 * trie's content), so the target keeps its own external_nodes and
-	 * must NOT have them promoted into the source.  This matters once a
-	 * move-style caller bootstraps from the target itself (the climb
-	 * starts at *detach_node_flag_ptr == the target); the descent-based
-	 * callers passed the single-child chain head here, which never
-	 * carries external_nodes, so this gate is a no-op for them.
+	 * This is only for a destroy-style detach (free_detached_subtree).
+	 * A move-style detach PRESERVES the target subtree: it becomes
+	 * another trie's content.  So the target keeps its own
+	 * external_nodes, and they must NOT be promoted into the source.
+	 * This matters once a move-style caller bootstraps from the target
+	 * itself (the climb starts at *detach_node_flag_ptr == the target).
+	 * The descent-based callers passed the single-child chain head
+	 * here.  That head never carries external_nodes, so this gate is a
+	 * no-op for them.
 	 */
 	if (free_detached_subtree) {
 		/*
-		 * ☠ ONE RESOLUTION FOR BOTH USES.  The leaf check below and the
-		 * external_nodes capture after it must judge the SAME value.  The
-		 * slot can hold a peer's parked proxy, and a proxy resolves
-		 * through a decision that may flip between two resolutions: the
-		 * check resolved it UNDECIDED, to the old value (our leaf), and
-		 * passed; the capture resolved it DECIDED, to the peer's fresh
-		 * junction, and took the junction's external_nodes -- our leaf --
-		 * as a chain to promote.  The climb then pruned the boundary and
-		 * published the leaf this op removes into the boundary's slot,
-		 * frozen, with its cell already unspliced: every later insert
-		 * whose predecessor search lands on it planned against the dead
-		 * cell and retried for ever.  MEASURED (ft_inv 147,
-		 * inv_prefix_pair_compressed_holder: a two-insert livelock after
-		 * a remove committed root[96]: compressed -> the removed leaf).
+		 * ☠ ONE RESOLUTION FOR BOTH USES.  The leaf check below and
+		 * the external_nodes capture after it must judge the SAME
+		 * value.  The slot can hold a peer's parked proxy.  A proxy
+		 * resolves through a decision that may flip between two
+		 * resolutions:
+		 *   1. The check resolved it UNDECIDED, to the old value
+		 *      (our leaf), and passed.
+		 *   2. The capture resolved it DECIDED, to the peer's fresh
+		 *      junction.  It took the junction's external_nodes
+		 *      (our leaf) as a chain to promote.
+		 *   3. The climb then pruned the boundary.  It published
+		 *      the leaf this op removes into the boundary's slot,
+		 *      frozen, with its cell already unspliced.
+		 *   4. Every later insert whose predecessor search lands on
+		 *      it planned against the dead cell and retried for
+		 *      ever.
+		 * MEASURED (ft_inv 147, inv_prefix_pair_compressed_holder: a
+		 * two-insert livelock after a remove committed root[96]:
+		 * compressed -> the removed leaf).
 		 */
 		struct cds_ft_inode_flag *detach_child =
 			ft_resolve_flip_proxy(*detach_node_flag_ptr);
 
 		/*
-		 * ☠ THE SLOT MUST STILL HOLD THE CALLER'S LEAF.  Every destroy-
-		 * style caller is a remove that names the chain head it came to
-		 * clear (@freeze_leaf) and checked it at @detach_node_flag_ptr --
-		 * at an EARLIER instant.  A peer insert of a LONGER key through
-		 * that head (past-child: "zone46" under "zone4") republishes the
-		 * slot with a fresh junction that carries the head as its
-		 * external_nodes AND the peer's key as a child.  Read here, that
-		 * junction is "a detached internal node whose prefix head must be
-		 * promoted": the plan below drops the junction -- the peer's key
-		 * with it -- and republishes the head this op is REMOVING
-		 * (MEASURED: key loss within seconds with two writers, one key
-		 * each).  Nothing is built, locked or reserved yet: re-descend.
+		 * ☠ THE SLOT MUST STILL HOLD THE CALLER'S LEAF.  Every
+		 * destroy-style caller is a remove.  It names the chain head
+		 * it came to clear (@freeze_leaf), and it checked it at
+		 * @detach_node_flag_ptr at an EARLIER instant.  A peer can
+		 * insert a LONGER key through that head (past-child:
+		 * "zone46" under "zone4").  That republishes the slot with a
+		 * fresh junction, which carries the head as its
+		 * external_nodes AND the peer's key as a child.  Read here,
+		 * that junction is "a detached internal node whose prefix
+		 * head must be promoted".  The plan below then drops the
+		 * junction, and the peer's key with it.  It republishes the
+		 * head this op is REMOVING.  MEASURED: key loss within
+		 * seconds with two writers, one key each.  Nothing is built,
+		 * locked or reserved yet: re-descend.
 		 */
 #ifndef FT_DEBUG_NO_LEAF_IDENTITY
 		if (freeze_leaf && caa_unlikely((struct cds_ft_node *)
@@ -3251,35 +3566,40 @@ int ft_detach_node(struct cds_ft *ft,
 			return -EAGAIN;
 #endif
 		/*
-		 * RESOLVE-THEN-SKIP, in that order (ft-helpers.h:1870, and the
+		 * RESOLVE-THEN-SKIP, in that order (ft-helpers.h:1870).  The
 		 * entry-holder read below at :2373 does exactly this:
-		 * ft_reanchor_flag(ft, ft_resolve_flip_proxy(raw), ...)).
+		 * ft_reanchor_flag(ft, ft_resolve_flip_proxy(raw), ...).
 		 *
-		 * ☠ THE FLIP-PROXY HALF WAS MISSING HERE, AND IT FAULTS.  (It is
-		 * now done once, at the load above -- see there for why once.)
-		 * This slot can hold a parked proxy: a concurrent one-commit splice
-		 * parks a type-7 MCAS descriptor in it; the low nibble 0xF then
-		 * fails ft_node_external, so the type check below admits it and
-		 * ft_flag_to_metadata computes a metadata address from a
-		 * DESCRIPTOR pointer.  The comment on the very next statement
-		 * already names that outcome -- "the SKIP_X form dispatches the
-		 * 0xF flag as a node (ft_node_external fails -> item_to_metadata
-		 * faults)" -- and the sibling parent-slot read twenty lines down
-		 * says a raw load "feeds that proxy to cds_ft_item_to_metadata()
-		 * ... and faults".  Both guard their slot; this one did not, and
-		 * it is a measured SEGV site: 2 of 5 sampled rc=139 backtraces
+		 * ☠ THE FLIP-PROXY HALF WAS MISSING HERE, AND IT FAULTS.  (It
+		 * is now done once, at the load above -- see there for why
+		 * once.)  This slot can hold a parked proxy: a concurrent
+		 * one-commit splice parks a type-7 MCAS descriptor in it.
+		 * The low nibble 0xF then fails ft_node_external.  So the
+		 * type check below admits it, and ft_flag_to_metadata
+		 * computes a metadata address from a DESCRIPTOR pointer.
+		 *
+		 * Two neighbouring comments already name that outcome:
+		 *   - The comment on the very next statement: "the SKIP_X
+		 *     form dispatches the 0xF flag as a node
+		 *     (ft_node_external fails -> item_to_metadata faults)".
+		 *   - The sibling parent-slot read twenty lines down says a
+		 *     raw load "feeds that proxy to
+		 *     cds_ft_item_to_metadata() ... and faults".
+		 * Both guard their slot.  This one did not, and it is a
+		 * measured SEGV site.  2 of 5 sampled rc=139 backtraces
 		 * crash at the ft_flag_to_metadata below
 		 * (doc/design/ft-stale-disposal-predicate.md §5.17).
 		 *
-		 * Skip-compressed must still be resolved before the type checks:
-		 * a skip pointer with an external child has low bits == 0,
-		 * falsely matching ft_node_external and skipping the
-		 * external_nodes preservation entirely.
+		 * Skip-compressed must still be resolved before the type
+		 * checks.  A skip pointer with an external child has low
+		 * bits == 0.  It falsely matches ft_node_external and skips
+		 * the external_nodes preservation entirely.
 		 *
-		 * Sound to resolve: @detach_child is only ever DEREFERENCED here
-		 * (its metadata read for external_nodes preservation), never used
-		 * as a CAS expected-old -- the same argument the entry-holder
-		 * read below makes for @cur.
+		 * It is sound to resolve.  @detach_child is only ever
+		 * DEREFERENCED here (its metadata read for external_nodes
+		 * preservation).  It is never used as a CAS expected-old.
+		 * The entry-holder read below makes the same argument for
+		 * @cur.
 		 */
 		detach_child = ft_resolve_skip_compressed(ft, detach_child);
 
@@ -3287,16 +3607,19 @@ int ft_detach_node(struct cds_ft *ft,
 			struct cds_ft_metadata *child_meta =
 				ft_flag_to_metadata(ft, detach_child);
 			/*
-			 * Resolve a parked flip proxy before capture: a concurrent
-			 * one-commit splice (ft_insert_park_external_nodes)
-			 * transiently installs its descriptor in external_nodes, and
-			 * this value is republished RAW into cn->child + the SKIP_X
-			 * dual by the external-promote below.  Snapshotting a peer's
-			 * latch into a structural slot leaves a dangling descriptor
-			 * once that txn settles and reclaims -- and the SKIP_X form
-			 * dispatches the 0xF flag as a node (ft_node_external fails ->
-			 * item_to_metadata faults).  Mirror every ft_dereference_external
-			 * descent reader; the common no-splice case is one masked test.
+			 * Resolve a parked flip proxy before capture.  A
+			 * concurrent one-commit splice
+			 * (ft_insert_park_external_nodes) transiently installs
+			 * its descriptor in external_nodes.  The
+			 * external-promote below republishes this value RAW
+			 * into cn->child + the SKIP_X dual.  Snapshotting a
+			 * peer's latch into a structural slot leaves a
+			 * dangling descriptor once that txn settles and
+			 * reclaims.  And the SKIP_X form dispatches the 0xF
+			 * flag as a node (ft_node_external fails ->
+			 * item_to_metadata faults).  Mirror every
+			 * ft_dereference_external descent reader.  The common
+			 * no-splice case is one masked test.
 			 */
 			if (child_meta && child_meta->external_nodes) {
 				topmost_external_nodes = ft_dereference_external(
@@ -3317,41 +3640,46 @@ int ft_detach_node(struct cds_ft *ft,
 	 * Resolve the initial parent slot.  Two layers:
 	 *
 	 *  - Flip-proxy: @detach_parent_flag_ptr is a forward child slot (the
-	 *    grandparent's slot to the holder), which a concurrent recompaction
-	 *    re-home transiently parks a type-7 MCAS proxy in.  A raw load feeds
-	 *    that proxy to cds_ft_item_to_metadata() at the top of the up-walk
-	 *    below and faults (the SAME crash the loop-body parent read guards
-	 *    against, but on iteration 0).  Resolve it exactly as cds_ft_remove
-	 *    does at its compressed-child identity compare.  @cur is only ever
-	 *    dereferenced here (never a CAS expected-old), so resolving is sound.
+	 *    grandparent's slot to the holder).  A concurrent recompaction
+	 *    re-home transiently parks a type-7 MCAS proxy in it.  A raw
+	 *    load feeds that proxy to cds_ft_item_to_metadata() at the top
+	 *    of the up-walk below and faults.  That is the SAME crash the
+	 *    loop-body parent read guards against, but on iteration 0.
+	 *    Resolve it exactly as cds_ft_remove does at its
+	 *    compressed-child identity compare.  @cur is only ever
+	 *    dereferenced here (never a CAS expected-old), so resolving is
+	 *    sound.
 	 *
-	 *  - Skip-compressed: when the detach is bootstrapped from a leaf whose
-	 *    holder is a compressed node (e.g. cds_ft_remove deriving the
-	 *    position from node->prev), the slot is skip-encoded (SKIP_X(cn->
-	 *    child)); ft_node_ptr does not strip the skip high bits, so resolve
-	 *    to the plain compressed flag.  No-op for a plain (descent) slot.
+	 *  - Skip-compressed: the detach can be bootstrapped from a leaf
+	 *    whose holder is a compressed node (e.g. cds_ft_remove deriving
+	 *    the position from node->prev).  The slot is then skip-encoded
+	 *    (SKIP_X(cn->child)).  ft_node_ptr does not strip the skip high
+	 *    bits, so resolve to the plain compressed flag.  No-op for a
+	 *    plain (descent) slot.
 	 */
 	{
 		/*
 		 * Reanchor a skip-compressed initial slot through the shared
-		 * read-side primitive (MW convergence) rather than the unvalidated
-		 * one-hop ft_resolve_skip_compressed: a peer split can tear the
-		 * one-hop recovery to a node whose ft_meta_nr_child reads a bitmap
-		 * byte (the skip-gated ft-remove.h prune-climb 0-child assert).  @cur
-		 * is only ever dereferenced (never a CAS expected-old), so using the
-		 * reanchored LIVE node is sound; a rewind is tolerated (the climb
-		 * self-corrects / the commit guards it).
+		 * read-side primitive (MW convergence), not through the
+		 * unvalidated one-hop ft_resolve_skip_compressed.  A peer
+		 * split can tear the one-hop recovery to a node whose
+		 * ft_meta_nr_child reads a bitmap byte (the skip-gated
+		 * ft-remove.h prune-climb 0-child assert).  @cur is only
+		 * ever dereferenced (never a CAS expected-old), so using the
+		 * reanchored LIVE node is sound.  A rewind is tolerated: the
+		 * climb self-corrects / the commit guards it.
 		 */
 		unsigned int cur_rewind;
 
 		/*
-		 * ONE load feeds both @cur and @entry_holder_raw: the climb's
-		 * whole verdict about this level is derived from @cur, so the
-		 * expected-old that says "the slot still holds what I walked"
-		 * must be the SAME read that produced it.  A second load a few
-		 * hundred nanoseconds later is a coherent-pair violation, and
-		 * MEASURED to be one -- a peer's publish landing between the two
-		 * is captured as the plan's own expected value and then pruned.
+		 * ONE load feeds both @cur and @entry_holder_raw.  The
+		 * climb's whole verdict about this level is derived from
+		 * @cur.  So the expected-old that says "the slot still holds
+		 * what I walked" must be the SAME read that produced it.  A
+		 * second load a few hundred nanoseconds later is a
+		 * coherent-pair violation, and MEASURED to be one.  A peer's
+		 * publish landing between the two is captured as the plan's
+		 * own expected value and then pruned.
 		 */
 		entry_holder_raw = (struct cds_ft_inode_flag *)
 			rcu_dereference(*detach_parent_flag_ptr);
@@ -3362,38 +3690,40 @@ int ft_detach_node(struct cds_ft *ft,
 	entry_holder_slot = detach_parent_flag_ptr;
 	/*
 	 * HOLDER IDENTITY: @cur must be the very node @detach_node_flag_ptr
-	 * addresses a slot inside.  The caller reached that slot by descending
-	 * through the holder; @cur is a SEPARATE, later load of the slot that
-	 * holds the holder.  A peer that republishes the holder between the two
-	 * -- an insert splitting the compressed chain here, whose fresh copy
-	 * carries the removed key AND its own -- leaves the pair disagreeing:
-	 * the slot addresses the retired body, @cur names the fresh copy.
+	 * addresses a slot inside.  The caller reached that slot by
+	 * descending through the holder.  @cur is a SEPARATE, later load of
+	 * the slot that holds the holder.  A peer can republish the holder
+	 * between the two: an insert splitting the compressed chain here,
+	 * whose fresh copy carries the removed key AND its own.  The pair
+	 * then disagrees: the slot addresses the retired body, @cur names
+	 * the fresh copy.
 	 *
 	 * The climb then walks the WRONG node.  It is fatal precisely because
-	 * the fresh copy looks prunable: a compressed node structurally holds
-	 * exactly one child, so the climb scores it a single-child ancestor,
-	 * elevates past it, and drops the branch whole -- the multi-child
-	 * junction the peer published UNDER it is never looked at, and the peer's
-	 * key goes with the prune.  No expected-old on the holder slot can see
-	 * this: that slot's value agrees with itself at every load (the climb
-	 * elevates ONTO it and both reads return the fresh copy).  What is stale
-	 * is the DESCENT's premise -- "the chain below this holder holds only the
-	 * key I am removing" -- and this is where that premise is checkable.
+	 * the fresh copy looks prunable.  A compressed node structurally
+	 * holds exactly one child.  So the climb scores it a single-child
+	 * ancestor, elevates past it, and drops the branch whole.  The
+	 * multi-child junction the peer published UNDER it is never looked
+	 * at, and the peer's key goes with the prune.  No expected-old on the
+	 * holder slot can see this.  That slot's value agrees with itself at
+	 * every load: the climb elevates ONTO it and both reads return the
+	 * fresh copy.  What is stale is the DESCENT's premise: "the chain
+	 * below this holder holds only the key I am removing".  This is
+	 * where that premise is checkable.
 	 *
 	 * Nothing is built, locked or reserved yet: re-descend against the
 	 * settled tree.
 	 *
-	 * ☠ THIS TESTS THE SLOT THE OP READS, NOT THE ONE IT WRITES.  The slot
-	 * an elevation clears -- and a DEL recompaction publishes into -- is
-	 * @detach_parent_flag_ptr, and "it is the slot ft_get_parent_slot
-	 * recovered INSIDE the new @cur" was an assumption: the address was
-	 * derived at an EARLIER instant, and a peer that republishes @cur's
-	 * parent since leaves it pointing into the RETIRED body while @cur's
+	 * ☠ THIS TESTS THE SLOT THE OP READS, NOT THE ONE IT WRITES.  The
+	 * slot an elevation clears, and a DEL recompaction publishes into, is
+	 * @detach_parent_flag_ptr.  "It is the slot ft_get_parent_slot
+	 * recovered INSIDE the new @cur" was an assumption.  The address was
+	 * derived at an EARLIER instant.  A peer that republishes @cur's
+	 * parent since leaves it pointing into the RETIRED body, while @cur's
 	 * word names the fresh copy.  That slot is validated per level inside
-	 * the climb below, against the parent @cur's own word names (MEASURED:
-	 * the elevated clear landed 0x30 past a 32-byte parent, in the
-	 * neighbouring item; and re-resolving the pair at the refusal finds it
-	 * self-coherent EVERY time -- it is a stale plan, not a torn read).
+	 * the climb below, against the parent @cur's own word names.
+	 * MEASURED: the elevated clear landed 0x30 past a 32-byte parent, in
+	 * the neighbouring item.  Re-resolving the pair at the refusal finds
+	 * it self-coherent EVERY time: it is a stale plan, not a torn read.
 	 */
 	if (caa_unlikely(!ft_slot_in_node(cur, detach_node_flag_ptr)))
 		return -EAGAIN;
@@ -3406,24 +3736,30 @@ int ft_detach_node(struct cds_ft *ft,
 		FT_DT_INC(ft_dt_cap0_null);
 	/*
 	 * ☠ A NULL PLAN EXPECTED-OLD IS A STALE PLAN, NOT A VALUE.  The slot
-	 * this op came to clear is ALREADY EMPTY: a peer's in-place delete
-	 * landed between the caller's position derivation (ft_locate_chain_head
-	 * / node->prev, both validated against a slot that then held the chain)
-	 * and this capture.  The recompacting tier never produced this state --
-	 * it retired the holder with the delete, so the {C,P,GP} acquire refused
-	 * the tombstone -- and the in-place tier leaves a live holder with a
-	 * NULL hole instead, which is exactly what the equality guard below
-	 * cannot see: it compares the re-read against the plan, and NULL equals
-	 * NULL.  Left through, the plan reaches ft_node_replace_ptr with a NULL
-	 * expected-old (ft_popcount_node_replace_ptr's `*node_flag_ptr != NULL`,
-	 * MEASURED on inv_concurrent_remove_all_nolist: both sides NULL at the
-	 * guard, 1 of ~1000 plans), or -- past min_child -- a DEL recompaction
-	 * that drops a child that is not there and folds -1 a second time.
+	 * this op came to clear is ALREADY EMPTY.  A peer's in-place delete
+	 * landed between the caller's position derivation and this capture.
+	 * (The derivation is ft_locate_chain_head / node->prev, both
+	 * validated against a slot that then held the chain.)
+	 *
+	 * The recompacting tier never produced this state.  It retired the
+	 * holder with the delete, so the {C,P,GP} acquire refused the
+	 * tombstone.  The in-place tier leaves a live holder with a NULL
+	 * hole instead.  That is exactly what the equality guard below
+	 * cannot see: it compares the re-read against the plan, and NULL
+	 * equals NULL.
+	 *
+	 * Left through, one of two things happens:
+	 *   - The plan reaches ft_node_replace_ptr with a NULL expected-old
+	 *     (ft_popcount_node_replace_ptr's `*node_flag_ptr != NULL`).
+	 *     MEASURED on inv_concurrent_remove_all_nolist: both sides NULL
+	 *     at the guard, 1 of ~1000 plans.
+	 *   - Past min_child, a DEL recompaction drops a child that is not
+	 *     there and folds -1 a second time.
 	 *
 	 * Nothing is built, locked or reserved yet: re-descend.  The wrapper
 	 * re-seeds through a fresh lookup, which cannot return a chain head
-	 * from an empty slot, so this -EAGAIN clears on the next attempt
-	 * (NOT_FOUND, or a fresh plan against whatever a re-insert put here).
+	 * from an empty slot.  So this -EAGAIN clears on the next attempt:
+	 * NOT_FOUND, or a fresh plan against whatever a re-insert put here.
 	 */
 #ifndef FT_DEBUG_NO_NULLPLAN
 	if (caa_unlikely(!plan_old_child))
@@ -3431,9 +3767,10 @@ int ft_detach_node(struct cds_ft *ft,
 #endif
 	/*
 	 * The same identity, on the read the PLAN rests on.  The check above
-	 * is a separate, earlier load; the peer's publish can land between
-	 * the two, and then everything below -- climb, orphan walk, replace --
-	 * is coherent with the peer's junction and every expected-old matches.
+	 * is a separate, earlier load.  The peer's publish can land between
+	 * the two.  Then everything below is coherent with the peer's
+	 * junction: the climb, the orphan walk and the replace.  Every
+	 * expected-old matches.
 	 * Only the caller's leaf says the plan is about the wrong node.
 	 */
 #ifndef FT_DEBUG_NO_LEAF_IDENTITY
@@ -3443,12 +3780,13 @@ int ft_detach_node(struct cds_ft *ft,
 		return -EAGAIN;
 #endif
 	/*
-	 * @cur HOLDS the detached child's slot, so it starts a full SPAN above
-	 * it -- one key byte for a bitmap node, the whole run for a compressed
-	 * one, which is what ft_node_span answers.  A span wider than the
-	 * child's own depth means @cur is not the parent of anything at that
-	 * depth: the plan is stale, so re-descend (nothing is built, locked or
-	 * reserved yet, exactly as the bail above).
+	 * @cur HOLDS the detached child's slot, so it starts a full SPAN
+	 * above it.  The span is one key byte for a bitmap node and the whole
+	 * run for a compressed one.  That is what ft_node_span answers.  A
+	 * span wider than the child's own depth means @cur is not the parent
+	 * of anything at that depth.  The plan is then stale, so re-descend.
+	 * Nothing is built, locked or reserved yet, exactly as the bail
+	 * above.
 	 */
 	cur_span = ft_node_span(ft, cur);
 	if (caa_unlikely(cur_span > detach_depth))
@@ -3456,10 +3794,11 @@ int ft_detach_node(struct cds_ft *ft,
 	cur_depth = detach_depth - cur_span;
 
 	/*
-	 * nr_keys count fold (LEAF Increment 2): no standalone pre-decrement
-	 * here anymore -- each per-outcome commit below folds the @count_delta
-	 * walk onto its own flip so the count flips ATOMICALLY with the unlink
-	 * (exact under concurrent writers).  See @count_folded.
+	 * nr_keys count fold (LEAF Increment 2): there is no standalone
+	 * pre-decrement here anymore.  Each per-outcome commit below folds
+	 * the @count_delta walk onto its own flip.  So the count flips
+	 * ATOMICALLY with the unlink (exact under concurrent writers).  See
+	 * @count_folded.
 	 */
 
 	while (cur) {
@@ -3473,17 +3812,20 @@ int ft_detach_node(struct cds_ft *ft,
 		pair_held = NULL;
 		/*
 		 * ONE proxy-resolved snapshot of this ancestor's parent
-		 * back-pointer, consumed by every use below (the is_root
-		 * boundary test, the boundary parent_meta classify, and the
-		 * climb).  &metadata->parent is a flip-txn parked slot
-		 * (ft_reparent_record_meta), so a concurrent recompaction
-		 * re-home transiently parks a type-7 proxy here; a raw load fed
-		 * to cds_ft_item_to_metadata() computes metadata off the
+		 * back-pointer.  Every use below consumes it:
+		 *   - the is_root boundary test;
+		 *   - the boundary parent_meta classify;
+		 *   - the climb.
+		 * &metadata->parent is a flip-txn parked slot
+		 * (ft_reparent_record_meta).  So a concurrent recompaction
+		 * re-home transiently parks a type-7 proxy here.  A raw load
+		 * fed to cds_ft_item_to_metadata() computes metadata off the
 		 * latch/record memory and faults (the dominant FT_INV_MW
-		 * up-walk crash), and a raw non-NULL proxy also mis-answers
-		 * is_root.  Resolve once (a predicted-not-taken mask-compare
-		 * when no re-home is in flight -- single-writer unchanged),
-		 * exactly as the reader up-walk ft_skip_reanchor does.
+		 * up-walk crash).  A raw non-NULL proxy also mis-answers
+		 * is_root.  Resolve once, exactly as the reader up-walk
+		 * ft_skip_reanchor does.  That is a predicted-not-taken
+		 * mask-compare when no re-home is in flight, so
+		 * single-writer is unchanged.
 		 */
 		resolved_parent = ft_parent_node_resolved(
 				rcu_dereference(metadata->parent_word));
@@ -3494,49 +3836,60 @@ int ft_detach_node(struct cds_ft *ft,
 		 *
 		 * @detach_parent_flag_ptr is the slot this plan may CLEAR (an
 		 * elevation) or PUBLISH INTO (a DEL recompaction of @cur).  The
-		 * CALLER derived it from @cur's (parent_word, parent_slot_offset)
-		 * at an earlier instant; by the time this level consumes it, a
-		 * peer may have REPUBLISHED @cur's parent (a recompaction copies
-		 * the parent body and retires the original).  The caller's
-		 * address then points into the RETIRED body while @cur's word
-		 * names the fresh copy -- individually coherent, not a pair.
-		 * ft_resolve_parent_slot cannot see it (its coherence re-read
-		 * only catches a re-home landing on the parent WORD, and that
-		 * word is stable across both loads), and the entry HOLDER
-		 * IDENTITY test cannot either: it checks the slot this op READS
-		 * (@detach_node_flag_ptr inside @cur), not the slot it WRITES.
+		 * CALLER derived it from @cur's (parent_word,
+		 * parent_slot_offset) at an earlier instant.  By the time this
+		 * level uses it, a peer may have REPUBLISHED @cur's parent.  (A
+		 * recompaction copies the parent body and retires the
+		 * original.)  The caller's address then points into the
+		 * RETIRED body, while @cur's word names the fresh copy.  Each
+		 * value is coherent alone, but they are not a pair.
+		 *
+		 * Two existing checks cannot see this:
+		 *   - ft_resolve_parent_slot: its coherence re-read only
+		 *     catches a re-home landing on the parent WORD, and that
+		 *     word is stable across both loads.
+		 *   - The entry HOLDER IDENTITY test: it checks the slot this
+		 *     op READS (@detach_node_flag_ptr inside @cur), not the
+		 *     slot it WRITES.
 		 *
 		 * MEASURED on inv_concurrent_remove_all_nolist, per-node AND
-		 * root-only: the parent word resolved to a 32-byte node while
-		 * the offset read 6 (an order-6 body's), so the elevated clear
-		 * NULLed a word of the NEIGHBOURING item -- which held a live
-		 * external head -- and fused the nr_child-- onto the real parent.
-		 * That parent then carries one non-NULL child its count does not
-		 * cover: every plan built from the count is wrong, every
-		 * validation against the structure fails, and the node WEDGES
+		 * root-only:
+		 *   - the parent word resolved to a 32-byte node, while the
+		 *     offset read 6 (an order-6 body's);
+		 *   - so the elevated clear NULLed a word of the NEIGHBOURING
+		 *     item, which held a live external head;
+		 *   - and it fused the nr_child-- onto the real parent.
+		 * That parent then carries one non-NULL child its count does
+		 * not cover.  Every plan built from the count is wrong.  Every
+		 * validation against the structure fails.  The node WEDGES
 		 * (the memcg-killed legs).
 		 *
-		 * ☞ That signature was FIRST read as a torn two-store re-parent,
-		 * and that reading is REFUTED.  A parent republished between the
-		 * caller's derivation and this use produces the identical
-		 * order-5-word / offset-6 disagreement with no torn read at all,
-		 * and four independent probes agree it is the republish:
-		 * re-resolving the pair AT the refusal finds it self-coherent in
-		 * 100% of why2 hits (28/28 per-node, 119/119 root-only), while
-		 * the three writer-side probes -- an offset store onto a word
-		 * naming a different parent, a parent-word-only re-parent, and a
-		 * plain offset store onto a child that is still REACHABLE
-		 * through its own pair -- all read ZERO on this row.  Nobody
-		 * tears the pair; the plan simply goes stale.  So this block is
-		 * a STALE-PLAN refusal, and no re-parent producer is owed a fix
-		 * on its account.
+		 * ☞ That signature was FIRST read as a torn two-store
+		 * re-parent.  That reading is REFUTED.  A parent republished
+		 * between the caller's derivation and this use produces the
+		 * same order-5-word / offset-6 disagreement, with no torn read
+		 * at all.  Four independent probes agree it is the republish:
+		 *   - Re-resolving the pair AT the refusal finds it
+		 *     self-coherent in 100% of why2 hits (28/28 per-node,
+		 *     119/119 root-only).
+		 *   - Three writer-side probes all read ZERO on this row.
+		 *     They count an offset store onto a word naming a
+		 *     different parent, a parent-word-only re-parent, and a
+		 *     plain offset store onto a child still REACHABLE
+		 *     through its own pair.
+		 * Nobody tears the pair; the plan simply goes stale.  So this
+		 * block is a STALE-PLAN refusal.  No re-parent producer is
+		 * owed a fix on its account.
 		 *
-		 * The witness that is independent of the torn pair is the parent
-		 * @cur's OWN word names, resolved just above: the slot must lie
-		 * INSIDE that parent's body (or be the trie root slot), and what
-		 * it holds must be @cur.  Both are address / identity tests, no
-		 * value this op adopts.  Nothing is built, locked or reserved:
-		 * re-descend, and the retry reads the pair after the re-parent's
+		 * The witness independent of the torn pair is the parent that
+		 * @cur's OWN word names, resolved just above.  Two tests use
+		 * it:
+		 *   - the slot must lie INSIDE that parent's body (or be the
+		 *     trie root slot);
+		 *   - what the slot holds must be @cur.
+		 * Both are address or identity tests.  This op adopts no value
+		 * from them.  Nothing is built, locked or reserved, so
+		 * re-descend.  The retry reads the pair after the re-parent's
 		 * second store has landed.
 		 */
 		{
@@ -3552,26 +3905,26 @@ int ft_detach_node(struct cds_ft *ft,
 #ifdef FT_DEBUG_DEL_TOMB
 				/*
 				 * DISCRIMINATOR for why2.  Two different faults
-				 * produce the identical signature "the slot lies
-				 * outside the parent the word names":
+				 * produce the same signature: "the slot lies
+				 * outside the parent the word names".
 				 *
-				 *  (a) a TORN PAIR -- @cur's own (parent_word,
-				 *      parent_slot_offset) were read one after the
-				 *      other across a two-store re-parent, so the
-				 *      pair NEVER described one real edge; or
-				 *  (b) a STALE PLAN -- the pair is perfectly
-				 *      coherent, but a peer REPUBLISHED the parent
-				 *      since the CALLER derived
-				 *      @detach_parent_flag_ptr, so the caller's
-				 *      address points into the retired body while
-				 *      the word names the fresh copy.
+				 *  (a) A TORN PAIR.  @cur's own (parent_word,
+				 *      parent_slot_offset) were read one after
+				 *      the other across a two-store re-parent.
+				 *      The pair NEVER described one real edge.
+				 *  (b) A STALE PLAN.  The pair is coherent, but
+				 *      a peer REPUBLISHED the parent after the
+				 *      CALLER derived @detach_parent_flag_ptr.
+				 *      The caller's address points into the
+				 *      retired body.  The word names the fresh
+				 *      copy.
 				 *
-				 * Re-resolving the pair NOW separates them: if the
-				 * fresh slot lands inside the fresh parent, the pair
-				 * is self-coherent and (b) is what happened.  The
-				 * refusal is right either way -- this only says WHICH
-				 * defect the -EAGAIN is absorbing, i.e. whether a
-				 * producer is still owed a fix.
+				 * Re-resolving the pair NOW separates them.  If
+				 * the fresh slot lands inside the fresh parent,
+				 * the pair is self-coherent, so (b) happened.
+				 * The refusal is right either way.  This only
+				 * says WHICH defect the -EAGAIN is absorbing,
+				 * i.e. whether a producer is still owed a fix.
 				 */
 				{
 					struct cds_ft_inode_flag *fresh_parent = NULL;
@@ -3594,9 +3947,10 @@ int ft_detach_node(struct cds_ft *ft,
 				/*
 				 * A compressed @cur is named by its parent through
 				 * the SKIP_X form of ITS child (an external head's
-				 * address with the skip bits set), so resolve the
-				 * skip encoding BEFORE asking whether the value is a
-				 * bare external: only a bare one is a foreign word.
+				 * address with the skip bits set).  So resolve
+				 * the skip encoding BEFORE asking whether the
+				 * value is a bare external.  Only a bare one is
+				 * a foreign word.
 				 */
 				held_res = held ?
 					ft_resolve_skip_compressed(ft, held) : NULL;
@@ -3627,63 +3981,70 @@ int ft_detach_node(struct cds_ft *ft,
 		}
 		FT_DT_INC(ft_dt_pair_checked);
 		/*
-		 * ONE proxy-resolved snapshot of this ancestor's child count, for
-		 * exactly the same two reasons as @resolved_parent just above --
-		 * and &metadata->state is the SAME kind of parked slot.
+		 * ONE proxy-resolved snapshot of this ancestor's child count.
+		 * The two reasons are exactly those for @resolved_parent just
+		 * above.  &metadata->state is the SAME kind of parked slot.
 		 *
 		 * RESOLVED: a peer's in-flight commit parks an engine record
 		 * POINTER in the state word (FT_STATE_PROXY, bit 0).  A raw
-		 * ft_meta_nr_child() then decodes bits 2-10 of that pointer as the
-		 * count -- an arbitrary value, almost always > 1, which answers
-		 * "this ancestor is a surviving multi-child boundary" YES for a
-		 * node that in truth holds only the child we came up from.  The
-		 * prune then stops one level too low and ft_node_replace_ptr
-		 * DELs the boundary's last child, the case ft_node_recompact's
-		 * NODE_INDEX_NULL assert catches at the dereference site.
+		 * ft_meta_nr_child() then decodes bits 2-10 of that pointer as
+		 * the count.  That value is arbitrary, and almost always > 1.
+		 * It answers YES to "this ancestor is a surviving multi-child
+		 * boundary", for a node that in truth holds only the child we
+		 * came up from.  The prune then stops one level too low, and
+		 * ft_node_replace_ptr DELs the boundary's last child.
+		 * ft_node_recompact's NODE_INDEX_NULL assert catches that case
+		 * at the dereference site.
 		 *
-		 * ONCE: the three tests below (the emptied-ancestor bail, the
-		 * nr_clear tally and the boundary stop) must agree on one value.
-		 * Three separate loads of a word peers mutate can disagree, and a
-		 * plan built from two different counts is incoherent even when
-		 * each load is individually resolved.
+		 * ONCE: the three tests below must agree on one value.  They
+		 * are the emptied-ancestor bail, the nr_clear tally and the
+		 * boundary stop.  Three separate loads of a word peers mutate
+		 * can disagree.  A plan built from two different counts is
+		 * incoherent, even when each load is resolved on its own.
 		 *
-		 * Off the commit window urcu_txn_read short-circuits to a plain
-		 * load, so single-writer is unchanged.
+		 * Off the commit window, urcu_txn_read short-circuits to a
+		 * plain load, so single-writer is unchanged.
 		 */
 		nr_child = ft_meta_nr_child_load(metadata);
 
 		/*
-		 * A climbed ancestor with nr_child == 0 means a peer is concurrently
-		 * recompacting / emptying a shared spine node (skip-compression drives
-		 * this churn, hence skip-gated): our prune plan is racing that peer.
-		 * Bail before any build and re-descend against the settled tree,
-		 * exactly as the flip-proxy holder bail below.  Under mutual exclusion
-		 * this is impossible -- a climbed ancestor always still holds the child
-		 * we came up from (nr_child >= 1) -- so the pre-MW invariant assert
-		 * becomes an MW retry point, not a fatal abort.
+		 * A climbed ancestor with nr_child == 0 means a peer is
+		 * recompacting or emptying a shared spine node right now.
+		 * Skip-compression drives this churn, hence skip-gated.  Our
+		 * prune plan is racing that peer.  Bail before any build and
+		 * re-descend against the settled tree, exactly as the
+		 * flip-proxy holder bail below.
+		 *
+		 * Under mutual exclusion this is impossible.  A climbed
+		 * ancestor always still holds the child we came up from
+		 * (nr_child >= 1).  So the pre-MW invariant assert becomes an
+		 * MW retry point, not a fatal abort.
 		 */
 		if (caa_unlikely(nr_child == 0))
 			return -EAGAIN;
 		/*
-		 * ☠ AND A RETIRED ANCESTOR VOIDS THE WHOLE PLAN, at EVERY level
-		 * of the climb -- the boundary included, since the stop test
-		 * below runs on this same @cur.
+		 * ☠ AND A RETIRED ANCESTOR VOIDS THE WHOLE PLAN, at EVERY
+		 * level of the climb.  That includes the boundary, since the
+		 * stop test below runs on this same @cur.
 		 *
-		 * The climb reads every ancestor with NOTHING held, and from
-		 * those reads it decides which slot is cleared, which chain is
-		 * orphaned and where the prune stops.  A peer that RETIRED any
-		 * node on this path has already republished a fresh copy
-		 * elsewhere, so every one of those decisions names a node that
-		 * is no longer in the trie -- and the plan then condemns, frees
-		 * and re-parents around a dead path.  nr_child cannot see it: a
-		 * retired node keeps its body readable (RCU) and its count
-		 * intact; only the TOMBSTONE bit says the node has left.
+		 * The climb reads every ancestor with NOTHING held.  From
+		 * those reads it decides:
+		 *   - which slot is cleared;
+		 *   - which chain is orphaned;
+		 *   - where the prune stops.
+		 * A peer that RETIRED any node on this path has already
+		 * republished a fresh copy elsewhere.  So each of those
+		 * decisions names a node that is no longer in the trie.  The
+		 * plan then condemns, frees and re-parents around a dead path.
+		 * nr_child cannot see it.  A retired node keeps its body
+		 * readable (RCU) and its count intact.  Only the TOMBSTONE bit
+		 * says the node has left.
 		 *
-		 * The recompacting delete never needed this either -- the
+		 * The recompacting delete never needed this either.  Its
 		 * {C,P,GP} acquire refuses PROXY|TOMBSTONE|LOCK outright, so a
-		 * dead ancestor was rejected at the lock.  The in-place tier is
-		 * what removes that acquire from the common path, which is why
-		 * the check has to be stated here instead.
+		 * dead ancestor was rejected at the lock.  The in-place tier
+		 * removes that acquire from the common path.  That is why the
+		 * check has to be stated here instead.
 		 *
 		 * Bail before anything is built, locked or reserved, exactly as
 		 * the nr_child == 0 arm above.
@@ -3698,19 +4059,27 @@ int ft_detach_node(struct cds_ft *ft,
 		}
 		nr_branch++;
 		/*
-		 * Stop the upward prune at a surviving boundary: a multi-child
-		 * node, the root, a level past one whose external_nodes were
-		 * promoted (prev_external_nodes_found), or a node that keeps its
-		 * own key (external_nodes) once a deeper promotion is already in
-		 * flight (topmost_external_nodes set).  A SINGLE-child node that
-		 * carries external_nodes does NOT stop here: pruning its only
-		 * (on-path) child empties it, so it cannot stay -- its external
-		 * chain is promoted into its own parent slot and the climb
-		 * continues past it (handled just below).  When the detach was
-		 * bootstrapped from a node that already carried external_nodes
-		 * (descent callers, topmost set at start), that node is the one
-		 * being promoted and a further external ancestor is a genuine
-		 * boundary -- hence the `&& topmost_external_nodes` guard.
+		 * Stop the upward prune at a surviving boundary.  A boundary
+		 * is one of:
+		 *   - a multi-child node;
+		 *   - the root;
+		 *   - a level past one whose external_nodes were promoted
+		 *     (prev_external_nodes_found);
+		 *   - a node that keeps its own key (external_nodes), once a
+		 *     deeper promotion is already in flight
+		 *     (topmost_external_nodes set).
+		 *
+		 * A SINGLE-child node that carries external_nodes does NOT
+		 * stop here.  Pruning its only (on-path) child empties it, so
+		 * it cannot stay.  Its external chain is promoted into its own
+		 * parent slot, and the climb continues past it (handled just
+		 * below).
+		 *
+		 * The detach may be bootstrapped from a node that already
+		 * carried external_nodes (descent callers, topmost set at
+		 * start).  Then that node is the one being promoted, and a
+		 * further external ancestor is a genuine boundary.  Hence the
+		 * `&& topmost_external_nodes` guard.
 		 */
 		if (prev_external_nodes_found || nr_child > 1 ||
 		    (metadata->external_nodes && topmost_external_nodes) ||
@@ -3721,18 +4090,18 @@ int ft_detach_node(struct cds_ft *ft,
 #ifdef FT_ENABLE_TRACING
 				/*
 				 * THE CLIMB'S DEREFERENCE, checked before it
-				 * happens.  This is the frame the residual SEGV
-				 * faults in, and it is the signature that
-				 * SURVIVES tracing (the reader-side one does
-				 * not: 0/2100 traced against ~1%/run untraced).
+				 * happens.  The residual SEGV faults in this
+				 * frame.  This signature SURVIVES tracing.  The
+				 * reader-side one does not: 0/2100 traced
+				 * against ~1%/run untraced.
 				 *
 				 * A freelist link is 8-mod-16, so it clears the
-				 * EXTERNAL tag -- a reclaimed parent reads as an
-				 * external node here, which is exactly the
-				 * invariant ft_get_parent_rcu asserts and this
-				 * climb never checked.  Round-trip it so the
-				 * event alone separates recycled memory from a
-				 * live object with a bad link.
+				 * EXTERNAL tag.  A reclaimed parent then reads
+				 * as an external node here.  ft_get_parent_rcu
+				 * asserts exactly that invariant, and this
+				 * climb never checked it.  Round-trip it, so
+				 * the event alone separates recycled memory
+				 * from a live object with a bad link.
 				 */
 				if (caa_unlikely(resolved_parent &&
 						ft_node_external(resolved_parent))) {
@@ -3758,42 +4127,47 @@ int ft_detach_node(struct cds_ft *ft,
 			 * separately below).
 			 *
 			 * ☠ A MISS IS A STALE PLAN, NOT A CAN'T-HAPPEN.  The
-			 * reverse lookup compares the slot's live value against
-			 * @*detach_node_flag_ptr by RAW IDENTITY across two
-			 * separate loads of the same word, and this climb runs
-			 * PRE-FENCE: a peer commit on that slot lands between
-			 * them and every slot mismatches, so the lookup returns
-			 * false.  Its header calls that "should not happen on a
-			 * well-formed trie" -- true single-writer, and why the
-			 * result went unchecked.
+			 * reverse lookup compares the slot's live value
+			 * against @*detach_node_flag_ptr by RAW IDENTITY.  It
+			 * does so across two separate loads of the same word.
+			 * This climb runs PRE-FENCE.  A peer commit on that
+			 * slot can land between the two loads.  Then every
+			 * slot mismatches, and the lookup returns false.  Its
+			 * header calls that "should not happen on a
+			 * well-formed trie".  That is true single-writer, and
+			 * it is why the result went unchecked.
 			 *
-			 * Left unchecked it is SILENT AND FATAL: @n keeps its
-			 * initialiser 0, and the shape-D survivor scan below
-			 * skips byte @n to exclude the child being detached.
-			 * With @n == 0 it excludes nothing and takes the FIRST
-			 * live child -- the detached branch itself.  The
-			 * post-fence re-validation cannot catch it (it only asks
-			 * that @surviving_byte still maps to @surviving_child,
-			 * which is trivially true of the detached child), so the
-			 * collapse fuses around the very head this commit
-			 * freezes: the real sibling's key is ORPHANED and a
-			 * REMOVED node stays reachable.  Readers never consult
-			 * the removed mark, so cds_ft_lookup returns that
-			 * tombstone as live; the next insert onto it records
-			 * slot (void **) 2 from a marked `next`, and the MW
-			 * install dereferences it.
+			 * Left unchecked, the miss is SILENT AND FATAL:
+			 *   - @n keeps its initialiser 0.
+			 *   - The shape-D survivor scan below skips byte @n to
+			 *     exclude the child being detached.  With @n == 0
+			 *     it excludes nothing.  It takes the FIRST live
+			 *     child: the detached branch itself.
+			 *   - The post-fence re-validation cannot catch it.  It
+			 *     only asks that @surviving_byte still maps to
+			 *     @surviving_child.  That is trivially true of the
+			 *     detached child.
+			 *   - So the collapse fuses around the very head this
+			 *     commit freezes.  The real sibling's key is
+			 *     ORPHANED, and a REMOVED node stays reachable.
+			 *   - Readers never consult the removed mark, so
+			 *     cds_ft_lookup returns that tombstone as live.
+			 *   - The next insert onto it records slot (void **) 2
+			 *     from a marked `next`, and the MW install
+			 *     dereferences it.
 			 *
-			 * Do NOT retry the lookup in place: a retried find_child
-			 * succeeds (measured 50,590 of 50,590 misses are
-			 * transient) but then names the PEER'S NEW child, a
-			 * subtree this climb never counted.  Abandoning the plan
-			 * is the only correct response.
+			 * Do NOT retry the lookup in place.  A retried
+			 * find_child succeeds (measured: 50,590 of 50,590
+			 * misses are transient).  But it then names the
+			 * PEER'S NEW child, a subtree this climb never
+			 * counted.  Abandoning the plan is the only correct
+			 * response.
 			 *
-			 * MEASURED on a build that widens the miss-to-scan window
-			 * (a 10,000-iteration cpu_relax on the miss path, nothing
-			 * else), exponential spacing, two arms differing by this
-			 * bail alone: 64 of 96 runs SEGV without it, 0 of 96
-			 * with it.
+			 * MEASURED on a build that widens the miss-to-scan
+			 * window: a 10,000-iteration cpu_relax on the miss
+			 * path, nothing else.  Exponential spacing, two arms
+			 * that differ by this bail alone.  64 of 96 runs SEGV
+			 * without it, 0 of 96 with it.
 			 */
 			if (!ft_node_compressed(cur) &&
 					caa_unlikely(!ft_node_find_child(ft, cur,
@@ -3802,12 +4176,12 @@ int ft_detach_node(struct cds_ft *ft,
 			/*
 			 * PLAN -> COMMIT window (-DFT_DELAY_INJECT only, no-op
 			 * otherwise).  The decision "this ancestor keeps a child,
-			 * so it stays wired" has just been made from a count read
-			 * a few lines up; everything that empties it happens after
-			 * this point.  Widening the gap here is what lets a peer's
-			 * removal of the OTHER child land inside the window, which
-			 * is the interleaving the residual needs and which is
-			 * otherwise ~1 run in 100.
+			 * so it stays wired" was just made from a count read a
+			 * few lines up.  Everything that empties it happens
+			 * after this point.  Widening the gap here lets a peer's
+			 * removal of the OTHER child land inside the window.
+			 * The residual needs that interleaving.  Otherwise it
+			 * shows ~1 run in 100.
 			 */
 #ifndef FT_DELAY_SITE_B_ONLY
 			ft_delay_writer();
@@ -3815,10 +4189,11 @@ int ft_detach_node(struct cds_ft *ft,
 			break;
 		}
 		/*
-		 * Single-child node made childless by the prune that carries a
-		 * shorter key: promote its external chain (the deepest such node
-		 * on the path is the one promoted; prev_external_nodes_found then
-		 * stops the climb at the next, surviving level).
+		 * A single-child node, made childless by the prune, that
+		 * carries a shorter key: promote its external chain.  The
+		 * deepest such node on the path is the one promoted.
+		 * prev_external_nodes_found then stops the climb at the next,
+		 * surviving level.
 		 */
 		/* Resolve a parked splice proxy before republish (see above). */
 		if (metadata->external_nodes && !topmost_external_nodes) {
@@ -3828,14 +4203,16 @@ int ft_detach_node(struct cds_ft *ft,
 			/*
 			 * The junction the prune empties.  Its head takes its
 			 * place in the boundary's slot, so the node itself is
-			 * unlinked -- an orphan the walks below must budget for.
+			 * unlinked.  It is an orphan the walks below must
+			 * budget for.
 			 * ☠ It is NOT in @nr_clear (that tally is for keyless
-			 * links), and a walk budgeted on @nr_clear alone stops one
-			 * node short.  The plain REMOVE hid that: its target-chain
-			 * walk picks up whatever the elevated budget left behind.
-			 * A MOVE-style detach runs no such walk, and leaked the last
-			 * link of every promote -- the junction under a compressed
-			 * boundary, the run under the junction otherwise.
+			 * links).  A walk budgeted on @nr_clear alone stops one
+			 * node short.  The plain REMOVE hid that: its
+			 * target-chain walk picks up whatever the elevated budget
+			 * left behind.  A MOVE-style detach runs no such walk.
+			 * It leaked the last link of every promote: the junction
+			 * under a compressed boundary, else the run under the
+			 * junction.
 			 */
 			climb_promoted = topmost_external_nodes != NULL;
 		}
@@ -3872,44 +4249,50 @@ int ft_detach_node(struct cds_ft *ft,
 			 */
 			{
 				/*
-				 * Climb one level: cur (and its child-on-path,
-				 * already at detach_node_flag_ptr's level) is pruned,
-				 * so the detach target becomes cur and its parent
-				 * becomes parent_nf.  The new detach_parent_flag_ptr
-				 * must therefore point to PARENT_NF's slot in its own
-				 * parent (so *detach_parent_flag_ptr == parent_nf ==
-				 * the new cur), recovered in O(1) from parent_nf's
-				 * metadata parent-slot offset.  ft_get_parent_slot
-				 * handles all kinds: root (parent == NULL) -> &ft->root,
-				 * compressed -> its grandparent slot, plain internal ->
-				 * the body slot.  (The previous code recovered cur's own
-				 * slot here, which aliases detach_parent_flag_ptr and
-				 * left *detach_parent_flag_ptr != cur after the climb -- a
-				 * latent bug, never reached because descent callers pass
-				 * the surviving-ancestor detach point and break above.)
+				 * Climb one level.  cur is pruned, with its
+				 * child-on-path (already at detach_node_flag_ptr's
+				 * level).  So the detach target becomes cur, and its
+				 * parent becomes parent_nf.  The new
+				 * detach_parent_flag_ptr must therefore point to
+				 * PARENT_NF's slot in its own parent.  Then
+				 * *detach_parent_flag_ptr == parent_nf == the new
+				 * cur.  That slot is recovered in O(1) from
+				 * parent_nf's metadata parent-slot offset.
+				 * ft_get_parent_slot handles all kinds:
+				 *   - root (parent == NULL) -> &ft->root;
+				 *   - compressed -> its grandparent slot;
+				 *   - plain internal -> the body slot.
+				 * (The previous code recovered cur's own slot here.
+				 * That aliases detach_parent_flag_ptr, and left
+				 * *detach_parent_flag_ptr != cur after the climb.  It
+				 * was a latent bug, never reached: descent callers
+				 * pass the surviving-ancestor detach point and break
+				 * above.)
 				 */
 				struct cds_ft_metadata *parent_nf_meta =
 					cds_ft_item_to_metadata(ft_node_ptr(parent_nf));
 				struct cds_ft_inode_flag **new_parent_flag_ptr =
 					ft_get_parent_slot(parent_nf_meta, ft);
 				/*
-				 * Defensive: if the recovered slot aliases the current
-				 * detach_parent_flag_ptr, advancing would put both
-				 * pointers at the same slot, breaking the replace which
-				 * assumes detach_node_flag_ptr is WITHIN
-				 * iter_node_flag's child array.
+				 * Defensive: the recovered slot may alias the
+				 * current detach_parent_flag_ptr.  Advancing would
+				 * then put both pointers at the same slot.  That
+				 * breaks the replace, which assumes
+				 * detach_node_flag_ptr is WITHIN iter_node_flag's
+				 * child array.
 				 *
 				 * ☠ A STALE PLAN, NOT A BOUNDARY.  The slot recovered
-				 * from @parent_nf's metadata lives in ITS parent's body;
-				 * the slot that holds @cur lives in @parent_nf's own.
-				 * They alias only when the chain this climb read is not
-				 * a tree any more -- a peer's relocation seen through
-				 * reclaimed memory.  Breaking here used to keep the
-				 * level's verdict (its @nr_clear tally, and now its
-				 * promote) while NOT elevating past it, so both orphan
-				 * walks would then reach one link too far: the detach
-				 * target itself, freed while live.  Nothing is built,
-				 * locked or reserved yet: re-descend, as every other
+				 * from @parent_nf's metadata lives in ITS parent's
+				 * body.  The slot that holds @cur lives in
+				 * @parent_nf's own.  They alias only when the chain
+				 * this climb read is not a tree any more: a peer's
+				 * relocation seen through reclaimed memory.
+				 * Breaking here used to keep the level's verdict
+				 * (its @nr_clear tally, and now its promote), while
+				 * NOT elevating past it.  Both orphan walks would
+				 * then reach one link too far: the detach target
+				 * itself, freed while live.  Nothing is built, locked
+				 * or reserved yet.  So re-descend, as every other
 				 * stale-plan bail in this climb does.
 				 */
 				if (caa_unlikely(new_parent_flag_ptr ==
@@ -3919,14 +4302,14 @@ int ft_detach_node(struct cds_ft *ft,
 				detach_parent_flag_ptr = new_parent_flag_ptr;
 				/*
 				 * Re-anchor the plan's expected-old onto the level
-				 * this iteration just decided to prune: @cur held
-				 * only the branch below, so the slot that holds @cur
-				 * is the one the drop targets, and the value that
-				 * verdict rests on is the one @cur was resolved from
-				 * (see @plan_old_child).  For the entry holder that
-				 * value is already in hand -- reusing it is what keeps
-				 * the pair coherent; deeper levels reach @cur through
-				 * the back-pointer chain and have no earlier read.
+				 * this iteration just decided to prune.  @cur held
+				 * only the branch below.  So the slot that holds @cur
+				 * is the one the drop targets.  The verdict rests on
+				 * the value @cur was resolved from (see
+				 * @plan_old_child).  For the entry holder, that value
+				 * is already in hand.  Reusing it keeps the pair
+				 * coherent.  Deeper levels reach @cur through the
+				 * back-pointer chain, and have no earlier read.
 				 */
 				plan_old_child = detach_node_flag_ptr ==
 						entry_holder_slot ?
@@ -3942,8 +4325,9 @@ int ft_detach_node(struct cds_ft *ft,
 					FT_DT_INC(ft_dt_cap1_null);
 				/*
 				 * The level just decided to prune is already
-				 * empty: same stale plan as the entry capture,
-				 * same answer (see there).
+				 * empty.  This is the same stale plan as the
+				 * entry capture, with the same answer (see
+				 * there).
 				 */
 #ifndef FT_DEBUG_NO_NULLPLAN
 				if (caa_unlikely(!plan_old_child))
@@ -3952,11 +4336,11 @@ int ft_detach_node(struct cds_ft *ft,
 			}
 			/*
 			 * One hop up moves the byte-depth by the PARENT's span,
-			 * never by one: a compressed parent consumes its whole
+			 * never by one.  A compressed parent consumes its whole
 			 * run.  Dating the climb by one per ancestor puts every
-			 * node it reports at a depth the descent disagrees with,
-			 * and a lock-set member is then anchored at a level that
-			 * is not its own.
+			 * node it reports at a depth the descent disagrees with.
+			 * A lock-set member is then anchored at a level that is
+			 * not its own.
 			 */
 			cur_span = ft_node_span(ft, parent_nf);
 			if (caa_unlikely(cur_span > cur_depth))
@@ -3970,43 +4354,52 @@ int ft_detach_node(struct cds_ft *ft,
 	iter_node_flag = *detach_parent_flag_ptr;
 	elevated_old_child = *detach_node_flag_ptr;
 	/*
-	 * F1 / RESOLVED-POINTER CONTRACT (ft-helpers.h): a peer mid-commit
-	 * recompacting or re-homing the boundary (or the detach target) parks a
-	 * flip-proxy on its slot.  Left raw, that proxy is silently misclassified
-	 * as a type-7 internal node below (ft_node_compressed / the phase-2 free
-	 * walk / the shape-D ft_node_ptr) and its tag stripped into a wild
-	 * pointer, faulting frames later in cds_ft_item_to_metadata.  Do NOT
-	 * classify or embed a parked proxy: bail so the wrapper re-descends and
-	 * re-derives the slot once the peer's commit settles.  Resolving in place
-	 * would be wrong -- a recompaction relocates the boundary and retires its
-	 * old parent body, so detach_parent_flag_ptr can point into freed memory.
+	 * F1 / RESOLVED-POINTER CONTRACT (ft-helpers.h).  A peer mid-commit
+	 * may be recompacting or re-homing the boundary (or the detach
+	 * target).  It parks a flip-proxy on that slot.  Left raw, the proxy
+	 * is silently misclassified as a type-7 internal node below.  That
+	 * happens in ft_node_compressed, the phase-2 free walk and the
+	 * shape-D ft_node_ptr.
+	 * Its tag is stripped into a wild pointer, which faults frames later
+	 * in cds_ft_item_to_metadata.
+	 *
+	 * Do NOT classify or embed a parked proxy.  Bail, so the wrapper
+	 * re-descends and re-derives the slot once the peer's commit
+	 * settles.  Resolving in place would be wrong.  A recompaction
+	 * relocates the boundary and retires its old parent body, so
+	 * detach_parent_flag_ptr can point into freed memory.
 	 */
 	if (caa_unlikely(ft_node_flip_proxy(iter_node_flag) ||
 			ft_node_flip_proxy(elevated_old_child)))
 		return -EAGAIN;
 	/*
 	 * ☠ AN EMPTY HOLDER SLOT IS A STALE PLAN, NOT A NODE.  The climb
-	 * validated @detach_parent_flag_ptr against its level's @cur (THE PAIR
-	 * THIS LEVEL WRITES THROUGH, above), but that check and this READ are
-	 * two separate instants: the loop exited, and a peer's in-place delete
-	 * can clear the slot in between.  No pair check can close that -- the
-	 * validation cannot be held across the read -- so the empty value has to
-	 * be caught where it is actually observed, exactly as the plan
-	 * expected-old below catches a republished child.
+	 * validated @detach_parent_flag_ptr against its level's @cur (THE
+	 * PAIR THIS LEVEL WRITES THROUGH, above).  But that check and this
+	 * READ are two separate instants.  The loop exited, and a peer's
+	 * in-place delete can clear the slot in between.  No pair check can
+	 * close that, because the validation cannot be held across the read.
+	 * So the empty value has to be caught where it is actually observed.
+	 * The plan expected-old below catches a republished child the same
+	 * way.
 	 *
-	 * Left through, NULL is not rejected by anything downstream: every
-	 * classifier here asks the node's FLAGS, and ft_node_compressed(NULL) /
-	 * ft_node_skip_compressed(NULL) are both false, so a NULL holder walks
-	 * straight into the internal-node arm and reaches
-	 * cds_ft_item_to_metadata(NULL), which indexes the metadata array of the
-	 * range that would contain address 0 and FAULTS (MEASURED: release
-	 * root-only, inv_concurrent_remove_all_list, SIGSEGV at 0x200010 -- the
-	 * NULL page base plus the range's metadata offset -- with
-	 * iter_node_flag = 0x0 in the frame).  This is the same failure the
-	 * flip-proxy bail above prevents, reached by the other bad value.
+	 * If NULL gets through, nothing downstream rejects it:
+	 *   - Every classifier here asks the node's FLAGS.
+	 *   - ft_node_compressed(NULL) and ft_node_skip_compressed(NULL) are
+	 *     both false.
+	 *   - So a NULL holder walks straight into the internal-node arm.
+	 *   - It reaches cds_ft_item_to_metadata(NULL).  That indexes the
+	 *     metadata array of the range that would contain address 0, and
+	 *     FAULTS.
+	 * MEASURED on release root-only, inv_concurrent_remove_all_list.  It
+	 * gave SIGSEGV at 0x200010, with iter_node_flag = 0x0 in the frame.
+	 * That address is the NULL page base plus the range's metadata
+	 * offset.  This is the same
+	 * failure the flip-proxy bail above prevents, reached by the other
+	 * bad value.
 	 *
-	 * Nothing is built, locked or reserved yet: re-descend, exactly as the
-	 * two guards either side of this one do.
+	 * Nothing is built, locked or reserved yet.  So re-descend, exactly
+	 * as the two guards either side of this one do.
 	 */
 	FT_DT_INC(ft_dt_holder_reach);
 	if (caa_unlikely(!iter_node_flag)) {
@@ -4015,35 +4408,41 @@ int ft_detach_node(struct cds_ft *ft,
 	}
 	/*
 	 * ☠ THE HOLDER IS THE NODE THE CLIMB ENDED AT, OR THE PLAN IS VOID.
-	 * @detach_node_flag_ptr is a slot INSIDE the climb's boundary (its last
-	 * @cur, metadata_stack[nr_branch - 1]), and every write below goes
-	 * through it -- but @iter_node_flag is a FRESH read of the slot above
-	 * it, and a peer that republished the boundary since (a compressed
-	 * split's fresh junction, a recompaction's copy) hands back a node the
-	 * slot does not live in.  Nothing downstream re-asks: the op locks
-	 * THAT node, which is live, and its record lands on the RETIRED
-	 * boundary's slot, whose body still holds the plan's value, so even an
-	 * MW expected-old matches.  The live copy keeps naming the child this
-	 * commit then retires.
+	 * @detach_node_flag_ptr is a slot INSIDE the climb's boundary (its
+	 * last @cur, metadata_stack[nr_branch - 1]).  Every write below goes
+	 * through it.  But @iter_node_flag is a FRESH read of the slot above
+	 * it.  A peer may have republished the boundary since (a compressed
+	 * split's fresh junction, a recompaction's copy).  The read then
+	 * hands back a node the slot does not live in.  Nothing downstream
+	 * re-asks:
+	 *   - the op locks THAT node, which is live;
+	 *   - its record lands on the RETIRED boundary's slot;
+	 *   - that body still holds the plan's value, so even an MW
+	 *     expected-old matches.
+	 * The live copy keeps naming the child this commit then retires.
 	 *
-	 * MEASURED (LTTng, inv_prefix_shape_zoo insert/remove_all): the climb
-	 * condemned H, a junction whose only content left was its prefix head
-	 * N, under the compressed boundary CN.  A peer split CN into a fresh
-	 * junction J still carrying H, and committed; this op read J here,
-	 * locked it, recorded CN->child: H -> N, and retired H.  J still named
-	 * H: a tombstoned node reachable from a live one, and every remove of
-	 * N's key then spun on it (50,000 consecutive retries).
+	 * MEASURED (LTTng, inv_prefix_shape_zoo insert/remove_all):
+	 *   - The climb condemned H, under the compressed boundary CN.  H
+	 *     was a junction whose only content left was its prefix head N.
+	 *   - A peer split CN into a fresh junction J still carrying H, and
+	 *     committed.
+	 *   - This op read J here and locked it.  It recorded
+	 *     CN->child: H -> N, and retired H.
+	 *   - J still named H: a tombstoned node reachable from a live one.
+	 *     Every remove of N's key then spun on it (50,000 consecutive
+	 *     retries).
 	 *
-	 * The leaf hoist below states this same test for its own arm; the
-	 * promote arm had none.  With identity established here, the holder's
-	 * acquire (which refuses a tombstone) is what keeps it: under that lock
-	 * the boundary is live, so its slot is too.  Nothing is built, locked
-	 * or reserved yet: re-descend.
+	 * The leaf hoist below states this same test for its own arm.  The
+	 * promote arm had none.  Once identity is established here, the
+	 * holder's acquire keeps it, because the acquire refuses a
+	 * tombstone.  Under that lock the boundary is live, so its slot is
+	 * too.  Nothing is built, locked or reserved yet: re-descend.
 	 *
-	 * An EXTERNAL word is the same stale plan -- a peer collapsed the
-	 * boundary into the bare leaf it carried -- and has no metadata to
-	 * compare: refuse it first (MEASURED: 2 of 12 runs SEGV'd resolving
-	 * one).  SKIP before EXTERNAL: a SKIP_X word carries its child's tag.
+	 * An EXTERNAL word is the same stale plan: a peer collapsed the
+	 * boundary into the bare leaf it carried.  It has no metadata to
+	 * compare, so refuse it first (MEASURED: 2 of 12 runs SEGV'd
+	 * resolving one).  SKIP before EXTERNAL: a SKIP_X word carries its
+	 * child's tag.
 	 */
 #ifndef FT_DEBUG_NO_HOLDER_IDENTITY
 	if (caa_unlikely((!ft_node_skip_compressed(iter_node_flag) &&
@@ -4053,12 +4452,15 @@ int ft_detach_node(struct cds_ft *ft,
 		return -EAGAIN;	/* boundary republished: re-descend */
 #endif
 	/*
-	 * PLAN EXPECTED-OLD, enforced (see @plan_old_child): everything below --
-	 * the orphan set walked from @elevated_old_child, the count fold, and the
-	 * drop itself -- names the subtree the climb condemned.  A peer that
-	 * republished this slot since has put a DIFFERENT subtree here, one no
-	 * level of the climb ever counted, so the whole plan is void.  Nothing is
-	 * built, locked or reserved yet: re-descend against the settled tree.
+	 * PLAN EXPECTED-OLD, enforced (see @plan_old_child).  Everything below
+	 * names the subtree the climb condemned:
+	 *   - the orphan set walked from @elevated_old_child;
+	 *   - the count fold;
+	 *   - the drop itself.
+	 * A peer that republished this slot since has put a DIFFERENT subtree
+	 * here, one no level of the climb ever counted.  So the whole plan is
+	 * void.  Nothing is built, locked or reserved yet: re-descend against
+	 * the settled tree.
 	 */
 	FT_DT_INC(ft_dt_guard_reach);
 	if (!elevated_old_child && !plan_old_child)
@@ -4073,12 +4475,14 @@ int ft_detach_node(struct cds_ft *ft,
 		return -EAGAIN;
 	/*
 	 * The elevated chain from @elevated_old_child down to (excluding) the
-	 * original target: the keyless links the climb counted, plus the keyed
-	 * junction it promoted past -- which always sits at the chain's TOP, the
-	 * climb stopping at the very next level (prev_external_nodes_found).
-	 * Both orphan walks below are budgeted on this, so a promote's junction
-	 * is retired with the rest whether the target's subtree is destroyed
-	 * (remove) or moved (rekey).
+	 * original target.  It holds:
+	 *   - the keyless links the climb counted;
+	 *   - the keyed junction it promoted past.  That junction always sits
+	 *     at the chain's TOP, because the climb stops at the very next
+	 *     level (prev_external_nodes_found).
+	 * Both orphan walks below are budgeted on this.  So a promote's
+	 * junction is retired with the rest, whether the target's subtree is
+	 * destroyed (remove) or moved (rekey).
 	 */
 	nr_elevated = nr_clear + (climb_promoted ? 1 : 0);
 	/* Plan-snapshot the holder slot before any recompaction overwrite. */
@@ -4110,9 +4514,9 @@ int ft_detach_node(struct cds_ft *ft,
 
 		/*
 		 * Phase 2-style free walk for the orphaned chain below
-		 * the compressed parent.  When a compressed cn's child
-		 * was an internal node N with N->external_nodes
-		 * promoted (or no external_nodes), the chain
+		 * the compressed parent.  Say a compressed cn's child
+		 * was an internal node N, with N->external_nodes
+		 * promoted (or no external_nodes).  Then the chain
 		 * [N -> ... -> external_target] is now unreachable.
 		 * Walk from @elevated_old_child (the original cn->child)
 		 * down the single-child no-ext chain, collecting nodes
@@ -4120,28 +4524,33 @@ int ft_detach_node(struct cds_ft *ft,
 		 * itself may carry residual content (external_nodes)
 		 * that was promoted as topmost_external_nodes.
 		 *
-		 * Freeze-on-free (doc §4.B, atomic detach): COLLECT the orphaned
-		 * chain HERE; the per-node freeze-on-free tombstones are RECORDED
-		 * into the replace's publish txn just below and flip ATOMICALLY
-		 * with the commit that unlinks the chain, so a concurrent MCAS
-		 * writer targeting any of these nodes validates the mark (expected
-		 * = live) and fails -- and an aborted replace leaves them live and
-		 * unmarked (no stranded dead-but-linked node).  The walk is
-		 * read-only on the orphan subtree, whose internal pointers the
-		 * replace does NOT touch (it rewrites the parent slot + promotes
-		 * the target's external_nodes, tolerated by the phase2_first
-		 * special-case), so the set it builds is identical pre/post commit;
-		 * the actual free is deferred to after the commit.
+		 * Freeze-on-free (doc §4.B, atomic detach): COLLECT the
+		 * orphaned chain HERE.  The per-node freeze-on-free
+		 * tombstones are RECORDED into the replace's publish txn
+		 * just below.  They flip ATOMICALLY with the commit that
+		 * unlinks the chain.  So:
+		 *   - a concurrent MCAS writer targeting any of these nodes
+		 *     validates the mark (expected = live) and fails;
+		 *   - an aborted replace leaves them live and unmarked (no
+		 *     stranded dead-but-linked node).
+		 * The walk is read-only on the orphan subtree.  The replace
+		 * does NOT touch that subtree's internal pointers.  It
+		 * rewrites the parent slot and promotes the target's
+		 * external_nodes, which the phase2_first special-case
+		 * tolerates.  So the set the walk builds is identical before
+		 * and after the commit.  The actual free is deferred to after
+		 * the commit.
 		 *
-		 * A MOVE-style detach (@free_detached_subtree false: the target's
-		 * subtree is re-attached elsewhere, not destroyed) still owns the
-		 * ELEVATED chain above the target -- the keyed junction whose head
-		 * the replace below promotes into cn->child, and any keyless link
-		 * under it.  Walk exactly @nr_elevated links for it and stop short
-		 * of the target; the plain remove walks on to the leaf.  A SKIP
-		 * word stops the move's walk (the body reads it as its child): the
-		 * elided run is the chain's last link, claimed by the trailing arm
-		 * below while the budget is unspent.
+		 * A MOVE-style detach has @free_detached_subtree false: the
+		 * target's subtree is re-attached elsewhere, not destroyed.
+		 * It still owns the ELEVATED chain above the target.  That
+		 * chain is the keyed junction whose head the replace below
+		 * promotes into cn->child, plus any keyless link under it.  Walk exactly
+		 * @nr_elevated links for it, and stop short of the target.
+		 * The plain remove walks on to the leaf.  A SKIP word stops
+		 * the move's walk, because the body reads it as its child.
+		 * The elided run is the chain's last link.  The trailing arm
+		 * below claims it while the budget is unspent.
 		 */
 		if (free_detached_subtree || nr_elevated > 0) {
 			struct cds_ft_inode_flag *walk_nf = elevated_old_child;
@@ -4152,15 +4561,15 @@ int ft_detach_node(struct cds_ft *ft,
 			 * ☞ ITS OWN DESCENT, EXTENDED PER ORPHAN, and the depth
 			 * ADVANCED with it (doc/design/ft-lockset-inventory.md §2
 			 * row 6).  This walk used to date every orphan at the
-			 * FIRST one's depth and anchor it from the op's descent,
-			 * whose table ends above the chain -- so an orphan past
-			 * the first anchored on ITSELF by ft_anchor_meta's
-			 * on-a-level early return while every other op anchored
-			 * it on an ancestor (88k of 200k acquires at exponential).
-			 * The phase-2 walk below already extends a copy of its
-			 * own; this one does the same, for the same reason: the
-			 * op's descent stays on the KEY path for the acquires that
-			 * resolve after it.
+			 * FIRST one's depth.  It anchored each from the op's
+			 * descent, whose table ends above the chain.  So an
+			 * orphan past the first anchored on ITSELF, by
+			 * ft_anchor_meta's on-a-level early return.  Every other
+			 * op anchored it on an ancestor (88k of 200k acquires at
+			 * exponential).  The phase-2 walk below already extends a
+			 * copy of its own.  This one does the same, for the same
+			 * reason: the op's descent stays on the KEY path for the
+			 * acquires that resolve after it.
 			 */
 			struct ft_descent fwd;
 			struct ft_lock_ctx flctx = lctx;
@@ -4193,19 +4602,23 @@ int ft_detach_node(struct cds_ft *ft,
 						ft_node_ptr(walk_nf));
 				/*
 				 * §9.2 plan-lock: lock acquire the orphan BEFORE
-				 * reading its nr_child for the collapse decision, so
-				 * the "retire it" verdict is derived from a FROZEN
-				 * word and the fenced tombstone's expected-old (this
-				 * snap) is exactly that state.  A peer that grows the
-				 * orphan AFTER the mark tears the fenced expected-old
-				 * and aborts our commit (detect) -- and in practice
-				 * cannot even reach that: ft_meta_nr_child_inc spins on
-				 * FT_STATE_INPLACE_WAIT_MASK, which includes LOCK
-				 * unconditionally, so it WAITS for the mark.  One that
-				 * grew it BEFORE is reflected
-				 * in @osnap and stops the walk (nr_child > 1).  A dirty
-				 * mark (peer proxy / concurrent copier / real retire)
-				 * bails to the caller's re-descend.
+				 * reading its nr_child for the collapse decision.
+				 * Then the "retire it" verdict is derived from a
+				 * FROZEN word.  The fenced tombstone's expected-old
+				 * (this snap) is exactly that state.
+				 *
+				 * Peers that grow the orphan:
+				 *   - AFTER the mark: the growth tears the fenced
+				 *     expected-old and aborts our commit (detect).
+				 *     In practice it cannot even reach that.
+				 *     ft_meta_nr_child_inc spins on
+				 *     FT_STATE_INPLACE_WAIT_MASK, which includes
+				 *     LOCK unconditionally, so it WAITS for the
+				 *     mark.
+				 *   - BEFORE the mark: the growth is reflected in
+				 *     @osnap, and stops the walk (nr_child > 1).
+				 * A dirty mark (peer proxy, concurrent copier, real
+				 * retire) bails to the caller's re-descend.
 				 */
 				if (ft->lock_fine) {
 					lctx.held.nr_extra =
@@ -4214,21 +4627,24 @@ int ft_detach_node(struct cds_ft *ft,
 					flctx.held.nr_extra = lctx.held.nr_extra;
 					/*
 					 * The copy anchors the walk only because the
-					 * op's descent already ENTERED the node the walk
-					 * starts under; a cursor still ON it would leave
-					 * its levels uncrossed (skeptic, 2026-09-17).
+					 * op's descent already ENTERED the node the
+					 * walk starts under.  A cursor still ON it
+					 * would leave its levels uncrossed (skeptic,
+					 * 2026-09-17).
 					 *
-					 * ☠ THAT IS A PLAN, NOT AN INVARIANT.  @walk_depth
-					 * comes from the climb (key_len minus the spans it
-					 * reads LIVE), the anchors from the descent, and a
-					 * peer split or merge between the two lets the climb
-					 * date the walk deeper than the descent ever went.
-					 * ft_anchor_meta then answers from the wrong path:
-					 * the assert fired under rcu-debug, and a release
-					 * build anchored a garbage item and faulted in
-					 * ft_lock_set_order_by_anchor (two-writer owned-key
-					 * harness, exponential spacing).  Re-descend, as the
-					 * acquire's own refusal below does.
+					 * ☠ THAT IS A PLAN, NOT AN INVARIANT.
+					 * @walk_depth comes from the climb (key_len
+					 * minus the spans it reads LIVE).  The anchors
+					 * come from the descent.  A peer split or merge
+					 * between the two lets the climb date the walk
+					 * deeper than the descent ever went.
+					 * ft_anchor_meta then answers from the wrong
+					 * path.  The assert fired under rcu-debug.  A
+					 * release build anchored a garbage item and
+					 * faulted in ft_lock_set_order_by_anchor
+					 * (two-writer owned-key harness, exponential
+					 * spacing).  Re-descend, as the acquire's own
+					 * refusal below does.
 					 */
 #ifndef FT_DEBUG_ORPHAN_WALK_UNDATED
 					if (caa_unlikely(wd_valid &&
@@ -4266,53 +4682,58 @@ int ft_detach_node(struct cds_ft *ft,
 
 				/*
 				 * ☠☠ A `break` HERE IS NOT A REFUSAL.  The walk
-				 * stops, but everything after it runs: the replace
-				 * unlinks this whole chain from its parent while
-				 * @to_free holds only [0, k), so orphan @k is
-				 * unlinked and NEVER FREED -- leaked, together with
-				 * whatever a peer put on it.  Single-writer the walk
-				 * always reaches the leaf (every chain node passed
-				 * the climb's 1-child/no-ext tests), so this arm
-				 * fires ONLY on a plan the peer has invalidated --
-				 * and a stale plan must ABORT the op, not truncate
-				 * its free list.
+				 * stops, but everything after it runs.  The replace
+				 * unlinks this whole chain from its parent, while
+				 * @to_free holds only [0, k).  So orphan @k is
+				 * unlinked and NEVER FREED.  It leaks, together
+				 * with whatever a peer put on it.  Single-writer,
+				 * the walk always reaches the leaf: every chain
+				 * node passed the climb's 1-child/no-ext tests.  So
+				 * this arm fires ONLY on a plan the peer has
+				 * invalidated.  A stale plan must ABORT the op, not
+				 * truncate its free list.
 				 *
-				 * Nothing is built, recorded or reserved yet (the
-				 * walk is read-only and @orphan_txn does not exist),
-				 * so `goto end` is byte-for-byte clean and the sweep
-				 * there releases every mark this op still holds.
-				 * The mismatch is a COMMITTED peer write sitting in
-				 * our own locked snapshot, so the re-descend sees a
-				 * settled tree: one retry per peer event, never a
-				 * conflict the op manufactures for itself.
+				 * Nothing is built, recorded or reserved yet.  The
+				 * walk is read-only, and @orphan_txn does not
+				 * exist.  So `goto end` is byte-for-byte clean.
+				 * The sweep there releases every mark this op still
+				 * holds.  The mismatch is a COMMITTED peer write
+				 * sitting in our own locked snapshot.  So the
+				 * re-descend sees a settled tree.  That is one
+				 * retry per peer event, never a conflict the op
+				 * manufactures for itself.
 				 *
 				 *
-				 * ★ AND THE EXEMPTION IS NOW KEYED ON IDENTITY, not
-				 * position -- but NOT on the identity the first
-				 * design assumed.  MEASURED (ft_unit, single-writer,
-				 * probe at this line): the first orphan's own head is
-				 * @ext_nodes == NULL while @topmost_external_nodes is
-				 * NON-NULL, in every one of 24 samples, all in branch
-				 * 2.  @topmost was promoted from an ancestor ABOVE
-				 * this node (@prev_external_nodes_found is already
-				 * set), so it is simply not THIS node's head.
-				 * Requiring @ext_nodes == @topmost therefore refuses
-				 * the NORMAL shape and wedges ft_unit entering
+				 * ★ AND THE EXEMPTION IS NOW KEYED ON IDENTITY,
+				 * not position.  But it is NOT keyed on the
+				 * identity the first design assumed.  MEASURED
+				 * (ft_unit, single-writer, probe at this line):
+				 *   - the first orphan's own head @ext_nodes is
+				 *     NULL, while @topmost_external_nodes is
+				 *     NON-NULL;
+				 *   - this held in every one of 24 samples, all in
+				 *     branch 2.
+				 * @topmost was promoted from an ancestor ABOVE this
+				 * node (@prev_external_nodes_found is already set).
+				 * So it is simply not THIS node's head.  Requiring
+				 * @ext_nodes == @topmost therefore refuses the
+				 * NORMAL shape.  It wedges ft_unit entering
 				 * test_density_stress.
 				 *
 				 * What the climb actually believes about the first
-				 * orphan is weaker: it carries NO head of its own, OR
-				 * the one head the climb lifted off it.  Anything
-				 * else is a head that arrived after the plan -- a
-				 * peer's park -- and freeing this node would take the
+				 * orphan is weaker.  The orphan carries either NO
+				 * head of its own, or the one head the climb lifted
+				 * off it.  Any other head arrived after the plan (a
+				 * peer's park).  Freeing this node would take that
 				 * key with it.
 				 */
 				/*
 				 * SKEPTIC'S DISCRIMINATOR (probe only, no behaviour
-				 * change): the FIRST orphan is exempted from the
-				 * nr_child > 1 test, and its IDENTITY is never
-				 * compared with the node the climb condemned
-				 * (@elevated_old_child is RE-READ after the climb).
+				 * change).  Two facts about the FIRST orphan:
+				 *   - it is exempted from the nr_child > 1 test;
+				 *   - its IDENTITY is never compared with the node
+				 *     the climb condemned (@elevated_old_child is
+				 *     RE-READ after the climb).
 				 * Count both, on the oracle that loses keys.
 				 */
 				if (phase2_first) {
@@ -4325,16 +4746,17 @@ int ft_detach_node(struct cds_ft *ft,
 				}
 				/*
 				 * ☠ AND A HEAD THAT DEPARTED.  The rule above
-				 * accepts a first orphan with NO head, because the
+				 * accepts a first orphan with NO head.  The
 				 * promoted head usually came from an ancestor above
-				 * it -- but when it came off THIS node, "no head now"
-				 * means a peer REMOVED it after the climb read it,
-				 * pre-lock.  Promoting it anyway republishes a
-				 * removed node into the boundary slot (MEASURED: the
-				 * remove of "...zone46" resurrected a concurrently
-				 * removed "...zone4", next == REMOVED, both writers
-				 * then livelocked on it).  Under this orphan's lock
-				 * the node it was lifted off must still carry it.
+				 * it.  But when it came off THIS node, "no head
+				 * now" means a peer REMOVED it after the climb read
+				 * it, pre-lock.  Promoting it anyway republishes a
+				 * removed node into the boundary slot.  MEASURED:
+				 * the remove of "...zone46" resurrected a
+				 * concurrently removed "...zone4" (next ==
+				 * REMOVED).  Both writers then livelocked on it.
+				 * Under this orphan's lock, the node it was lifted
+				 * off must still carry it.
 				 */
 				if ((!phase2_first && (nr_child > 1 || ext_nodes)) ||
 				    (phase2_first && ext_nodes &&
@@ -4347,17 +4769,17 @@ int ft_detach_node(struct cds_ft *ft,
 				    /*
 				     * ☠ THE FIRST ORPHAN IS THE TARGET ONLY WHEN
 				     * NOTHING WAS ELEVATED.  After a climb it is
-				     * the chain's top -- a link the climb scored
-				     * single-child from an UNHELD read -- and an
+				     * the chain's top: a link the climb scored
+				     * single-child from an UNHELD read.  An
 				     * in-place insert (FEATURE_FT_INSERT_IN_PLACE)
-				     * grows it under this very lock without
-				     * retiring it: the walk then stops (no scan
-				     * past one child) and the drop retires the
-				     * link with the peer's new child inside
-				     * (MEASURED: inv_prefix_siblings_compressed_
+				     * grows it under this very lock, without
+				     * retiring it.  The walk then stops (no scan
+				     * past one child).  The drop retires the link
+				     * with the peer's new child inside.
+				     * MEASURED: inv_prefix_siblings_compressed_
 				     * holder, in-place legs, "ord-cell list longer
-				     * than trie").  Branch 2's phase 1 enforces
-				     * the same count under its planlock.
+				     * than trie".  Branch 2's phase 1 enforces the
+				     * same count under its planlock.
 				     */
 				    || (phase2_first && nr_elevated > 0 &&
 					    nr_child > 1)
@@ -4380,14 +4802,15 @@ int ft_detach_node(struct cds_ft *ft,
 				walk_nf = next;
 			}
 			/*
-			 * As in the replace-ptr free-walk below: a skip-compressed
-			 * external leaf at the chain end keeps its path bytes in a
-			 * separate, now-orphaned skip-target compressed node that the
-			 * walk stops short of.  Free it (the external leaf stays
-			 * caller-owned).  For a MOVE the skip-target is an orphan
-			 * only while the elevated budget is unspent: at the budget
-			 * the skip word encodes the target's own run, which moves
-			 * with it.
+			 * As in the replace-ptr free-walk below.  A
+			 * skip-compressed external leaf at the chain end keeps
+			 * its path bytes in a separate skip-target compressed
+			 * node.  That node is now orphaned, and the walk stops
+			 * short of it.  Free it (the external leaf stays
+			 * caller-owned).  For a MOVE, the skip-target is an
+			 * orphan only while the elevated budget is unspent.  At
+			 * the budget, the skip word encodes the target's own
+			 * run, which moves with it.
 			 */
 			if (walk_nf && ft_node_skip_compressed(walk_nf) &&
 					(free_detached_subtree ||
@@ -4401,23 +4824,27 @@ int ft_detach_node(struct cds_ft *ft,
 							trailing_skip_cn);
 
 			/*
-			 * The one-hop ft_skip_to_compressed is NOT MW-safe: a peer
-			 * split/merge can tear the skip back-pointer so it recovers
-			 * a node that is not this skip's target at all (type
-			 * confusion -- ft_reanchor_flag's header states the same
-			 * hazard for the descent side).  Every OTHER orphan is
-			 * guarded before it is retired (the walk breaks on
-			 * nr_child > 1, ft_detach_orphan_planlock refuses a grown
-			 * one); the trailing skip-target was the one that was not,
-			 * and it is retired unconditionally below.
+			 * The one-hop ft_skip_to_compressed is NOT MW-safe.
+			 * A peer split/merge can tear the skip back-pointer.
+			 * The resolve then recovers a node that is not this
+			 * skip's target at all (type confusion).
+			 * ft_reanchor_flag's header states the same hazard
+			 * for the descent side.
 			 *
-			 * A compressed node holds exactly ONE child, so a resolved
-			 * target whose count says otherwise is not the node this
-			 * plan is about.  Measured: retiring it dropped a
-			 * concurrently published 2-child subtree, i.e. SILENT KEY
-			 * LOSS (an insert reported OK for a key no root descent
-			 * could then find).  Bail to the op's re-descend, the same
-			 * answer a dirty mark gets one line below.
+			 * Every OTHER orphan is guarded before it is retired:
+			 * - the walk breaks on nr_child > 1;
+			 * - ft_detach_orphan_planlock refuses a grown one.
+			 * The trailing skip-target had no such guard.  It is
+			 * retired unconditionally below.
+			 *
+			 * A compressed node holds exactly ONE child.  A
+			 * resolved target with another count is not the node
+			 * this plan is about.  Measured: retiring it dropped
+			 * a concurrently published 2-child subtree.  That is
+			 * SILENT KEY LOSS: an insert reported OK for a key
+			 * that no root descent could then find.  Bail to the
+			 * op's re-descend.  A dirty mark gets the same answer
+			 * one line below.
 			 */
 					if (ft_meta_nr_child_load(tm) != 1) {
 						ret = -EAGAIN;
@@ -4452,25 +4879,32 @@ int ft_detach_node(struct cds_ft *ft,
 			}
 		}
 		/*
-		 * Atomic detach (§4.B): create the publish txn sized for the
-		 * replace's structural edges PLUS one freeze-on-free tombstone per
-		 * collected orphan (+ the trailing skip-target), and record each so
-		 * the whole retired chain freezes ATOMICALLY with the replace
-		 * commit that unlinks it.  create_bounded mallocs the exact cap;
-		 * OOM aborts before any reader-visible store (the orphan walk above
-		 * is read-only), and on the replace failing we destroy it here.
+		 * Atomic detach (§4.B).  Create the publish txn and size it
+		 * for:
+		 * - the replace's structural edges;
+		 * - one freeze-on-free tombstone per collected orphan;
+		 * - one more for the trailing skip-target.
+		 * Record each tombstone.  The whole retired chain then
+		 * freezes ATOMICALLY with the replace commit that unlinks it.
+		 *
+		 * create_bounded mallocs the exact cap.  OOM aborts before
+		 * any reader-visible store: the orphan walk above is
+		 * read-only.  If the replace fails, we destroy the txn here.
 		 */
 		{
 			/*
-			 * FOLD: ride the CALLER's commit.  Its own txn commits
-			 * strictly earlier, and this arm publishes a SKIP_X dual
-			 * whose home the publish resolves against the descriptor
-			 * it is handed -- a private one cannot see the caller's
-			 * pending re-parent of the compressed node, so the dual
-			 * was written into the parent the caller's commit then
-			 * retired.  Refused when the caller brought a cell or a
-			 * run: ft_remove_commit_rec's record-only arm asserts
-			 * !run && !dead_cell.
+			 * FOLD: ride the CALLER's commit.  This arm's own txn
+			 * commits strictly earlier.  This arm publishes a
+			 * SKIP_X dual.  The publish resolves the dual's home
+			 * against the descriptor it is handed.  A private
+			 * descriptor cannot see the caller's pending
+			 * re-parent of the compressed node.  So the dual was
+			 * written into the parent that the caller's commit
+			 * then retired.
+			 *
+			 * The fold is refused when the caller brought a cell
+			 * or a run: ft_remove_commit_rec's record-only arm
+			 * asserts !run && !dead_cell.
 			 */
 			struct ft_flip_txn *orphan_txn = fold_replace ? shared_txn :
 				ft_flip_txn_create_bounded(ft,
@@ -4487,15 +4921,18 @@ int ft_detach_node(struct cds_ft *ft,
 				goto end;
 			}
 			/*
-			 * PUBLISH THE WALK'S MARKS BEFORE THE FREEZE READS THEM.
-			 * An orphan whose anchor is its OWN word is never registered
-			 * in the txn (its fused tombstone is the terminal, see
-			 * ft_detach_freeze_one), so the record's ownership witness
-			 * is the held set -- and the walk above left @nr_extra one
-			 * short of the last acquire.  Under a per-op-armed CALLER's
-			 * txn (the fold) an unwitnessed tombstone is an abort at the
-			 * record; the plain-parent branch publishes before its
-			 * freeze for the same reason.
+			 * PUBLISH THE WALK'S MARKS BEFORE THE FREEZE READS
+			 * THEM.  An orphan whose anchor is its OWN word is
+			 * never registered in the txn: its fused tombstone
+			 * is the terminal (see ft_detach_freeze_one).  So the
+			 * record's ownership witness is the held set.  The
+			 * walk above left @nr_extra one short of the last
+			 * acquire.
+			 *
+			 * The fold runs under a per-op-armed CALLER's txn.
+			 * There, an unwitnessed tombstone is an abort at the
+			 * record.  The plain-parent branch publishes before
+			 * its freeze for the same reason.
 			 */
 			lctx.held.txn = orphan_txn;
 			lctx.held.nr_extra = (unsigned int) nr_orphan_locked;
@@ -4522,18 +4959,19 @@ int ft_detach_node(struct cds_ft *ft,
 					ft_flip_txn_record_tombstone(orphan_txn, m);
 			}
 			/*
-			 * The removed external leaf freezes atomically with this
-			 * compressed-parent replace that unlinks its chain (doc §4.B):
-			 * one MARK edge into @orphan_txn, the +1 reserved above.  The
-			 * replace records it, after the acquire that holds its chain.
+			 * The removed external leaf freezes atomically with
+			 * this compressed-parent replace, which unlinks its
+			 * chain (doc §4.B).  The freeze is one MARK edge into
+			 * @orphan_txn: the +1 reserved above.  The replace
+			 * records it after the acquire that holds its chain.
 			 */
 			if (freeze_leaf)
 				freeze_leaf_fused = true;
 			/*
-			 * @cur_depth dates @iter_node_flag: the climb tracks the
-			 * holder's byte-depth alongside the node itself, and
-			 * @iter_node_flag is that same holder re-read from its
-			 * slot.
+			 * @cur_depth dates @iter_node_flag.  The climb tracks
+			 * the holder's byte-depth alongside the node itself.
+			 * @iter_node_flag is that same holder, re-read from
+			 * its slot.
 			 */
 			lctx.held.txn = orphan_txn;
 			lctx.held.nr_extra = (unsigned int) nr_orphan_locked;
@@ -4546,9 +4984,9 @@ int ft_detach_node(struct cds_ft *ft,
 				count_delta, freeze_leaf, freeze_len);
 			if (ret) {
 				/*
-				 * -EAGAIN: the commit CONSUMED @orphan_txn (a
-				 * peer won mid-flip); only a pre-commit failure
-				 * (-ENOMEM before the commit) leaves it live.
+				 * -EAGAIN: the commit CONSUMED @orphan_txn
+				 * (a peer won mid-flip).  Only a failure
+				 * before the commit (-ENOMEM) leaves it live.
 				 */
 				if (ret != -EAGAIN && !fold_replace)
 					ft_flip_txn_destroy(orphan_txn);
@@ -4556,16 +4994,19 @@ int ft_detach_node(struct cds_ft *ft,
 			}
 		}
 		/*
-		 * Orphan chain unlinked: free the set collected above -- unless
-		 * this detach committed NOTHING (the FOLD), in which case the chain
-		 * is still live and linked and the CALLER's commit is the unlink.
-		 * Hand it out with the retired copy's lifetime then, exactly as the
-		 * plain-parent branch does: the caller reclaims it after its commit
-		 * lands and leaves it alone when that commit aborts.  The trailing
-		 * skip-target goes out as its PLAIN compressed flag, decoded above
-		 * under the plan -- a post-commit one-hop decode of the skip word
-		 * would run through a back-pointer this very commit re-points (the
-		 * promoted head's).
+		 * The orphan chain is unlinked: free the set collected
+		 * above.  The FOLD is the exception.  There this detach
+		 * committed NOTHING: the chain is still live and linked, and
+		 * the CALLER's commit is the unlink.  So hand the set out
+		 * with the retired copy's lifetime, as the plain-parent
+		 * branch does.  The caller reclaims it after its commit
+		 * lands, and leaves it alone when that commit aborts.
+		 *
+		 * The trailing skip-target goes out as its PLAIN compressed
+		 * flag, decoded above under the plan.  A one-hop decode of
+		 * the skip word after the commit would run through a
+		 * back-pointer that this very commit re-points (the promoted
+		 * head's).
 		 */
 		if (fold_replace) {
 			if (recompact_out) {
@@ -4603,53 +5044,65 @@ int ft_detach_node(struct cds_ft *ft,
 		 * structural changes).
 		 */
 		/*
-		 * Freeze-on-free (doc §4.B): COLLECT the orphaned detach subtree
-		 * and tombstone every node HERE, before ANY of this branch's
-		 * commits unlinks it -- the shape-D ft_chain_compress_fused below,
-		 * or ft_node_replace_ptr / ft_remove_one_commit further down.  The
-		 * walk is read-only on the orphan subtree, whose internal pointers
-		 * none of those commits touch (they rewrite the surviving boundary
-		 * + its parent slot; the detach target's own external_nodes clear /
-		 * topmost promote is tolerated by the phase2_first special-case), so
-		 * the set it builds is identical pre/post commit.  The free is
-		 * deferred to after the commit (the loop in the !ret block below
-		 * consumes @to_free / @trailing_skip_cn_flag).  (On an OOM abort
-		 * these still-live nodes are left marked dead -- a no-op under one
-		 * writer, corrected by a later successful detach.)
+		 * Freeze-on-free (doc §4.B).  COLLECT the orphaned detach
+		 * subtree and tombstone every node HERE, before ANY of this
+		 * branch's commits unlinks it.  Those commits are:
+		 * - the shape-D ft_chain_compress_fused below;
+		 * - ft_node_replace_ptr or ft_remove_one_commit further down.
+		 *
+		 * The walk is read-only on the orphan subtree.  None of those
+		 * commits touch the subtree's internal pointers.  They
+		 * rewrite the surviving boundary and its parent slot.  The
+		 * detach target's own external_nodes clear / topmost promote
+		 * is tolerated by the phase2_first special-case.  So the set
+		 * the walk builds is identical before and after the commit.
+		 *
+		 * The free is deferred to after the commit.  The loop in the
+		 * !ret block below consumes @to_free and
+		 * @trailing_skip_cn_flag.  On an OOM abort these still-live
+		 * nodes are left marked dead.  That is a no-op under one
+		 * writer, and a later successful detach corrects it.
 		 *
 		 * Free walk semantics:
 		 *
-		 *   Phase 1 -- elevated ancestors (single-child by the upward
-		 *   walk's own invariant: keyless, or the ONE keyed junction the
-		 *   climb promoted past, at the chain's top).  Free @nr_elevated
-		 *   nodes unconditionally.
+		 *   Phase 1 -- elevated ancestors.  Each is single-child by
+		 *   the upward walk's own invariant.  It is keyless, or it is
+		 *   the ONE keyed junction the climb promoted past, at the
+		 *   chain's top.  Free @nr_elevated nodes unconditionally.
 		 *
-		 *   Phase 2 -- target and chain below.  For destroy-style detach,
-		 *   walk the target's single-child no-external chain (descent
-		 *   tracking guarantees this) until we hit an external, a
-		 *   multi-child node, a node with external_nodes (its content was
-		 *   either preserved as topmost_external_nodes or still referenced),
-		 *   or nr_child == 0.  For move-style, stop -- the target is the new
+		 *   Phase 2 -- target and chain below.  A destroy-style
+		 *   detach walks the target's single-child no-external chain
+		 *   (descent tracking guarantees this).  The walk stops at:
+		 *   - an external;
+		 *   - a multi-child node;
+		 *   - a node with external_nodes (its content was either
+		 *     preserved as topmost_external_nodes or still
+		 *     referenced);
+		 *   - nr_child == 0.
+		 *   A move-style detach stops at once: the target is the new
 		 *   trie's root and must be preserved.
 		 *
-		 * Pointer classification: ft_node_external() is an external leaf
-		 * (caller-reclaimed); ft_node_compressed() covers plain + high-bit
-		 * skip-compressed; otherwise an internal node.
+		 * Pointer classification:
+		 * - ft_node_external(): an external leaf (caller-reclaimed);
+		 * - ft_node_compressed(): plain and high-bit skip-compressed;
+		 * - otherwise: an internal node.
 		 */
 		{
 			struct cds_ft_inode_flag *walk_nf = elevated_old_child;
 			unsigned int walk_depth = ft_child_depth_of(ft,
 				iter_node_flag, cur_depth);
 			/*
-			 * The walk leaves the key path -- it descends the
-			 * elevated chain, then the target's own chain -- so it
-			 * extends a descent OF ITS OWN.  Extending the op's
-			 * would re-answer the anchor query for every lock set
-			 * that resolves after it (the chain-compress fuse and
-			 * both publish guards below): those members sit on the
-			 * KEY path, and a level whose boundary node is still
-			 * pending resolves to the descent's CURSOR, which the
-			 * walk would have moved onto its own branch.
+			 * The walk leaves the key path.  It descends the
+			 * elevated chain, then the target's own chain.  So
+			 * it extends a descent OF ITS OWN.
+			 *
+			 * Extending the op's descent would re-answer the
+			 * anchor query for every lock set that resolves after
+			 * it.  Those are the chain-compress fuse and both
+			 * publish guards below.  Their members sit on the KEY
+			 * path.  A level whose boundary node is still pending
+			 * resolves to the descent's CURSOR.  The walk would
+			 * have moved that cursor onto its own branch.
 			 */
 			struct ft_descent wwd;
 			struct ft_lock_ctx wlctx;
@@ -4660,50 +5113,60 @@ int ft_detach_node(struct cds_ft *ft,
 				op_ctx ? op_ctx->op : NULL);
 			wlctx.held.extra = orphan_held;
 			/*
-			 * CHAIN to the caller's held set, for the same reason the
-			 * detach's own @lctx does: ft_lock_ctx_init NULLs .outer, so a
-			 * walk that does not restore it makes every orphan acquire BLIND
-			 * to the holds this op arrived with -- and reads its OWN mark as
-			 * a peer's.  ft_held_set_snap recurses through .outer and tests
-			 * each level's .glue, so the one link reaches the caller's txn
-			 * registry, its extra array and its glue alike.  The rekey fold
-			 * is the ctx that carries a glue, and it is exactly the caller
-			 * whose detach ELEVATES into this walk.
+			 * CHAIN to the caller's held set, as the detach's own
+			 * @lctx does.  ft_lock_ctx_init NULLs .outer.  A walk
+			 * that does not restore it makes every orphan acquire
+			 * BLIND to the holds this op arrived with.  The
+			 * acquire then reads its OWN mark as a peer's.
+			 *
+			 * ft_held_set_snap recurses through .outer and tests
+			 * each level's .glue.  So the one link reaches the
+			 * caller's txn registry, its extra array and its
+			 * glue.  The rekey fold is the ctx that carries a
+			 * glue.  It is also the caller whose detach ELEVATES
+			 * into this walk.
 			 */
 			wlctx.held.outer = op_ctx ? &op_ctx->held : NULL;
 
 			/*
 			 * Phase 1: elevated ancestors.
 			 *
-			 * ☠ SKIP BEFORE EXTERNAL, and the body two lines down has
-			 * always said so.  ft_node_external tests the LOW TAG BITS
-			 * ONLY, and a SKIP_X word carries its child's tag -- so a
-			 * skip pointer ONTO AN EXTERNAL HEAD reads as external and
-			 * this loop never starts.  The body's own first arm is the
-			 * skip arm; the condition disagreed with it.
+			 * ☠ SKIP BEFORE EXTERNAL.  The body two lines down
+			 * has always said so.  ft_node_external tests the LOW
+			 * TAG BITS ONLY, and a SKIP_X word carries its
+			 * child's tag.  Without the skip test, a skip pointer
+			 * ONTO AN EXTERNAL HEAD reads as external and this
+			 * loop never starts.  The body's own first arm is the
+			 * skip arm.  The condition disagreed with it.
 			 *
-			 * What that costs is the skip-TARGET run: the node holding
-			 * the path bytes between the boundary and a bare external
-			 * head.  A move-style detach (@free_detached_subtree false,
-			 * which is what the rekey passes) has no other collector --
-			 * the trailing skip-target arm is nested inside
-			 * `if (free_detached_subtree)` -- and ft_rekey_cow_stop owns
-			 * nothing for a bare head (@s_top_meta is NULL).  So nobody
-			 * frees it.
+			 * What that costs is the skip-TARGET run: the node
+			 * holding the path bytes between the boundary and a
+			 * bare external head.  A move-style detach has no
+			 * other collector for it.  (@free_detached_subtree is
+			 * false there, which is what the rekey passes.)  The
+			 * trailing skip-target arm is nested inside
+			 * `if (free_detached_subtree)`.  ft_rekey_cow_stop
+			 * owns nothing for a bare head (@s_top_meta is NULL).
+			 * So nobody frees it.
 			 *
-			 * MEASURED with the drain oracle over the 3000-shape corpus
-			 * on a -DDEBUG_COUNTERS build: 310 of 310 seeds whose src is
-			 * a bare head under a SKIP-encoded boundary slot leak exactly
-			 * one compressed node, and 0 of the 197 bare-head seeds whose
-			 * boundary slot is a plain internal do.  100 per cent
-			 * penetrant, and invisible to every other oracle -- keys
-			 * right, cds_ft_verify clean on all of them.  A point REMOVE
-			 * of the same key is fine: it passes @free_detached_subtree
-			 * true and the trailing arm catches it.
+			 * MEASURED with the drain oracle over the 3000-shape
+			 * corpus, on a -DDEBUG_COUNTERS build:
+			 * - src is a bare head under a SKIP-encoded boundary
+			 *   slot: 310 of 310 seeds leak exactly one
+			 *   compressed node;
+			 * - src is a bare head under a plain internal
+			 *   boundary slot: 0 of 197 seeds leak.
+			 * The leak is 100 per cent penetrant.  Every other
+			 * oracle misses it: the keys are right and
+			 * cds_ft_verify is clean on all of them.  A point
+			 * REMOVE of the same key is fine.  It passes
+			 * @free_detached_subtree true, and the trailing arm
+			 * catches it.
 			 *
-			 * ☞ This is the dispatch-order trap ft-rekey.h's own descent
-			 * comment names ("a skip word's low tag bits are 0, so the
-			 * external and internal predicates both read it wrong").
+			 * ☞ ft-rekey.h's own descent comment names this
+			 * dispatch-order trap.  It says: "a skip word's low
+			 * tag bits are 0, so the external and internal
+			 * predicates both read it wrong".
 			 */
 			while (nr_to_free < nr_elevated &&
 			       walk_nf &&
@@ -4715,25 +5178,30 @@ int ft_detach_node(struct cds_ft *ft,
 				bool require_sc;
 
 				/*
-				 * F1 / RESOLVED-POINTER CONTRACT, at every link.
-				 * The walk steps through raw child slots
-				 * (@cn->child below, and phase 2's @ocn->child):
-				 * a peer mid-commit on the chain parks a type-7
-				 * flip proxy there, and a proxy's low nibble reads
-				 * as an INTERNAL node.  Left unchecked it is
-				 * classified as one, its tag stripped into the
-				 * latch address, and ft_node_get_nth dispatches on
-				 * ft_types[7] -- the garbage jump named in
+				 * F1 / RESOLVED-POINTER CONTRACT, at every
+				 * link.  The walk steps through raw child
+				 * slots (@cn->child below, and phase 2's
+				 * @ocn->child).  A peer mid-commit on the
+				 * chain parks a type-7 flip proxy there.  A
+				 * proxy's low nibble reads as an INTERNAL
+				 * node.  Left unchecked:
+				 * - it is classified as an internal node;
+				 * - its tag is stripped into the latch
+				 *   address;
+				 * - ft_node_get_nth dispatches on
+				 *   ft_types[7].
+				 * That is the garbage jump named in
 				 * ft_node_get_nth's own header.
 				 *
-				 * Bail rather than resolve, exactly as the three
-				 * plan-lock bails in these loops do: a parked proxy
-				 * means a peer commit is in flight on the very
-				 * chain this free set is being derived from, so the
-				 * set is stale.  Nothing is published yet -- the
-				 * to_free[] walk runs BEFORE the commit and its
-				 * nodes are freed only in the !ret block -- so the
-				 * op re-descends and re-derives it.
+				 * Bail rather than resolve, as the three
+				 * plan-lock bails in these loops do.  A
+				 * parked proxy means a peer commit is in
+				 * flight on the chain this free set is
+				 * derived from.  So the set is stale.
+				 * Nothing is published yet: the to_free[]
+				 * walk runs BEFORE the commit, and its nodes
+				 * are freed only in the !ret block.  So the
+				 * op re-descends and re-derives the set.
 				 */
 				if (caa_unlikely(ft_node_flip_proxy(walk_nf))) {
 					ret = -EAGAIN;
@@ -4752,35 +5220,55 @@ int ft_detach_node(struct cds_ft *ft,
 					struct cds_ft_compressed_node *cn =
 						ft_skip_to_compressed(ft, walk_nf);
 					/*
-					 * ☠ THE ONE-HOP RESOLVE IS NOT MW-SAFE, and
-					 * "structurally single-child" was an ASSUMPTION about
-					 * the node this plan MEANS, never a fact about the
-					 * node it just GOT.  ft_skip_to_compressed follows the
-					 * skip child's parent back-pointer, and its own header
-					 * says callers "get whatever the back-pointer
-					 * currently says": a concurrent split re-parents that
-					 * child onto the junction it is publishing, so this
-					 * recovers the PEER'S FRESH JUNCTION instead of the
-					 * elided skip-target.
+					 * ☠ THE ONE-HOP RESOLVE IS NOT
+					 * MW-SAFE.  "Structurally
+					 * single-child" was an ASSUMPTION
+					 * about the node this plan MEANS.
+					 * It was never a fact about the
+					 * node the resolve just GOT.
 					 *
-					 * Queueing it puts a LIVE node into the orphan set,
-					 * which TOMBSTONES it -- killing every key beneath it
-					 * -- and then frees it as a compressed node.  MEASURED
-					 * on inv_sibling_split_compress_unpinned: the collect
-					 * lands 1.7 us AFTER the peer's publish_to_parent,
-					 * the freeze and the free follow, the parent slot is
-					 * never republished, and the key is gone for good.
-					 * ☠ Guarding the FREE does not help -- two predicates
-					 * were measured and both left the oracle red, because
-					 * the TOMBSTONE has already killed the key.
+					 * ft_skip_to_compressed follows the
+					 * skip child's parent back-pointer.
+					 * Its own header says callers "get
+					 * whatever the back-pointer
+					 * currently says".  A concurrent
+					 * split re-parents that child onto
+					 * the junction it is publishing.
+					 * So the resolve recovers the
+					 * PEER'S FRESH JUNCTION instead of
+					 * the elided skip-target.
 					 *
-					 * A compressed node holds EXACTLY ONE child, so a
-					 * resolved target whose count says otherwise is not
-					 * the node this plan is about.  This is the trailing
-					 * skip-target's own rule (the guard above, added on
-					 * the same measured key loss) applied at the one site
-					 * that resolves the same way and never checked it.
-					 * Bail to the op's re-descend.
+					 * Queueing it puts a LIVE node into
+					 * the orphan set.  The set
+					 * TOMBSTONES it, which kills every
+					 * key beneath it.  Then the node is
+					 * freed as a compressed node.
+					 *
+					 * MEASURED on
+					 * inv_sibling_split_compress_unpinned:
+					 * - the collect lands 1.7 us AFTER
+					 *   the peer's publish_to_parent;
+					 * - the freeze and the free follow;
+					 * - the parent slot is never
+					 *   republished;
+					 * - the key is gone for good.
+					 * ☠ Guarding the FREE does not
+					 * help.  Two predicates were
+					 * measured and both left the oracle
+					 * red: the TOMBSTONE has already
+					 * killed the key.
+					 *
+					 * A compressed node holds EXACTLY
+					 * ONE child.  A resolved target
+					 * with another count is not the
+					 * node this plan is about.  This is
+					 * the trailing skip-target's own
+					 * rule (the guard above, added on
+					 * the same measured key loss).  It
+					 * is applied here, at the one site
+					 * that resolves the same way and
+					 * never checked it.  Bail to the
+					 * op's re-descend.
 					 */
 					if (ft_meta_nr_child_load(
 							cds_ft_item_to_metadata(
@@ -4833,35 +5321,45 @@ int ft_detach_node(struct cds_ft *ft,
 					goto end;
 				}
 				/*
-				 * ☠ THE NEXT LINK IS READ UNDER THE MARK, NOT
-				 * BEFORE IT.  A compressed link's count never moves
-				 * -- it holds exactly one child -- so the plan-lock
-				 * above validates nothing about WHICH child: a peer
-				 * insert of a longer key republishes @cn->child in
-				 * place, under this very word, from the head this op
-				 * is removing to a fresh junction carrying that head
-				 * AND the peer's key.  Read before the mark, the walk
-				 * followed the old head, found it external, and
-				 * stopped with the junction never looked at; the drop
-				 * then took the branch whole (MEASURED: the peer's key
-				 * lost within seconds, two writers, "...runs" vs
-				 * "...runs6" under one compressed node).  Read after
-				 * it, the walk reaches the junction and phase 2
-				 * refuses its head.  Phase 2 and the compressed-parent
-				 * walk already take the mark first.
+				 * ☠ THE NEXT LINK IS READ UNDER THE MARK,
+				 * NOT BEFORE IT.  A compressed link's count
+				 * never moves: it holds exactly one child.
+				 * So the plan-lock above validates nothing
+				 * about WHICH child.  A peer insert of a
+				 * longer key republishes @cn->child in
+				 * place, under this very word.  The old
+				 * value is the head this op is removing.
+				 * The new value is a fresh junction that
+				 * carries that head AND the peer's key.
+				 *
+				 * Read before the mark, the walk followed
+				 * the old head, found it external and
+				 * stopped.  It never looked at the junction.
+				 * The drop then took the branch whole.
+				 * MEASURED: the peer's key was lost within
+				 * seconds, with two writers and "...runs" vs
+				 * "...runs6" under one compressed node.
+				 *
+				 * Read after the mark, the walk reaches the
+				 * junction and phase 2 refuses its head.
+				 * Phase 2 and the compressed-parent walk
+				 * already take the mark first.
 				 */
 #ifndef FT_DEBUG_ORPHAN_NEXT_BEFORE_LOCK
 				next = ft_detach_walk_next(ft, walk_nf);
 #endif
 				/*
-				 * A HEAD ON A CHAIN LINK THAT ARRIVED AFTER THE PLAN.
-				 * The keyless links carry none, and the chain's top may
-				 * carry exactly the one the climb lifted off it (the
-				 * promoted junction).  Anything else is a peer's park,
-				 * and retiring the link would take that key with it --
-				 * the refusal phase 2 makes on its first orphan, read
-				 * here under the mark taken just above (the plan-lock
-				 * validates the child count alone).
+				 * A HEAD ON A CHAIN LINK THAT ARRIVED AFTER
+				 * THE PLAN.  The keyless links carry no
+				 * head.  The chain's top may carry exactly
+				 * the one the climb lifted off it (the
+				 * promoted junction).  Any other head is a
+				 * peer's park.  Retiring the link would take
+				 * that key with it.  Phase 2 makes the same
+				 * refusal on its first orphan.  The head is
+				 * read here under the mark taken just above:
+				 * the plan-lock validates the child count
+				 * alone.
 				 */
 				if ((ometa->external_nodes &&
 						(nr_to_free != 0 ||
@@ -4869,11 +5367,12 @@ int ft_detach_node(struct cds_ft *ft,
 							topmost_external_nodes))
 #ifndef FT_DEBUG_NO_DEPARTED_HEAD
 				    /*
-				     * ...and a head that DEPARTED from the link
-				     * the climb lifted it off: the compressed
-				     * arm's rule, which this walk lacked (the
-				     * same resurrection, reached through a plain
-				     * internal boundary).
+				     * ...and a head that DEPARTED from the
+				     * link the climb lifted it off.  This is
+				     * the compressed arm's rule.  This walk
+				     * lacked it.  (It is the same
+				     * resurrection, reached through a plain
+				     * internal boundary.)
 				     */
 				    || (ometa == topmost_src_meta &&
 					ometa->external_nodes !=
@@ -4897,31 +5396,41 @@ int ft_detach_node(struct cds_ft *ft,
 				bool phase2_first = true;
 
 				/*
-				 * ☠ PHASE 2 STARTS AT THE TARGET, OR NOT AT ALL.
-				 * Its first node is exempt from the nr_child > 1
-				 * test below -- it is the target, whose count the
-				 * detach itself is changing -- but nothing asked
-				 * whether it IS the target.  Phase 1 follows each
-				 * link's child as read UNDER that link's lock, so it
-				 * walks the tree as it is NOW, not as the climb
-				 * counted it: a peer insert that split a compressed
-				 * link of the chain (a fresh run over a fresh
-				 * junction carrying the old continuation AND the
-				 * peer's key) is walked through, and the fresh
-				 * junction lands here -- exempt -- and is retired
-				 * with both keys inside.  MEASURED (LTTng + an
-				 * orphan-count abort, inv_prefix_shape_zoo
-				 * insert/remove_all): 6 of 6 runs, orphan[3] of 4,
-				 * nr_child 2, cds_ft_verify then "ord-cell list
-				 * longer than trie" with a never-removed key gone.
+				 * ☠ PHASE 2 STARTS AT THE TARGET, OR NOT AT
+				 * ALL.  Its first node is exempt from the
+				 * nr_child > 1 test below.  That node is the
+				 * target, and the detach itself is changing
+				 * its count.  But nothing asked whether it
+				 * IS the target.
 				 *
-				 * Every destroy-style caller is a remove whose
-				 * target is the chain head the entry pinned
-				 * (@freeze_leaf): an EXTERNAL node, where this loop
-				 * does not run.  An internal node here that is not
-				 * the entry's target means the chain moved under the
-				 * walk: re-descend.  Nothing of this walk's is
-				 * recorded yet; its held links release at @end.
+				 * Phase 1 follows each link's child as read
+				 * UNDER that link's lock.  So it walks the
+				 * tree as it is NOW, not as the climb
+				 * counted it.  A peer insert can split a
+				 * compressed link of the chain.  The split
+				 * leaves a fresh run over a fresh junction,
+				 * which carries the old continuation AND
+				 * the peer's key.  Phase 1 walks through
+				 * it.  Without this check, the fresh
+				 * junction lands here and is exempt.  It
+				 * is then retired with both keys inside.
+				 *
+				 * MEASURED (LTTng + an orphan-count abort,
+				 * inv_prefix_shape_zoo insert/remove_all):
+				 * 6 of 6 runs, orphan[3] of 4, nr_child 2.
+				 * cds_ft_verify then reported "ord-cell list
+				 * longer than trie", with a never-removed
+				 * key gone.
+				 *
+				 * Every destroy-style caller is a remove.
+				 * Its target is the chain head the entry
+				 * pinned (@freeze_leaf).  That is an
+				 * EXTERNAL node, where this loop does not
+				 * run.  An internal node here that is not
+				 * the entry's target means the chain moved
+				 * under the walk: re-descend.  Nothing of
+				 * this walk is recorded yet.  Its held
+				 * links release at @end.
 				 */
 #ifndef FT_DEBUG_NO_PHASE2_TARGET
 				if (walk_nf && !ft_node_external(walk_nf) &&
@@ -4932,27 +5441,37 @@ int ft_detach_node(struct cds_ft *ft,
 #endif
 #ifndef FT_DEBUG_NO_ARRIVAL_EXTERNAL
 				/*
-				 * ☠ AND AN EXTERNAL ARRIVAL IS NOT EXEMPT: it has to
-				 * be the target too.  The exemption above assumed a
-				 * walk that reaches an external has reached THE chain
-				 * head, because every link it took was a single
-				 * child.  The in-place delete tier breaks that: a
-				 * peer's in-place delete leaves a link LIVE with one
-				 * child fewer, so a link this climb counted as
-				 * "single child = our path" is single again with a
-				 * DIFFERENT child -- a sibling key's -- and phase 1,
-				 * taking the first child under the lock, walks into
-				 * it.  MEASURED (delete tier, skip-compress off,
-				 * inv_concurrent_remove_all_nolist, LTTng): lane A
-				 * deleted key 62 in place from a two-child holder;
-				 * lane B, planned with key 62 there, climbed through
-				 * the holder, walked to key 63's head, retired it
-				 * (LOST) and handed key 62's chain back a second time
-				 * (DOUBLE-OWNED).  With skip-compression on, the
-				 * in-place delete that would leave such a holder is
-				 * re-planned instead (the shape-D hoist below), which
-				 * is why only a skip-off build saw it.  Identity by
-				 * address: a parked proxy retries too.
+				 * ☠ AND AN EXTERNAL ARRIVAL IS NOT EXEMPT:
+				 * it has to be the target too.  The
+				 * exemption above assumed that a walk which
+				 * reaches an external has reached THE chain
+				 * head, because every link it took was a
+				 * single child.  The in-place delete tier
+				 * breaks that.  A peer's in-place delete
+				 * leaves a link LIVE with one child fewer.
+				 * So a link this climb counted as "single
+				 * child = our path" is single again with a
+				 * DIFFERENT child: a sibling key's.  Phase 1
+				 * takes the first child under the lock and
+				 * walks into it.
+				 *
+				 * MEASURED (delete tier, skip-compress off,
+				 * inv_concurrent_remove_all_nolist, LTTng):
+				 * - lane A deleted key 62 in place from a
+				 *   two-child holder;
+				 * - lane B, planned with key 62 there,
+				 *   climbed through the holder and walked
+				 *   to key 63's head;
+				 * - lane B retired that head (LOST);
+				 * - lane B handed key 62's chain back a
+				 *   second time (DOUBLE-OWNED).
+				 *
+				 * With skip-compression on, the in-place
+				 * delete that would leave such a holder is
+				 * re-planned instead (the shape-D hoist
+				 * below).  That is why only a skip-off
+				 * build saw it.  Identity is by address: a
+				 * parked proxy retries too.
 				 */
 				if (walk_nf && ft_node_external(walk_nf) &&
 						ft_node_ptr_raw(walk_nf) !=
@@ -4987,10 +5506,12 @@ int ft_detach_node(struct cds_ft *ft,
 						: cds_ft_item_to_metadata(
 							ft_node_ptr(walk_nf));
 					/*
-					 * §9.2 plan-lock (mirrors Block A): MARK before
-					 * reading nr_child for the collapse decision so the
-					 * fenced tombstone's expected-old is the exact word
-					 * the "retire it" verdict rests on.
+					 * §9.2 plan-lock (mirrors Block A).
+					 * MARK before reading nr_child for
+					 * the collapse decision.  The fenced
+					 * tombstone's expected-old is then
+					 * the exact word the "retire it"
+					 * verdict rests on.
 					 */
 					if (ft->lock_fine) {
 						wlctx.held.txn = lctx.held.txn;
@@ -5055,11 +5576,13 @@ int ft_detach_node(struct cds_ft *ft,
 					walk_nf = next;
 				}
 				/*
-				 * The chain stops at @walk_nf.  A skip-compressed
-				 * external leaf keeps its path bytes in a separate
-				 * skip-target compressed node the walk stops short of:
-				 * the external leaf is caller-owned, but that
-				 * skip-target is trie-owned and now orphaned.  Queue it.
+				 * The chain stops at @walk_nf.  A
+				 * skip-compressed external leaf keeps its
+				 * path bytes in a separate skip-target
+				 * compressed node.  The walk stops short of
+				 * that node.  The external leaf is
+				 * caller-owned.  The skip-target is
+				 * trie-owned and now orphaned.  Queue it.
 				 */
 				if (walk_nf && ft_node_skip_compressed(walk_nf)) {
 					trailing_skip_cn_flag = walk_nf;
@@ -5096,29 +5619,39 @@ int ft_detach_node(struct cds_ft *ft,
 				}
 			}
 			/*
-			 * The collected set (+ trailing skip-target) is tombstoned at
-			 * the commit that unlinks it, not here -- see the freeze below
-			 * this branch's commit dispatch (shape-D records into its own
-			 * merge flip; an in-place delete records into @commit_txn;
-			 * recompaction / list-off keep a standalone freeze before the
-			 * free).  Deferred to the free walk in the !ret block below.
+			 * The collected set (+ trailing skip-target) is
+			 * tombstoned at the commit that unlinks it, not here.
+			 * See the freeze below this branch's commit dispatch:
+			 * - shape-D records into its own merge flip;
+			 * - an in-place delete records into @commit_txn;
+			 * - recompaction / list-off keep a standalone freeze
+			 *   before the free.
+			 * Deferred to the free walk in the !ret block below.
 			 */
 		}
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		/*
-		 * Shape-D fusion: a pure delete (no external promote) that leaves
-		 * the surviving boundary a non-root 1-child no-external internal
-		 * folds the chain-compress prune INTO the key-removal commit -- build
-		 * the merged compressed node and let it REPLACE the boundary in ONE
-		 * flip (forward + surviving-child re-parent + a SKIP_X dual + the
-		 * dead cell's unsplice), bypassing ft_node_replace_ptr entirely (no
-		 * intermediate 1-child node is ever published) AND the standalone
-		 * post-detach canonicalize below.  The boundary has exactly 2 live
-		 * children here (it drops to 1); the surviving child is the one NOT
-		 * being detached, read from pre-commit state.  On the merged-node
-		 * allocation failing the whole detach aborts before any reader-
-		 * visible store (the caller rolls back the count).  Out of bound
-		 * (merged_len > FT_SKIP_LEN_MAX) falls through to replace_ptr.
+		 * Shape-D fusion.  It applies to a pure delete (no external
+		 * promote) that leaves the surviving boundary a non-root
+		 * 1-child no-external internal.  The fusion folds the
+		 * chain-compress prune INTO the key-removal commit.  Build
+		 * the merged compressed node and let it REPLACE the boundary
+		 * in ONE flip.  The flip carries:
+		 * - the forward;
+		 * - the surviving-child re-parent;
+		 * - a SKIP_X dual;
+		 * - the dead cell's unsplice.
+		 * This bypasses ft_node_replace_ptr entirely, so no
+		 * intermediate 1-child node is ever published.  It also
+		 * bypasses the standalone post-detach canonicalize below.
+		 *
+		 * The boundary has exactly 2 live children here, and it
+		 * drops to 1.  The surviving child is the one NOT being
+		 * detached, read from pre-commit state.  If the merged-node
+		 * allocation fails, the whole detach aborts before any
+		 * reader-visible store (the caller rolls back the count).
+		 * Out of bound (merged_len > FT_SKIP_LEN_MAX) falls through
+		 * to replace_ptr.
 		 */
 		{
 			struct cds_ft_metadata *bmeta =
@@ -5126,17 +5659,21 @@ int ft_detach_node(struct cds_ft *ft,
 
 			/*
 			 * Proxy-resolved, for the reason spelled out at the
-			 * up-walk's own snapshot: @bmeta IS that boundary node,
-			 * so this is a SECOND raw read of the very word the climb
-			 * just had to resolve.  Measured on the shared-destination
-			 * merge oracle's plan: 711 of 749873 reads here land on a
-			 * peer's parked state word.  The failure is worse than the
-			 * climb's, because it is silent -- a garbage count that
-			 * happens to decode as 2 enters the shape-D fusion, whose
-			 * scan below takes the FIRST surviving child and builds a
-			 * merged compressed node to REPLACE the boundary, dropping
-			 * every other child the node really had.  No assert stands
-			 * between that and a published trie.
+			 * up-walk's own snapshot.  @bmeta IS that boundary
+			 * node.  A raw read here is a SECOND raw read of the
+			 * very word the climb just had to resolve.  Measured
+			 * on the shared-destination merge oracle's plan: 711
+			 * of 749873 reads here land on a peer's parked state
+			 * word.
+			 *
+			 * The failure is worse than the climb's, because it
+			 * is silent.  A garbage count that happens to decode
+			 * as 2 enters the shape-D fusion.  The scan below
+			 * takes the FIRST surviving child.  It builds a
+			 * merged compressed node to REPLACE the boundary.
+			 * That drops every other child the node really had.
+			 * No assert stands between that and a published
+			 * trie.
 			 */
 			shape_d_plan = ft_group_skip_compressed(ft->group) &&
 			    !topmost_external_nodes &&
@@ -5165,22 +5702,27 @@ int ft_detach_node(struct cds_ft *ft,
 				}
 				/*
 				 * ☠ THE SURVIVOR SLOT MAY BE THIS TXN'S OWN
-				 * PENDING FORWARD PUBLISH (@pending_pub_slot,
-				 * armed before the fold ran -- by
-				 * ft_glue_set_publish on the GLUE and merge
-				 * lanes, or directly by the NOSPLIT store
-				 * commit, ft-graft.h): a same-trie SIBLING
-				 * move's shared parent
-				 * holds exactly the detached child and the
-				 * destination.  @s_child is then the COMMITTED
-				 * occupant -- a node the SAME commit retires and
-				 * replaces with the merged cluster -- and fusing
-				 * around it strands the whole moved subtree
-				 * (measured: the sibling two-child-BP pin, all
-				 * four faces).  Build around the PENDING value
-				 * instead (@pending_child at the collapse), the
-				 * exact substitution ft_node_recompact's copy
-				 * loops make by identity on this same slot.
+				 * PENDING FORWARD PUBLISH
+				 * (@pending_pub_slot).  That slot is armed
+				 * before the fold ran:
+				 * - by ft_glue_set_publish on the GLUE and
+				 *   merge lanes;
+				 * - or directly by the NOSPLIT store commit
+				 *   (ft-graft.h).
+				 * The shared parent of a same-trie SIBLING
+				 * move holds exactly the detached child and
+				 * the destination.  @s_child is then the
+				 * COMMITTED occupant.  The SAME commit
+				 * retires that node and replaces it with the
+				 * merged cluster.  Fusing around it strands
+				 * the whole moved subtree (measured: the
+				 * sibling two-child-BP pin, all four faces).
+				 *
+				 * Build around the PENDING value instead
+				 * (@pending_child at the collapse).
+				 * ft_node_recompact's copy loops make the
+				 * same substitution, by identity, on this
+				 * same slot.
 				 */
 				if (s_child && record_only && shared_txn &&
 						shared_txn->pending_pub_slot &&
@@ -5188,49 +5730,58 @@ int ft_detach_node(struct cds_ft *ft,
 					fold_pending = shared_txn->pending_pub_val;
 					/*
 					 * A COMPRESSED cluster top cannot be
-					 * fused: absorbing it would retire a
-					 * fresh node that was never published
-					 * and re-aim its cluster's deferred
-					 * edges (an ownership question the
-					 * collapse does not take on), while
-					 * falling back to the recompaction
-					 * would publish a 1-child internal that
-					 * skip mode's canonical form -- enforced
-					 * at every writer-scope exit -- does not
-					 * allow to persist.  So the SHAPE is
-					 * uncovered: refuse the whole move,
-					 * before any side-effect, with the
-					 * rekey's own carve-out code
+					 * fused.  Absorbing it would retire a
+					 * fresh node that was never published.
+					 * It would also re-aim its cluster's
+					 * deferred edges.  That is an ownership
+					 * question the collapse does not take
+					 * on.  Falling back to the recompaction
+					 * would publish a 1-child internal.
+					 * Skip mode's canonical form does not
+					 * allow that to persist.  It is
+					 * enforced at every writer-scope exit.
+					 * So the SHAPE is uncovered.  Refuse
+					 * the whole move, before any
+					 * side-effect.  Use the rekey's own
+					 * carve-out code
 					 * (FT_REKEY_UNCOVERED == -EDOM).  Only
-					 * the rekey fold can reach this: BOTH
-					 * armers are gated on @record_only, and
+					 * the rekey fold can reach this.  BOTH
+					 * armers are gated on @record_only.
 					 * ft-rekey.h is its only setter.
 					 */
 					/*
-					 * ☑ ABSORBED, not refused.  ☞ the
-					 * @pending_child contract at
-					 * ft_chain_compress_fused: a compressed
-					 * pending top joins the merged run rather
-					 * than sitting under it, which is the only
-					 * legal product -- fusing AROUND it makes
-					 * two adjacent compressed nodes and the
-					 * replace_ptr fallback publishes a
-					 * one-child internal.  An over-long run is
-					 * still refused, by the merge's own
+					 * ☑ ABSORBED, not refused.  ☞ See
+					 * the @pending_child contract at
+					 * ft_chain_compress_fused.  A
+					 * compressed pending top joins the
+					 * merged run rather than sitting
+					 * under it.  That is the only legal
+					 * product:
+					 * - fusing AROUND it makes two
+					 *   adjacent compressed nodes;
+					 * - the replace_ptr fallback
+					 *   publishes a one-child internal.
+					 * An over-long run is still
+					 * refused, by the merge's own
 					 * FT_SKIP_LEN_MAX arm.
 					 *
-					 * ☠ ...BUT ONLY WHERE THE RUN HAS AN OWNER
-					 * TO LEAVE.  The absorption untracks the
-					 * pending top from the glue that BUILT it
-					 * and frees it unpublished; with no glue in
-					 * this frame's chain there is nobody to
-					 * untrack it from, and freeing it anyway
-					 * would leave it in some other owner's
-					 * hands.  The glue is what armed
-					 * @pending_pub_slot (ft_glue_set_publish),
-					 * so it is always present for this shape --
-					 * and where it is not, the old refusal is
-					 * still the only answer available.
+					 * ☠ ...BUT ONLY WHERE THE RUN HAS
+					 * AN OWNER TO LEAVE.  The absorption
+					 * untracks the pending top from the
+					 * glue that BUILT it and frees it
+					 * unpublished.  With no glue in
+					 * this frame's chain, there is
+					 * nobody to untrack it from.
+					 * Freeing it anyway would leave it
+					 * in some other owner's hands.
+					 *
+					 * The glue is what armed
+					 * @pending_pub_slot
+					 * (ft_glue_set_publish).  So it is
+					 * always present for this shape.
+					 * Where it is not, the old refusal
+					 * is still the only answer
+					 * available.
 					 */
 					if ((ft_node_compressed(fold_pending) ||
 							ft_node_skip_compressed(
@@ -5243,54 +5794,67 @@ int ft_detach_node(struct cds_ft *ft,
 						ft_chain_compress_deep_pending(
 							s_child, shared_txn)) {
 					/*
-					 * The SAME collision ONE COMPRESSED LEVEL
-					 * DEEPER: the survivor is a compressed node
-					 * whose own child slot is this txn's pending
-					 * publish target, so the merged node's child
-					 * -- normally taken from that very slot --
-					 * must come from the pending value instead.
-					 * The collapse does that substitution itself
-					 * (it is the only frame that has @child_cn);
-					 * what MUST happen here, before any
-					 * side-effect, is the same refusal the
-					 * shallow arm makes.
+					 * The SAME collision ONE COMPRESSED
+					 * LEVEL DEEPER.  The survivor is a
+					 * compressed node whose own child
+					 * slot is this txn's pending publish
+					 * target.  The merged node's child
+					 * is normally taken from that very
+					 * slot.  Here it must come from the
+					 * pending value instead.  The
+					 * collapse does that substitution
+					 * itself: it is the only frame that
+					 * has @child_cn.  What MUST happen
+					 * here, before any side-effect, is
+					 * the same refusal the shallow arm
+					 * makes.
 					 *
-					 * ☠ A COMPRESSED pending value cannot be the
-					 * merged node's child: the merged node IS
-					 * compressed, and two adjacent compressed
-					 * nodes are not a canonical form (cds_ft_verify
-					 * rejects it).  The committed occupant this
-					 * substitutes for can never be compressed for
-					 * exactly that reason, so the substitution
-					 * would be the only way to produce the shape.
-					 * Refuse the whole move terminally with the
-					 * rekey's carve-out code, as the shallow arm
-					 * does -- never publish it.
+					 * ☠ A COMPRESSED pending value
+					 * cannot be the merged node's
+					 * child.  The merged node IS
+					 * compressed, and two adjacent
+					 * compressed nodes are not a
+					 * canonical form (cds_ft_verify
+					 * rejects it).  For that reason the
+					 * committed occupant this
+					 * substitutes for can never be
+					 * compressed.  So the substitution
+					 * would be the only way to produce
+					 * the shape.  Refuse the whole move
+					 * terminally with the rekey's
+					 * carve-out code, as the shallow
+					 * arm does.  Never publish it.
 					 */
 					/*
-					 * ☠ THE ARM IS LIVE; ONLY THIS SUB-CASE IS
-					 * UNOBSERVED.  A counter at the arm fires
-					 * 1 per 3000 shapes (with a PLAIN pending
-					 * value); a counter at the COMPRESSED
-					 * sub-case counts zero over 6000 runs, which
-					 * is evidence for the canonical-form reading
-					 * -- reaching it needs the pending slot to be
-					 * a RUN'S OWN CHILD SLOT, i.e. the dst
-					 * descent ending exactly where a run ends,
-					 * and the graft's product there is an
-					 * INTERNAL node (a displaced head, or a
-					 * recompacted branch), never a run.
+					 * ☠ THE ARM IS LIVE; ONLY THIS
+					 * SUB-CASE IS UNOBSERVED.  A counter
+					 * at the arm fires 1 per 3000
+					 * shapes (with a PLAIN pending
+					 * value).  A counter at the
+					 * COMPRESSED sub-case counts zero
+					 * over 6000 runs.  That is evidence
+					 * for the canonical-form reading.
+					 * To reach the sub-case, the
+					 * pending slot must be a RUN'S OWN
+					 * CHILD SLOT: the dst descent ends
+					 * exactly where a run ends.  The
+					 * graft's product there is an
+					 * INTERNAL node (a displaced head,
+					 * or a recompacted branch), never
+					 * a run.
 					 *
-					 * ☞ SO IT STAYS A GUARD, not an assert.  An
-					 * assert one branch off a LIVE path buys
-					 * nothing on the build that ships: falling
+					 * ☞ SO IT STAYS A GUARD, not an
+					 * assert.  An assert one branch off
+					 * a LIVE path buys nothing on the
+					 * build that ships.  Falling
 					 * through lands on
-					 * `new_cn->child = pending_pub_val`, two
-					 * adjacent compressed nodes, which is the
-					 * form the absorption exists to avoid.  The
-					 * shallow arm absorbs its pending top; this
-					 * one cannot, because the value is the
-					 * merged node's CHILD rather than a run to
+					 * `new_cn->child = pending_pub_val`:
+					 * two adjacent compressed nodes,
+					 * the form the absorption exists to
+					 * avoid.  The shallow arm absorbs
+					 * its pending top.  This one
+					 * cannot: the value is the merged
+					 * node's CHILD, not a run to
 					 * concatenate.
 					 */
 					if (ft_node_compressed(
@@ -5303,12 +5867,17 @@ int ft_detach_node(struct cds_ft *ft,
 				}
 				if (s_child) {
 					/*
-					 * nr_keys fold (LEAF Increment 2): shape-D is the R3
-					 * chain-compress fuse -- the merged node is built with
-					 * its post-removal count and the -1 walk from its stable
-					 * parent (publish_parent) rides the merge flip.  Reserve
-					 * the walk (bounded by the removed leaf's depth); a no-op
-					 * for a count-neutral move / !rank_stats.
+					 * nr_keys fold (LEAF Increment 2).
+					 * Shape-D is the R3 chain-compress
+					 * fuse.  The merged node is built
+					 * with its post-removal count.  The
+					 * -1 walk from its stable parent
+					 * (publish_parent) rides the merge
+					 * flip.  Reserve the walk, which is
+					 * bounded by the removed leaf's
+					 * depth.  This is a no-op for a
+					 * count-neutral move or
+					 * !rank_stats.
 					 */
 						lctx.held.txn = NULL;
 					lctx.held.nr_extra =
@@ -5335,15 +5904,18 @@ int ft_detach_node(struct cds_ft *ft,
 					 * test 2 and the memcg SIGKILLing the leak.
 					 */
 					/*
-					 * INTENT: the boundary carries no external
-					 * head (the gate above asserts it), and this
-					 * commit detaches the pair the climb
-					 * condemned -- @elevated_old_child at byte
-					 * @n, both fixed before the boundary is
-					 * acquired, and already enforced against the
-					 * plan PRE-fence (@plan_old_child).  Carrying
-					 * them here is that predicate moved past the
-					 * acquire, where it can speak for the commit.
+					 * INTENT: the boundary carries no
+					 * external head (the gate above
+					 * asserts it).  This commit
+					 * detaches the pair the climb
+					 * condemned: @elevated_old_child at
+					 * byte @n.  Both are fixed before
+					 * the boundary is acquired.  Both
+					 * are already enforced against the
+					 * plan PRE-fence (@plan_old_child).
+					 * Carrying them here moves that
+					 * predicate past the acquire, where
+					 * it can speak for the commit.
 					 */
 					const struct ft_chain_compress_intent intent = {
 						.detach_child = elevated_old_child,
@@ -5364,11 +5936,13 @@ int ft_detach_node(struct cds_ft *ft,
 						count_delta,
 						ft->rank_stats ? detach_depth + 1 : 0,
 				/*
-				 * FOLD the collapse into the caller's txn when this
-				 * detach is itself being folded, so the whole move is
-				 * ONE decide.  Its retired chain and its unpublished
-				 * merged node come back through @recompact_out for the
-				 * caller to reclaim on the right side of its commit.
+				 * FOLD the collapse into the caller's txn
+				 * when this detach is itself being folded.
+				 * The whole move is then ONE decide.  Its
+				 * retired chain and its unpublished merged
+				 * node come back through @recompact_out.
+				 * The caller reclaims them on the right
+				 * side of its commit.
 				 */
 				record_only ? shared_txn : NULL, record_only,
 				fold_pending, &intent,
@@ -5382,16 +5956,26 @@ int ft_detach_node(struct cds_ft *ft,
 						if (freeze_leaf)
 							freeze_leaf_fused = true;
 						/*
-						 * Shape-D already fused @fuse_cell's unsplice
-						 * (ft_chain_compress_fused -> ft_remove_commit_rec)
-						 * INTO this commit, so signal the caller: a
-						 * standalone two-commit unsplice would re-record the
-						 * (now stale) head/tail neighbour edge and reopen a
-						 * cross-view window where a reader sees the removed
-						 * key's cell as the ordered min after its structural
-						 * removal.  @pub is non-NULL only on the fuse_cell
-						 * point-remove path; the bulk @run is armed by
-						 * ft_remove_commit_rec itself.
+						 * Shape-D already fused
+						 * @fuse_cell's unsplice INTO
+						 * this commit
+						 * (ft_chain_compress_fused ->
+						 * ft_remove_commit_rec).  So
+						 * signal the caller.  A
+						 * standalone two-commit
+						 * unsplice would re-record the
+						 * (now stale) head/tail
+						 * neighbour edge.  That would
+						 * reopen a cross-view window:
+						 * a reader sees the removed
+						 * key's cell as the ordered
+						 * min after its structural
+						 * removal.
+						 *
+						 * @pub is non-NULL only on the
+						 * fuse_cell point-remove path.
+						 * ft_remove_commit_rec itself
+						 * arms the bulk @run.
 						 */
 						if (pub)
 							pub->armed = true;
@@ -5406,60 +5990,87 @@ int ft_detach_node(struct cds_ft *ft,
 #endif
 		if (!boundary_fused) {
 			/*
-			 * Pre-reserve the commit txn BEFORE ft_node_replace_ptr's pre-flip
-			 * side-effects -- the in-place delete's nr_child decrement (it
-			 * commits the deferred slot store fused with the cell unsplice via
-			 * ft_remove_one_commit below) OR the recompaction's eager re-parent
-			 * of the rebuilt node's children (it publishes via the tail
-			 * ft_remove_commit_rec).  Reserve only when that commit will be
-			 * multi-edge: a cell unsplice / run is present, or the boundary's
-			 * parent is compressed so the forward publish carries a SKIP_X dual.
-			 * A lone edge (non-compressed parent, no cell) stays the infallible
-			 * on-stack release store, so no txn is needed -- and an in-place
-			 * delete with neither is a direct lone store inside
-			 * ft_node_replace_ptr that never reaches ft_remove_one_commit.
-			 * Reservation failure aborts before any side-effect (the upward
-			 * walk is read-only).  Whichever commit fires consumes the txn; if
-			 * none does (e.g. an n==1 publish, or replace_ptr failed) it is
-			 * freed unused at @end.
+			 * Pre-reserve the commit txn BEFORE
+			 * ft_node_replace_ptr's pre-flip side-effects.  They
+			 * are one of:
+			 * - the in-place delete's nr_child decrement.  It
+			 *   commits the deferred slot store fused with the
+			 *   cell unsplice, via ft_remove_one_commit below;
+			 * - the recompaction's eager re-parent of the rebuilt
+			 *   node's children.  It publishes via the tail
+			 *   ft_remove_commit_rec.
 			 *
-			 * @commit_txn is also the retire txn for a DEL recompaction: when the
-			 * boundary shrinks, ft_node_replace_ptr's recompact records the old
-			 * copy's freeze-on-free tombstone INTO @commit_txn, so it flips
-			 * atomically with the forward republish this same txn commits below
-			 * (atomic detach, §4.B) rather than as an early standalone flip.
+			 * Reserve only when that commit will be multi-edge.
+			 * That is the case when:
+			 * - a cell unsplice / run is present; or
+			 * - the boundary's parent is compressed, so the forward
+			 *   publish carries a SKIP_X dual.
+			 * A lone edge (non-compressed parent, no cell) stays
+			 * the infallible on-stack release store.  No txn is
+			 * needed.  An in-place delete with neither is a direct
+			 * lone store inside ft_node_replace_ptr.  It never
+			 * reaches ft_remove_one_commit.
 			 *
-			 * FORCE-TXN: created UNCONDITIONALLY.  The former residual gate
-			 * (list-off shrink under a non-compressed parent with no run,
-			 * rank-stats off) left @commit_txn NULL, sending the DEL
-			 * recompaction down ft_node_recompact's retire_txn-NULL arm --
-			 * an IMMEDIATE reparent sweep + external-head prev store onto
-			 * the not-yet-published copy, reader-followable through the
-			 * still-reachable children until the republish (the early
-			 * live-wire class).  With the txn always present, every DEL
-			 * retire records its sweep, tombstone and forward republish
-			 * into ONE flip.  A txn no commit consumes is freed unused at
-			 * @end; the new -ENOMEM aborts before any side-effect.
+			 * A reservation failure aborts before any side-effect
+			 * (the upward walk is read-only).  Whichever commit
+			 * fires consumes the txn.  If none does (e.g. an n==1
+			 * publish, or replace_ptr failed), it is freed unused
+			 * at @end.
+			 *
+			 * @commit_txn is also the retire txn for a DEL
+			 * recompaction.  When the boundary shrinks,
+			 * ft_node_replace_ptr's recompact records the old
+			 * copy's freeze-on-free tombstone INTO @commit_txn.
+			 * The tombstone then flips atomically with the
+			 * forward republish this same txn commits below
+			 * (atomic detach, §4.B).  It is not an early
+			 * standalone flip.
+			 *
+			 * FORCE-TXN: created UNCONDITIONALLY.  The former
+			 * residual gate left @commit_txn NULL for a list-off
+			 * shrink under a non-compressed parent with no run
+			 * and rank-stats off.  That sent the DEL recompaction
+			 * down ft_node_recompact's retire_txn-NULL arm.  That
+			 * arm does an IMMEDIATE reparent sweep and an
+			 * external-head prev store onto the not-yet-published
+			 * copy.  Readers can follow both through the
+			 * still-reachable children until the republish (the
+			 * early live-wire class).  With the txn always
+			 * present, every DEL retire records its sweep,
+			 * tombstone and forward republish into ONE flip.  A
+			 * txn that no commit consumes is freed unused at
+			 * @end.  The new -ENOMEM aborts before any
+			 * side-effect.
 			 */
 			if (record_only) {
 				/*
-				 * FOLD (coherent rekey one-decide writer): the caller's
-				 * SHARED mixed txn absorbs this SIMPLE-case detach's forward-
-				 * slot clear + nr_child-- (both MW -- BP survives unlocked, a
-				 * peer conflict aborts the fold clean) so they flip atomically
-				 * with the dst-attach + S_top COW the caller records into the
-				 * same txn; the caller runs the ONE commit and owns @commit_txn
-				 * (never freed here).  The caller pre-reserved it for the whole
-				 * fold, an ELEVATING detach's orphan tombstones included.
+				 * FOLD (coherent rekey one-decide writer).
+				 * The caller's SHARED mixed txn absorbs this
+				 * SIMPLE-case detach's forward-slot clear
+				 * and nr_child--.  Both are MW: BP survives
+				 * unlocked, and a peer conflict aborts the
+				 * fold clean.  They flip atomically with the
+				 * dst-attach and the S_top COW that the
+				 * caller records into the same txn.  The
+				 * caller runs the ONE commit and owns
+				 * @commit_txn (never freed here).  The
+				 * caller pre-reserved it for the whole fold,
+				 * an ELEVATING detach's orphan tombstones
+				 * included.
 				 *
-				 * An ELEVATING detach IS expressible here: its orphan chain rides
-				 * @recompact_out with the RETIRED copy's lifetime (the caller's
-				 * commit is what unlinks it, so it is freed when that commit
-				 * lands), and every tombstone freezes into this same shared txn --
-				 * so the freeze flips with the unlink exactly as it does when this
-				 * detach commits for itself.  What remains out of scope is a
-				 * caller-supplied retire set or leaf freeze: the rekey fold passes
-				 * neither, and each would need a reclaim owner of its own.
+				 * An ELEVATING detach IS expressible here.
+				 * Its orphan chain rides @recompact_out with
+				 * the RETIRED copy's lifetime.  The caller's
+				 * commit is what unlinks it, so it is freed
+				 * when that commit lands.  Every tombstone
+				 * freezes into this same shared txn.  So the
+				 * freeze flips with the unlink, as it does
+				 * when this detach commits for itself.
+				 *
+				 * What remains out of scope is a
+				 * caller-supplied retire set or leaf freeze.
+				 * The rekey fold passes neither, and each
+				 * would need a reclaim owner of its own.
 				 */
 				assert(!retire_glue && !freeze_leaf);
 				commit_txn = shared_txn;
@@ -5480,31 +6091,35 @@ int ft_detach_node(struct cds_ft *ft,
 			}
 #ifdef FT_REMOVE_CLAIM
 			/*
-			 * §4 STEP B2's DRY RUN, the tool 658989ef was for the rekey
-			 * writer: point B0's owner assert at the remove commit_rec so
-			 * every record it plants without owning is named, at an abort,
-			 * on a build otherwise byte-identical to the unarmed one.
+			 * §4 STEP B2's DRY RUN, the tool 658989ef was for the
+			 * rekey writer.  Point B0's owner assert at the
+			 * remove commit_rec.  Every record it plants without
+			 * owning is then named, at an abort.  The build is
+			 * otherwise byte-identical to the unarmed one.
 			 *
-			 * ☞ CLAIMED HERE, WHICH IS EARLIER THAN THE ARM WOULD BE.  A
-			 * dry run has to claim BEFORE the records it wants checked, and
-			 * for this site that is before its acquires finish -- so read a
-			 * miss as "this record is planted before its owner is
-			 * registered" FIRST.  That ORDERING class has been the answer
-			 * more often than a missing acquire.
+			 * ☞ CLAIMED HERE, WHICH IS EARLIER THAN THE ARM WOULD
+			 * BE.  A dry run has to claim BEFORE the records it
+			 * wants checked.  For this site that is before its
+			 * acquires finish.  So read a miss FIRST as "this
+			 * record is planted before its owner is registered".
+			 * That ORDERING class has been the answer more often
+			 * than a missing acquire.
 			 *
-			 * ☠ And read a miss as "the registry cannot SEE this hold"
-			 * before "the op does not HOLD it": where a caller's SWEEP owns
-			 * the mark's clearing, the absence is by design (ft_flip_txn_owns).
+			 * ☠ And read a miss as "the registry cannot SEE this
+			 * hold" before "the op does not HOLD it".  Where a
+			 * caller's SWEEP owns the mark's clearing, the
+			 * absence is by design (ft_flip_txn_owns).
 			 */
 			ft_flip_txn_claim_per_op_armable(ft, commit_txn);
 #endif
 #ifdef FEATURE_FT_PROBE_PROMOTE
 			/*
-			 * §4.B unguarded-promote probe.  At the CALL SITE, not inside
-			 * ft_popcount_node_replace_ptr: that function returns from its
-			 * `if (pub)` branch before any counter placed within it, so an
-			 * inside counter reads 0 for BOTH variants and looks like the
-			 * arm is dead when only the unguarded one is.
+			 * §4.B unguarded-promote probe.  It sits at the CALL
+			 * SITE, not inside ft_popcount_node_replace_ptr.
+			 * That function returns from its `if (pub)` branch
+			 * before any counter placed within it.  So an inside
+			 * counter reads 0 for BOTH variants.  The arm then
+			 * looks dead when only the unguarded one is.
 			 */
 			if (topmost_external_nodes) {
 				if (pub)
@@ -5516,68 +6131,80 @@ int ft_detach_node(struct cds_ft *ft,
 			lctx.held.txn = commit_txn;
 			lctx.held.nr_extra = (unsigned int) nr_orphan_locked;
 			/*
-			 * RE-DERIVE the hint when the climb MOVED.  The caller's
-			 * names the detach target's junction; after an elevation
-			 * the recompacted node is an ANCESTOR of that, and its own
-			 * parent is @boundary_parent_nf with @detach_parent_flag_ptr
-			 * as its slot -- both re-derived by the same walk that
-			 * moved, which is the only frame that can know them.  Left
-			 * stale, the @parent_guard read-set term validates the
-			 * recompacted node against a parent that is not its own, so
-			 * the acquire's commit ABORTS on every attempt and the
-			 * caller's -EAGAIN loop re-derives the identical plan
-			 * forever.
+			 * RE-DERIVE the hint when the climb MOVED.  The
+			 * caller's hint names the detach target's junction.
+			 * After an elevation the recompacted node is an
+			 * ANCESTOR of that junction.  Its own parent is
+			 * @boundary_parent_nf, with @detach_parent_flag_ptr
+			 * as its slot.  Both are re-derived by the same walk
+			 * that moved, which is the only frame that can know
+			 * them.  Left stale, the @parent_guard read-set term
+			 * validates the recompacted node against a parent
+			 * that is not its own.  The acquire's commit then
+			 * ABORTS on every attempt, and the caller's -EAGAIN
+			 * loop re-derives the identical plan forever.
 			 *
-			 * @parent_held is FALSE and @gp / @gp_slot are NULL: the
-			 * caller's answers were about ITS junction and say nothing
-			 * about this one.  A word this op does happen to hold is
-			 * still handled -- the acquire DEDUPES against the held set
-			 * rather than refusing -- and a COMPRESSED parent, whose
-			 * SKIP_X dual would need a great-grandparent this frame has
-			 * not derived, is refused above.
+			 * @parent_held is FALSE and @gp / @gp_slot are NULL:
+			 * the caller's answers were about ITS junction and
+			 * say nothing about this one.  A word this op does
+			 * happen to hold is still handled: the acquire
+			 * DEDUPES against the held set rather than refusing.
+			 * A COMPRESSED parent is refused above.  Its SKIP_X
+			 * dual would need a great-grandparent this frame has
+			 * not derived.
 			 */
 			/*
-			 * ☑ A COMPRESSED LANDING PARENT IS NOT, BY ITSELF, A SHAPE
-			 * THIS FRAME CANNOT EXPRESS -- and the refusal that said so
-			 * was VACUOUS for two thirds of what it caught.
+			 * ☑ A COMPRESSED LANDING PARENT IS NOT, BY ITSELF, A
+			 * SHAPE THIS FRAME CANNOT EXPRESS.  The refusal that
+			 * said so was VACUOUS for two thirds of what it
+			 * caught.
 			 *
-			 * It read: "a COMPRESSED landing parent carries a SKIP_X dual
-			 * the recompact re-encodes into its OWN parent's slot, and
-			 * this walk has not derived that great-grandparent pair."
-			 * Every clause is true and none of them bites.  The recompact
-			 * takes GP only when the hint's @gp is non-NULL; a DEL never
-			 * re-encodes the dual itself; and the detach's own republish
-			 * records the dual from @cn_meta as MW (@dual_owner_held
-			 * false, the arm below).  ☞ THE UN-CLIMBED REKEY PATH IS THE
-			 * SHIPPED PRECEDENT: ft-rekey.h's own elevated hint passes
-			 * `.gp = NULL, .gp_slot = NULL` under a compressed parent and
-			 * has done all along.
+			 * It read: "a COMPRESSED landing parent carries a
+			 * SKIP_X dual the recompact re-encodes into its OWN
+			 * parent's slot, and this walk has not derived that
+			 * great-grandparent pair."  Every clause is true and
+			 * none of them bites:
+			 * - the recompact takes GP only when the hint's @gp
+			 *   is non-NULL;
+			 * - a DEL never re-encodes the dual itself;
+			 * - the detach's own republish records the dual from
+			 *   @cn_meta as MW (@dual_owner_held false, the arm
+			 *   below).
+			 * ☞ THE UN-CLIMBED REKEY PATH IS THE SHIPPED
+			 * PRECEDENT.  ft-rekey.h's own elevated hint passes
+			 * `.gp = NULL, .gp_slot = NULL` under a compressed
+			 * parent, and has done all along.
 			 *
-			 * MEASURED by ablating it: 19 of the 26 shapes it refused on
-			 * -DNO_FEATURE_FT_SKIP_COMPRESSED (4 of 5 on the default
-			 * build) are then SERVED, cds_ft_verify CLEAN, keys right, on
-			 * every rank x list arm and on --enable-rcu-debug and
-			 * -DFT_REKEY_CLAIM -- including the shapes where the
-			 * great-grandparent is an INTERNAL node, which the 3000-shape
-			 * corpus cannot even produce.
+			 * MEASURED by ablating it.  It refused 26 shapes on
+			 * -DNO_FEATURE_FT_SKIP_COMPRESSED, and 19 of them are
+			 * then SERVED (4 of 5 on the default build).
+			 * cds_ft_verify is CLEAN and the keys are right, on
+			 * every rank x list arm, on --enable-rcu-debug and on
+			 * -DFT_REKEY_CLAIM.  This includes the shapes where
+			 * the great-grandparent is an INTERNAL node, which
+			 * the 3000-shape corpus cannot even produce.
 			 *
-			 * ☠ WHAT IT WAS REALLY CATCHING is one sub-family and nothing
-			 * else: the resting node's run parent is the very node the
-			 * CALLER's graft SPLIT.  That is the collapse-vs-split
-			 * collision the arm at the top of this function refuses, wearing
-			 * a second exit -- ablate this one on that sub-family and the
-			 * engine aborts on `r->kind == kind` (rcu-debug) or the op
-			 * livelocks (noskip).  So the predicate is narrowed to the
-			 * thing that is actually red, and stays terminal: the shape is
-			 * deterministic, so -EAGAIN would spin.
+			 * ☠ WHAT IT WAS REALLY CATCHING is one sub-family and
+			 * nothing else: the resting node's run parent is the
+			 * very node the CALLER's graft SPLIT.  That is the
+			 * collapse-vs-split collision which the arm at the
+			 * top of this function refuses, with a second exit.
+			 * Ablate this one on that sub-family and the engine
+			 * aborts on `r->kind == kind` (rcu-debug), or the op
+			 * livelocks (noskip).  So the predicate is narrowed
+			 * to the thing that is actually red.  It stays
+			 * terminal: the shape is deterministic, so -EAGAIN
+			 * would spin.
 			 */
 			/*
-			 * ☠ @split_cn IS THE COMPRESSED NODE POINTER, NOT THE FLAG --
-			 * the arm at the top of this function passes @parent_cn for
-			 * the same lookup.  Handing it the flag compares a tagged word
-			 * against an untagged one, matches nothing, and lets the one
-			 * shape this guard exists for straight through: MEASURED, the
-			 * engine then aborts on `r->kind == kind` at seed 2919.
+			 * ☠ @split_cn IS THE COMPRESSED NODE POINTER, NOT THE
+			 * FLAG.  The arm at the top of this function passes
+			 * @parent_cn for the same lookup.  Handing it the
+			 * flag compares a tagged word against an untagged
+			 * one.  That matches nothing, and lets through the
+			 * one shape this guard exists for.  MEASURED: the
+			 * engine then aborts on `r->kind == kind` at seed
+			 * 2919.
 			 */
 			if (climbed && src_held_hint && boundary_parent_nf &&
 					!topmost_external_nodes &&
@@ -5598,39 +6225,52 @@ int ft_detach_node(struct cds_ft *ft,
 				replace_hint = &elevated_hint;
 			}
 			/*
-			 * THE LEAF-DELETE HOIST: LOCK THE HOLDER BEFORE THE PLAN IS
-			 * READ (doc/design/ft-lockset-inventory.md §1, row 1).
+			 * THE LEAF-DELETE HOIST: LOCK THE HOLDER BEFORE THE
+			 * PLAN IS READ (doc/design/ft-lockset-inventory.md
+			 * §1, row 1).
 			 *
-			 * ft_node_replace_ptr's in-place arm decides "stay in place"
-			 * from the holder's nr_child and defers the slot clear plus
-			 * the fused nr_child-- into @pub -- and until now this op
-			 * held NOTHING when it read that count, when it recorded
-			 * those two words, and when it committed them: 2.6M commits
-			 * per ft_inv run, arbitrated only by the fused CAS.  The
-			 * promote arm below acquires the holder, but AFTER the plan;
-			 * the leaf arm never did.
+			 * ft_node_replace_ptr's in-place arm decides "stay in
+			 * place" from the holder's nr_child.  It defers the
+			 * slot clear plus the fused nr_child-- into @pub.
+			 * Until now this op held NOTHING at three points:
+			 * - when it read that count;
+			 * - when it recorded those two words;
+			 * - when it committed them.
+			 * That is 2.6M commits per ft_inv run, arbitrated
+			 * only by the fused CAS.  The promote arm below
+			 * acquires the holder, but AFTER the plan.  The leaf
+			 * arm never did.
 			 *
-			 * So take the holder -- its own word at per-node, its ANCHOR
-			 * above -- here, ahead of the decision, exactly as the insert
-			 * tier's hoist takes the attach node ahead of its reserve.
-			 * The count replace_ptr reads is then the count under the
-			 * lock, and the freeze_leaf chain word recorded below is
-			 * under its nearest ancestor lock.  Registered in @commit_txn
-			 * with its {LOCK|s -> s} release, so every exit reaches a
-			 * terminal: the commit consumes it, and @end's destroy of an
-			 * unused txn releases it.  If replace_ptr routes to a DEL
-			 * recompaction instead, its {C,P,GP} acquire finds C held
-			 * through @lctx and dedupes rather than refusing its own mark.
+			 * So take the holder here, ahead of the decision: its
+			 * own word at per-node, its ANCHOR above.  The insert
+			 * tier's hoist takes the attach node ahead of its
+			 * reserve in the same way.  The count replace_ptr
+			 * reads is then the count under the lock.  The
+			 * freeze_leaf chain word recorded below is under its
+			 * nearest ancestor lock.
 			 *
-			 * Scope: the point removes on a SHARED trie.  An exclusive
-			 * trie has no peer to exclude, the bulk callers pass the
-			 * exclusive-only tier, and the FOLD's @shared_txn belongs to
-			 * its caller.  A promote keeps its own acquire below.
+			 * The lock is registered in @commit_txn with its
+			 * {LOCK|s -> s} release, so every exit reaches a
+			 * terminal:
+			 * - the commit consumes it;
+			 * - @end's destroy of an unused txn releases it.
+			 * If replace_ptr routes to a DEL recompaction
+			 * instead, its {C,P,GP} acquire finds C held through
+			 * @lctx.  It dedupes rather than refusing its own
+			 * mark.
 			 *
-			 * ☞ LOCKS FIRST, SW LATER.  @leaf_hoisted keeps the B2 arm
-			 * below from converting this commit's records to SW: the
-			 * transition flips MW to SW once, when every writer of these
-			 * words holds its lock, not one producer at a time.
+			 * Scope: the point removes on a SHARED trie.  The
+			 * other cases are out:
+			 * - an exclusive trie has no peer to exclude;
+			 * - the bulk callers pass the exclusive-only tier;
+			 * - the FOLD's @shared_txn belongs to its caller.
+			 * A promote keeps its own acquire below.
+			 *
+			 * ☞ LOCKS FIRST, SW LATER.  @leaf_hoisted keeps the
+			 * B2 arm below from converting this commit's records
+			 * to SW.  The transition flips MW to SW once, when
+			 * every writer of these words holds its lock.  It
+			 * does not flip one producer at a time.
 			 */
 			if (ft->lock_fine && !ft->exclusive && in_place &&
 					!record_only && commit_txn &&
@@ -5638,18 +6278,23 @@ int ft_detach_node(struct cds_ft *ft,
 				enum ft_lock_or_guard_exit hex;
 
 				/*
-				 * LOCK THE HOLDER THE PLAN NAMES.  @iter_node_flag is
-				 * RE-READ from the parent slot after the climb, and
-				 * @metadata_stack is what the climb derived: a peer
-				 * that republished that slot in between (a
-				 * recompaction of the holder into a copy) leaves the
-				 * two naming DIFFERENT nodes.  MEASURED 1,819 times
-				 * per ft_inv run at per-node, climb or no climb.  The
-				 * pre-hoist code carried that torn plan to its commit
-				 * and aborted there; locking @iter_node_flag would
-				 * instead hold the COPY while the records name the
-				 * planned node.  So refuse the torn plan before the
-				 * acquire, and re-check the slot under the lock.
+				 * LOCK THE HOLDER THE PLAN NAMES.
+				 * @iter_node_flag is RE-READ from the parent
+				 * slot after the climb.  @metadata_stack is
+				 * what the climb derived.  A peer can
+				 * republish that slot in between (a
+				 * recompaction of the holder into a copy).
+				 * The two then name DIFFERENT nodes.
+				 * MEASURED 1,819 times per ft_inv run at
+				 * per-node, climb or no climb.
+				 *
+				 * The pre-hoist code carried that torn plan
+				 * to its commit and aborted there.  Locking
+				 * @iter_node_flag would instead hold the
+				 * COPY while the records name the planned
+				 * node.  So refuse the torn plan before the
+				 * acquire, and re-check the slot under the
+				 * lock.
 				 */
 				if (ft_flag_to_metadata(ft, iter_node_flag) !=
 						metadata_stack[nr_branch - 1]) {
@@ -5683,23 +6328,29 @@ int ft_detach_node(struct cds_ft *ft,
 				}
 #if defined(FEATURE_FT_SKIP_COMPRESSED) && !defined(FT_DEBUG_INPLACE_DELETE_RESIDUE)
 				/*
-				 * THE IN-PLACE TWIN OF THE RECOMPACTION RE-PLAN below.
-				 * This hoist only runs for a pure delete, and an
-				 * in-place delete drops the boundary's child count at
-				 * its commit with no copy for that check to inspect.
-				 * The shape-D test above is a PLAN read: a peer that
-				 * removed the boundary's prefix key (or a third child)
-				 * since leaves, under the lock we now hold, a keyless
-				 * 2-child node this delete turns into the 1-child
-				 * keyless internal skip mode refuses.  Measured on the
-				 * in-place build's owned-key row: 5 of 96 runs left
-				 * one at root-only and exponential spacing, 0 of 96
-				 * with this re-plan.  Nothing is
-				 * recorded yet and the lock rides @commit_txn: re-plan;
-				 * the next plan reads the node keyless and collapses
-				 * it.  Only where this plan did NOT choose the
-				 * collapse, as below, so an out-of-bound shape-D
-				 * cannot send it round forever.
+				 * THE IN-PLACE TWIN OF THE RECOMPACTION
+				 * RE-PLAN below.  This hoist only runs for a
+				 * pure delete.  An in-place delete drops the
+				 * boundary's child count at its commit, with
+				 * no copy for that check to inspect.
+				 *
+				 * The shape-D test above is a PLAN read.  A
+				 * peer may since have removed the boundary's
+				 * prefix key (or a third child).  Under the
+				 * lock we now hold, that leaves a keyless
+				 * 2-child node.  This delete turns it into
+				 * the 1-child keyless internal that skip
+				 * mode refuses.  Measured on the in-place
+				 * build's owned-key row: 5 of 96 runs left
+				 * one at root-only and exponential spacing,
+				 * 0 of 96 with this re-plan.
+				 *
+				 * Nothing is recorded yet and the lock rides
+				 * @commit_txn, so re-plan.  The next plan
+				 * reads the node keyless and collapses it.
+				 * As below, re-plan only where this plan did
+				 * NOT choose the collapse.  An out-of-bound
+				 * shape-D then cannot send it round forever.
 				 */
 				if (!shape_d_plan &&
 				    ft_group_skip_compressed(ft->group)) {
@@ -5730,22 +6381,32 @@ int ft_detach_node(struct cds_ft *ft,
 		}
 #if defined(FEATURE_FT_SKIP_COMPRESSED) && !defined(FT_DEBUG_RECOMPACT_RESIDUE)
 		/*
-		 * A COPY THAT SHOULD HAVE BEEN A COLLAPSE.  The shape-D test above
-		 * is a PLAN read: it saw @iter_node_flag keep its prefix key (or a
-		 * third child), so removing one child left a legal keyed node and
-		 * no collapse was owed.  A peer removing that prefix key between the
-		 * plan and the recompaction's lock changes the answer: the copy the
-		 * recompaction just built from the LOCKED state has one child and no
-		 * key -- the 1-child keyless internal cds_ft_verify refuses in skip
-		 * mode, and which a later remove below it cannot date its plan on
-		 * (it livelocks at exponential spacing).  Measured: 143 such copies
-		 * in 24 owned-key runs, every one planned with nr_child 2 and a key.
-		 * Nothing is committed yet -- the copy is unpublished and its
-		 * re-parent sweep and retire ride @commit_txn -- so re-plan; the
-		 * next attempt sees the node without its key and collapses it.
-		 * Only where this plan did NOT choose the collapse, so a shape-D that
-		 * refuses as out of bound cannot send it round forever; not for a
-		 * bulk fold (@record_only), which no peer can race.
+		 * A COPY THAT SHOULD HAVE BEEN A COLLAPSE.  The shape-D test
+		 * above is a PLAN read.  It saw @iter_node_flag keep its
+		 * prefix key (or a third child).  So removing one child left
+		 * a legal keyed node and no collapse was owed.
+		 *
+		 * A peer that removes that prefix key between the plan and
+		 * the recompaction's lock changes the answer.  The copy the
+		 * recompaction just built from the LOCKED state has one
+		 * child and no key.  That is the 1-child keyless internal
+		 * which cds_ft_verify refuses in skip mode.  A later remove
+		 * below it cannot date its plan on such a node: it livelocks
+		 * at exponential spacing.  Measured: 143 such copies in 24
+		 * owned-key runs, every one planned with nr_child 2 and a
+		 * key.
+		 *
+		 * Nothing is committed yet: the copy is unpublished, and its
+		 * re-parent sweep and retire ride @commit_txn.  So re-plan.
+		 * The next attempt sees the node without its key and
+		 * collapses it.
+		 *
+		 * Two limits apply:
+		 * - re-plan only where this plan did NOT choose the
+		 *   collapse.  A shape-D that refuses as out of bound then
+		 *   cannot send it round forever;
+		 * - do not re-plan for a bulk fold (@record_only), which no
+		 *   peer can race.
 		 */
 		if (!ret && !boundary_fused && !shape_d_plan && !record_only &&
 		    old_recompacted_node && !topmost_external_nodes &&
@@ -5764,18 +6425,26 @@ int ft_detach_node(struct cds_ft *ft,
 #endif
 		if (!ret) {
 			/*
-			 * Freeze the collected orphan chain (+ trailing skip-target)
-			 * before the free below (doc §4.B, atomic detach).  Now that
-			 * replace_ptr has run, record the tombstones INTO the commit
-			 * that unlinks the chain, since the free is now deferred past ALL
-			 * of them (below the republish block).  pub != NULL always reserves
-			 * and consumes @commit_txn -- via ft_remove_one_commit for an
-			 * in-place delete, or the recompaction republish in the parent-slot
-			 * block -- so the freeze flips ATOMICALLY with that unlink and an
-			 * aborted commit discards it.  The list-off pub-less path does a
-			 * direct lone store that never touches @commit_txn, so it keeps a
-			 * standalone freeze (NULL txn) -- a no-op under one writer.  Shape-D
-			 * already recorded into its own merge flip.
+			 * Freeze the collected orphan chain (+ trailing
+			 * skip-target) before the free below (doc §4.B,
+			 * atomic detach).  replace_ptr has run.  Record the
+			 * tombstones INTO the commit that unlinks the chain:
+			 * the free is now deferred past ALL of them (below
+			 * the republish block).
+			 *
+			 * pub != NULL always reserves and consumes
+			 * @commit_txn, through one of:
+			 * - ft_remove_one_commit for an in-place delete;
+			 * - the recompaction republish in the parent-slot
+			 *   block.
+			 * So the freeze flips ATOMICALLY with that unlink,
+			 * and an aborted commit discards it.
+			 *
+			 * The list-off pub-less path does a direct lone store
+			 * that never touches @commit_txn.  It keeps a
+			 * standalone freeze (NULL txn), which is a no-op
+			 * under one writer.  Shape-D already recorded into
+			 * its own merge flip.
 			 */
 			if (!boundary_fused && (nr_to_free > 0 || trailing_skip_cn_flag))
 				ft_detach_freeze_orphans(ft,
@@ -5787,18 +6456,23 @@ int ft_detach_node(struct cds_ft *ft,
 					/* @commit_txn IS @shared_txn then */
 					record_only);
 			/*
-			 * A caller-supplied external retire set (@retire_glue: the
-			 * merge src-side glue's overlap-spine free-list, freed by the
-			 * caller AFTER this detach returns) freezes atomically with the
-			 * SAME unlink that makes it unreachable.  A LIST-ON src detach
-			 * rides @commit_txn here on the branch-2 commit_txn path --
-			 * empirically 100% of merge stress: branch 2, pub != NULL,
-			 * commit_txn present.  Recorded AFTER replace_ptr so a
-			 * recompaction's own DEL tombstone is already in @commit_txn;
-			 * order among tombstones is irrelevant (all commit together).
-			 * A LIST-OFF src detach (pub == NULL) leaves it for the
-			 * standalone fallback at @end -- as do shape-D / a compressed
-			 * parent (a no-op under one writer).
+			 * @retire_glue is a caller-supplied external retire
+			 * set: the merge src-side glue's overlap-spine
+			 * free-list.  The caller frees it AFTER this detach
+			 * returns.  It freezes atomically with the SAME
+			 * unlink that makes it unreachable.
+			 *
+			 * A LIST-ON src detach rides @commit_txn here, on the
+			 * branch-2 commit_txn path.  Empirically that is 100%
+			 * of merge stress: branch 2, pub != NULL, commit_txn
+			 * present.  It is recorded AFTER replace_ptr, so a
+			 * recompaction's own DEL tombstone is already in
+			 * @commit_txn.  The order among tombstones is
+			 * irrelevant: all commit together.
+			 *
+			 * A LIST-OFF src detach (pub == NULL) leaves it for
+			 * the standalone fallback at @end.  So do shape-D and
+			 * a compressed parent (a no-op under one writer).
 			 */
 			if (!boundary_fused && retire_glue && pub && commit_txn) {
 				retire_glue->txn = commit_txn;
@@ -5807,21 +6481,26 @@ int ft_detach_node(struct cds_ft *ft,
 				retire_glue_fused = true;
 			}
 			/*
-			 * The removed external leaf (single-entry chain, node->next
-			 * == NULL) freezes atomically with the SAME unlink: recorded
-			 * into @commit_txn beside the orphan tombstones (the +1
-			 * reserved above) when the in-place / recompaction commit
-			 * consumes it (pub && commit_txn).  The list-off pub-less
-			 * direct-store path (commit_txn NULL) keeps the standalone
-			 * fallback at @end -- a no-op under one writer; shape-D already
-			 * froze it in its merge flip.
+			 * The removed external leaf (single-entry chain,
+			 * node->next == NULL) freezes atomically with the
+			 * SAME unlink.  It is recorded into @commit_txn
+			 * beside the orphan tombstones (the +1 reserved
+			 * above).  That happens when the in-place /
+			 * recompaction commit consumes the txn (pub &&
+			 * commit_txn).
+			 *
+			 * The list-off pub-less direct-store path (commit_txn
+			 * NULL) keeps the standalone fallback at @end, a
+			 * no-op under one writer.  Shape-D already froze the
+			 * leaf in its merge flip.
 			 */
 			if (!boundary_fused && freeze_leaf && pub && commit_txn) {
 #ifdef FT_DEBUG_CHAIN_HOLD
 				/*
-				 * THE HEAD-WORD CONTROL: the removed leaf is a LIVE
-				 * head until this commit, so ft_ch_head_reachable must
-				 * read it reachable -- else its HIDDEN zeros are blind.
+				 * THE HEAD-WORD CONTROL.  The removed leaf is a
+				 * LIVE head until this commit.  So
+				 * ft_ch_head_reachable must read it reachable.
+				 * Otherwise its HIDDEN zeros are blind.
 				 */
 				if (ft->lock_fine && !ft->exclusive &&
 						ft_wlock_held != ft)
@@ -5830,47 +6509,59 @@ int ft_detach_node(struct cds_ft *ft,
 #endif
 				ft_ch_audit_ctx(ft, commit_txn, &lctx, freeze_leaf);
 				/*
-				 * ★ VALIDATE THE PLAN UNDER THE LOCK (Mathieu,
-				 * 2026-09-19).  @freeze_len reached this op as a
-				 * LITERAL -- cds_ft_remove's "1 = this key's SOLE
-				 * entry" -- derived from a read of @succ_node taken
-				 * with NOTHING HELD, while the chain's holder is not
-				 * acquired until ft_node_replace_ptr above.  So a
-				 * same-key insert can append a duplicate in that
-				 * window, and the freeze's derived NULL has been
-				 * standing in for the exclusion the count did not
-				 * have: MEASURED 10,157 (per-node) / 16,219
-				 * (exponential) disagreements per ft_inv leg, with
-				 * the txn registry owning the holder at 100% of them.
+				 * ★ VALIDATE THE PLAN UNDER THE LOCK
+				 * (Mathieu, 2026-09-19).  @freeze_len
+				 * reached this op as a LITERAL:
+				 * cds_ft_remove's "1 = this key's SOLE
+				 * entry".  It was derived from a read of
+				 * @succ_node taken with NOTHING HELD.  The
+				 * chain's holder is not acquired until
+				 * ft_node_replace_ptr above.  So a same-key
+				 * insert can append a duplicate in that
+				 * window.  The freeze's derived NULL has
+				 * been standing in for the exclusion the
+				 * count did not have.  MEASURED: 10,157
+				 * (per-node) / 16,219 (exponential)
+				 * disagreements per ft_inv leg.  The txn
+				 * registry owned the holder at 100% of them.
 				 *
-				 * We hold it HERE, so ask the word.  A stale plan is
-				 * refused before any record is filed, which is the
-				 * SAME decision the commit's install CAS makes today
-				 * -- taken earlier, and mostly without needing the
-				 * CAS to make it.  ☠ NOT "instead of" the CAS: see
-				 * ft_hlist_chain_plan_ok's header -- an UNDECIDED
-				 * peer proxy that outlasts urcu_txn_read's patience
-				 * window still reads as NULL here, so the install CAS
+				 * We hold it HERE, so ask the word.  A stale
+				 * plan is refused before any record is
+				 * filed.  That is the SAME decision the
+				 * commit's install CAS makes today.  It is
+				 * taken earlier, and mostly without needing
+				 * the CAS to make it.
+				 *
+				 * ☠ NOT "instead of" the CAS: see
+				 * ft_hlist_chain_plan_ok's header.  An
+				 * UNDECIDED peer proxy that outlasts
+				 * urcu_txn_read's patience window still
+				 * reads as NULL here.  So the install CAS
 				 * remains the backstop until the lock set is
 				 * complete.  This shrinks the window the CAS
-				 * arbitrates; it does not on its own make the record
-				 * parkable.
+				 * arbitrates.  It does not on its own make
+				 * the record parkable.
 				 *
-				 * ☠ RETRIABLE, AND IT TERMINATES: the caller
-				 * re-derives and finds the longer chain, so the next
-				 * attempt takes the promote/unchain lane instead of
-				 * this prune -- it does not re-enter the same refusal.
+				 * ☠ RETRIABLE, AND IT TERMINATES.  The
+				 * caller re-derives and finds the longer
+				 * chain.  The next attempt takes the
+				 * promote/unchain lane instead of this
+				 * prune.  It does not re-enter the same
+				 * refusal.
 				 *
-				 * ☠ AND NOTHING IS READER-VISIBLE YET.  On this arm
-				 * (@pub and @commit_txn both present) the forward
-				 * store, the head back edge and the recompaction
-				 * republish are all RECORDED into @commit_txn, which
-				 * ft_remove_one_commit does not reach until below; the
-				 * lone bare rcu_assign_pointer of the back edge is the
-				 * @commit_txn-NULL arm, which cannot be this one.  So
-				 * @end's sweep returns the structure byte-for-byte to
-				 * its pre-op state, exactly as for the leaf hoist's
-				 * two -EAGAIN exits above.
+				 * ☠ AND NOTHING IS READER-VISIBLE YET.  On
+				 * this arm, @pub and @commit_txn are both
+				 * present.  The forward store, the head back
+				 * edge and the recompaction republish are
+				 * all RECORDED into @commit_txn.
+				 * ft_remove_one_commit does not reach that
+				 * txn until below.  The lone bare
+				 * rcu_assign_pointer of the back edge is the
+				 * @commit_txn-NULL arm, which cannot be this
+				 * one.  So @end's sweep returns the
+				 * structure byte-for-byte to its pre-op
+				 * state, as for the leaf hoist's two -EAGAIN
+				 * exits above.
 				 */
 				if (!ft_hlist_chain_plan_ok(ft,
 						ft_flip_txn_handle(commit_txn),
@@ -5878,15 +6569,20 @@ int ft_detach_node(struct cds_ft *ft,
 					FT_HLIST_PLAN_BAIL();
 					FT_DBG_RETRY_SITE();
 					/*
-					 * ☠ THE ERRNO IS LOAD-BEARING, not just a
-					 * status.  @end's recompaction arm keys on it
-					 * EXACTLY: `ret == -EAGAIN` frees the
-					 * UNPUBLISHED fresh copy, anything else
-					 * call_rcu-frees @old_recompacted_node -- the
-					 * OLD, still-linked node.  -ENOENT is already a
-					 * legal detach return elsewhere, so a later
-					 * edit of this bail to any other negative value
-					 * is a use-after-free one token away.
+					 * ☠ THE ERRNO IS LOAD-BEARING, not
+					 * just a status.  @end's
+					 * recompaction arm keys on it
+					 * EXACTLY:
+					 * - `ret == -EAGAIN` frees the
+					 *   UNPUBLISHED fresh copy;
+					 * - anything else call_rcu-frees
+					 *   @old_recompacted_node, the OLD,
+					 *   still-linked node.
+					 * -ENOENT is already a legal detach
+					 * return elsewhere.  So a later
+					 * edit of this bail to any other
+					 * negative value is a
+					 * use-after-free one token away.
 					 */
 					ret = -EAGAIN;
 					goto end;
@@ -5897,38 +6593,46 @@ int ft_detach_node(struct cds_ft *ft,
 				freeze_leaf_fused = true;
 			}
 			/*
-			 * In-place key-disappearing remove (the holder stayed
-			 * above min_child, so replace_ptr deferred its single
-			 * reader-visible forward store into @pub instead of doing
-			 * it): commit that store -- @old_val -> @new_val (NULL for a
-			 * leaf delete, the promoted external chain head for an
-			 * external promote) -- fused with @fuse_cell's ordered-list
-			 * unsplice in ONE flip.  A pigeon delete leaves its occupancy
-			 * bit set (sticky soft-delete hint; recompact rebuilds it
-			 * clean), so nothing settles after the flip.  Recompaction
-			 * (pub unarmed) published its rebuilt node itself and stays
-			 * two-commit -- the caller unsplices.
+			 * In-place key-disappearing remove.  The holder
+			 * stayed above min_child, so replace_ptr deferred its
+			 * single reader-visible forward store into @pub
+			 * instead of doing it.  Commit that store, @old_val
+			 * -> @new_val, fused with @fuse_cell's ordered-list
+			 * unsplice in ONE flip.  @new_val is:
+			 * - NULL for a leaf delete;
+			 * - the promoted external chain head for an external
+			 *   promote.
+			 * A pigeon delete leaves its occupancy bit set.  The
+			 * bit is a sticky soft-delete hint, and recompact
+			 * rebuilds it clean.  So nothing settles after the
+			 * flip.  Recompaction (pub unarmed) published its
+			 * rebuilt node itself and stays two-commit: the
+			 * caller unsplices.
 			 */
 			if (!boundary_fused && pub && pub->armed) {
 #ifdef FEATURE_FT_PROBE_PROMOTE
 				/*
-				 * Did the §4.B acquire actually run for a PROMOTE?
-				 * `pub != NULL` is only a proxy: the guard needs
-				 * pub->armed too, so a promote that left @pub unarmed
-				 * would store without the acquire just as the pub-less
-				 * path would.  Count the consequence, not the proxy.
+				 * Did the §4.B acquire actually run for a
+				 * PROMOTE?  `pub != NULL` is only a proxy:
+				 * the guard needs pub->armed too.  A promote
+				 * that left @pub unarmed would store without
+				 * the acquire, as the pub-less path would.
+				 * Count the consequence, not the proxy.
 				 */
 				if (topmost_external_nodes)
 					FT_PROMOTE_PROBE_INC(cds_ft_probe_promote_guarded);
 #endif
 				/*
-				 * nr_keys fold (LEAF Increment 2): the in-place delete /
-				 * external promote leaves the holder @iter_node_flag in
-				 * place (its subtree loses the disappearing key), so the
-				 * -1 walk from @iter_node_flag up to root rides THIS
-				 * commit atomically -- recorded before ft_remove_one_commit
-				 * consumes @commit_txn.  A no-op / skipped for a count-
-				 * neutral move / !rank_stats.
+				 * nr_keys fold (LEAF Increment 2).  The
+				 * in-place delete / external promote leaves
+				 * the holder @iter_node_flag in place: its
+				 * subtree loses the disappearing key.  So
+				 * the -1 walk from @iter_node_flag up to
+				 * root rides THIS commit atomically.  It is
+				 * recorded before ft_remove_one_commit
+				 * consumes @commit_txn.  It is a no-op, or
+				 * skipped, for a count-neutral move or
+				 * !rank_stats.
 				 */
 				if (count_delta && commit_txn) {
 					ft_flip_txn_record_count_parent(ft, commit_txn,
@@ -5936,33 +6640,43 @@ int ft_detach_node(struct cds_ft *ft,
 					count_folded = true;
 				}
 				/*
-				 * External promote: the promoted head's back-channel
-				 * re-parent (captured by replace_ptr into @pub) rides
-				 * THIS commit so an ABORT discards it with the forward
-				 * flip.  The @commit_txn-NULL lone-edge boundary keeps
-				 * the pre-fusion timing: apply it just before the lone
-				 * forward store (single writer, cannot abort).
+				 * External promote: the promoted head's
+				 * back-channel re-parent (captured by
+				 * replace_ptr into @pub) rides THIS commit.
+				 * An ABORT then discards it with the forward
+				 * flip.  The @commit_txn-NULL lone-edge
+				 * boundary keeps the pre-fusion timing:
+				 * apply it just before the lone forward
+				 * store (single writer, cannot abort).
 				 */
 				/*
-				 * ☞ THE BACK-EDGE CLAIM READS ZERO ON EVERY OWNER
-				 * COLUMN HERE, AND THE OP DOES HOLD THE OWNER.
+				 * ☞ THE BACK-EDGE CLAIM READS ZERO ON EVERY
+				 * OWNER COLUMN HERE, AND THE OP DOES HOLD
+				 * THE OWNER.
 				 *
-				 * FT_BE_DETACH_UNCHAIN is the one site where the txn
-				 * registry, the per-thread hold ledger AND the CALLER's
-				 * @op_ctx all report "holds nothing".  MEASURED: the
-				 * owner's state word carries FT_STATE_LOCK (0x80004,
-				 * tombstone clear) in 5/5 samples of a SINGLE-writer
-				 * run, and @lctx -- THIS function's own lock context --
+				 * FT_BE_DETACH_UNCHAIN is the one site where
+				 * all three report "holds nothing":
+				 * - the txn registry;
+				 * - the per-thread hold ledger;
+				 * - the CALLER's @op_ctx.
+				 * MEASURED on a SINGLE-writer run: the
+				 * owner's state word carries FT_STATE_LOCK
+				 * (0x80004, tombstone clear) in 5/5 samples.
+				 * @lctx, THIS function's own lock context,
 				 * answers held in 5/5.
 				 *
-				 * The marks live in @orphan_held, a fn-scope array
-				 * rather than the txn locks[] registry (the orphan chain
-				 * reaches FT_MAX_DEPTH, past FT_FLIP_TXN_MAX_LOCKS; see
-				 * the DLM orphan plan-lock note at the top), so they are
-				 * the `extra[]` arm of the held set: reachable from
-				 * @lctx, invisible to @op_ctx and to the registry by
-				 * construction.  Do not read the claim's zeros here as
-				 * an unowned write -- ask @lctx.
+				 * The marks live in @orphan_held.  That is a
+				 * fn-scope array, not the txn locks[]
+				 * registry.  The orphan chain reaches
+				 * FT_MAX_DEPTH, which is past
+				 * FT_FLIP_TXN_MAX_LOCKS.  See the DLM orphan
+				 * plan-lock note at the top.  So they are
+				 * the `extra[]` arm of
+				 * the held set.  By construction they are
+				 * reachable from @lctx, and invisible to
+				 * @op_ctx and to the registry.  Do not read
+				 * the claim's zeros here as an unowned
+				 * write.  Ask @lctx.
 				 */
 				if (pub->head_parent_field) {
 					if (commit_txn) {
@@ -5982,22 +6696,38 @@ int ft_detach_node(struct cds_ft *ft,
 					}
 				}
 				/*
-				 * §4.B VALIDATE (Phase 4.3, MW): the EXTERNAL-PROMOTE
-				 * in-place commit stores pub->slot INSIDE the live holder
-				 * @iter_node_flag but records NO state edge on it --
-				 * pub->state_meta is NULL for a promote (set only for a
-				 * pure leaf delete, which fuses a real nr_child-- that
-				 * self-guards the holder).  The forward CAS below validates
-				 * only the slot VALUE (the displaced old child), so a peer
-				 * that recompacts/freezes the holder through its grandparent
-				 * slot leaves that value intact in the retired copy: the CAS
-				 * still matches and the promoted head is published into a
-				 * reclaimed node (UAF).  Guard the holder's state word so
-				 * such a peer's freeze-on-free ABORTs this commit --
-				 * symmetric with the external-CLEAR guards (2547, 3071).
-				 * Reuses the "+1 §4.B parent guard" reservation on
-				 * @commit_txn (mutually exclusive with the recompaction
-				 * republish guard, which fires only on the pub-UNARMED path).
+				 * §4.B VALIDATE (Phase 4.3, MW).
+				 * The EXTERNAL-PROMOTE in-place
+				 * commit stores pub->slot INSIDE the
+				 * live holder @iter_node_flag.  But
+				 * it records NO state edge on it.
+				 * pub->state_meta is NULL for a
+				 * promote.  It is set only for a
+				 * pure leaf delete, which fuses a
+				 * real nr_child-- that self-guards
+				 * the holder.
+				 *
+				 * The forward CAS below validates
+				 * only the slot VALUE (the displaced
+				 * old child).  A peer can recompact
+				 * or freeze the holder through its
+				 * grandparent slot.  That leaves the
+				 * value intact in the retired copy.
+				 * So the CAS still matches, and the
+				 * promoted head is published into a
+				 * reclaimed node (UAF).
+				 *
+				 * So guard the holder's state word.
+				 * Such a peer's freeze-on-free then
+				 * ABORTs this commit.  This is
+				 * symmetric with the external-CLEAR
+				 * guards (2547, 3071).  It reuses
+				 * the "+1 §4.B parent guard"
+				 * reservation on @commit_txn.  It is
+				 * mutually exclusive with the
+				 * recompaction republish guard,
+				 * which fires only on the
+				 * pub-UNARMED path.
 				 */
 				if (commit_txn && !pub->state_meta) {
 					lctx.held.txn = commit_txn;
@@ -6007,22 +6737,33 @@ int ft_detach_node(struct cds_ft *ft,
 						commit_txn, &lctx,
 						iter_node_flag, cur_depth);
 					/*
-					 * ☠ A MISSED HOLDER ENDS THE ATTEMPT HERE.  A
-					 * peer holds @iter_node_flag's word (a parked
-					 * proxy on it counts), so the take latched
-					 * @acquire_miss and @commit_txn is doomed: its
-					 * commit would discard everything.  Carrying on
-					 * arms the per-op claim and records the promote
-					 * on @pub->slot -- a word this op does not own --
-					 * which the rcu-debug owner assert catches
-					 * (MEASURED: inv_prefix_shape_zoo, in-place
-					 * rcu-debug at exponential, remove_all's detach,
-					 * 2 of 128 pinned runs; the dump showed the
-					 * holder's state word carrying a peer's proxy).
-					 * Nothing is committed: @end destroys the unused
-					 * txn, releasing what it registered, as
-					 * insert_replace's and remove_all's arms do
-					 * (dbc41961, da4ac288).
+					 * ☠ A MISSED HOLDER ENDS THE ATTEMPT
+					 * HERE.  A peer holds
+					 * @iter_node_flag's word (a parked
+					 * proxy on it counts).  So the take
+					 * latched @acquire_miss, and
+					 * @commit_txn is doomed.  Its commit
+					 * would discard everything.
+					 *
+					 * Carrying on would arm the per-op
+					 * claim.  It would record the
+					 * promote on @pub->slot, a word this
+					 * op does not own.  The rcu-debug
+					 * owner assert catches that.
+					 * MEASURED on:
+					 * - inv_prefix_shape_zoo, in-place
+					 *   rcu-debug at exponential,
+					 *   remove_all's detach;
+					 * - 2 of 128 pinned runs.
+					 * The dump showed the holder's state
+					 * word carrying a peer's proxy.
+					 *
+					 * Nothing is committed.  @end
+					 * destroys the unused txn and
+					 * releases what it registered.
+					 * insert_replace's and remove_all's
+					 * arms do the same (dbc41961,
+					 * da4ac288).
 					 */
 #ifndef FT_DEBUG_DETACH_MISS_CARRIES_ON
 					if (caa_unlikely(commit_txn->acquire_miss)) {
@@ -6032,29 +6773,34 @@ int ft_detach_node(struct cds_ft *ft,
 #endif
 				}
 				/*
-				 * PHASE B, STEP B2 -- THE ARM.  The guard/release
-				 * above is this path's LAST ft_flip_txn_lock_register,
-				 * and ft_remove_one_commit below plants the first
-				 * record after it, so this is where
-				 * ft_flip_txn_arm_per_op's "after the op's last
-				 * register" contract puts it.  The helper applies the
-				 * lock_fine, per-node-spacing and empty-registry
+				 * PHASE B, STEP B2 -- THE ARM.  The
+				 * guard/release above is this path's LAST
+				 * ft_flip_txn_lock_register.
+				 * ft_remove_one_commit below plants the
+				 * first record after it.  So
+				 * ft_flip_txn_arm_per_op's "after the op's
+				 * last register" contract puts the arm here.
+				 * The helper applies the lock_fine,
+				 * per-node-spacing and empty-registry
 				 * refusals itself.
 				 *
-				 * ☞ WHAT IT CONVERTS IS THE TAIL, and that is a
-				 * property of this op rather than a gap.  ft_detach_node
-				 * interleaves registers and records -- the orphan
-				 * freezes and the recompact/collapse edges are planted
-				 * EARLIER on this same txn and stay MW, which is
-				 * stricter and always sound.  Converting them needs
-				 * their own arm points, each with its own last-register
-				 * to sit after; that is a later step, not something
-				 * this one leaves half-done.
+				 * ☞ WHAT IT CONVERTS IS THE TAIL.  That is a
+				 * property of this op, not a gap.
+				 * ft_detach_node interleaves registers and
+				 * records.  The orphan freezes and the
+				 * recompact/collapse edges are planted
+				 * EARLIER on this same txn.  They stay MW,
+				 * which is stricter and always sound.
+				 * Converting them needs their own arm
+				 * points.  Each must sit after its own last
+				 * register.  That is a later step, not
+				 * something this one leaves half-done.
 				 *
-				 * ☞ The dry run (-DFT_REMOVE_CLAIM) claims at txn
-				 * CREATION -- strictly earlier than here -- and is clean
-				 * on both suites, so every record on this txn already
-				 * passes the owner check, not merely the ones this arm
+				 * ☞ The dry run (-DFT_REMOVE_CLAIM) claims at
+				 * txn CREATION, strictly earlier than here.
+				 * It is clean on both suites.  So every
+				 * record on this txn already passes the
+				 * owner check, not only the ones this arm
 				 * converts.
 				 */
 				if (commit_txn && !leaf_hoisted)
@@ -6109,22 +6855,27 @@ int ft_detach_node(struct cds_ft *ft,
 			}
 			/*
 			 * Hand the collected orphan chain off to the deferred free
-			 * below the republish block (@orphan_free): a recompaction's
-			 * forward unlink commits down there, so the reclaim must wait
-			 * for it (a freed node's freeze-on-free tombstone commits with
-			 * that unlink, and the free must follow the structural unlink,
-			 * not precede it).  The tombstones are already recorded above --
-			 * into @commit_txn (pub) or standalone (list-off).
+			 * below the republish block (@orphan_free).  A
+			 * recompaction's forward unlink commits down
+			 * there.  So the reclaim must wait for it.  A
+			 * freed node's freeze-on-free tombstone commits
+			 * with that unlink.  The free must follow the
+			 * structural unlink, not precede it.  The
+			 * tombstones are already recorded above: into
+			 * @commit_txn (pub), or standalone (list-off).
 			 */
 			if (!ret) {
 				/*
-				 * FOLD: this detach commits NOTHING, so the chain is
-				 * still live and linked when it returns -- the caller's
-				 * commit is the unlink.  Hand it out with the retired
-				 * copy's lifetime instead of arming the local deferred
-				 * free below, which would reclaim a node a reader is
-				 * entitled to be walking (and would free it even when
-				 * the caller's commit ABORTS and nothing unlinked it).
+				 * FOLD: this detach commits NOTHING.  So
+				 * the chain is still live and linked when
+				 * it returns.  The caller's commit is the
+				 * unlink.  Hand the chain out with the
+				 * retired copy's lifetime.  Do not arm the
+				 * local deferred free below.  It would
+				 * reclaim a node a reader is entitled to be
+				 * walking.  It would also free it when the
+				 * caller's commit ABORTS and nothing
+				 * unlinked it.
 				 */
 				if (record_only) {
 					if (recompact_out) {
@@ -6151,9 +6902,10 @@ int ft_detach_node(struct cds_ft *ft,
 	/*
 	 * Update address of parent ptr in its parent.
 	 * Skip for compressed parents: the replacement was already
-	 * published inline above.  Skip entirely when shape-D fusion already
-	 * committed the merged compressed node in place of the boundary (the
-	 * boundary is freed, there is no forward republish or separate prune).
+	 * published inline above.  Skip entirely when shape-D fusion
+	 * already committed the merged compressed node in place of the
+	 * boundary.  The boundary is then freed.  There is no forward
+	 * republish and no separate prune.
 	 */
 	if (!boundary_fused &&
 	    !ft_node_compressed(iter_node_flag) &&
@@ -6162,17 +6914,22 @@ int ft_detach_node(struct cds_ft *ft,
 			cds_ft_item_to_metadata(ft_node_ptr(iter_node_flag));
 
 		/*
-		 * nr_keys fold (LEAF Increment 2): a recompaction rebuilds the
-		 * holder smaller; the fresh copy (@iter_node_flag) carried the OLD
-		 * node's count out of ft_node_recompact, so bake in its post-removal
-		 * count here -- a build-invisible plain store on the not-yet-
-		 * published fresh copy.  Reader-safety: the fresh copy is reachable
-		 * via up-walk pre-commit (recompact re-parents children to it), but
-		 * a node's own nr_keys is only ever read at a root-DESCENDED position
-		 * -- which lands on the OLD node via the not-yet-flipped parent slot
-		 * -- so its transiently-shifted count is never observed (same
-		 * invariant as the insert I7 relocation fold).  The -1 walk from the
-		 * STABLE grandparent iter_meta->parent rides the republish below.
+		 * nr_keys fold (LEAF Increment 2).  A recompaction rebuilds the
+		 * holder smaller.  The fresh copy (@iter_node_flag) carried the
+		 * OLD node's count out of ft_node_recompact.  So bake in its
+		 * post-removal count here.  This is a build-invisible plain
+		 * store on the not-yet-published fresh copy.
+		 *
+		 * Reader-safety.  The fresh copy is reachable via up-walk
+		 * pre-commit, because recompact re-parents children to it.  But
+		 * a node's own nr_keys is only ever read at a root-DESCENDED
+		 * position.  That lands on the OLD node via the not-yet-flipped
+		 * parent slot.  So the transiently-shifted count is never
+		 * observed.  This is the same invariant as the insert I7
+		 * relocation fold.
+		 *
+		 * The -1 walk from the STABLE grandparent iter_meta->parent
+		 * rides the republish below.
 		 */
 		if (old_recompacted_node && count_delta)
 			ft_nr_keys_store(ft, iter_meta,
@@ -6182,48 +6939,64 @@ int ft_detach_node(struct cds_ft *ft,
 		dbg_printf("ft_detach_node: publish %p instead of %p\n",
 			iter_node_flag, *detach_parent_flag_ptr);
 		/*
-		 * Recompaction publish (old_recompacted_node set => the holder
-		 * was rebuilt smaller; a NULL topmost_external_nodes => a pure
-		 * delete, no external-promote).  When fusion is requested, record
-		 * the publish's 1-2 reader-visible edges (forward slot + a
-		 * compressed grandparent's SKIP_X dual) and commit them in ONE
-		 * flip with @fuse_cell's unsplice -- the recompaction dual of the
-		 * in-place fusion above -- and signal it via pub->armed so the
-		 * caller skips the standalone unsplice.  A compressed grandparent
-		 * publishes into cn->child; every reader that descends a compressed
-		 * child now resolves a flip proxy there
-		 * (ft_cn_child_dereference_acquire_prefetch), so the parked forward
-		 * edge is safe.  Direct publish for an in-place redundant
-		 * republish, external-promote, or list off.
+		 * Recompaction publish.  This arm runs when:
+		 * - old_recompacted_node is set: the holder was rebuilt
+		 *   smaller;
+		 * - topmost_external_nodes is NULL: a pure delete, no
+		 *   external-promote.
+		 * When fusion is requested, record the publish's 1-2
+		 * reader-visible edges:
+		 * - the forward slot;
+		 * - a compressed grandparent's SKIP_X dual.
+		 * Commit them in ONE flip with @fuse_cell's unsplice.
+		 * This is the recompaction dual of the in-place fusion
+		 * above.  Signal it via pub->armed, so the caller skips
+		 * the standalone unsplice.
+		 *
+		 * A compressed grandparent publishes into cn->child.  Every
+		 * reader that descends a compressed child now resolves a flip
+		 * proxy there (ft_cn_child_dereference_acquire_prefetch).  So
+		 * the parked forward edge is safe.
+		 *
+		 * Publish directly for an in-place redundant republish, an
+		 * external-promote, or list off.
 		 */
 		if ((fuse_cell || run) && pub && !pub->armed &&
 		    old_recompacted_node && !topmost_external_nodes) {
 			/*
 			 * @mtxn: this publish can carry a compressed
-			 * grandparent's SKIP_X dual, and the dual's HOME is
-			 * resolved from a parent_word THIS op may already have
-			 * a pending re-parent for (a same-trie rekey folds its
-			 * detach into the graft's commit).  Without the handle
-			 * ft_dual_home_is_private cannot see that re-parent and
-			 * answers with the PRE-OP slot -- a word inside the node
-			 * this very commit retires.  Same defect as the
+			 * grandparent's SKIP_X dual.  The dual's HOME is
+			 * resolved from a parent_word.  THIS op may already
+			 * have a pending re-parent for that word: a same-trie
+			 * rekey folds its detach into the graft's commit.
+			 * Without the handle, ft_dual_home_is_private cannot
+			 * see that re-parent.  It answers with the PRE-OP
+			 * slot, a word inside the node this very commit
+			 * retires.  This is the same defect as the
 			 * external-promote arm above, two sites deeper.
 			 */
 			struct ft_pub_rec rec = { .ctx = &lctx, .n = 0,
 				.mtxn = commit_txn ? commit_txn->mtxn : NULL };
 
 			/*
-			 * MW consistency: @detach_parent_flag_ptr was recovered by the
-			 * up-prune walk, while @iter_meta->parent and its state-word slot
-			 * offset were inherited by the recompact from a later snapshot.  A
-			 * peer re-home of the grandparent between the two tears the pair --
-			 * _ft_publish_to_parent_meta would then compute the fresh copy's
-			 * offset (ft_set_parent_slot -> ft_slot_to_byte) off the wrong
-			 * parent body and fault out of range against its bitmap.  Bail to a
-			 * re-descend when iter_meta's OWN resolved slot no longer IS
-			 * @detach_parent_flag_ptr: nothing is published yet (this fresh
-			 * copy is build-invisible), so the end: unwind discards the copy and
-			 * the unconsumed txn, exactly as the peer-won -EAGAIN below.
+			 * MW consistency.  The up-prune walk recovered
+			 * @detach_parent_flag_ptr.  The recompact
+			 * inherited @iter_meta->parent and its state-word
+			 * slot offset from a later snapshot.  A peer
+			 * re-home of the grandparent between the two tears
+			 * the pair.  _ft_publish_to_parent_meta would then
+			 * compute the fresh copy's offset
+			 * (ft_set_parent_slot -> ft_slot_to_byte) off the
+			 * wrong parent body.  It would fault out of range
+			 * against its bitmap.
+			 *
+			 * So bail to a re-descend when iter_meta's OWN
+			 * resolved slot no longer IS
+			 * @detach_parent_flag_ptr.  Nothing is published
+			 * yet: this fresh copy is build-invisible.  So the
+			 * end: unwind discards the copy and the unconsumed
+			 * txn.  This is exactly as the peer-won -EAGAIN
+			 * below.
 			 */
 			if (ft_get_parent_slot(iter_meta, ft) !=
 					detach_parent_flag_ptr) {
@@ -6233,13 +7006,16 @@ int ft_detach_node(struct cds_ft *ft,
 			/*
 			 * VALIDATE (§4.B): guard the LIVE grandparent iter_meta->parent.
 			 *
-			 * LOCK_FINE (§9.3): a recompact ran (@old_recompacted_node), so
-			 * this grandparent is its P -- already LOCKED, with a
-			 * {LOCK|s -> s} release recorded on this very word.  The release
-			 * record IS the guard (same word, same abort on a peer state
-			 * change) and is strictly stronger, so the conversion REPLACES it.
-			 * (Leaving the guard would be vacuous, not wrong: release-then-guard
-			 * chains as a read-your-writes no-op -- see the ordering rule at
+			 * LOCK_FINE (§9.3).  A recompact ran
+			 * (@old_recompacted_node).  So this grandparent is
+			 * its P.  It is already LOCKED, with a
+			 * {LOCK|s -> s} release recorded on this very word.
+			 * The release record IS the guard: same word, same
+			 * abort on a peer state change.  It is strictly
+			 * stronger, so the conversion REPLACES the guard.
+			 * (Leaving the guard would be vacuous, not wrong.
+			 * Release-then-guard chains as a read-your-writes
+			 * no-op.  See the ordering rule at
 			 * ft_flip_txn_record_release_lock.)
 			 */
 			if (!(ft->lock_fine && old_recompacted_node))
@@ -6249,47 +7025,50 @@ int ft_detach_node(struct cds_ft *ft,
 			/*
 			 * PHASE B, STEP B2 -- THE ARM, RECOMPACTION PUBLISH
 			 * (fused).  This is where the remove surface commits
-			 * whenever the delete RECOMPACTED: every delete does on
-			 * a build without FEATURE_FT_INSERT_IN_PLACE, and one
-			 * that would shrink the holder below min_child does on
-			 * any build (@in_place, ft_node_replace_ptr); an
-			 * in-place delete commits through the pub-armed arm
+			 * whenever the delete RECOMPACTED.  That happens:
+			 * - for every delete, on a build without
+			 *   FEATURE_FT_INSERT_IN_PLACE;
+			 * - on any build, for a delete that would shrink the
+			 *   holder below min_child (@in_place,
+			 *   ft_node_replace_ptr).
+			 * An in-place delete commits through the pub-armed arm
 			 * above instead.
 			 *
 			 * PLACEMENT.  The op's last ft_flip_txn_lock_register
 			 * on @commit_txn is ft_node_recompact's RELEASE-half
-			 * loop ({P}, plus {GP} when P is compressed), which ran
-			 * inside ft_node_replace_ptr above; the line beside
-			 * this one plants a read-set guard and registers
-			 * nothing, and ft_remove_commit_rec below plants the
-			 * first record after it.  Measured (-DFT_ARM_REACH):
-			 * @nr_locks is NEVER zero here, so the helper's
-			 * empty-registry refusal is not what decides this site.
+			 * loop ({P}, plus {GP} when P is compressed).  That
+			 * loop ran inside ft_node_replace_ptr above.  The line
+			 * beside this one plants a read-set guard and
+			 * registers nothing.  ft_remove_commit_rec below plants
+			 * the first record after it.  Measured
+			 * (-DFT_ARM_REACH): @nr_locks is NEVER zero here.  So
+			 * the helper's empty-registry refusal is not what
+			 * decides this site.
 			 *
 			 * ☞ WHAT IT CONVERTS is the forward publish (+ a
-			 * compressed grandparent's SKIP_X dual), whose owner is
+			 * compressed grandparent's SKIP_X dual).  Its owner is
 			 * the grandparent this recompact holds and released
 			 * through this very txn.  The recompaction's OWN edges
-			 * -- the reparent sweep, the child state guards -- are
-			 * not converted and must not be: they dispatch MW
-			 * themselves (@child_held false in
+			 * are not converted and must not be.  These are the
+			 * reparent sweep and the child state guards.  They
+			 * dispatch MW themselves (@child_held false in
 			 * ft_flip_txn_record_parent_word /
-			 * ft_reparent_record_meta) because C's CHILDREN are
-			 * never in the DLM set.  The cell / run edges stay
-			 * MW_ALWAYS by their own helpers.
+			 * ft_reparent_record_meta).  The reason is that C's
+			 * CHILDREN are never in the DLM set.  The cell / run
+			 * edges stay MW_ALWAYS by their own helpers.
 			 *
 			 * ☠ NOT ON THE FOLD PATH.  @record_only means
-			 * @commit_txn is the CALLER's shared txn, and whether
-			 * its registry is complete is the caller's judgement,
-			 * not this frame's -- the rekey writer arms it itself,
-			 * so refusing here costs nothing.
+			 * @commit_txn is the CALLER's shared txn.  Whether its
+			 * registry is complete is the caller's judgement, not
+			 * this frame's.  The rekey writer arms it itself.  So
+			 * refusing here costs nothing.
 			 */
 			/*
-			 * §9.3's THIRD MEMBER, as on the non-fused twin below:
-			 * the dual's grandparent is DERIVED at publish, so the
+			 * §9.3's THIRD MEMBER, as on the non-fused twin below.
+			 * The dual's grandparent is DERIVED at publish.  So the
 			 * only sound way to hold it is to acquire it from that
-			 * same derivation.  ABOVE the arm -- it is a
-			 * ft_flip_txn_lock_register.
+			 * same derivation.  This sits ABOVE the arm, because it
+			 * is a ft_flip_txn_lock_register.
 			 */
 			dual_gp_held = ft_lock_skip_dual_gp(ft, &lctx, commit_txn,
 				ft_parent_node(iter_meta->parent_word),
@@ -6302,39 +7081,44 @@ int ft_detach_node(struct cds_ft *ft,
 				/*
 				 * ☠ FALSE, AND `old_recompacted_node != NULL`
 				 * WAS NOT SOUND.  It said "the recompact took
-				 * {C,P,GP}, so we hold the dual's owner", and
-				 * that is a PLAN-TIME fact: ft_node_recompact
-				 * resolves @pf_gp before the acquire and takes
-				 * GP only `if (pf_gp)`, while the empty member
-				 * is skipped by ft_dlm_acquire_set's
-				 * `if (!set[i].nf) continue` -- guard included.
+				 * {C,P,GP}, so we hold the dual's owner".  That
+				 * is a PLAN-TIME fact:
+				 * - ft_node_recompact resolves @pf_gp before
+				 *   the acquire;
+				 * - it takes GP only `if (pf_gp)`;
+				 * - ft_dlm_acquire_set skips the empty member
+				 *   (`if (!set[i].nf) continue`), guard
+				 *   included.
 				 * The dual's owner, meanwhile, is DERIVED FRESH
 				 * at publish from cn_meta's back-pointer.  So a
 				 * compressed P that was ROOT-ATTACHED at plan
-				 * time yields no GP and no guard, and a peer
-				 * re-home landing in that window makes the
-				 * publish derive a grandparent this op never
-				 * acquired -- an SW park on an unowned word, at
-				 * an armed site, silent without rcu-debug.
+				 * time yields no GP and no guard.  A peer
+				 * re-home can land in that window.  The publish
+				 * then derives a grandparent this op never
+				 * acquired.  That is an SW park on an unowned
+				 * word, at an armed site.  It is silent without
+				 * rcu-debug.
 				 *
 				 * No current op live-re-homes a root-attached
-				 * compressed node (root restructures retire and
-				 * rebuild), so the window is unproven-reachable
-				 * -- which is a reason to keep looking, not a
-				 * reason to park on it.  The dual costs one
-				 * record on the minority of republishes whose
-				 * parent is compressed; MW is stricter and
-				 * always sound.
+				 * compressed node.  Root restructures retire
+				 * and rebuild.  So the window is
+				 * unproven-reachable.  That is a reason to keep
+				 * looking, not a reason to park on it.  The
+				 * dual costs one record on the minority of
+				 * republishes whose parent is compressed.  MW
+				 * is stricter and always sound.
 				 *
 				 * ☞ To make this true again, the ANSWER must be
-				 * publish-time: the acquired GP compared against
-				 * the derived dual owner, not the plan's intent.
+				 * publish-time.  Compare the acquired GP
+				 * against the derived dual owner, not the
+				 * plan's intent.
 				 */
 				dual_gp_held);
 			/*
-			 * nr_keys fold (LEAF Increment 2): the recompaction's -1
-			 * walk from the STABLE grandparent iter_meta->parent (the
-			 * rebuilt copy itself was baked above) rides this same commit.
+			 * nr_keys fold (LEAF Increment 2).  The
+			 * recompaction's -1 walk from the STABLE
+			 * grandparent iter_meta->parent rides this same
+			 * commit.  The rebuilt copy itself was baked above.
 			 */
 			if (count_delta) {
 				ft_flip_txn_record_count_parent(ft, commit_txn,
@@ -6343,10 +7127,11 @@ int ft_detach_node(struct cds_ft *ft,
 				count_folded = true;
 			}
 			/*
-			 * Recompaction (its eager child re-parent already ran in
-			 * ft_node_replace_ptr) so the publish commits through the
-			 * pre-reserved txn (reserved above; this arm requires
-			 * fuse_cell/run) and cannot fail.
+			 * Recompaction: its eager child re-parent already
+			 * ran in ft_node_replace_ptr.  So the publish
+			 * commits through the pre-reserved txn and cannot
+			 * fail.  The txn was reserved above; this arm
+			 * requires fuse_cell/run.
 			 */
 			if (ft_remove_commit_rec(ft, &rec, fuse_cell, run,
 					commit_txn_used ? NULL : commit_txn,
@@ -6366,46 +7151,57 @@ int ft_detach_node(struct cds_ft *ft,
 				.mtxn = commit_txn ? commit_txn->mtxn : NULL };
 
 			/*
-			 * Real forward-slot change not yet committed: a
-			 * non-fused recompaction (rebuilt node) or a
-			 * non-in-place external promote.  Commit the
-			 * forward slot + any compressed-grandparent
-			 * SKIP_X dual atomically through @commit_txn
-			 * (recompaction's child re-parent already ran);
-			 * a lone-edge promote stays one release store.
+			 * A real forward-slot change is not yet committed.
+			 * It is one of:
+			 * - a non-fused recompaction (rebuilt node);
+			 * - a non-in-place external promote.
+			 * Commit the forward slot + any
+			 * compressed-grandparent SKIP_X dual atomically
+			 * through @commit_txn.  The recompaction's child
+			 * re-parent already ran.  A lone-edge promote
+			 * stays one release store.
 			 *
 			 * The !pub->armed guard excludes the IN-PLACE
-			 * external promote: there the holder never moves
-			 * (the promoted head goes into a slot below it,
-			 * already committed by ft_remove_one_commit and
-			 * fused with the cell unsplice, consuming
-			 * @commit_txn).  Re-emitting the unchanged
-			 * parent->holder edge here is an old==new no-op
-			 * and, with @commit_txn spent, would trip the
+			 * external promote.  There the holder never moves.
+			 * The promoted head goes into a slot below it.
+			 * ft_remove_one_commit already committed that slot,
+			 * fused with the cell unsplice, and consumed
+			 * @commit_txn.  Re-emitting the unchanged
+			 * parent->holder edge here is an old==new no-op.
+			 * With @commit_txn spent, it would also trip the
 			 * NULL-txn assert(n<=1) once a compressed
-			 * grandparent makes it multi-edge; it falls
+			 * grandparent makes it multi-edge.  So it falls
 			 * through to the no-op else.  (pub->armed and
 			 * old_recompacted_node are mutually exclusive.)
 			 */
 			/*
-			 * MW consistency, RECOMPACTION sub-case ONLY (old_recompacted_node
-			 * set).  A non-fused recompaction publishes a build-invisible fresh
-			 * copy whose (parent, offset) the recompact inherited as ONE plain
-			 * snapshot, so ft_get_parent_slot(iter_meta) is a STABLE value no
-			 * peer can write; a grandparent re-home that tears it vs
-			 * @detach_parent_flag_ptr would fault ft_slot_to_byte in
-			 * _ft_publish_to_parent_meta, so bail to a re-descend -- the fresh
-			 * copy is freed and the recorded (unconsumed) txn destroyed at end:,
-			 * nothing published yet (as the fused site above).
+			 * MW consistency, RECOMPACTION sub-case ONLY
+			 * (old_recompacted_node set).  A non-fused
+			 * recompaction publishes a build-invisible fresh
+			 * copy.  The recompact inherited its (parent,
+			 * offset) as ONE plain snapshot.  So
+			 * ft_get_parent_slot(iter_meta) is a STABLE value
+			 * no peer can write.  A grandparent re-home can
+			 * tear it against @detach_parent_flag_ptr.  That
+			 * would fault ft_slot_to_byte in
+			 * _ft_publish_to_parent_meta.  So bail to a
+			 * re-descend.  The fresh copy is freed at end:, and
+			 * the recorded (unconsumed) txn is destroyed.
+			 * Nothing is published yet, as at the fused site
+			 * above.
 			 *
-			 * Do NOT guard the external-promote sub-case (old_recompacted_node
-			 * == NULL, reachable list-off with pub == NULL): there
-			 * @iter_node_flag is the LIVE holder whose promoted head was already
-			 * published reader-visibly above, so a -EAGAIN here would STRAND
-			 * that mutation (the caller retries as "nothing published"), and its
-			 * parent is peer-writable -- a check-then-use cannot make the raw
-			 * re-read in _ft_publish_to_parent_meta atomic anyway.  That torn
-			 * pair is a separate, pre-existing list-off gap.
+			 * Do NOT guard the external-promote sub-case
+			 * (old_recompacted_node == NULL).  It is reachable
+			 * list-off with pub == NULL.  There @iter_node_flag
+			 * is the LIVE holder.  Its promoted head was
+			 * already published reader-visibly above.  So a
+			 * -EAGAIN here would STRAND that mutation: the
+			 * caller retries as "nothing published".  Its
+			 * parent is also peer-writable.  A check-then-use
+			 * cannot make the raw re-read in
+			 * _ft_publish_to_parent_meta atomic anyway.  That
+			 * torn pair is a separate, pre-existing list-off
+			 * gap.
 			 */
 			if (old_recompacted_node &&
 			    ft_get_parent_slot(iter_meta, ft) !=
@@ -6415,15 +7211,20 @@ int ft_detach_node(struct cds_ft *ft,
 			}
 			/*
 			 * VALIDATE (§4.B): lock (or guard-fallback) the LIVE
-			 * grandparent iter_meta->parent -- value-swap target (§10.5).
+			 * grandparent iter_meta->parent.  It is the
+			 * value-swap target (§10.5).
 			 *
-			 * LOCK_FINE (§9.3): skip entirely ONLY when a recompact actually
-			 * ran -- then this grandparent is its P, already locked, and its
-			 * recorded {LOCK|s -> s} release IS the guard, strictly stronger
-			 * (see the ordering rule at ft_flip_txn_record_release_lock).
-			 * The external-promote sub-case below reaches here with
-			 * @old_recompacted_node == NULL and NO recompact, hence no lock on
-			 * this parent -- lock_or_guard acquires it (or guard-falls-back).
+			 * LOCK_FINE (§9.3): skip entirely ONLY when a
+			 * recompact actually ran.  Then this grandparent is
+			 * its P, already locked.  Its recorded
+			 * {LOCK|s -> s} release IS the guard, and is
+			 * strictly stronger.  See the ordering rule at
+			 * ft_flip_txn_record_release_lock.  The
+			 * external-promote sub-case below reaches here with
+			 * @old_recompacted_node == NULL and NO recompact.
+			 * So there is no lock on this parent.
+			 * lock_or_guard acquires it, or falls back to a
+			 * guard.
 			 */
 			if (ft->lock_fine && old_recompacted_node)
 				; /* recompact's P already locked; release IS the guard */
@@ -6436,18 +7237,20 @@ int ft_detach_node(struct cds_ft *ft,
 			 * §9.3's THIRD MEMBER, and the answer this producer owes
 			 * the record below.  The paragraph that used to sit at
 			 * the @dual_owner_held argument said exactly how to earn
-			 * it -- "the ANSWER must be publish-time: the acquired GP
-			 * compared against the derived dual owner, not the plan's
-			 * intent" -- and ft_lock_skip_dual_gp IS that: it derives
-			 * the GP the same way the record will and acquires THAT,
-			 * so its return is the honest held answer rather than an
-			 * inference from `old_recompacted_node != NULL`.
+			 * it.  It read: "the ANSWER must be publish-time: the
+			 * acquired GP compared against the derived dual owner,
+			 * not the plan's intent".  ft_lock_skip_dual_gp IS
+			 * that.  It derives the GP the same way the record
+			 * will, and acquires THAT.  So its return is the
+			 * honest held answer.  It is not an inference from
+			 * `old_recompacted_node != NULL`.
 			 *
-			 * A no-op unless a dual is actually recorded; @mtxn NULL
-			 * mirrors this producer's @rec, which carries none.
-			 * ABOVE the arm, because it is a ft_flip_txn_lock_register
-			 * and the arm's contract is "after the op's LAST
-			 * register" -- the same placement the promote arms use.
+			 * It is a no-op unless a dual is actually recorded.
+			 * @mtxn NULL mirrors this producer's @rec, which
+			 * carries none.  It sits ABOVE the arm, because it is a
+			 * ft_flip_txn_lock_register.  The arm's contract is
+			 * "after the op's LAST register".  The promote arms use
+			 * the same placement.
 			 */
 			dual_gp_held = ft_lock_skip_dual_gp(ft, &lctx, commit_txn,
 				ft_parent_node(iter_meta->parent_word),
@@ -6455,12 +7258,12 @@ int ft_detach_node(struct cds_ft *ft,
 			/*
 			 * PHASE B, STEP B2 -- THE ARM, RECOMPACTION PUBLISH
 			 * (non-fused) and the non-in-place external promote.
-			 * The argument is the fused arm's above, with the one
-			 * difference that decides the placement: on the else
-			 * arm the lock_or_guard beside this line IS this path's
-			 * last register (the recompact arm's was
-			 * ft_node_recompact's release loop), so the arm sits
-			 * below BOTH.
+			 * The argument is the fused arm's above, with one
+			 * difference.  That difference decides the placement.
+			 * On the else arm, the lock_or_guard beside this line
+			 * IS this path's last register.  (The recompact arm's
+			 * was ft_node_recompact's release loop.)  So the arm
+			 * sits below BOTH.
 			 */
 			if (commit_txn && !commit_txn_used && !record_only)
 				ft_flip_txn_arm_per_op(ft, commit_txn);
@@ -6468,25 +7271,26 @@ int ft_detach_node(struct cds_ft *ft,
 				detach_parent_flag_ptr, iter_node_flag,
 				holder_old_flag, &rec,
 				/*
-				 * ☐ STILL false -- but for a DIFFERENT reason
-				 * than before, and the difference is the whole
-				 * finding.  The note that stood here explained why
-				 * `old_recompacted_node != NULL` was NOT sound:
-				 * it is a PLAN-TIME fact (ft_node_recompact
-				 * resolves @pf_gp before the acquire and takes
-				 * GP only `if (pf_gp)`, and an empty member is
-				 * skipped by ft_dlm_acquire_set), while the
-				 * dual's owner is DERIVED FRESH at publish from
-				 * cn_meta's back-pointer -- so a compressed P
-				 * that was ROOT-ATTACHED at plan time yields no
-				 * GP, and a peer re-home landing in that window
+				 * ☐ STILL false, but for a DIFFERENT reason
+				 * than before.  The difference is the whole
+				 * finding.  The note that stood here explained
+				 * why `old_recompacted_node != NULL` was NOT
+				 * sound.  It is a PLAN-TIME fact:
+				 * - ft_node_recompact resolves @pf_gp before
+				 *   the acquire;
+				 * - it takes GP only `if (pf_gp)`;
+				 * - ft_dlm_acquire_set skips an empty member.
+				 * The dual's owner is DERIVED FRESH at publish
+				 * from cn_meta's back-pointer.  So a compressed
+				 * P that was ROOT-ATTACHED at plan time yields
+				 * no GP.  A peer re-home landing in that window
 				 * would have parked SW on a word this op never
 				 * acquired.
 				 *
-				 * ☑ THE ACQUIRE IS NOW TAKEN ANYWAY, above --
-				 * and it is worth taking for its own sake, kind
-				 * aside: struct ft_pub_rec says "holding GP is
-				 * what EXCLUDES a peer recompaction from copying
+				 * ☑ THE ACQUIRE IS NOW TAKEN ANYWAY, above.  It
+				 * is worth taking for its own sake, kind aside.
+				 * struct ft_pub_rec says "holding GP is what
+				 * EXCLUDES a peer recompaction from copying
 				 * that body out from under the record, and that
 				 * is ft_lock_skip_dual_gp's job, not this word's".
 				 * So this site now HOLDS the word it writes.
@@ -6494,41 +7298,45 @@ int ft_detach_node(struct cds_ft *ft,
 				 * ☑ AND THE KIND NOW FOLLOWS @dual_gp_held.  The
 				 * note that stood here said the flip waited on
 				 * ft_node_recompact ("it holds the DERIVED
-				 * grandparent 0 times in 9721"), then corrected
-				 * itself with "the kind is a per-op claim, not a
-				 * global one -- the LOCK serialises an SW park
-				 * against an MW CAS, so producers convert
-				 * INDIVIDUALLY".
+				 * grandparent 0 times in 9721").  It then
+				 * corrected itself with "the kind is a per-op
+				 * claim, not a global one -- the LOCK
+				 * serialises an SW park against an MW CAS, so
+				 * producers convert INDIVIDUALLY".
 				 *
 				 * ☠ THAT SECOND SENTENCE IS TRUE ONLY OF AN MW
-				 * THAT HOLDS THE WORD, and stating it unqualified
+				 * THAT HOLDS THE WORD.  Stating it unqualified
 				 * is how a body word gets read as lock-bearing.
-				 * An MW record whose op holds nothing arbitrates
-				 * against nothing, so a peer's SW park -- a plain
-				 * store -- genuinely races it.  What makes the
-				 * per-site conversion safe is not that "MW and SW
-				 * serialise": it is that a site which cannot
-				 * vouch answers FALSE and stays MW.  The
-				 * lock-bearing carve-out (an MW record TAKES the
-				 * lock, SW writes follow it) belongs to
-				 * @metadata.state, NOT to a grandparent body
-				 * word, which has no lock in its bits.
+				 * An MW record whose op holds nothing
+				 * arbitrates against nothing.  So a peer's SW
+				 * park, a plain store, genuinely races it.
+				 * The per-site conversion is NOT safe because
+				 * "MW and SW serialise".  It is safe because a
+				 * site which cannot vouch answers FALSE and
+				 * stays MW.  The lock-bearing carve-out belongs
+				 * to @metadata.state: an MW record TAKES the
+				 * lock, and SW writes follow it.  It does NOT
+				 * belong to a grandparent body word, which has
+				 * no lock in its bits.
 				 *
-				 * The 9721 reading was itself a blind query: that
-				 * site HELD its word and was asked through a
-				 * registry ft_dlm_acquire_set can never populate.
+				 * The 9721 reading was itself a blind query.
+				 * That site HELD its word.  It was asked
+				 * through a registry ft_dlm_acquire_set can
+				 * never populate.
 				 * ☞ THE TRANSACTED-SLOT REGISTER.
 				 */
 				dual_gp_held);
 			(void) dual_gp_held;
 			/*
-			 * nr_keys fold (LEAF Increment 2): a non-fused RECOMPACTION
-			 * folds the -1 walk from the stable grandparent onto this
-			 * republish (the rebuilt copy was baked above).  A non-in-place
-			 * external PROMOTE (old_recompacted_node NULL) does NOT -- the
-			 * holder never moved, this republish re-emits an old==new no-op,
-			 * and the promote's count falls to the standalone residual
-			 * below (base @iter_node_flag).
+			 * nr_keys fold (LEAF Increment 2).  A non-fused
+			 * RECOMPACTION folds the -1 walk from the stable
+			 * grandparent onto this republish.  The rebuilt
+			 * copy was baked above.  A non-in-place external
+			 * PROMOTE (old_recompacted_node NULL) does NOT.
+			 * The holder never moved, and this republish
+			 * re-emits an old==new no-op.  The promote's count
+			 * falls to the standalone residual below (base
+			 * @iter_node_flag).
 			 */
 			if (old_recompacted_node && count_delta) {
 				ft_flip_txn_record_count_parent(ft, commit_txn,
@@ -6549,47 +7357,58 @@ int ft_detach_node(struct cds_ft *ft,
 		/*
 		 * else: in-place redundant republish.  The holder
 		 * stayed at its parent slot (a plain leaf delete or
-		 * an in-place external promote), so the forward slot
-		 * -- and any compressed-grandparent SKIP_X dual --
-		 * already hold @iter_node_flag.  The in-place forward
-		 * store committed via ft_remove_one_commit above;
-		 * re-emitting the unchanged slot(s) is a pure no-op
-		 * (old == new), so skip it entirely.  Any commit_txn
-		 * left unconsumed here is freed at @end.
+		 * an in-place external promote).  So the forward slot
+		 * already holds @iter_node_flag, and so does any
+		 * compressed-grandparent SKIP_X dual.  The in-place
+		 * forward store committed via ft_remove_one_commit
+		 * above.  Re-emitting the unchanged slot(s) is a pure
+		 * no-op (old == new), so skip it entirely.  Any
+		 * commit_txn left unconsumed here is freed at @end.
 		 */
 
 		/*
-		 * nr_keys: every outcome now folds its -@count_delta walk onto the
-		 * op's own commit -- in-place / recompaction into @commit_txn, shape-D
-		 * into ft_chain_compress_fused's txn, compressed parent into
-		 * @orphan_txn, and the former list-off pub-less lone store via the
-		 * @local_pub substitution above (which arms @pub, so the pub-armed
-		 * fold fires).  There is no standalone post-commit residual left.
+		 * nr_keys: every outcome now folds its -@count_delta walk
+		 * onto the op's own commit:
+		 *   - in-place and recompaction fold into @commit_txn;
+		 *   - shape-D folds into ft_chain_compress_fused's txn;
+		 *   - a compressed parent folds into @orphan_txn;
+		 *   - the former list-off pub-less lone store uses the
+		 *     @local_pub substitution above.  It arms @pub, so the
+		 *     pub-armed fold fires.
+		 * There is no standalone post-commit residual left.
 		 */
 		assert(count_folded || !count_delta || !ft->rank_stats);
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		/*
-		 * Post-detach canonicalization: if the surviving ancestor
-		 * is now a non-root internal with exactly 1 live child and
-		 * no external_nodes attached, fold it via the chain-compress
-		 * 4-case merge (canonical form under SKIP_COMPRESSED).
+		 * Post-detach canonicalization.  The surviving ancestor may
+		 * now be a non-root internal with exactly 1 live child and
+		 * no external_nodes attached.  If so, fold it via the
+		 * chain-compress 4-case merge (canonical form under
+		 * SKIP_COMPRESSED).
 		 */
 		/*
-		 * ☠ NEVER ON THE FOLD (@record_only): this is a STANDALONE
-		 * SECOND FLIP, and under the fold the caller's one-decide txn
-		 * has NOT COMMITTED yet -- canonicalizing here publishes over a
-		 * plan the caller still holds (measured: ft_skip_reanchor's
-		 * assert(0), the up-walk landing on a mid-plan parent chain).
-		 * Reachable on the fold only through the out-of-bound residue
-		 * (merged_len > FT_SKIP_LEN_MAX falls back to the recompaction
-		 * above; the pending-publish sibling shape is either FUSED with
-		 * the @pending_child substitution or refused whole): that rare
-		 * geometry -- a near-max compressed parent run over a 2-child
-		 * boundary -- then keeps its 1-child internal past the op, which
-		 * skip mode's verifier flags at the writer-scope exit.  KNOWN
-		 * INCOMPLETE: closing it needs the caller to own a post-commit
-		 * canonicalize, which is a rekey-side change, not this frame's.
+		 * ☠ NEVER ON THE FOLD (@record_only).  This is a STANDALONE
+		 * SECOND FLIP.  Under the fold the caller's one-decide txn
+		 * has NOT COMMITTED yet.  Canonicalizing here publishes over
+		 * a plan the caller still holds.  Measured:
+		 * ft_skip_reanchor's assert(0), the up-walk landing on a
+		 * mid-plan parent chain.
+		 *
+		 * On the fold, this is reachable only through the
+		 * out-of-bound residue: merged_len > FT_SKIP_LEN_MAX falls
+		 * back to the recompaction above.  The pending-publish
+		 * sibling shape does not reach it: it is either FUSED with
+		 * the @pending_child substitution or refused whole.
+		 *
+		 * That rare geometry is a near-max compressed parent run
+		 * over a 2-child boundary.  It then keeps its 1-child
+		 * internal past the op.  Skip mode's verifier flags that at
+		 * the writer-scope exit.
+		 *
+		 * KNOWN INCOMPLETE: closing it needs the caller to own a
+		 * post-commit canonicalize.  That is a rekey-side change,
+		 * not a change to this frame.
 		 */
 		if (!record_only &&
 		    ft_meta_nr_child(iter_meta) == 1 &&
@@ -6613,12 +7432,12 @@ int ft_detach_node(struct cds_ft *ft,
 #endif
 	}
 	/*
-	 * Deferred branch-2 orphan free (see @orphan_free): runs AFTER the commit
-	 * that unlinked the chain -- the in-place ft_remove_one_commit or the
-	 * recompaction republish above -- so every freed node's freeze-on-free
-	 * tombstone has already committed and the reclaim follows the structural
-	 * unlink.  An abort takes `goto end` above and bypasses this; the flag is
-	 * set only on a branch-2 success.
+	 * Deferred branch-2 orphan free (see @orphan_free).  It runs AFTER the
+	 * commit that unlinked the chain: the in-place ft_remove_one_commit or
+	 * the recompaction republish above.  So the freeze-on-free tombstone of
+	 * every freed node has already committed, and the reclaim follows the
+	 * structural unlink.  An abort takes `goto end` above and bypasses
+	 * this.  The flag is set only on a branch-2 success.
 	 */
 	if (free_orphans_pending) {
 		int fj;
@@ -6638,21 +7457,25 @@ end:
 	/*
 	 * DLM orphan plan-lock cleanup (§9.2): release every orphan lock acquire the
 	 * op still holds AND still owns.  What is left here marks the orphan's OWN
-	 * word, so its terminal is the fenced {LOCK|s -> TOMBSTONE|s} tombstone: a
-	 * successful detach committed it (LOCK dropped, and an acquire refuses a
-	 * TOMBSTONE, so the bit cannot come back) and clear_if_held no-ops; on ANY
-	 * abort / pre-commit bail (including a mark-miss mid-collection, which
-	 * jumps here) the tombstone never applied, so the mark is still {LOCK|s}
-	 * and is released here -- the structure returns byte-for-byte to its
-	 * pre-op state.  One sweep covers both Block A and Block B (mutually
-	 * exclusive), the trailing skip-target (an entry of @orphan_held like any
-	 * other) and every commit outcome (in-place / recompaction / shape-D), no
-	 * "consumed" tracking.
+	 * word.  So its terminal is the fenced {LOCK|s -> TOMBSTONE|s}
+	 * tombstone.
+	 *   - A successful detach committed it.  LOCK is dropped.  An acquire
+	 *     refuses a TOMBSTONE, so the bit cannot come back.  clear_if_held
+	 *     no-ops.
+	 *   - On ANY abort or pre-commit bail, the tombstone never applied.
+	 *     This includes a mark-miss mid-collection, which jumps here.  The
+	 *     mark is still {LOCK|s} and is released here.  The structure
+	 *     returns byte-for-byte to its pre-op state.
+	 * One sweep covers all of these, with no "consumed" tracking:
+	 *   - both Block A and Block B (mutually exclusive);
+	 *   - the trailing skip-target (an entry of @orphan_held like any
+	 *     other);
+	 *   - every commit outcome (in-place / recompaction / shape-D).
 	 *
-	 * A mark whose anchor SURVIVES the retire is NOT here: ft_detach_freeze_one
-	 * handed it to the freezing txn (@txn_owned), which is the only owner that
-	 * can tell a consumed mark from a peer's fresh one on that still-lockable
-	 * word.
+	 * A mark whose anchor SURVIVES the retire is NOT here.
+	 * ft_detach_freeze_one handed it to the freezing txn (@txn_owned).  On
+	 * that still-lockable word, only that txn can tell a consumed mark from
+	 * a peer's fresh one.
 	 */
 	{
 		int oi;
@@ -6663,14 +7486,16 @@ end:
 				/*
 				 * ☠ ONLY A TXN THIS DETACH DOES NOT COMMIT is
 				 * safe to ask.  A commit CONSUMES the flip-txn
-				 * wrapper, so on every other path @commit_txn /
-				 * @shared_txn may already be freed here and
-				 * reading ->mtxn->desc is a use-after-free
-				 * (measured: SEGV at both fine spacings, test 9,
-				 * inside urcu_txn_find on a dead descriptor).
-				 * @record_only is exactly the deferred contract:
-				 * the collapse is RECORDED into the caller's txn
-				 * and the caller commits it, so it is open here.
+				 * wrapper.  So on every other path @commit_txn
+				 * / @shared_txn may already be freed here, and
+				 * reading ->mtxn->desc is a use-after-free.
+				 * Measured: SEGV at both fine spacings, test 9,
+				 * inside urcu_txn_find on a dead descriptor.
+				 *
+				 * @record_only is exactly the deferred
+				 * contract.  The collapse is RECORDED into the
+				 * caller's txn and the caller commits it, so
+				 * the txn is open here.
 				 */
 				struct ft_flip_txn *pend_txn = record_only ?
 					shared_txn : NULL;
@@ -6679,27 +7504,33 @@ end:
 						orphan_held[oi].lock);
 				/*
 				 * ☠ THE TERMINAL HAS NOT RUN YET.  The sweep's
-				 * premise -- a successful detach COMMITTED this
-				 * word's fused tombstone, an aborted one recorded
-				 * none -- holds only when the detach commits its
-				 * own txn.  Under a DEFERRED commit (@record_only
-				 * / @fold_replace: the rekey's one-decide writer
-				 * commits @shared_txn later) the record exists
-				 * and is UNDECIDED right here, and its expected
-				 * old is {LOCK|s}: a plain-CAS release now drops
-				 * a bit the record still counts on, the word
-				 * becomes lockable by a peer, and the SW park
-				 * that follows writes over the peer blind.
+				 * premise is: a successful detach COMMITTED
+				 * this word's fused tombstone, an aborted one
+				 * recorded none.  It holds only when the detach
+				 * commits its own txn.
+				 *
+				 * Under a DEFERRED commit (@record_only /
+				 * @fold_replace), the rekey's one-decide writer
+				 * commits @shared_txn later.  The record exists
+				 * and is UNDECIDED right here.  Its expected
+				 * old is {LOCK|s}.  A plain-CAS release now
+				 * would:
+				 *   - drop a bit the record still counts on;
+				 *   - make the word lockable by a peer;
+				 *   - let the SW park that follows write over
+				 *     the peer blind.
 				 *
 				 * So hand the word to the txn that carries the
-				 * terminal and let it own the clear on BOTH
-				 * outcomes: its commit consumes the bit into the
-				 * tombstone, its destroy releases it.  Measured
-				 * (-DURCU_TXN_DEBUG_PARK_CLOBBER): the parks that
-				 * clobbered {old 0x80004, found 0x4} were all
-				 * this, worst at per-node spacing, where the
-				 * orphan's lock IS its own word and the existing
-				 * hand-off (h->lock != m) never fires.
+				 * terminal.  That txn owns the clear on BOTH
+				 * outcomes: its commit consumes the bit into
+				 * the tombstone, its destroy releases it.
+				 *
+				 * Measured (-DURCU_TXN_DEBUG_PARK_CLOBBER): the
+				 * parks that clobbered {old 0x80004, found 0x4}
+				 * were all this case.  It was worst at per-node
+				 * spacing.  There the orphan's lock IS its own
+				 * word, and the existing hand-off
+				 * (h->lock != m) never fires.
 				 */
 #ifdef FT_RED_ORPHAN_RELEASE_EARLY
 				pend = NULL;	/* red control: release anyway */
@@ -6712,20 +7543,25 @@ end:
 
 						/*
 						 * ☠ REGISTER, BUT WITHOUT THE
-						 * SILENCER.  ft_flip_txn_lock_own
-						 * links &h->shared so the commit's
-						 * terminal can scrub the handing
-						 * entry -- and @orphan_held is THIS
-						 * FRAME'S STACK.  A deferred commit
-						 * runs after ft_detach_node has
-						 * returned, so that pointer would be
-						 * dangling: the terminal writes
-						 * through it (*src_shared = true)
-						 * and the run SEGVs (measured, both
-						 * fine spacings).  Nothing reads
-						 * @orphan_held past this sweep --
-						 * it is the frame's last use -- so
-						 * the silencer has no job here.
+						 * SILENCER.
+						 * ft_flip_txn_lock_own links
+						 * &h->shared so that the
+						 * commit's terminal can scrub
+						 * the handing entry.  But
+						 * @orphan_held is THIS FRAME'S
+						 * STACK.  A deferred commit
+						 * runs after ft_detach_node
+						 * has returned, so that pointer
+						 * would be dangling.  The
+						 * terminal writes through it
+						 * (*src_shared = true) and the
+						 * run SEGVs (measured, both
+						 * fine spacings).
+						 *
+						 * Nothing reads @orphan_held
+						 * past this sweep, which is the
+						 * frame's last use.  So the
+						 * silencer has no job here.
 						 */
 						ft_flip_txn_lock_register_member(
 							pend_txn,
@@ -6744,38 +7580,46 @@ end:
 				}
 				/*
 				 * ☠ THE FENCE MAY ALREADY BE GONE, AND THE WORD
-				 * CANNOT SAY SO.  Our own committed terminal drops
-				 * the LOCK; from that instant the word is a peer's
-				 * to take, and a set bit means THEIRS, not ours.
-				 * The sweep used to ask the word (clear_if_held)
-				 * on the premise quoted above -- "an acquire
-				 * refuses a TOMBSTONE, so the bit cannot come
-				 * back" -- which holds only for a terminal that
-				 * actually leaves the word TOMBSTONEd.  Where it
-				 * drops LOCK without one, the word is re-lockable
+				 * CANNOT SAY SO.  Our own committed terminal
+				 * drops the LOCK.  From that instant a peer may
+				 * take the word, and a set bit means THEIRS,
+				 * not ours.
+				 *
+				 * The sweep used to ask the word
+				 * (clear_if_held), on the premise quoted above:
+				 * "an acquire refuses a TOMBSTONE, so the bit
+				 * cannot come back".  That holds only for a
+				 * terminal that actually leaves the word
+				 * TOMBSTONEd.  Where the terminal drops LOCK
+				 * without a TOMBSTONE, the word is re-lockable
 				 * and the sweep clears a peer's fence.
 				 *
-				 * So ask what THIS op did.  Under @record_only the
-				 * descriptor is still alive and answers exactly
-				 * (above).  Otherwise it is already freed -- the
-				 * UAF this block's first comment records -- and
-				 * the op's own outcome is the witness: @ret == 0
-				 * means the detach committed, so its fused
-				 * tombstone consumed the fence; any bail or abort
-				 * applied nothing and the mark is still {LOCK|s}.
+				 * So ask what THIS op did:
+				 *   - Under @record_only the descriptor is
+				 *     still alive and answers exactly (above).
+				 *   - Otherwise it is already freed (the UAF
+				 *     this block's first comment records), and
+				 *     the op's own outcome is the witness.
+				 *     @ret == 0 means the detach committed, so
+				 *     its fused tombstone consumed the fence.
+				 *     Any bail or abort applied nothing, and
+				 *     the mark is still {LOCK|s}.
 				 */
 				if (!pend_txn && !ret) {
 					FT_ORPHAN_CONSUMED();
 					/*
-					 * PREFER A LEAK TO A THEFT, AND MEASURE
-					 * IT.  If the premise is ever false the
-					 * fence stays set and the node becomes
-					 * unmutable -- bad, but bounded and
-					 * local, where a theft corrupts a peer's
-					 * exclusion.  Record it rather than
-					 * refuse: a still-LOCKED, un-TOMBSTONEd
-					 * word here is the premise failing, and
-					 * the count is the thing to look at next.
+					 * PREFER A LEAK TO A THEFT, AND
+					 * MEASURE IT.  If the premise is ever
+					 * false, the fence stays set and the
+					 * node becomes unmutable.  That is bad
+					 * but bounded and local.  A theft
+					 * corrupts a peer's exclusion.
+					 *
+					 * Record it, do not refuse.  A word
+					 * that is still LOCKED and not
+					 * TOMBSTONEd here means the premise
+					 * failed.  The count is the thing to
+					 * look at next.
 					 */
 					FT_ORPHAN_PREMISE_CHECK(
 						orphan_held[oi].lock);
@@ -6784,10 +7628,10 @@ end:
 				FT_ORPHAN_RELEASED();
 				ft_meta_lock_release(orphan_held[oi].lock);
 				/*
-				 * SCRUB only RELEASED-LIVE (finding A); a
+				 * SCRUB only RELEASED-LIVE (finding A).  A
 				 * TOMBSTONED word is a CONSUMED fence and must
-				 * keep answering holds() -- dedupe-on-dead is
-				 * the designed flow, and taking a dead word
+				 * keep answering holds().  Dedupe-on-dead is
+				 * the designed flow.  Taking a dead word
 				 * hard-refuses forever (the exp-MW storm).
 				 */
 				if (!(CMM_LOAD_SHARED(
@@ -6797,19 +7641,22 @@ end:
 			}
 	}
 	/*
-	 * nr_keys fold (LEAF Increment 2): no abort rollback needed.  Every
-	 * per-outcome count fold rides an UNcommitted txn on the abort path (the
-	 * commit is what would apply it), so an abort applies nothing; the
-	 * standalone residual runs only on success (ret == 0, inside the parent-
-	 * slot block).  So a failed detach leaves nr_keys untouched, and there is
-	 * no pre-decrement left to undo.
+	 * nr_keys fold (LEAF Increment 2): no abort rollback needed.  On the
+	 * abort path, every per-outcome count fold rides an UNcommitted txn.
+	 * The commit is what would apply it, so an abort applies nothing.  The
+	 * standalone residual runs only on success (ret == 0, inside the
+	 * parent-slot block).  So a failed detach leaves nr_keys untouched, and
+	 * there is no pre-decrement left to undo.
 	 */
 	/*
-	 * Free a pre-reserved commit txn that no commit consumed (reservation
-	 * succeeded but ft_node_replace_ptr recompacted / failed, or shape-D
-	 * fused with its own txn).  PREPARE state -> no grace period.  Under
-	 * record_only @commit_txn IS the caller's SHARED txn -- never freed here
-	 * (the caller owns it and, on any bail, destroys it after re-descending).
+	 * Free a pre-reserved commit txn that no commit consumed.  This happens
+	 * when the reservation succeeded but ft_node_replace_ptr recompacted or
+	 * failed, or when shape-D fused with its own txn.  The txn is in
+	 * PREPARE state, so no grace period is needed.
+	 *
+	 * Under record_only, @commit_txn IS the caller's SHARED txn.  It is
+	 * never freed here.  The caller owns it and, on any bail, destroys it
+	 * after re-descending.
 	 */
 #ifdef FT_DEBUG_STACK_SILENCER
 	/*
@@ -6818,11 +7665,12 @@ end:
 	 * ft_flip_txn_lock_own links &h->shared as the terminal's silencer, and
 	 * @orphan_held is THIS frame's stack.  When the txn is the caller's
 	 * deferred one (@record_only), its terminal runs after this function has
-	 * returned and writes through that pointer -- the same dangling write
-	 * that SEGV'd the orphan sweep before @c5ab837d.  The bounds are known
-	 * exactly here, so this is a measurement, not a heuristic: no address
-	 * arithmetic guess, just "is the registered silencer inside the array I
-	 * am about to destroy".
+	 * returned and writes through that pointer.  This is the same dangling
+	 * write that SEGV'd the orphan sweep before @c5ab837d.
+	 *
+	 * The bounds are known exactly here, so this is a measurement, not a
+	 * heuristic.  It guesses no address arithmetic.  It only asks "is the
+	 * registered silencer inside the array I am about to destroy".
 	 */
 	if (record_only && shared_txn) {
 		unsigned int li;
@@ -6848,21 +7696,27 @@ end:
 	if (commit_txn && !commit_txn_used && !record_only)
 		ft_flip_txn_destroy(commit_txn);
 	/*
-	 * Reclaim safely after replacement.  Under record_only the src-junction
-	 * recompaction's OLD copy stays LIVE (resolved through the parked grandparent
-	 * proxy) until the CALLER's commit publishes the fresh copy, so its free is
-	 * DEFERRED to the caller: hand it out through @old_recompacted_out on a
-	 * recorded-OK (ret == 0) path; the caller frees it (call_rcu) after its commit
-	 * succeeds.  A record_only bail (ret != 0) frees the unpublished fresh copy
-	 * here, exactly as the self-committing abort arm.
+	 * Reclaim safely after replacement.
+	 *
+	 * Under record_only, the OLD copy of the src-junction recompaction
+	 * stays LIVE until the CALLER's commit publishes the fresh copy.  It is
+	 * resolved through the parked grandparent proxy.  So its free is
+	 * DEFERRED to the caller.  On a recorded-OK (ret == 0) path, hand it
+	 * out through @old_recompacted_out.  The caller frees it (call_rcu)
+	 * after its commit succeeds.
+	 *
+	 * A record_only bail (ret != 0) frees the unpublished fresh copy here,
+	 * exactly as the self-committing abort arm.
 	 */
 	if (record_only && old_recompacted_node && !ret) {
 		/*
-		 * Hand BOTH copies to the caller: the OLD copy stays LIVE (resolved
-		 * through the parked grandparent proxy) until the caller's commit
-		 * retires it -> free on commit OK; the fresh NEW copy (@iter_node_flag,
-		 * republished into the shared txn) is UNPUBLISHED until that commit ->
-		 * free unpublished if the caller's commit ABORTS.
+		 * Hand BOTH copies to the caller:
+		 *   - The OLD copy stays LIVE until the caller's commit
+		 *     retires it.  It is resolved through the parked
+		 *     grandparent proxy.  Free it on commit OK.
+		 *   - The fresh NEW copy (@iter_node_flag, republished into
+		 *     the shared txn) is UNPUBLISHED until that commit.  Free
+		 *     it unpublished if the caller's commit ABORTS.
 		 */
 		if (recompact_out) {
 			recompact_out->old_node = old_recompacted_node;
@@ -6871,11 +7725,12 @@ end:
 	} else if (old_recompacted_node) {
 		if (ret == -EAGAIN)
 			/*
-			 * ABORTED republish: the rebuilt copy never published
-			 * (its child re-parent edges and the old copy's
+			 * ABORTED republish: the rebuilt copy never published.
+			 * Its child re-parent edges and the old copy's
 			 * tombstone were recorded into the aborted commit and
-			 * discarded with it).  The OLD node stays live and
-			 * linked; reclaim the never-visible FRESH copy instead.
+			 * discarded with it.  The OLD node stays live and
+			 * linked.  Reclaim the never-visible FRESH copy
+			 * instead.
 			 */
 			free_cds_ft_node_unpublished(ft,
 				ft_node_ptr(iter_node_flag));
@@ -6885,16 +7740,20 @@ end:
 
 	/*
 	 * Standalone fallback for a caller-supplied @retire_glue that no commit
-	 * txn absorbed.  A LIST-ON src detach passes pub != NULL and fuses above
-	 * (probed: 100% branch-2 commit_txn); a LIST-OFF src detach passes pub ==
-	 * NULL (no cell to unsplice, run == NULL), so the freeze block's `pub`
-	 * gate fails and the retire set lands here -- the same lone-store residual
-	 * the list-off orphan chain leaves, to be closed once the lone edge is
-	 * forced through a txn.  A theoretical shape-D / compressed-parent detach
-	 * lands here too.  On success (the unlink that stranded the retire set
-	 * committed) freeze it standalone before the caller frees it; on an abort
-	 * (ret != 0) the caller rolls the whole op back and does NOT free it, so
-	 * leave it untouched.  A no-op under one writer either way.
+	 * txn absorbed.  Which detach lands here:
+	 *   - A LIST-ON src detach does not.  It passes pub != NULL and fuses
+	 *     above (probed: 100% branch-2 commit_txn).
+	 *   - A LIST-OFF src detach does.  It passes pub == NULL (no cell to
+	 *     unsplice, run == NULL), so the freeze block's `pub` gate fails.
+	 *     This is the same lone-store residual that the list-off orphan
+	 *     chain leaves.  It is to be closed once the lone edge is forced
+	 *     through a txn.
+	 *   - A theoretical shape-D / compressed-parent detach does too.
+	 *
+	 * On success, the unlink that stranded the retire set has committed:
+	 * freeze the set standalone before the caller frees it.  On an abort
+	 * (ret != 0) the caller rolls the whole op back and does NOT free it,
+	 * so leave it untouched.  A no-op under one writer either way.
 	 */
 	if (!ret && retire_glue && !retire_glue_fused) {
 		retire_glue->fuse_free_list = false;
@@ -6902,51 +7761,58 @@ end:
 	}
 	/*
 	 * Standalone fallback for the removed external leaf when no commit txn
-	 * absorbed its freeze: the list-off pub-less direct-store detach (pub ==
-	 * NULL leaves @commit_txn NULL, so the freeze block's `pub` gate fails) --
-	 * the same lone-store residual as the list-off orphan chain, to be closed
-	 * once the lone edge is forced through a txn.  On success (the unlink that
-	 * stranded it committed) freeze @node before the caller reclaims it; on an
-	 * abort (ret != 0) leave it chained.  Behaviour-identical to the old
-	 * caller-side mark; a no-op under one writer.
+	 * absorbed its freeze.  This is the list-off pub-less direct-store
+	 * detach: pub == NULL leaves @commit_txn NULL, so the freeze block's
+	 * `pub` gate fails.  It is the same lone-store residual as the list-off
+	 * orphan chain, to be closed once the lone edge is forced through a
+	 * txn.
+	 *
+	 * On success, the unlink that stranded @node has committed: freeze
+	 * @node before the caller reclaims it.  On an abort (ret != 0) leave it
+	 * chained.  Behaviour-identical to the old caller-side mark.  A no-op
+	 * under one writer.
 	 */
 	if (!ret && freeze_leaf && !freeze_leaf_fused) {
 		unsigned int fi;
 		struct cds_ft_node *fn = freeze_leaf;
 
 		/*
-		 * Bounded by @freeze_len for the same reason the txn arm is: a
-		 * duplicate appended since the caller's derivation is NOT this
-		 * op's to retire (ft_hlist_freeze_chain_prepare).  This arm has
-		 * no commit to abort, so the bound is the only thing holding
-		 * that line.
+		 * Bounded by @freeze_len for the same reason as the txn arm.
+		 * A duplicate appended since the caller's derivation is NOT
+		 * this op's to retire (ft_hlist_freeze_chain_prepare).  This
+		 * arm has no commit to abort, so only the bound enforces
+		 * that.
 		 */
 		/*
 		 * ☠☠ THE LAST RAW PRODUCER ON A CHAIN WORD, AND THE CHAIN NOW
-		 * PARKS.  ft_node_mark_removed_flip CASes &fn->next outside the
-		 * record layer, so it cannot be SW-parked; since @80e855f5 every
-		 * other writer of that word parks SW by default.  Its loop spins
-		 * out a parked FT_HLIST_TAG before its CAS, which covers
-		 * park-then-CAS -- but NOT the reverse: a CAS that lands first
-		 * on a clean word is overwritten by the parker's blind settle,
-		 * republishing the successor with the TOMBSTONE ERASED (see that
-		 * function's header for the full ordering).
+		 * PARKS.  ft_node_mark_removed_flip CASes &fn->next outside
+		 * the record layer, so it cannot be SW-parked.  Since
+		 * @80e855f5 every other writer of that word parks SW by
+		 * default.
+		 *
+		 * Its loop spins out a parked FT_HLIST_TAG before its CAS.
+		 * That covers park-then-CAS, but NOT the reverse.  A CAS that
+		 * lands first on a clean word is overwritten by the parker's
+		 * blind settle.  The settle republishes the successor with
+		 * the TOMBSTONE ERASED.  See that function's header for the
+		 * full ordering.
 		 *
 		 * It is safe today only because this arm is not reached:
-		 * -DFT_DEBUG_CHAIN_CANARY scores the producer at raw = 0 in
-		 * ft_inv AND ft_unit at all three spacings, and the chain hold
-		 * audit gives this fallback no row at all.
+		 *   - -DFT_DEBUG_CHAIN_CANARY scores the producer at raw = 0
+		 *     in ft_inv AND ft_unit at all three spacings;
+		 *   - the chain hold audit gives this fallback no row at all.
 		 *
-		 * ☠ THAT IS A COVERAGE STATEMENT ABOUT TWO SUITES, NOT A PROOF,
-		 * and a stale one would be silent.  So count every entry and,
-		 * where the engine's own self-checks are armed, ABORT: if this
-		 * path ever becomes reachable it must be converted to a RECORDED
-		 * store before it runs, never re-argued.
+		 * ☠ THAT IS A COVERAGE STATEMENT ABOUT TWO SUITES, NOT A
+		 * PROOF, and a stale one would be silent.  So count every
+		 * entry and, where the engine's own self-checks are armed,
+		 * ABORT.  If this path ever becomes reachable, it must be
+		 * converted to a RECORDED store before it runs.  It must
+		 * never be re-argued.
 		 *
-		 * ☞ ASSERT ONLY, no counter: a counter on a path that never
+		 * ☞ ASSERT ONLY, no counter.  A counter on a path that never
 		 * executes is write-only in a release build (nothing prints
-		 * it), so it would be decoration.  The measurement above is the
-		 * record; this is what stops a silent regression.
+		 * it), so it would be decoration.  The measurement above is
+		 * the record.  This assert is what stops a silent regression.
 		 */
 		urcu_assert_debug(!"ft_detach_node standalone freeze reached: "
 			"raw CAS on a chain word that now parks SW -- convert "
@@ -6960,10 +7826,10 @@ end:
 		}
 	}
 	/*
-	 * A fused @retire_glue->txn now points at the commit_txn its commit
-	 * reclaimed above -- clear it so a future free-path reader of the glue
-	 * cannot dereference freed memory (nothing reads it on the caller's free
-	 * path today; this is defensive).
+	 * A fused @retire_glue->txn now points at the commit_txn that its
+	 * commit reclaimed above.  Clear it so that a future free-path reader
+	 * of the glue cannot dereference freed memory.  This is defensive:
+	 * nothing reads it on the caller's free path today.
 	 */
 	if (retire_glue)
 		retire_glue->txn = NULL;
@@ -6992,38 +7858,47 @@ end:
  * node->prev (either the parent pointer or the predecessor node).
  *
  * Ordering: next_node->prev is updated BEFORE the pointer publication
- * (*head_slot or prev_node->next).  If we published first, a concurrent
- * reader following the new head via a skip-compressed pointer could call
- * ft_skip_to_compressed and read the stale prev pointing to @node (the
- * node being removed, a cds_ft_node rather than the flagged parent),
- * returning a garbage compressed-node pointer.  rcu_assign_pointer on
- * the publication provides release semantics pairing with the reader's
- * rcu_dereference of child->prev.
+ * (*head_slot or prev_node->next).  Suppose we published first.  A
+ * concurrent reader could follow the new head via a skip-compressed pointer
+ * and call ft_skip_to_compressed.  It would read the stale prev pointing to
+ * @node: the node being removed, a cds_ft_node rather than the flagged
+ * parent.  It would return a garbage compressed-node pointer.
+ * rcu_assign_pointer on the publication provides release semantics.  They
+ * pair with the reader's rcu_dereference of child->prev.
  */
 /*
- * Head promotion: @node, the head of a duplicate chain, leaves the trie and
- * @next_node (its next duplicate, non-NULL) takes its place at the same key.
+ * Head promotion.  @node is the head of a duplicate chain.  It leaves the
+ * trie.  @next_node (its next duplicate, non-NULL) takes its place at the
+ * same key.
  *
- * Publish a FRESH cell for @next_node -- its node field set while the cell is
- * still hidden, keeping cell->node WRITE-ONCE (the public cds_ft_cell_node and
- * the internal cell readers load it as a plain pointer, never a flip proxy) --
- * and swap it in for @node's cell, FUSED with the structural forward publish
- * (@next_node into *@head_slot) and, for a compressed holder, the grandparent
- * SKIP_X dual, in ONE flip (ft_ord_cell_swap_publish_multi).  A reader thus
- * never observes the promoted head at one index but the old head at another,
- * nor a torn cell->node-vs-external_nodes prefix comparison (ft_rebuild_key_upwalk).
+ * Publish a FRESH cell for @next_node.  Set its node field while the cell is
+ * still hidden.  This keeps cell->node WRITE-ONCE: the public
+ * cds_ft_cell_node and the internal cell readers load it as a plain pointer,
+ * never a flip proxy.  Swap the fresh cell in for @node's cell in ONE flip
+ * (ft_ord_cell_swap_publish_multi), FUSED with:
+ *   - the structural forward publish (@next_node into *@head_slot);
+ *   - for a compressed holder, the grandparent SKIP_X dual.
+ * So a reader never observes the promoted head at one index but the old head
+ * at another.  It never observes a torn cell->node-vs-external_nodes prefix
+ * comparison either (ft_rebuild_key_upwalk).
  *
  * @parent_nf is the holder flag used by _ft_publish_to_parent to locate the
- * SKIP_X dual: a compressed node's PLAIN flag for a compressed holder, else the
- * internal holder flag (no dual).  The list-on promotion is fully abortable: the
- * fresh-cell alloc AND the flip-txn pre-reservation both fail cleanly on OOM
- * (-ENOMEM, nothing published, the chain intact and retriable).  @next_node's
- * prev (its node->cell link) FOLDS into the swap commit as a proxied edge, so it
- * flips atomically with the forward publish; a concurrent skip resolution strips
- * the transient proxy at the load (ft_dereference_prev_resolved) before
- * ft_resolve_head_prev interprets it.  The flip is still pre-reserved so the
- * commit cannot OOM, never a bare in-place cell->node retarget under memory
- * pressure.  List off (no cell) inherits the flagged parent on the successor --
+ * SKIP_X dual.  For a compressed holder it is the compressed node's PLAIN
+ * flag.  Otherwise it is the internal holder flag (no dual).
+ *
+ * The list-on promotion is fully abortable.  The fresh-cell alloc AND the
+ * flip-txn pre-reservation both fail cleanly on OOM.  They return -ENOMEM.
+ * Nothing is published, and the chain is intact and retriable.
+ *
+ * @next_node's prev (its node->cell link) FOLDS into the swap commit as a
+ * proxied edge, so it flips atomically with the forward publish.  A
+ * concurrent skip resolution strips the transient proxy at the load
+ * (ft_dereference_prev_resolved) before ft_resolve_head_prev interprets it.
+ *
+ * The flip is still pre-reserved so that the commit cannot OOM.  It is never
+ * a bare in-place cell->node retarget under memory pressure.
+ *
+ * List off (no cell) inherits the flagged parent on the successor.  That is
  * still a SETTLED store there (read raw), see the list-off branch.
  */
 static
@@ -7040,11 +7915,13 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 	unsigned int n_s;
 	/*
 	 * Did this attempt actually ACQUIRE the SKIP_X dual's grandparent?  The
-	 * publish must say so per ATTEMPT, not per call site:
+	 * publish must say so per ATTEMPT, not per call site.
 	 * ft_lock_skip_dual_gp returns false on the shapes where it acquires
-	 * nothing (no compressed parent, no skip-encoded slot, or a ROOT dual
-	 * whose record names no owner at all), and claiming ownership there
-	 * hands FT_OWNER_ASSERT_OWNED a NULL owner.
+	 * nothing:
+	 *   - no compressed parent;
+	 *   - no skip-encoded slot;
+	 *   - a ROOT dual whose record names no owner at all.
+	 * Claiming ownership there hands FT_OWNER_ASSERT_OWNED a NULL owner.
 	 */
 	bool dual_gp_held;
 
@@ -7052,28 +7929,35 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 	if (old_cell) {
 		/*
 		 * Ordered list on: cell->node is write-once, so head promotion
-		 * publishes a FRESH cell and swaps it in.  Allocate the cell AND
-		 * pre-reserve the flip-txn FIRST, before any reader-visible change;
-		 * on either OOM abort here -- nothing is published and the chain is
-		 * untouched, so the caller returns CDS_FT_STATUS_MEMORY_ERROR (the
-		 * promotion may be retried).  No bare in-place cell->node retarget
-		 * on OOM: that would commit a reader-visible store outside the
+		 * publishes a FRESH cell and swaps it in.  Allocate the cell
+		 * AND pre-reserve the flip-txn FIRST, before any
+		 * reader-visible change.  On either OOM, abort here.  Nothing
+		 * is published and the chain is untouched, so the caller
+		 * returns CDS_FT_STATUS_MEMORY_ERROR (the promotion may be
+		 * retried).  No bare in-place cell->node retarget on OOM:
+		 * that would commit a reader-visible store outside the
 		 * descriptor protocol.
 		 */
 		/*
-		 * ☠ RESOLVE THE PARENT BEFORE COPYING IT.  The holder's lock is
-		 * held, but a re-home INTO that holder can still be settling:
-		 * the peer that published the holder fresh (its born lock) has
-		 * already released it while its record on this very cell's
-		 * parent still parks a proxy, the descriptor SUCCEEDED.  Copied
-		 * raw, the proxy names a record of ANOTHER slot that no settle
-		 * rewrites, and the new cell's parent stays a proxy for ever
-		 * (MEASURED: inv_prefix_dup_promote_vs_extension at exponential
-		 * spacing, the rcu-debug "FT CELL PARENT COPY" abort in 2 of 4
-		 * full-suite runs; a probe at this line saw the holder live and
-		 * held, the head slot naming @node, and the record re-homing the
-		 * head from the compressed node to that holder).  Decided and
-		 * holder-held, the resolved value is the parent.
+		 * ☠ RESOLVE THE PARENT BEFORE COPYING IT.  The holder's lock
+		 * is held, but a re-home INTO that holder can still be
+		 * settling.  The peer that published the holder fresh has
+		 * already released its born lock.  Its record on this very
+		 * cell's parent still parks a proxy, and its descriptor has
+		 * SUCCEEDED.  Copied raw, the proxy names a record of ANOTHER
+		 * slot that no settle rewrites.  The new cell's parent then
+		 * stays a proxy for ever.
+		 *
+		 * MEASURED: inv_prefix_dup_promote_vs_extension at
+		 * exponential spacing hit the rcu-debug "FT CELL PARENT COPY"
+		 * abort in 2 of 4 full-suite runs.  A probe at this line saw:
+		 *   - the holder live and held;
+		 *   - the head slot naming @node;
+		 *   - the record re-homing the head from the compressed node
+		 *     to that holder.
+		 *
+		 * The descriptor is decided and the holder is held, so the
+		 * resolved value is the parent.
 		 */
 #ifndef FT_DEBUG_NO_CELL_PARENT_RESOLVE
 		void *new_cell_flag = ft_ord_cell_alloc(ft, next_node,
@@ -7104,52 +7988,58 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		}
 #ifdef FT_HLIST_CLAIM_PROMOTE
 		/*
-		 * §4 STEP B4's DRY RUN, the a3c75659 tool aimed at the
-		 * EXTERNAL-HEAD lane: point B0's owner assert at this txn so
-		 * every record it plants without owning is named at an abort,
-		 * on a build otherwise byte-identical to the unarmed one.
+		 * §4 STEP B4's DRY RUN.  This is the a3c75659 tool aimed at
+		 * the EXTERNAL-HEAD lane.  It points B0's owner assert at this
+		 * txn.  Every record the txn plants without owning is then
+		 * named at an abort.  The build is otherwise byte-identical
+		 * to the unarmed one.
 		 *
-		 * ☞ CLAIMED AT CREATION, EARLIER THAN THE ARM WOULD BE -- so
-		 * read a miss as "this record is planted before its owner is
-		 * registered" FIRST.  That ORDERING class is what e9268e13
-		 * closed for this very lane by hoisting the holder's fence
-		 * ABOVE the back edge.
+		 * ☞ CLAIMED AT CREATION, EARLIER THAN THE ARM WOULD BE.  So
+		 * read a miss FIRST as "this record is planted before its
+		 * owner is registered".  e9268e13 closed that ORDERING class
+		 * for this very lane by hoisting the holder's fence ABOVE the
+		 * back edge.
 		 *
 		 * ☠ And read a miss as "the registry cannot SEE this hold"
 		 * before "the op does not HOLD it" (ft_flip_txn_owns).
 		 *
-		 * ☠☠ THE PROMOTE KNOB IS SEPARATE FROM THE HEAD-CLEAR ONE,
-		 * because BOTH promote arms carry a KNOWN EXCLUSION GAP and the
-		 * head clear provably does not -- one knob would mask the
-		 * armable lane behind the blocked ones.
+		 * ☠☠ THE PROMOTE KNOB IS SEPARATE FROM THE HEAD-CLEAR ONE.
+		 * BOTH promote arms carry a KNOWN EXCLUSION GAP and the head
+		 * clear provably does not.  One knob would mask the armable
+		 * lane behind the blocked ones.
 		 *
-		 * THE GAP, measured (ft_unit test_dup_chain_head_promotion, the
-		 * 15th test, --enable-rcu-debug): _ft_publish_to_parent_meta
-		 * emits TWO structural edges when the holder is skip-encoded --
-		 * the forward @head_slot, owned by @parent_nf and REGISTERED by
-		 * the fence above, and a SKIP_X DUAL into the GRANDPARENT's
-		 * body, owned by a node this op never acquires (in the repro it
-		 * is the ROOT node's slot at item+8).  ft_ord_cell_flip_into
-		 * gives both edges the dispatching recorder, so an armed txn
-		 * would SW-PARK a word the op does not exclude.
+		 * THE GAP was measured with --enable-rcu-debug.  The test is
+		 * ft_unit test_dup_chain_head_promotion (the 15th test).
+		 * _ft_publish_to_parent_meta emits TWO structural edges when
+		 * the holder is skip-encoded:
+		 *   - the forward @head_slot, owned by @parent_nf and
+		 *     REGISTERED by the fence above;
+		 *   - a SKIP_X DUAL into the GRANDPARENT's body, owned by a
+		 *     node this op never acquires.  In the repro it is the
+		 *     ROOT node's slot at item+8.
+		 * ft_ord_cell_flip_into gives both edges the dispatching
+		 * recorder, so an armed txn would SW-PARK a word the op does
+		 * not exclude.
 		 *
-		 * ☠ IT IS NOT SPECIFIC TO THIS ARM -- it is SLOT-SHAPED
+		 * ☠ IT IS NOT SPECIFIC TO THIS ARM.  It is SLOT-SHAPED
 		 * ([[feedback_a_site_inventory_cannot_cover_a_dynamic_slot]]).
-		 * The LIST-OFF twin below carries it too, and its whole-suite dry
-		 * run was CLEAN: a constructed public-API repro aborts it.  A
-		 * clean dry run is evidence about the SUITE, not about the lane.
-		 * ☞ ft_unchain_node's head clear is the exception, and by
-		 * ROUTING rather than by luck -- see the detector there.
+		 * The LIST-OFF twin below carries it too.  Its whole-suite
+		 * dry run was CLEAN, yet a constructed public-API repro
+		 * aborts it.  A clean dry run is evidence about the SUITE,
+		 * not about the lane.
+		 * ☞ ft_unchain_node's head clear is the exception, by ROUTING
+		 * rather than by luck.  See the detector there.
 		 *
-		 * ☞ The fix is per EDGE, not per site: ft_ord_cell_edge already
-		 * carries @owner and @root, and the missing third answer is
-		 * whether the OP HOLDS that owner -- the same shape
-		 * ft_flip_txn_record_parent_word already takes as @child_held.
-		 * Where the op does hold it (ft_detach_node's republish holds
-		 * the recompact's {P,GP}) the dual is a real conversion, so a
-		 * blanket always-MW would give that back.  Which of the two --
-		 * carry the flag, or extend these ops' lock-set to the
-		 * grandparent -- is a DESIGN call, not this step's to assume.
+		 * ☞ The fix is per EDGE, not per site.  ft_ord_cell_edge
+		 * already carries @owner and @root.  The missing third answer
+		 * is whether the OP HOLDS that owner.
+		 * ft_flip_txn_record_parent_word already takes the same shape
+		 * as @child_held.  Where the op does hold the owner
+		 * (ft_detach_node's republish holds the recompact's {P,GP}),
+		 * the dual is a real conversion.  So a blanket always-MW
+		 * would give that back.  There are two options: carry the
+		 * flag, or extend these ops' lock-set to the grandparent.
+		 * Which one is a DESIGN call, not this step's to assume.
 		 */
 		ft_flip_txn_claim_per_op_armable(ft, txn);
 #endif
@@ -7157,48 +8047,56 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		cds_ft_item_to_metadata(new_cell)->incoming_byte =
 			cds_ft_item_to_metadata(old_cell)->incoming_byte;
 		/*
-		 * Back-pointer (next_node->prev: the promoted successor's node->cell
-		 * link) FOLDED into the swap commit as a proxied edge -- it flips
-		 * ATOMICALLY with the forward head publish and @node's freeze, never a
-		 * pre-commit reader-visible store.  A concurrent skip resolution strips
-		 * the transient proxy at the load (ft_dereference_prev_resolved) before
-		 * ft_resolve_head_prev interprets it, so the slot may carry the proxy.
-		 * The forward publish's forward-before-parent check reads the folded
-		 * prev's intended value (new_cell_flag), not the not-yet-stored slot.
-		 * The reservation above carries this edge.
+		 * Back-pointer (next_node->prev: the promoted successor's
+		 * node->cell link).  It is FOLDED into the swap commit as a
+		 * proxied edge.  It flips ATOMICALLY with the forward head
+		 * publish and @node's freeze.  It is never a pre-commit
+		 * reader-visible store.
+		 *
+		 * A concurrent skip resolution strips the transient proxy at
+		 * the load (ft_dereference_prev_resolved) before
+		 * ft_resolve_head_prev interprets it, so the slot may carry
+		 * the proxy.  The forward publish's forward-before-parent
+		 * check reads the folded prev's intended value
+		 * (new_cell_flag), not the not-yet-stored slot.  The
+		 * reservation above carries this edge.
 		 */
 		/*
-		 * THE HOLDER'S FENCE IS TAKEN BEFORE THE BACK EDGE, NOT AFTER IT.
+		 * THE HOLDER'S FENCE IS TAKEN BEFORE THE BACK EDGE, NOT AFTER
+		 * IT.
 		 *
-		 * @next_node->prev is a back-channel word of an EXTERNAL head, and
-		 * an external carries no state word of its own -- so the word that
-		 * excludes a peer here is the HOLDER's, the internal node whose
-		 * @head_slot chains this list.  Recording the edge first named no
-		 * owner at all and left the whole promote lane reading as an
-		 * exclusion gap; taking the fence first makes the holder a
-		 * REGISTERED lock on this very txn, which is what
-		 * ft_flip_txn_owns then answers with.
+		 * @next_node->prev is a back-channel word of an EXTERNAL
+		 * head, and an external carries no state word of its own.  So
+		 * the word that excludes a peer here is the HOLDER's.  The
+		 * holder is the internal node whose @head_slot chains this
+		 * list.  Recording the edge first named no owner at all.  It
+		 * left the whole promote lane reading as an exclusion gap.
+		 * Taking the fence first makes the holder a REGISTERED lock
+		 * on this very txn.  ft_flip_txn_owns then answers with that.
 		 *
-		 * Safe to move: ft_flip_txn_hold_or_lock_parent returns void -- the
-		 * held arm records a RELEASE terminal and registers it, the unheld
-		 * arm acquires-or-guards -- so no bail is introduced, and every bail
-		 * that releases @held_holder explicitly is still ABOVE this point.
+		 * Safe to move: ft_flip_txn_hold_or_lock_parent returns void.
+		 * Its held arm records a RELEASE terminal and registers it.
+		 * Its unheld arm acquires-or-guards.  So no bail is
+		 * introduced, and every bail that releases @held_holder
+		 * explicitly is still ABOVE this point.
 		 *
-		 * VALIDATE (§4.B): it also guards the LIVE holder this head-promote
-		 * publishes into.
+		 * VALIDATE (§4.B): it also guards the LIVE holder this
+		 * head-promote publishes into.
 		 */
 		ft_flip_txn_hold_or_lock_parent(ft, txn, ctx, parent_nf,
 			parent_depth, held_holder, held_snap);
 		/*
 		 * §9.3's THIRD MEMBER: this publish's SKIP_X dual lands in the
-		 * GRANDPARENT's body, so acquire GP -- the promote lane never
-		 * took it, and a §4.B guard on GP's OWN word does not stand in
-		 * for the acquire above per-node spacing.  ☞ ft_lock_skip_dual_gp.
-		 * A no-op unless a dual will actually be recorded; @mtxn NULL
-		 * mirrors this producer's @rec, which carries none.  Placed with
-		 * the holder's fence, ABOVE the arm, because it is a
-		 * ft_flip_txn_lock_register and the arm's contract is "after the
-		 * op's LAST register".
+		 * GRANDPARENT's body, so acquire GP.  The promote lane never
+		 * took it.  Above per-node spacing, a §4.B guard on GP's OWN
+		 * word does not replace the acquire.  ☞ ft_lock_skip_dual_gp.
+		 *
+		 * A no-op unless a dual will actually be recorded.  @mtxn NULL
+		 * mirrors this producer's @rec, which carries none.
+		 *
+		 * Placed with the holder's fence, ABOVE the arm.  It is a
+		 * ft_flip_txn_lock_register, and the arm's contract is "after
+		 * the op's LAST register".
 		 */
 		dual_gp_held = ft_lock_skip_dual_gp(ft, ctx, txn, parent_nf,
 			txn ? txn->mtxn : NULL);
@@ -7206,28 +8104,32 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * ☠ A PRODUCER THAT CANNOT VOUCH MUST NOT REACH THE PUBLISH --
 		 * AND THE BAIL MUST DO THE COMMIT'S CLEANUP.
 		 *
-		 * On a MISS the arm used to build the publish with @dual_gp_held
-		 * false -- an MW record on a slot every other producer now parks
-		 * SW -- and CALL the commit, relying on @acquire_miss to make it
-		 * fail.  That puts this slot's kind at the mercy of a distant
-		 * function's ordering, and "the abort makes it harmless" is not
-		 * safe to say in any case: an aborted MW txn is not
-		 * side-effect-free, its records being installed and then settled
-		 * back.
+		 * On a MISS the arm used to build the publish with
+		 * @dual_gp_held false.  That is an MW record on a slot which
+		 * every other producer now parks SW.  The arm then CALLED the
+		 * commit and relied on @acquire_miss to make it fail.  This
+		 * made the slot's kind depend on the ordering inside a
+		 * distant function.  And "the abort makes it harmless" is not
+		 * safe to say in any case.  An aborted MW txn is not
+		 * side-effect-free: its records are installed and then
+		 * settled back.
 		 *
-		 * ☠ A BARE `return -EAGAIN` HERE WEDGES THE TRIE.  The commit is
-		 * also this arm's CLEANUP -- ft_flip_txn_commit's miss path runs
-		 * ft_flip_txn_destroy, hence ft_flip_txn_lock_release_all -- so
-		 * returning without it keeps the op's OWN locks held and the
-		 * retry then misses against them for ever.  ABLATION-MEASURED on
-		 * inv_concurrent_same_key_removes at per-node spacing: bare bail
-		 * = timeout at 100% CPU, control = 152/152 rc=0.  That is why
-		 * every other -EAGAIN in this function sits AFTER the commit.
+		 * ☠ A BARE `return -EAGAIN` HERE WEDGES THE TRIE.  The commit
+		 * is also this arm's CLEANUP: ft_flip_txn_commit's miss path
+		 * runs ft_flip_txn_destroy, hence
+		 * ft_flip_txn_lock_release_all.  Returning without it keeps
+		 * the op's OWN locks held.  The retry then misses against
+		 * them for ever.  ABLATION-MEASURED on
+		 * inv_concurrent_same_key_removes at per-node spacing: bare
+		 * bail = timeout at 100% CPU, control = 152/152 rc=0.  That
+		 * is why every other -EAGAIN in this function sits AFTER the
+		 * commit.
 		 *
-		 * So release exactly what the commit would.  @held_holder is NOT
-		 * released here: ft_flip_txn_hold_or_lock_parent above REGISTERED
-		 * it on @txn, so the destroy drops it -- which is why this file
-		 * says every bail releasing it explicitly stays ABOVE that call.
+		 * So release exactly what the commit would.  @held_holder is
+		 * NOT released here.  ft_flip_txn_hold_or_lock_parent above
+		 * REGISTERED it on @txn, so the destroy drops it.  That is
+		 * why this file says every bail releasing it explicitly
+		 * stays ABOVE that call.
 		 */
 		if (txn->acquire_miss) {
 			ft_flip_txn_destroy(txn);
@@ -7243,13 +8145,13 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * above is this arm's LAST ft_flip_txn_lock_register, and the
 		 * publish below plants the first record after it.
 		 *
-		 * ☞ WHAT UNBLOCKED IT is the per-edge @owner_held: this op holds
-		 * the HOLDER (the forward @head_slot's owner) and NOT the
-		 * grandparent, so the SKIP_X dual now records MW on its own
-		 * account instead of riding the txn's armed mode.  Before that,
-		 * arming here would have SW-parked a word the op never acquired
-		 * -- reproduced through the PUBLIC API, on a build whose
-		 * whole-suite dry run was clean.
+		 * ☞ WHAT UNBLOCKED IT is the per-edge @owner_held.  This op
+		 * holds the HOLDER (the forward @head_slot's owner) and NOT
+		 * the grandparent.  So the SKIP_X dual now records MW on its
+		 * own account instead of riding the txn's armed mode.  Before
+		 * that, arming here would have SW-parked a word the op never
+		 * acquired.  That was reproduced through the PUBLIC API, on a
+		 * build whose whole-suite dry run was clean.
 		 */
 		ft_flip_txn_arm_per_op(ft, txn);
 		_ft_publish_to_parent_meta(ft, parent_nf,
@@ -7258,55 +8160,61 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			(struct cds_ft_inode_flag *) node,
 			/*
 			 * ☑ THE HONEST ANSWER, AND IT IS NOW THE ONLY ONE LEFT
-			 * THAT CAN SAY NO.  @dual_gp_held is REGISTERED-or-SHARED,
-			 * both of which mean the op holds the word.  This used to
-			 * add "but every dual producer passes false until the LAST
-			 * one acquires, and then they flip TOGETHER", naming
-			 * ft_node_recompact as the holdout -- that is discharged:
-			 * its relocation site always HELD the word and merely
-			 * could not be asked (it answers from its own acquire now),
-			 * and the glue publishes are excluded by the FT-wide lock.
+			 * THAT CAN SAY NO.  @dual_gp_held is
+			 * REGISTERED-or-SHARED.  Both mean the op holds the
+			 * word.
 			 *
-			 * ☞ THESE TWO ARMS -- ft_promote_head's ordered-list-ON
-			 * publish (here) and its list-OFF twin below -- WERE the
-			 * last producers that could answer no, and they did so
-			 * exactly when the acquire MISSED: their MW count equalled
-			 * FT DUAL-GP EXIT MISS to the record.  The bail at the
-			 * acquire above now takes that case, so this publish is
-			 * reached only by an op that HOLDS the word.
+			 * This comment used to add: "but every dual producer
+			 * passes false until the LAST one acquires, and then
+			 * they flip TOGETHER".  It named ft_node_recompact as
+			 * the holdout.  That is discharged:
+			 *   - ft_node_recompact's relocation site always HELD
+			 *     the word and merely could not be asked.  It
+			 *     answers from its own acquire now.
+			 *   - The glue publishes are excluded by the FT-wide
+			 *     lock.
+			 *
+			 * ☞ THESE TWO ARMS WERE the last producers that could
+			 * answer no: ft_promote_head's ordered-list-ON publish
+			 * (here) and its list-OFF twin below.  They did so
+			 * exactly when the acquire MISSED: their MW count
+			 * equalled FT DUAL-GP EXIT MISS to the record.  The
+			 * bail at the acquire above now takes that case.  So
+			 * this publish is reached only by an op that HOLDS the
+			 * word.
 			 *
 			 * MEASURED AFTER IT (-DFT_DEBUG_DUAL_SITE, ft_inv,
-			 * per-node AND exponential): named_unheld = 0 for EVERY
-			 * producer, with 6304 misses per per-node leg taking the
-			 * bail instead of entering the engine.  ⇒ every record on
-			 * this slot class is made by an op that holds it, and that
-			 * is provable HERE rather than from what a later commit
-			 * does with it.
+			 * per-node AND exponential): named_unheld = 0 for
+			 * EVERY producer.  6304 misses per per-node leg took
+			 * the bail instead of entering the engine.
+			 * ⇒ Every record on this slot class is made by an op
+			 * that holds it.  That is provable HERE, not from what
+			 * a later commit does with it.
 			 */
 			NULL, new_cell_flag, &rec, /*slot_owner_nf=*/ parent_nf,
 			/* see above */ dual_gp_held);
 		(void) dual_gp_held;
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		/*
-		 * Fuse @node's freeze (mark node->next, target preserved) into the
-		 * swap commit: a reader never sees @node's head anchor promoted away
-		 * while @node is still unmarked (doc §4.B).  The reservation above
-		 * carries the extra edge.
+		 * Fuse @node's freeze (mark node->next, target preserved) into
+		 * the swap commit.  A reader then never sees @node's head
+		 * anchor promoted away while @node is still unmarked
+		 * (doc §4.B).  The reservation above carries the extra edge.
 		 */
 		/*
 		 * The swap's three cell words are taken inside
-		 * ft_ord_cell_swap_publish_multi, which every producer of this
-		 * shape reaches -- see its header.
+		 * ft_ord_cell_swap_publish_multi.  Every producer of this
+		 * shape reaches it.  See its header.
 		 */
 		ft_ch_audit(ft, txn, node);
 		ft_hlist_freeze_prepare(ft, ft_flip_txn_handle(txn), node);
 		if (ft_ord_cell_swap_publish_multi(ft, old_cell, new_cell,
 				sedges, n_s, txn)) {
 			/*
-			 * Peer won the commit: NOTHING installed -- @old_cell is
-			 * still the linked head cell (must NOT be freed) and the
-			 * fresh @new_cell never published.  Reclaim only ours
-			 * and retry from a fresh derivation.
+			 * Peer won the commit: NOTHING installed.  @old_cell
+			 * is still the linked head cell and must NOT be freed.
+			 * The fresh @new_cell never published.  Reclaim only
+			 * ours and retry from a fresh derivation.
 			 */
 			ft_ord_cell_free_unpublished(ft, new_cell);
 			return -EAGAIN;
@@ -7314,18 +8222,20 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		ft_ord_cell_free(ft, old_cell);
 	} else {
 		/*
-		 * List off: the head's prev IS the flagged parent, inherited on
-		 * the promoted successor as a FOLDED edge riding the swap commit
-		 * -- it flips ATOMICALLY with the forward head publish and
-		 * @node's freeze, never a pre-commit reader-visible store (and
-		 * never a hand-rolled restore on a peer-won commit, which the
-		 * remove-retry skeptic flagged as assuming one-remover-per-node).
+		 * List off: the head's prev IS the flagged parent.  The
+		 * promoted successor inherits it as a FOLDED edge riding the
+		 * swap commit.  It flips ATOMICALLY with the forward head
+		 * publish and @node's freeze.  It is never a pre-commit
+		 * reader-visible store.  It is never a hand-rolled restore on
+		 * a peer-won commit either: the remove-retry skeptic flagged
+		 * that as assuming one-remover-per-node.
+		 *
 		 * The prev readers resolve a parked proxy at the load
-		 * (ft_dereference_prev_resolved / ft_node_holder), mirroring the
-		 * cell arm above; the forward publish's forward-before-parent
-		 * check reads the folded INTENDED value, not the not-yet-stored
-		 * slot.  A peer latch already parked on either word aborts the
-		 * attempt before anything is recorded.
+		 * (ft_dereference_prev_resolved / ft_node_holder), as in the
+		 * cell arm above.  The forward publish's forward-before-parent
+		 * check reads the folded INTENDED value, not the
+		 * not-yet-stored slot.  A peer latch already parked on either
+		 * word aborts the attempt before anything is recorded.
 		 */
 		struct ft_flip_txn *txn =
 			ft_flip_txn_create_bounded(ft, FT_PUB_SEDGE_MAX_EDGES +
@@ -7342,13 +8252,14 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		}
 #ifdef FT_HLIST_CLAIM_PROMOTE
 		/*
-		 * §4 STEP B4's DRY RUN.  The SAME knob as the list-on arm above,
-		 * because this arm carries the SAME gap -- PROVEN by construction,
-		 * not inferred: a 60-line public-API program (list-off trie, four
-		 * duplicates of one key, remove the head) aborts at
-		 * ft-mutation-helpers.h:3108 on a build whose whole-suite dry run
-		 * was CLEAN.  The suite never builds a skip-encoded holder here;
-		 * that is a COVERAGE ARTIFACT, not an invariant.
+		 * §4 STEP B4's DRY RUN.  The SAME knob as the list-on arm
+		 * above, because this arm carries the SAME gap.  That is
+		 * PROVEN by construction, not inferred.  A 60-line public-API
+		 * program (list-off trie, four duplicates of one key, remove
+		 * the head) aborts at ft-mutation-helpers.h:3108.  It does so
+		 * on a build whose whole-suite dry run was CLEAN.  The suite
+		 * never builds a skip-encoded holder here.  That is a
+		 * COVERAGE ARTIFACT, not an invariant.
 		 */
 		ft_flip_txn_claim_per_op_armable(ft, txn);
 #endif
@@ -7368,14 +8279,16 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			parent_depth, held_holder, held_snap);
 		/*
 		 * §9.3's THIRD MEMBER: this publish's SKIP_X dual lands in the
-		 * GRANDPARENT's body, so acquire GP -- the promote lane never
-		 * took it, and a §4.B guard on GP's OWN word does not stand in
-		 * for the acquire above per-node spacing.  ☞ ft_lock_skip_dual_gp.
-		 * A no-op unless a dual will actually be recorded; @mtxn NULL
-		 * mirrors this producer's @rec, which carries none.  Placed with
-		 * the holder's fence, ABOVE the arm, because it is a
-		 * ft_flip_txn_lock_register and the arm's contract is "after the
-		 * op's LAST register".
+		 * GRANDPARENT's body, so acquire GP.  The promote lane never
+		 * took it.  Above per-node spacing, a §4.B guard on GP's OWN
+		 * word does not replace the acquire.  ☞ ft_lock_skip_dual_gp.
+		 *
+		 * A no-op unless a dual will actually be recorded.  @mtxn NULL
+		 * mirrors this producer's @rec, which carries none.
+		 *
+		 * Placed with the holder's fence, ABOVE the arm.  It is a
+		 * ft_flip_txn_lock_register, and the arm's contract is "after
+		 * the op's LAST register".
 		 */
 		dual_gp_held = ft_lock_skip_dual_gp(ft, ctx, txn, parent_nf,
 			txn ? txn->mtxn : NULL);
@@ -7383,28 +8296,32 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * ☠ A PRODUCER THAT CANNOT VOUCH MUST NOT REACH THE PUBLISH --
 		 * AND THE BAIL MUST DO THE COMMIT'S CLEANUP.
 		 *
-		 * On a MISS the arm used to build the publish with @dual_gp_held
-		 * false -- an MW record on a slot every other producer now parks
-		 * SW -- and CALL the commit, relying on @acquire_miss to make it
-		 * fail.  That puts this slot's kind at the mercy of a distant
-		 * function's ordering, and "the abort makes it harmless" is not
-		 * safe to say in any case: an aborted MW txn is not
-		 * side-effect-free, its records being installed and then settled
-		 * back.
+		 * On a MISS the arm used to build the publish with
+		 * @dual_gp_held false.  That is an MW record on a slot which
+		 * every other producer now parks SW.  The arm then CALLED the
+		 * commit and relied on @acquire_miss to make it fail.  This
+		 * made the slot's kind depend on the ordering inside a
+		 * distant function.  And "the abort makes it harmless" is not
+		 * safe to say in any case.  An aborted MW txn is not
+		 * side-effect-free: its records are installed and then
+		 * settled back.
 		 *
-		 * ☠ A BARE `return -EAGAIN` HERE WEDGES THE TRIE.  The commit is
-		 * also this arm's CLEANUP -- ft_flip_txn_commit's miss path runs
-		 * ft_flip_txn_destroy, hence ft_flip_txn_lock_release_all -- so
-		 * returning without it keeps the op's OWN locks held and the
-		 * retry then misses against them for ever.  ABLATION-MEASURED on
-		 * inv_concurrent_same_key_removes at per-node spacing: bare bail
-		 * = timeout at 100% CPU, control = 152/152 rc=0.  That is why
-		 * every other -EAGAIN in this function sits AFTER the commit.
+		 * ☠ A BARE `return -EAGAIN` HERE WEDGES THE TRIE.  The commit
+		 * is also this arm's CLEANUP: ft_flip_txn_commit's miss path
+		 * runs ft_flip_txn_destroy, hence
+		 * ft_flip_txn_lock_release_all.  Returning without it keeps
+		 * the op's OWN locks held.  The retry then misses against
+		 * them for ever.  ABLATION-MEASURED on
+		 * inv_concurrent_same_key_removes at per-node spacing: bare
+		 * bail = timeout at 100% CPU, control = 152/152 rc=0.  That
+		 * is why every other -EAGAIN in this function sits AFTER the
+		 * commit.
 		 *
-		 * So release exactly what the commit would.  @held_holder is NOT
-		 * released here: ft_flip_txn_hold_or_lock_parent above REGISTERED
-		 * it on @txn, so the destroy drops it -- which is why this file
-		 * says every bail releasing it explicitly stays ABOVE that call.
+		 * So release exactly what the commit would.  @held_holder is
+		 * NOT released here.  ft_flip_txn_hold_or_lock_parent above
+		 * REGISTERED it on @txn, so the destroy drops it.  That is
+		 * why this file says every bail releasing it explicitly
+		 * stays ABOVE that call.
 		 */
 		if (txn->acquire_miss) {
 			ft_flip_txn_destroy(txn);
@@ -7413,9 +8330,11 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		ft_flip_txn_record_reserved(txn,
 			ft_flag_to_metadata(ft, parent_nf),
 			(void **) &next_node->prev, prev_save, inherit);
-		/* PHASE B, STEP B4 -- THE ARM.  See the list-on arm above; the
-		 * per-edge @owner_held is what makes it legal here too, and this
-		 * is the arm whose absence a constructed repro exposed. */
+		/*
+		 * PHASE B, STEP B4 -- THE ARM.  See the list-on arm above.
+		 * The per-edge @owner_held makes it legal here too.  A
+		 * constructed repro exposed the absence of this arm.
+		 */
 		ft_flip_txn_arm_per_op(ft, txn);
 		_ft_publish_to_parent_meta(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot,
@@ -7424,30 +8343,36 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			NULL, inherit /* folded prev: intended parent value */, &rec,
 			/*
 			 * ☑ THE HONEST ANSWER, AND IT IS NOW THE ONLY ONE LEFT
-			 * THAT CAN SAY NO.  @dual_gp_held is REGISTERED-or-SHARED,
-			 * both of which mean the op holds the word.  This used to
-			 * add "but every dual producer passes false until the LAST
-			 * one acquires, and then they flip TOGETHER", naming
-			 * ft_node_recompact as the holdout -- that is discharged:
-			 * its relocation site always HELD the word and merely
-			 * could not be asked (it answers from its own acquire now),
-			 * and the glue publishes are excluded by the FT-wide lock.
+			 * THAT CAN SAY NO.  @dual_gp_held is
+			 * REGISTERED-or-SHARED.  Both mean the op holds the
+			 * word.
 			 *
-			 * ☞ THESE TWO ARMS -- ft_promote_head's ordered-list-ON
-			 * publish (here) and its list-OFF twin below -- WERE the
-			 * last producers that could answer no, and they did so
-			 * exactly when the acquire MISSED: their MW count equalled
-			 * FT DUAL-GP EXIT MISS to the record.  The bail at the
-			 * acquire above now takes that case, so this publish is
-			 * reached only by an op that HOLDS the word.
+			 * This comment used to add: "but every dual producer
+			 * passes false until the LAST one acquires, and then
+			 * they flip TOGETHER".  It named ft_node_recompact as
+			 * the holdout.  That is discharged:
+			 *   - ft_node_recompact's relocation site always HELD
+			 *     the word and merely could not be asked.  It
+			 *     answers from its own acquire now.
+			 *   - The glue publishes are excluded by the FT-wide
+			 *     lock.
+			 *
+			 * ☞ THESE TWO ARMS WERE the last producers that could
+			 * answer no: ft_promote_head's ordered-list-ON publish
+			 * (here) and its list-OFF twin below.  They did so
+			 * exactly when the acquire MISSED: their MW count
+			 * equalled FT DUAL-GP EXIT MISS to the record.  The
+			 * bail at the acquire above now takes that case.  So
+			 * this publish is reached only by an op that HOLDS the
+			 * word.
 			 *
 			 * MEASURED AFTER IT (-DFT_DEBUG_DUAL_SITE, ft_inv,
-			 * per-node AND exponential): named_unheld = 0 for EVERY
-			 * producer, with 6304 misses per per-node leg taking the
-			 * bail instead of entering the engine.  ⇒ every record on
-			 * this slot class is made by an op that holds it, and that
-			 * is provable HERE rather than from what a later commit
-			 * does with it.
+			 * per-node AND exponential): named_unheld = 0 for
+			 * EVERY producer.  6304 misses per per-node leg took
+			 * the bail instead of entering the engine.
+			 * ⇒ Every record on this slot class is made by an op
+			 * that holds it.  That is provable HERE, not from what
+			 * a later commit does with it.
 			 */
 			/*slot_owner_nf=*/ parent_nf, /* see above */ dual_gp_held);
 		(void) dual_gp_held;
@@ -7460,11 +8385,12 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 
 		if (cret) {
 			/*
-			 * NOTHING installed -- the folded prev edge was
-			 * discarded with the failed commit, @next_node's prev
-			 * still names its predecessor @node.  Nothing to undo:
-			 * -EAGAIN retries from a fresh derivation, -ENOMEM
-			 * (an acquire that could not allocate) does not.
+			 * NOTHING installed.  The folded prev edge was
+			 * discarded with the failed commit, and @next_node's
+			 * prev still names its predecessor @node.  Nothing to
+			 * undo.  -EAGAIN retries from a fresh derivation.
+			 * -ENOMEM (an acquire that could not allocate) does
+			 * not.
 			 */
 			return cret;
 		}
@@ -7475,52 +8401,55 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 #ifdef FT_ENABLE_TRACING
 /*
  * How often the chain arm's DERIVED holder had been re-homed between the
- * unlocked ft_chain_head_holder walk and the acquire -- i.e. how often the
+ * unlocked ft_chain_head_holder walk and the acquire.  That is how often the
  * re-derive below actually saves a LOST UPDATE.  A fix that never fires is not
- * a fix; this counter is how that claim is checked.
+ * a fix.  This counter is how that claim is checked.
  */
 unsigned long ft_dbg_unchain_rehomed;
 /*
- * How often the caller's ROUTING (member / promote / clear) had been overtaken
- * by a peer remove on the same chain between the unlocked derivation and the
- * acquire -- the ft_unchain_kind re-validation's firing count.
+ * The firing count of the ft_unchain_kind re-validation.  It counts how often
+ * a peer remove on the same chain had overtaken the caller's ROUTING (member /
+ * promote / clear).  The window is between the unlocked derivation and the
+ * acquire.
  */
 unsigned long ft_dbg_unchain_rerouted;
 #endif
 
 /*
- * The ROUTING DECISION _cds_ft_remove_locked took for @node, derived from
- * node->prev / node->next with NOTHING held, and re-validated by
- * ft_unchain_node under the holder lock before any arm trusts it:
+ * The ROUTING DECISION _cds_ft_remove_locked took for @node.  It is derived
+ * from node->prev / node->next with NOTHING held.  ft_unchain_node
+ * re-validates it under the holder lock before any arm trusts it:
  *   INTERIOR  @node is a non-head duplicate (prev is a node): relink past it.
  *   PROMOTE   @node heads its chain and has a successor: promote the successor.
- *   CLEAR     @node heads its chain with no successor, the holder is an
- *             INTERNAL node and neither the ordered list nor rank stats are on:
- *             clear the head slot.  (A compressed holder's emptied chain is a
- *             DETACH; a list-on / rank-on disappearance is the fused
- *             ft_remove_one_commit -- neither routes here.)
+ *   CLEAR     @node heads its chain with no successor.  The holder is an
+ *             INTERNAL node.  Neither the ordered list nor rank stats are
+ *             on.  Clear the head slot.  Two cases do not route here.  A
+ *             compressed holder's emptied chain is a DETACH.  A list-on /
+ *             rank-on disappearance is the fused ft_remove_one_commit.
  */
 enum ft_unchain_kind {
 	FT_UNCHAIN_INTERIOR,
 	FT_UNCHAIN_PROMOTE,
 	FT_UNCHAIN_CLEAR,
 	/*
-	 * A CLEAR after the fused collapse DECLINED (a run too long to spell):
-	 * the 1-child internal it leaves is the designed product, so the
+	 * A CLEAR after the fused collapse DECLINED (a run too long to spell).
+	 * The 1-child internal it leaves is the designed product.  So the
 	 * residue re-route must not send the op round forever.
 	 */
 	FT_UNCHAIN_CLEAR_KEEP,
 };
 
 /*
- * THE COLLAPSE THE PLAN DID NOT SEE, list-off arm.  The caller picked this plain
- * clear over the fused collapse from UNHELD reads of the holder (its nr_child,
- * its parent); a peer that removed the holder's second child -- or was
- * re-parenting it while the plan read -- makes clearing its last external leave
- * a 1-child keyless internal, which cds_ft_verify refuses in skip mode and a
- * later remove beneath it livelocks on (exponential spacing, owned-key row;
- * LTTng: five fused attempts refused on a peer's lock, the sixth took this arm).
- * Under the holder's lock nr_child is exact: re-route, and the retry's plan
+ * THE COLLAPSE THE PLAN DID NOT SEE, list-off arm.  The caller picked this
+ * plain clear over the fused collapse from UNHELD reads of the holder (its
+ * nr_child, its parent).  A peer may have removed the holder's second child,
+ * or may have been re-parenting the holder while the plan read.  Clearing the
+ * holder's last external then leaves a 1-child keyless internal.
+ * cds_ft_verify refuses that in skip mode, and a later remove beneath it
+ * livelocks on it.  Seen at exponential spacing, owned-key row.  LTTng: five
+ * fused attempts were refused on a peer's lock, the sixth took this arm.
+ *
+ * Under the holder's lock nr_child is exact.  Re-route, and the retry's plan
  * takes the fused collapse.
  */
 static inline
@@ -7556,50 +8485,62 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 
 	/*
 	 * MW LOCK_FINE (Step A, holder lock): serialise concurrent same-key chain
-	 * mutation on the head's IMMEDIATE PARENT -- the trie holder.  Acquire its
-	 * node lock BEFORE the chain read below (a peer mid-flip parks a proxy
-	 * on node->next / relinks a neighbour's prev that this read would deref)
-	 * and hold it across the mutate+commit.  @parent_nf is the holder for a
-	 * head op; an interior detach passes NULL, so derive the head's holder by
-	 * walking prev (ft_chain_head_holder).  Released after the op: promote /
-	 * interior post-commit-clear -- their commits leave holder->state untouched
-	 * (promote is a slot swap + a LOCK-masking guard; interior relinks
-	 * neighbours), so a held fence bit composes.  Head-no-successor records the
-	 * {LOCK|s -> s} RELEASE + registers it, so it FUSES with the same-word
-	 * nr_child-- (a masking guard would disagree on expected-old and poison)
-	 * and the txn owns the clear (commit consumes it; abort/destroy auto-clears
-	 * the registered fence).  Under the FT-wide writer_lock no peer contends
-	 * -> the acquire never misses in soak; FEATURE_FT_FAULT_INJECT drives the
-	 * -EAGAIN bail (shared cds_ft_fault_lock_countdown).
+	 * mutation on the head's IMMEDIATE PARENT -- the trie holder.
+	 *
+	 * Acquire its node lock BEFORE the chain read below.  A peer mid-flip
+	 * parks a proxy on node->next / relinks a neighbour's prev, and this
+	 * read would deref that.  Hold the lock across the mutate+commit.
+	 *
+	 * @parent_nf is the holder for a head op.  An interior detach passes
+	 * NULL, so derive the head's holder by walking prev
+	 * (ft_chain_head_holder).
+	 *
+	 * Released after the op:
+	 *   - Promote / interior: post-commit-clear.  Their commits leave
+	 *     holder->state untouched, so a held fence bit composes.  Promote
+	 *     is a slot swap + a LOCK-masking guard.  Interior relinks
+	 *     neighbours.
+	 *   - Head-no-successor records the {LOCK|s -> s} RELEASE + registers
+	 *     it.  So it FUSES with the same-word nr_child--.  A masking guard
+	 *     would disagree on expected-old and poison.  The txn owns the
+	 *     clear: commit consumes it, abort/destroy auto-clears the
+	 *     registered fence.
+	 *
+	 * Under the FT-wide writer_lock no peer contends, so the acquire never
+	 * misses in soak.  FEATURE_FT_FAULT_INJECT drives the -EAGAIN bail
+	 * (shared cds_ft_fault_lock_countdown).
 	 */
 	if (ft->lock_fine) {
 		struct cds_ft_inode_flag *lock_nf = parent_nf ? parent_nf :
 			ft_chain_head_holder(ft, node);
 
 		/*
-		 * ☠ A NULL HOLDER IS A STALE DERIVATION HERE TOO -- the exact twin
-		 * of the duplicate-append arm in ft-insert.h, down to the refuted
-		 * sentence.  The text that stood here said @node "HAS a holder",
-		 * that NULL came "only by ft-insert's unwind paths on UNPUBLISHED
-		 * nodes, which never reach an unchain", and cited the SAME count:
-		 * "0 NULL in 491532 ft_chain_head_holder calls across ft_unit and
-		 * ft_inv's three list modes".  One wrong zero was used to justify
-		 * both asserts, and it is wrong for one reason: every oracle behind
-		 * that count gives each writer a DISJOINT key range, so no two
-		 * writers ever met on one duplicate chain.
+		 * ☠ A NULL HOLDER IS A STALE DERIVATION HERE TOO.  This is the
+		 * exact twin of the duplicate-append arm in ft-insert.h, down
+		 * to the refuted sentence.  The text that stood here said:
+		 *   - @node "HAS a holder";
+		 *   - NULL came "only by ft-insert's unwind paths on
+		 *     UNPUBLISHED nodes, which never reach an unchain";
+		 *   - the SAME count: "0 NULL in 491532 ft_chain_head_holder
+		 *     calls across ft_unit and ft_inv's three list modes".
+		 * One wrong zero was used to justify both asserts.  It is
+		 * wrong for one reason: every oracle behind that count gives
+		 * each writer a DISJOINT key range.  So no two writers ever
+		 * met on one duplicate chain.
 		 *
-		 * Under LOCK_FINE a same-key cds_ft_insert -- concurrent by
-		 * contract -- retires or re-heads this chain between the descent
-		 * that produced @node and this derivation, and then
-		 * ft_chain_head_holder answers NULL.  MEASURED:
-		 * inv_concurrent_same_key_append_nolist trips this assert on an
-		 * UNPINNED run (full parallelism is the amplifier here -- pinning
-		 * to two cpus HID it).
+		 * Under LOCK_FINE a same-key cds_ft_insert is concurrent by
+		 * contract.  It retires or re-heads this chain between the
+		 * descent that produced @node and this derivation.
+		 * ft_chain_head_holder then answers NULL.  MEASURED:
+		 * inv_concurrent_same_key_append_nolist trips this assert on
+		 * an UNPINNED run.  Full parallelism is the amplifier here:
+		 * pinning to two cpus HID it.
 		 *
 		 * So bail retriably, as the two acquire failures just below
-		 * already do: the wrapper re-derives against the current tree.
-		 * Asserting was not merely loud -- a release build fell through to
-		 * ft_flag_to_metadata(ft, NULL) and acquired on the result.
+		 * already do.  The wrapper re-derives against the current
+		 * tree.  Asserting was not merely loud: a release build fell
+		 * through to ft_flag_to_metadata(ft, NULL) and acquired on
+		 * the result.
 		 */
 		if (caa_unlikely(!lock_nf))
 			return -EAGAIN;
@@ -7609,8 +8550,9 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 
 			/*
 			 * A DERIVED holder (interior detach, @parent_nf NULL)
-			 * carries no depth of its own -- the head's holder IS the
-			 * descent's parent (§5.2), so let the window date it.
+			 * carries no depth of its own.  The head's holder IS
+			 * the descent's parent (§5.2), so let the window date
+			 * it.
 			 */
 			if (!parent_nf)
 				lock_depth = FT_DEPTH_FROM_DESCENT;
@@ -7624,10 +8566,10 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				return -EAGAIN;
 			/*
 			 * A holder the op ALREADY held is protected without a
-			 * second mark, and its release belongs to the acquire
-			 * that took it: leave @hmeta NULL so the publish below
-			 * routes to the ordinary guard rather than recording a
-			 * second terminal on the one word.
+			 * second mark.  Its release belongs to the acquire
+			 * that took it.  So leave @hmeta NULL.  The publish
+			 * below then routes to the ordinary guard and records
+			 * no second terminal on the one word.
 			 */
 			if (!h.shared) {
 				hmeta = h.lock;
@@ -7636,31 +8578,35 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			/*
 			 * ★ RE-DERIVE AFTER THE ACQUIRE, for a DERIVED holder.
 			 *
-			 * @lock_nf came from ft_chain_head_holder (ft-helpers.h),
-			 * a walk of @node->prev, taken with NO exclusion held --
-			 * and a peer that inserts a key EXTENDING this chain's key
-			 * re-homes the head onto a fresh junction in one commit,
-			 * retiring nothing (ft-insert.h:2099-2141; the same edit
-			 * doc/design/ft-stale-disposal-predicate.md §5.10 roots the
-			 * bogus NOT_FOUND in).  Nothing below re-reads the holder,
-			 * and the commit "never touches holder->state", so a stale
-			 * @lock_nf is not arbitrated anywhere: this op and the next
-			 * chain op would hold DIFFERENT words and relink one chain.
-			 * The comment above already names the cost -- "once these
-			 * become sw it is a LOST UPDATE".
+			 * @lock_nf came from ft_chain_head_holder
+			 * (ft-helpers.h), a walk of @node->prev taken with NO
+			 * exclusion held.  A peer that inserts a key EXTENDING
+			 * this chain's key re-homes the head onto a fresh
+			 * junction in one commit, retiring nothing
+			 * (ft-insert.h:2099-2141).  It is the same edit that
+			 * doc/design/ft-stale-disposal-predicate.md §5.10
+			 * roots the bogus NOT_FOUND in.
 			 *
-			 * The engine's own splice-holder acquire does exactly this
-			 * check (ft_glue_acquire_splice_holders,
-			 * ft-mutation-helpers.h:14748: "re-parented under us: stale
-			 * lock" -> -EAGAIN).  Mirrored here, INCLUDING its skip on a
-			 * @shared hold: a word the op already held was validated by
-			 * the acquire that took it, and re-testing it here would
-			 * refuse on an outer frame's still-correct derivation.
+			 * Nothing below re-reads the holder, and the commit
+			 * "never touches holder->state".  So a stale @lock_nf
+			 * is not arbitrated anywhere.  This op and the next
+			 * chain op would hold DIFFERENT words and relink one
+			 * chain.  The comment above already names the cost:
+			 * "once these become sw it is a LOST UPDATE".
 			 *
-			 * Release only what THIS acquire took (@shared / @txn_owned
-			 * belong to another owner -- the predicate ft_unchain_node
-			 * already uses for @hmeta above and the remove wrapper uses
-			 * on its own exits).
+			 * The engine's own splice-holder acquire does exactly
+			 * this check (ft_glue_acquire_splice_holders,
+			 * ft-mutation-helpers.h:14748: "re-parented under us:
+			 * stale lock" -> -EAGAIN).  It is mirrored here,
+			 * INCLUDING its skip on a @shared hold.  A word the op
+			 * already held was validated by the acquire that took
+			 * it.  Re-testing it here would refuse on an outer
+			 * frame's still-correct derivation.
+			 *
+			 * Release only what THIS acquire took.  @shared and
+			 * @txn_owned belong to another owner.  ft_unchain_node
+			 * already uses this predicate for @hmeta above, and
+			 * the remove wrapper uses it on its own exits.
 			 */
 			if (!parent_nf && !h.shared &&
 			    ft_chain_head_holder(ft, node) != lock_nf) {
@@ -7673,30 +8619,38 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			}
 			/*
 			 * ★ RE-VALIDATE THE CALLER'S ROUTING, under the lock.
-			 * @kind was chosen from node->prev / node->next read with
-			 * NOTHING held (see ft_unchain_kind), and the arms below
-			 * trust it: the promote arm has no head slot for a member,
-			 * and the clear arm is legal only for an internal holder
-			 * with the list and rank stats off.  A peer REMOVE on the
-			 * SAME chain -- in contract under LOCK_FINE -- moves the op
-			 * across those lines between the derivation and this
-			 * acquire: it removes the head and @node, a member, is now
-			 * the head; or it removes the only other duplicate and a
-			 * promote finds no successor.  MEASURED: two writers
-			 * removing adjacent duplicates of one key aborted in under
-			 * a second in both list modes (the held arm's
-			 * assert(parent_nf) for the first; the clear lane's no-dual
-			 * detector on a compressed holder for the second, which a
-			 * release build would have turned into a compressed node
-			 * with a NULL child).
-			 * Both words are FROZEN here -- every chain mutation holds
-			 * this word, and a commit's lock release settles AFTER its
-			 * structural words (ft_flip_txn_commit's late tag) -- so a
-			 * mismatch is a fact about the trie: hand the whole op back
-			 * and let the wrapper derive once, cleanly, exactly as the
-			 * holder re-derive above does.  A hold this op already had
-			 * (@h.shared) was validated by the acquire that took it and
-			 * is not released here.
+			 * @kind was chosen from node->prev / node->next read
+			 * with NOTHING held (see ft_unchain_kind).  The arms
+			 * below trust it:
+			 *   - the promote arm has no head slot for a member;
+			 *   - the clear arm is legal only for an internal
+			 *     holder with the list and rank stats off.
+			 *
+			 * A peer REMOVE on the SAME chain is in contract under
+			 * LOCK_FINE.  Between the derivation and this acquire,
+			 * it moves the op across those lines:
+			 *   - it removes the head.  @node was a member and is
+			 *     now the head; or
+			 *   - it removes the only other duplicate, and a
+			 *     promote finds no successor.
+			 *
+			 * MEASURED: two writers removing adjacent duplicates
+			 * of one key aborted in under a second in both list
+			 * modes.  The first case hit the held arm's
+			 * assert(parent_nf).  The second hit the clear lane's
+			 * no-dual detector on a compressed holder.  A release
+			 * build would have turned the second into a compressed
+			 * node with a NULL child.
+			 *
+			 * Both words are FROZEN here.  Every chain mutation
+			 * holds this word, and a commit's lock release settles
+			 * AFTER its structural words (ft_flip_txn_commit's
+			 * late tag).  So a mismatch is a fact about the trie.
+			 * Hand the whole op back and let the wrapper derive
+			 * once, cleanly, exactly as the holder re-derive above
+			 * does.  A hold this op already had (@h.shared) was
+			 * validated by the acquire that took it and is not
+			 * released here.
 			 */
 			{
 				bool member = ft_node_external(
@@ -7705,13 +8659,15 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				bool succ = ft_node_next(node) != NULL;
 
 				/*
-				 * A peer removed @node itself since the derivation
-				 * (its MARK is on node->next): the interior lane
-				 * would otherwise unlink a ghost -- its prev still
-				 * names a member, and ft_hlist_del_prepare would
-				 * read a marked next as a neighbour.  Hand it back
-				 * as gone; the wrapper's re-derivation answers
-				 * NOT_FOUND from the top-of-op tombstone test.
+				 * A peer removed @node itself since the
+				 * derivation: its MARK is on node->next.
+				 * Without this test the interior lane would
+				 * unlink a ghost.  Its prev still names a
+				 * member, and ft_hlist_del_prepare would read
+				 * a marked next as a neighbour.  Hand it back
+				 * as gone.  The wrapper's re-derivation
+				 * answers NOT_FOUND from the top-of-op
+				 * tombstone test.
 				 */
 				if (ft_node_is_removed(node)) {
 					if (!h.shared && !h.txn_owned)
@@ -7732,19 +8688,23 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 					return -EAGAIN;
 				}
 				/*
-				 * ☠ THE HEAD SLOT IS A PLAN READ TOO.  The caller
-				 * found @node in @head_slot before this lock, and
-				 * the promote / clear below records that slot with
-				 * @node as its expected-old -- a blind SW store now
-				 * that the holder is HELD.  A peer insert of a key
-				 * extending @node's republishes the slot IN PLACE
-				 * under this very lock (a compressed holder's child
-				 * becomes a junction carrying @node's chain as its
-				 * prefix head), @node itself untouched: the checks
-				 * above all pass, and the promote overwrote the
-				 * junction, the peer's key with it (MEASURED:
-				 * inv_prefix_dup_promote_vs_extension, 16 of 16
-				 * runs).  Re-read it here.
+				 * ☠ THE HEAD SLOT IS A PLAN READ TOO.  The
+				 * caller found @node in @head_slot before this
+				 * lock.  The promote / clear below records
+				 * that slot with @node as its expected-old.
+				 * That is a blind SW store now that the holder
+				 * is HELD.
+				 *
+				 * A peer insert of a key extending @node's
+				 * republishes the slot IN PLACE under this
+				 * very lock.  A compressed holder's child
+				 * becomes a junction carrying @node's chain as
+				 * its prefix head.  @node itself is untouched,
+				 * so the checks above all pass.  The promote
+				 * then overwrote the junction, and the peer's
+				 * key with it.  MEASURED:
+				 * inv_prefix_dup_promote_vs_extension, 16 of
+				 * 16 runs.  Re-read the slot here.
 				 */
 #ifndef FT_DEBUG_NO_HEAD_SLOT_RECHECK
 				if (head_slot && kind != FT_UNCHAIN_INTERIOR &&
@@ -7762,30 +8722,33 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 	}
 
 	/*
-	 * ☑ IS @node's CHAIN RETIRED, though @node itself is not?  Asked HERE --
-	 * after the lock_fine acquire block and before any edge is derived --
-	 * because this is the one point where the prev walk is stable in BOTH
-	 * writer modes: FINE holds the chain holder by now, COARSE holds the
+	 * ☑ IS @node's CHAIN RETIRED, though @node itself is not?  Asked HERE:
+	 * after the lock_fine acquire block and before any edge is derived.
+	 * This is the one point where the prev walk is stable in BOTH writer
+	 * modes.  FINE holds the chain holder by now.  COARSE holds the
 	 * FT-wide writer lock throughout.
 	 *
-	 * ☠ INSIDE the `if (ft->lock_fine)` block it does not run under COARSE at
-	 * all, and COARSE then has NO protection: a whole-chain displacement
-	 * freezes only the HEAD (a txn is bounded, a chain is not), so a member
-	 * of a displaced chain is retired and UNMARKED, the interior lane derives
-	 * @pred from a stale prev, and the edge it records has an expected-old
-	 * the slot can never hold -- 50001 laps and a memcg kill.  Measured:
-	 * inv_concurrent_insert_replace_coarse died at ft_inv test 152.
+	 * ☠ INSIDE the `if (ft->lock_fine)` block it does not run under COARSE
+	 * at all, and COARSE then has NO protection.  A whole-chain
+	 * displacement freezes only the HEAD (a txn is bounded, a chain is
+	 * not).  So a member of a displaced chain is retired and UNMARKED.
+	 * The interior lane derives @pred from a stale prev.  The edge it
+	 * records has an expected-old the slot can never hold: 50001 laps and
+	 * a memcg kill.  Measured: inv_concurrent_insert_replace_coarse died
+	 * at ft_inv test 152.
 	 *
-	 * ☠ AND AT THE ENTRY ARM IT IS UNHELD, which is worse than useless: the
-	 * walk then catches the window where a head remove has marked H but not
-	 * yet relinked the members onto the promoted successor, and calls a chain
-	 * that is merely losing its head "retired" -- a FALSE NOT_FOUND that
-	 * LOSES A KEY (inv_concurrent_same_key_removes, count_keys 65 != 64).
-	 * ft_chain_head_is_removed says HOLDER-LOCK CALLERS ONLY for this reason.
+	 * ☠ AND AT THE ENTRY ARM IT IS UNHELD, which is worse than useless.
+	 * The walk then catches the window where a head remove has marked H
+	 * but not yet relinked the members onto the promoted successor.  It
+	 * calls a chain that is merely losing its head "retired".  That is a
+	 * FALSE NOT_FOUND that LOSES A KEY (inv_concurrent_same_key_removes,
+	 * count_keys 65 != 64).  ft_chain_head_is_removed says HOLDER-LOCK
+	 * CALLERS ONLY for this reason.
 	 *
-	 * -ESTALE, not -ENOENT: the wrapper routes -EAGAIN/-ENOENT to RETRY, and
-	 * a retry only terminates if the ENTRY arm can answer the same question,
-	 * which it cannot.  -ESTALE is definitive and answers NOT_FOUND.
+	 * -ESTALE, not -ENOENT.  The wrapper routes -EAGAIN/-ENOENT to RETRY.
+	 * A retry only terminates if the ENTRY arm can answer the same
+	 * question, and it cannot.  -ESTALE is definitive and answers
+	 * NOT_FOUND.
 	 */
 	if (ft_chain_head_is_removed(node)) {
 		if (hmeta)
@@ -7800,16 +8763,22 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 	if (ft_node_external((struct cds_ft_inode_flag *) node->prev)) {
 		/*
 		 * Non-head interior duplicate (prev is a cds_ft_node): atomic
-		 * detach.  ft_hlist_del_prepare freezes @node (marks node->next),
-		 * relinks the chain past it (prev_node->next: node -> next_node) and
-		 * fixes the back-link (next_node->prev: node -> prev_node) in ONE
-		 * commit -- freeze and unlink land together (doc §4.B), so once this is
-		 * a concurrent engine a racing del(node)/insert_after(node) fails its
-		 * old-value check.  Multi-edge: a reader resolves the transient
-		 * interior-next proxies via cds_ft_node_next_rcu.  This subsumes the
-		 * common ft_node_mark_removed freeze below, so it returns directly.
-		 * Abortable cleanly: on a txn-alloc OOM nothing is recorded or
-		 * published and @node stays fully chained.
+		 * detach.  ft_hlist_del_prepare does three things in ONE
+		 * commit:
+		 *   - it freezes @node (marks node->next);
+		 *   - it relinks the chain past it (prev_node->next: node ->
+		 *     next_node);
+		 *   - it fixes the back-link (next_node->prev: node ->
+		 *     prev_node).
+		 * Freeze and unlink land together (doc §4.B).  So once this
+		 * is a concurrent engine, a racing del(node) /
+		 * insert_after(node) fails its old-value check.
+		 *
+		 * Multi-edge: a reader resolves the transient interior-next
+		 * proxies via cds_ft_node_next_rcu.  This subsumes the common
+		 * ft_node_mark_removed freeze below, so it returns directly.
+		 * Abortable cleanly: on a txn-alloc OOM nothing is recorded
+		 * or published and @node stays fully chained.
 		 */
 		struct ft_flip_txn *txn =
 			ft_flip_txn_create_bounded(ft, FT_HLIST_DEL_MAX_EDGES);
@@ -7824,8 +8793,8 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		if (ft_hlist_del_prepare(ft, ft_flip_txn_handle(txn), node)) {
 			/*
 			 * Peer conflict observed at prepare time (@node or a
-			 * neighbour mid-deletion): nothing was installed
-			 * (records never install without a commit) -- drop the
+			 * neighbour mid-deletion).  Nothing was installed:
+			 * records never install without a commit.  Drop the
 			 * txn and retry from a fresh position derivation.
 			 */
 			ft_flip_txn_destroy(txn);
@@ -7835,7 +8804,7 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		}
 		st = ft_flip_txn_commit(ft, txn);
 		/*
-		 * The interior relink never touches holder->state -- the held
+		 * The interior relink never touches holder->state.  The held
 		 * fence is independent of this commit, so drop it directly on
 		 * every outcome.
 		 */
@@ -7847,40 +8816,50 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		return st > 0 ? -EAGAIN : 0;
 	} else if (next_node) {
 		/*
-		 * Head with a successor: prev is the cell flag (list on) or the
-		 * flagged parent (list off).  Promote @next_node via a fresh cell
-		 * swap fused with the structural publish, @node's freeze fused into
-		 * that same commit (doc §4.B).  A list-on promotion allocates the
-		 * fresh cell; on OOM it aborts before any reader-visible change
-		 * (@node stays chained, not tombstoned) and the caller maps the
-		 * failure to CDS_FT_STATUS_MEMORY_ERROR.
+		 * Head with a successor: prev is the cell flag (list on) or
+		 * the flagged parent (list off).  Promote @next_node via a
+		 * fresh cell swap fused with the structural publish.  @node's
+		 * freeze is fused into that same commit (doc §4.B).  A
+		 * list-on promotion allocates the fresh cell.  On OOM it
+		 * aborts before any reader-visible change: @node stays
+		 * chained, not tombstoned.  The caller maps the failure to
+		 * CDS_FT_STATUS_MEMORY_ERROR.
 		 */
 		/*
-		 * Hand the held fence to ft_promote_head: it records the RELEASE
-		 * (composing with its holder guard, which a still-held LOCK
-		 * would otherwise self-abort) and OWNS the fence outcome -- commit
-		 * consumes it, an abort/destroy auto-clears the registered fence,
-		 * and every early-fail path clears it directly.  No post-commit
-		 * clear here.
+		 * Hand the held fence to ft_promote_head.  It records the
+		 * RELEASE.  The RELEASE composes with its holder guard, which
+		 * a still-held LOCK would otherwise self-abort.
+		 * ft_promote_head OWNS the fence outcome:
+		 *   - commit consumes it;
+		 *   - an abort/destroy auto-clears the registered fence;
+		 *   - every early-fail path clears it directly.
+		 * No post-commit clear here.
 		 */
 		return ft_promote_head(ft, ctx, parent_nf, parent_depth,
 			head_slot, node,
 				next_node, hmeta, hsnap);
 	} else {
 		/*
-		 * Head with no successor: the key disappears (only reached for a
-		 * list-off internal external_nodes chain that empties -- a list-on
-		 * key disappearance routes through the fused ft_remove_one_commit,
-		 * and a compressed / body-slot leaf through ft_detach_node).  Clear
-		 * the head slot (+ a compressed holder's SKIP_X dual) and fuse
-		 * @node's freeze (mark node->next: NULL -> MARK(NULL), preserving the
-		 * end-of-chain target) into that same flip-txn (doc §4.B).
-		 * Abortable: the flip IS the op's commit (no pre-flip reader-visible
-		 * side-effect), so on a txn-alloc OOM the unchain aborts cleanly --
-		 * nothing published, @node still chained, caller rolls back the -1
-		 * count and returns MEMORY_ERROR.  Folding the freeze makes this a
-		 * multi-edge commit (freeze + >=1 structural), so it always allocates
-		 * a txn (no lone-edge on-stack path) -- one extra alloc per head
+		 * Head with no successor: the key disappears.  This is only
+		 * reached for a list-off internal external_nodes chain that
+		 * empties.  A list-on key disappearance routes through the
+		 * fused ft_remove_one_commit.  A compressed / body-slot leaf
+		 * routes through ft_detach_node.
+		 *
+		 * Clear the head slot (+ a compressed holder's SKIP_X dual).
+		 * Fuse @node's freeze into that same flip-txn (doc §4.B).  The
+		 * freeze marks node->next: NULL -> MARK(NULL), preserving the
+		 * end-of-chain target.
+		 *
+		 * Abortable: the flip IS the op's commit, with no pre-flip
+		 * reader-visible side-effect.  So on a txn-alloc OOM the
+		 * unchain aborts cleanly: nothing published, @node still
+		 * chained.  The caller rolls back the -1 count and returns
+		 * MEMORY_ERROR.
+		 *
+		 * Folding the freeze makes this a multi-edge commit (freeze +
+		 * >=1 structural).  So it always allocates a txn: there is no
+		 * lone-edge on-stack path.  That is one extra alloc per head
 		 * clear, the single-writer cost of the atomic detach.
 		 */
 		struct ft_pub_rec rec = { .ctx = ctx, .n = 0 };
@@ -7900,40 +8879,42 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		}
 #ifdef FT_HLIST_CLAIM
 		/*
-		 * §4 STEP B5's DRY RUN.  Its OWN knob, apart from the two
-		 * promote arms, because this lane does NOT carry their SKIP_X
-		 * dual gap and a shared knob would hide that behind their abort.
+		 * §4 STEP B5's DRY RUN.  It has its OWN knob, apart from the
+		 * two promote arms.  This lane does NOT carry their SKIP_X
+		 * dual gap, and a shared knob would hide that behind their
+		 * abort.
 		 */
 		ft_flip_txn_claim_per_op_armable(ft, txn);
 #endif
 		/*
-		 * VALIDATE (§4.B): guard the LIVE holder this head-clear publishes
-		 * into.  Holding its lock (hmeta): record the {LOCK|s -> s}
-		 * RELEASE + register so it FUSES with the fused nr_child-- on the
-		 * same word (a masking guard would disagree on expected-old and
-		 * poison the descriptor) and the txn owns the fence outcome --
-		 * commit consumes it, an aborted/destroyed commit auto-clears the
-		 * registered fence (so the flip_into abort below needs no manual
-		 * clear).
+		 * VALIDATE (§4.B): guard the LIVE holder this head-clear
+		 * publishes into.  When holding its lock (hmeta), record the
+		 * {LOCK|s -> s} RELEASE + register.  It then FUSES with the
+		 * fused nr_child-- on the same word.  A masking guard would
+		 * disagree on expected-old and poison the descriptor.  The
+		 * txn owns the fence outcome: commit consumes it, and an
+		 * aborted/destroyed commit auto-clears the registered fence.
+		 * So the flip_into abort below needs no manual clear.
 		 */
 		ft_flip_txn_hold_or_lock_parent(ft, txn, ctx, parent_nf,
 			parent_depth, hmeta, hsnap);
 		/*
-		 * §9.3's third member, for the same reason as the promote arms.
-		 * A NO-OP today by the routing the detector below asserts -- a
-		 * compressed holder never reaches the head clear, so no dual is
-		 * recorded and the helper's own condition returns early -- and
-		 * wired anyway, because that detector exists precisely because
-		 * "a ROUTING INVARIANT IS A CODE FACT, AND CODE MOVES".
+		 * §9.3's third member, for the same reason as the promote
+		 * arms.  It is a NO-OP today, by the routing that the detector
+		 * below asserts.  A compressed holder never reaches the head
+		 * clear.  So no dual is recorded and the helper's own
+		 * condition returns early.  It is wired anyway, because that
+		 * detector exists precisely because "a ROUTING INVARIANT IS A
+		 * CODE FACT, AND CODE MOVES".
 		 * ☞ ft_lock_skip_dual_gp.
 		 */
 		/*
 		 * ☞ KEEP THE ANSWER even though this lane emits no dual today.
-		 * It costs nothing, and the day the routing above changes the
-		 * publish will already be spelling its own exclusion instead of
-		 * a constant that nobody re-examines.  Measured: ft_unchain_node
-		 * has NO row in the FT_DEBUG_DUAL_SITE census, which is the
-		 * detector's claim restated as a number.
+		 * It costs nothing.  If the routing above changes, the publish
+		 * will already spell its own exclusion, not a constant that
+		 * nobody re-examines.  Measured: ft_unchain_node has NO row in
+		 * the FT_DEBUG_DUAL_SITE census.  That is the detector's claim
+		 * restated as a number.
 		 */
 		{
 			bool dual_gp_held = ft_lock_skip_dual_gp(ft, ctx, txn,
@@ -7950,35 +8931,37 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * it, so a DETECTOR says so rather than a comment.
 		 *
 		 * The dual arm of _ft_publish_to_parent is gated on
-		 * ft_node_compressed(@parent_nf), and this branch is only
-		 * reachable with @parent_nf NULL (interior relink) or INTERNAL:
-		 * _cds_ft_remove_locked routes a COMPRESSED holder by whether
-		 * @node has a successor -- none goes to ft_detach_node, one or
-		 * more goes to the PROMOTE arm above -- so the head clear never
-		 * sees a compressed holder, and the remaining call sites pass an
-		 * internal holder_flag.  (The branch comment naming "a compressed
-		 * holder's SKIP_X dual" is stale.)
+		 * ft_node_compressed(@parent_nf).  This branch is only
+		 * reachable with @parent_nf NULL (interior relink) or
+		 * INTERNAL.  _cds_ft_remove_locked routes a COMPRESSED holder
+		 * by whether @node has a successor:
+		 *   - none goes to ft_detach_node;
+		 *   - one or more goes to the PROMOTE arm above.
+		 * So the head clear never sees a compressed holder, and the
+		 * remaining call sites pass an internal holder_flag.  (The
+		 * branch comment naming "a compressed holder's SKIP_X dual"
+		 * is stale.)
 		 *
-		 * ☠ A ROUTING INVARIANT IS A CODE FACT, AND CODE MOVES.  The two
-		 * promote arms sit one page away and DO emit the dual into a
-		 * grandparent they never acquire; a clean dry run did not catch
-		 * that there, so this lane's arm is not resting on one either.
-		 * Armed under --enable-rcu-debug, which the gate runs at three
-		 * spacings across four configs.
+		 * ☠ A ROUTING INVARIANT IS A CODE FACT, AND CODE MOVES.  The
+		 * two promote arms sit one page away and DO emit the dual into
+		 * a grandparent they never acquire.  A clean dry run did not
+		 * catch that there, so this lane's arm does not rely on one
+		 * either.  Armed under --enable-rcu-debug, which the gate
+		 * runs at three spacings across four configs.
 		 */
 		urcu_assert_debug(n_s < 2);
 		/*
 		 * PHASE B, STEP B5 -- THE ARM.  ft_flip_txn_hold_or_lock_parent
-		 * above is this lane's LAST ft_flip_txn_lock_register (its held
-		 * arm registers @hmeta and records the release; its unheld arm
-		 * acquires-or-guards @parent_nf), and the publish below plants
-		 * the first record after it.
+		 * above is this lane's LAST ft_flip_txn_lock_register.  Its
+		 * held arm registers @hmeta and records the release.  Its
+		 * unheld arm acquires-or-guards @parent_nf.  The publish
+		 * below plants the first record after it.
 		 *
 		 * ☞ WHAT IT CONVERTS is the head-slot clear, owned by
-		 * @parent_nf -- the word the fence above holds.  The detector
-		 * beside it is what makes that the WHOLE of what it converts:
-		 * with no dual, the publish is a lone structural edge and there
-		 * is no second owner to answer for.
+		 * @parent_nf: the word the fence above holds.  The detector
+		 * beside it makes that the WHOLE of what it converts.  With
+		 * no dual, the publish is a lone structural edge and there is
+		 * no second owner to answer for.
 		 *
 		 * ☞ READINESS: -DFT_HLIST_CLAIM claims at txn CREATION,
 		 * strictly earlier, and is clean on ft_unit and ft_inv
@@ -8006,16 +8989,15 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
  *    or more items. Remove the node by unlinking it from its list.
  * 2) There is only one external node within this node's list.
  *    2.1) The node is within an external nodes list for which the list
- *         head is an standalone external nodes pointer. The external
+ *         head is a standalone external nodes pointer. The external
  *         nodes list for this key should be removed. Removing an
  *         external nodes list should prune the entire branch leading to
- *         that list so no lookup observe empty internal nodes. This is
- *         done by ft_detach_node(). Internal nodes are considered empty
- *         if they have no internal and no external node children, *and*
- *         their associated list of external nodes is empty. When
- *         detaching an internal node which has no children, but has
- *         an associated list of external nodes, it is replaced by a
- *         pointer to the external nodes.
+ *         that list, so that no lookup observes empty internal nodes.
+ *         This is done by ft_detach_node(). An internal node is empty
+ *         when it has no internal and no external node children, *and*
+ *         its associated list of external nodes is empty. Detaching an
+ *         internal node with no children but with an associated list of
+ *         external nodes replaces it by a pointer to the external nodes.
  *    2.2) The node is within an external nodes list which is associated
  *         with an internal node. Unlink the node from its list, leaving
  *         the external nodes list empty.
@@ -8030,54 +9012,62 @@ unsigned long ft_dbg_rm_stale_holder;
  * ☠ A REFUSAL IS A CLAIM ABOUT THE TRIE, NOT A RETURN CODE.
  *
  * The four-way branch below picks its arm from @holder_flag, derived from
- * @node->prev far above any mark.  When a peer re-homes the head in that
- * window the branch tests the WRONG node's words, the arm's identity compare
- * fails, and the op answers CDS_FT_STATUS_NOT_FOUND -- a PERMANENT, key-losing
- * answer to a TRANSIENT race.  MEASURED: at that exact return a fresh
- * ft_node_holder(@node) says the node IS its holder's head and the holder is
- * alive and untombstoned.
+ * @node->prev far above any mark.  A peer may re-home the head in that
+ * window.  Then:
+ *   - the branch tests the WRONG node's words;
+ *   - the arm's identity compare fails;
+ *   - the op answers CDS_FT_STATUS_NOT_FOUND.
+ * That is a PERMANENT, key-losing answer to a TRANSIENT race.  MEASURED: at
+ * that exact return, a fresh ft_node_holder(@node) says the node IS its
+ * holder's head.  The holder is alive and untombstoned.
  *
- * So before conceding, ask the question again.  If the holder moved, the
- * refusal was about a node this op no longer has any business reading: hand it
- * back to the op's own retry (@need_retry, the escape the dead-forward-holder
- * arm already uses) instead of reporting the key gone.
+ * So before conceding, ask the question again.  Suppose the holder moved.
+ * Then the refusal was about a node this op no longer has any business
+ * reading.  Hand it back to the op's own retry instead of reporting the key
+ * gone.  That retry is @need_retry, the escape the dead-forward-holder arm
+ * already uses.
  *
  * ☞ HISTORICAL, AND STILL LOAD-BEARING -- READ IT WITH ITS RESOLUTION.  What
  * follows is what this disposition measured WITH THE OLD PREDICATE (a bare
- * pointer double-read), which is why it was opt-in (-DFT_RM_HOLDER_RECHECK)
- * and DEFAULT OFF.  It is now DEFAULT ON, because the predicate -- not the
- * retry -- was the defect; the resolution is at ft_rm_holder_rehomed() below,
- * and each objection recorded here is answered inline.  A/B over 20 seeds of
- * the two-writer reproducer, identical source, only this arm differing:
+ * pointer double-read).  That is why it was opt-in (-DFT_RM_HOLDER_RECHECK)
+ * and DEFAULT OFF.  It is now DEFAULT ON.  The reason: the predicate was the
+ * defect, not the retry.  The resolution is at ft_rm_holder_rehomed() below.
+ * Each objection recorded here is answered inline.  The A/B ran over 20 seeds
+ * of the two-writer reproducer.  The source was identical; only this arm
+ * differed:
  *
  * ☠☠☠ AND MULTI-WRITER STRESS SAYS IT IS NOT A FIX.  MEASURED 2026-09-06:
  *
- *   - ft_unit 331/331 and ft_inv LIST-OFF 128/128 pass, but ft_inv LIST-ON and
- *     the FT_INV_MW concurrent-writer leg BOTH HANG at test 44
- *     (inv_insert_replace_splice_window, rc=124 after `ok 43`) -- the very test
- *     FT_RM_ACQUIRE_FIRST hangs, by the same alternation moved up to the
- *     wrapper: the tombstone arm runs a DESCENT precisely when @node->prev is
- *     lazily stale, so @holder_flag is descent-derived while @fresh here is
- *     prev-derived, the two disagree PERMANENTLY, every attempt reports
- *     "moved", and the op never converges.  Test 44 serialises its writers, so
- *     that hang is never contention.
+ *   - ft_unit 331/331 and ft_inv LIST-OFF 128/128 pass.  But ft_inv LIST-ON
+ *     and the FT_INV_MW concurrent-writer leg BOTH HANG at test 44
+ *     (inv_insert_replace_splice_window, rc=124 after `ok 43`).  It is the
+ *     very test FT_RM_ACQUIRE_FIRST hangs.  The same alternation is moved up
+ *     to the wrapper:
+ *       - the tombstone arm runs a DESCENT precisely when @node->prev is
+ *         lazily stale;
+ *       - so @holder_flag is descent-derived, while @fresh here is
+ *         prev-derived;
+ *       - the two disagree PERMANENTLY;
+ *       - every attempt reports "moved", and the op never converges.
+ *     Test 44 serialises its writers, so that hang is never contention.
  *
- *     ☑ RESOLVED, and this paragraph is its own proof: the permanently
+ *     ☑ RESOLVED, and this paragraph is its own proof.  The permanently
  *     disagreeing population is EXACTLY the one where @node->prev is lazily
- *     stale -- which means the holder it names is TOMBSTONED, which is WHY the
+ *     stale.  That means the holder it names is TOMBSTONED.  That is WHY the
  *     tombstone arm ran at all.  ft_rm_holder_rehomed() returns false on a
- *     tombstoned @fresh, so that population never retries and the alternation
- *     cannot form.  Gate with it default ON: 17 configs, ft_inv on/off/mw
- *     128/128 everywhere, test 44 included, plus five configs at all three
- *     lock spacings.
+ *     tombstoned @fresh.  So that population never retries, and the
+ *     alternation cannot form.  The gate ran with it default ON:
+ *       - 17 configs, ft_inv on/off/mw 128/128 everywhere, test 44 included;
+ *       - plus five configs at all three lock spacings.
  *
- *   - ☠ AND THE OBVIOUS GATE TRADES THE CURE FOR THE HANG.  Adding
- *     `!have_descent &&` here (ask @prev only about a holder that came from
- *     @prev) clears BOTH hangs -- ft_unit 331/331, ft_inv on/off/mw 128/128,
- *     all rc=0 -- and RM-FAIL then reads 21/30 on the two-key reproducer
- *     against 21/30 for the control.  THE CURE IS GONE.  So the cure and the
- *     hang are ONE code path: this arm withdraws the refusal only by retrying
- *     on exactly the condition that does not always terminate.
+ *   - ☠ AND THE OBVIOUS GATE TRADES THE CURE FOR THE HANG.  The gate adds
+ *     `!have_descent &&` here: ask @prev only about a holder that came from
+ *     @prev.  It clears BOTH hangs: ft_unit 331/331, ft_inv on/off/mw
+ *     128/128, all rc=0.  But RM-FAIL then reads 21/30 on the two-key
+ *     reproducer, against 21/30 for the control.  THE CURE IS GONE.  So the
+ *     cure and the hang are ONE code path.  This arm withdraws the refusal
+ *     only by retrying.  It retries on exactly the condition that does not
+ *     always terminate.
  *
  *     ☞ Which is why a bare double-read cannot be the fix.  It re-reads
  *     @node->prev with NO LOCK HELD, so it stabilises nothing and compares
@@ -8085,11 +9075,11 @@ unsigned long ft_dbg_rm_stale_holder;
  *     FIRST and re-read @prev under it -- prev against prev, never prev
  *     against a descent -- so that "unchanged" means "cannot change".
  *
- *     ☠ THAT PRESCRIPTION WAS REFUTED BY MEASUREMENT (§5.20c): a load -> lock
+ *     ☠ THAT PRESCRIPTION WAS REFUTED BY MEASUREMENT (§5.20c).  A load -> lock
  *     -> re-load of ft_node_holder() fires ZERO times in 9.7 M evaluations
- *     (ft_unit + ft_inv on + mw + the reproducer), positive-controlled to the
- *     unit.  For the !have_descent population the back edge simply never
- *     moves; for the descent population the compare is unequal BY
+ *     (ft_unit + ft_inv on + mw + the reproducer).  It was positive-controlled
+ *     to the unit.  For the !have_descent population, the back edge simply
+ *     never moves.  For the descent population, the compare is unequal BY
  *     CONSTRUCTION.  A lock cannot stabilise what was never moving.  What the
  *     predicate needed was not stability but the LIVENESS of @fresh.
  *
@@ -8098,18 +9088,21 @@ unsigned long ft_dbg_rm_stale_holder;
  *                                                          NOT create these)
  *     timeout or memcg kill             0/20  ->   5/20   ☠
  *
- * So the diagnosis is confirmed -- withdrawing the refusal all but eliminates
- * the shape -- and handing the op back to @need_retry SPINS: the caller's loop
- * is an unbounded for(;;), and under sustained churn @node->prev keeps moving,
- * so each retry re-derives a holder that has moved again.  -DFT_DEBUG_REMOVE_
- * RETRY_CAP does NOT catch it (it reports at 100/1000/10000 attempts and the
- * arm never passes 100); the failure is wall-clock and RSS, not attempt count.
+ * So the diagnosis is confirmed: withdrawing the refusal all but eliminates
+ * the shape.  But handing the op back to @need_retry SPINS.  The caller's loop
+ * is an unbounded for(;;).  Under sustained churn @node->prev keeps moving.
+ * So each retry re-derives a holder that has moved again.
+ * -DFT_DEBUG_REMOVE_RETRY_CAP does NOT catch it.  It reports at
+ * 100/1000/10000 attempts, and the arm never passes 100.  The failure is
+ * wall-clock and RSS, not attempt count.
  *
- * ☞ WHAT IT NEEDS: a BOUNDED disposition -- re-derive and re-run the arm
- * selection IN PLACE a bounded number of times, rather than restarting the op
- * -- or a bound on the outer loop.  Conceding NOT_FOUND after a bound is still
- * strictly better than today, where the wrong answer is unconditional.  That is
- * a contract question (may a remove refuse?) and is not settled here.
+ * ☞ WHAT IT NEEDS is one of two bounds:
+ *   - a BOUNDED disposition: re-derive and re-run the arm selection IN PLACE
+ *     a bounded number of times, rather than restarting the op;
+ *   - or a bound on the outer loop.
+ * Conceding NOT_FOUND after a bound is still strictly better than today.
+ * Today the wrong answer is unconditional.  That is a contract question (may
+ * a remove refuse?) and is not settled here.
  */
 /*
  * ★ WHAT THE BARE DOUBLE-READ LACKED WAS A PREDICATE, NOT A BOUND.
@@ -8118,30 +9111,35 @@ unsigned long ft_dbg_rm_stale_holder;
  * `fresh != holder_flag` folds TWO causes together and only one is transient:
  *
  *  - @fresh is TOMBSTONED.  The back edge is merely STALE: it names a RETIRED
- *    holder the forward descent above already replaced.  That is PERMANENT --
- *    no retry changes it -- and it is UNCONDITIONAL for the whole
- *    tombstone-arm population, because that arm deliberately replaces
- *    @holder_flag with a descent result while @node->prev goes on naming the
- *    retired one.  ☠ THAT is the 5/20 wall-clock/RSS spin recorded above: the
- *    old predicate fired on every single lap.  So no bound was ever needed --
- *    testing liveness removes the spinning population outright.
+ *    holder the forward descent above already replaced.  That is PERMANENT.
+ *    No retry changes it.  It is also UNCONDITIONAL for the whole
+ *    tombstone-arm population.  That arm deliberately replaces @holder_flag
+ *    with a descent result, while @node->prev goes on naming the retired
+ *    one.  ☠ THAT is the 5/20 wall-clock/RSS spin recorded above.  The old
+ *    predicate fired on every single lap.  So no bound was ever needed.
+ *    Testing liveness removes the spinning population outright.
  *
- *  - @fresh is LIVE.  A peer RE-HOMED @node under a different, live holder: an
- *    insert of a key that EXTENDS @node's converted its leaf into a PREFIX HEAD
- *    in place, chaining @node into the new head's external_nodes (ft-insert.h,
- *    ft_attach_node -- "the external node we are replacing at the attachment
- *    location ... chain this external node in the topmost internal node
- *    external node list").  @node is LIVE and REACHABLE one hop lower, so
- *    refusing is the §1 key loss.  This IS transient, and it is charged to that
- *    peer's COMMITTED conversion: the retry re-derives against a tree that has
- *    already moved on, reads @node->prev = the head (live, so the tombstone arm
- *    does not fire), and the branch reaches @node by its own external-member
- *    condition.
+ *  - @fresh is LIVE.  A peer RE-HOMED @node under a different, live holder.
+ *    An insert of a key that EXTENDS @node's key converted @node's leaf into
+ *    a PREFIX HEAD in place.  It chained @node into the new head's
+ *    external_nodes (ft-insert.h, ft_attach_node -- "the external node we
+ *    are replacing at the attachment location ... chain this external node
+ *    in the topmost internal node external node list").  @node is LIVE and
+ *    REACHABLE one hop lower, so refusing is the §1 key loss.  This IS
+ *    transient.  It is charged to that peer's COMMITTED conversion.  The
+ *    retry:
+ *      - re-derives against a tree that has already moved on;
+ *      - reads @node->prev = the head (live, so the tombstone arm does not
+ *        fire);
+ *      - and the branch reaches @node by its own external-member condition.
  *
  * MEASURED with the liveness test in (doc/design/ft-stale-disposal-predicate.md
- * §5.24): RM-FAIL 2/30 -> 0/30, and 0 across 90 further seeds -- 120 seeds,
- * ZERO.  The spin did NOT return: timeouts flat at 9/30 against a baseline of
- * 8/30, suite walls unchanged (unit 45 s, ion 86, ioff 86, imw 103).
+ * §5.24):
+ *   - RM-FAIL 2/30 -> 0/30, and 0 across 90 further seeds.  That is 120
+ *     seeds, ZERO.
+ *   - The spin did NOT return.  Timeouts stayed flat at 9/30, against a
+ *     baseline of 8/30.  Suite walls were unchanged (unit 45 s, ion 86,
+ *     ioff 86, imw 103).
  *
  * ☞ A genuinely unlinked node is a REAL miss and must NOT retry: tested first.
  */
@@ -8165,26 +9163,36 @@ bool ft_rm_holder_rehomed(struct cds_ft *ft, const struct cds_ft_node *node,
 }
 
 /*
- * The other transient miss: the slot came BACK.  @fresh == @holder_flag says
- * "not re-homed", but it cannot tell a miss from an ABA on the slot itself.
- * A peer insert of a key EXTENDING @node republishes @head_slot with a junction
- * carrying @node as its prefix head; that peer's remove then collapses the
- * junction and puts @node back into the SAME holder's slot.  An identity read
- * that landed in between saw the junction, and the back edge -- re-pointed and
- * restored by those two commits -- names @holder_flag again.  @node never left
- * the trie.  MEASURED: two writers toggling "...zone46" / "...zone4" through a
- * compressed holder, 3 of 5 runs refused the live "...zone4" here within 10 s.
+ * The other transient miss: the slot came back.  @fresh == @holder_flag says
+ * "not re-homed".  It cannot tell a miss from an ABA on the slot itself.
  *
- * A live @node back in @head_slot is a retry, charged to the peer's two
- * committed writes; a removed one is still the real miss.  A NULL @head_slot
- * -- the body arm's byte had no slot at all -- has nothing to come back to.
+ *   this remove                       peer
+ *   -----------                       ----
+ *                                     insert a key extending @node:
+ *                                     republish @head_slot with a junction
+ *                                     carrying @node as its prefix head
+ *   identity read: sees the junction
+ *                                     remove that key: collapse the
+ *                                     junction, put @node back into the
+ *                                     same holder's slot
  *
- * ☠ AND ONLY IN A LIVE HOLDER.  A RETIRED holder's slots keep whatever they
- * held when it was retired, so its slot "holds @node" forever: a remove
- * bootstrapped from a stale back edge naming that corpse would retry on it
- * without end (MEASURED: a lost "...zone46" whose remove spun alone at 100%
- * CPU after its peer exited).  ft_rm_holder_rehomed already calls a
- * tombstoned holder the real miss; this must agree with it.
+ * Those two commits re-point the back edge and then restore it, so it names
+ * @holder_flag again.  @node never left the trie.
+ *
+ * Measured: two writers toggled "...zone46" / "...zone4" through a compressed
+ * holder.  3 of 5 runs refused the live "...zone4" here within 10 s.
+ *
+ * A live @node back in @head_slot is a retry.  It is charged to the peer's
+ * two committed writes.  A removed @node is still the real miss.  A NULL
+ * @head_slot means the body arm's byte had no slot at all.  It has nothing to
+ * come back to.
+ *
+ * ☠ This holds only in a live holder.  A retired holder's slots keep whatever
+ * they held when it was retired, so its slot "holds @node" forever.  A remove
+ * bootstrapped from a stale back edge naming that retired holder would retry
+ * on it without end.  Measured: a lost "...zone46" whose remove spun alone at
+ * 100% CPU after its peer exited.  ft_rm_holder_rehomed already calls a
+ * tombstoned holder the real miss.  This function must agree with it.
  */
 static inline
 bool ft_rm_slot_regained(const struct cds_ft *ft, const struct cds_ft_node *node,
@@ -8204,21 +9212,33 @@ bool ft_rm_slot_regained(const struct cds_ft *ft, const struct cds_ft_node *node
 }
 
 /*
- * ☠ A MISS IS CONFIRMED UNDER THE HOLDER'S LOCK.  The identity compare and the
- * two predicates above are UNLOCKED reads, each answered at its own instant,
- * and a peer toggling a key that EXTENDS @node can answer each one from a
- * different tree: the compare sees the peer's junction in the slot, the back
- * edge (read next) sees that junction already collapsed and @node back under
- * @holder_flag, and the slot (read last) sees the peer's NEXT junction.  Three
- * self-consistent reads, one wrong verdict: NOT_FOUND for a key that never left
- * the trie (MEASURED: 5 of 32 two-writer runs, "...runs" vs "...runs6" through
- * one compressed holder, refused the live "...runs" at the compressed arm; a
- * lookup found it both before the remove and after the refusal).
+ * ☠ A miss is confirmed under the holder's lock.
  *
- * THE AUTHORITY IS THE KEY'S SLOT IN THE HOLDER, READ UNDER ITS LOCK -- not
- * @node's back edge, which is updated LAZILY and can name a RETIRED holder
- * while the forward path still reaches @node (the STALE BACK-EDGE arm in
- * _cds_ft_remove_locked).  Holding @lock_flag's lock, the slot cannot move:
+ * The identity compare and the two predicates above are unlocked reads.  Each
+ * is answered at its own instant.  A peer toggling a key that extends @node
+ * can answer each one from a different tree.
+ *
+ *   this remove                          peer
+ *   -----------                          ----
+ *                                        publish a junction in the slot
+ *   identity compare: sees the junction
+ *                                        collapse the junction: @node is
+ *                                        back under @holder_flag
+ *   back edge read: names @holder_flag
+ *                                        publish its next junction
+ *   slot read: sees the next junction
+ *
+ * Each of the three reads is self-consistent.  Yet the verdict is wrong.  It is
+ * NOT_FOUND for a key that never left the trie.  Measured: 5 of 32 two-writer
+ * runs ("...runs" vs "...runs6" through one compressed holder) refused the live
+ * "...runs" at the compressed arm.  A lookup found it both before the
+ * remove and after the refusal.
+ *
+ * The authority is the key's slot in the holder, read under the holder's
+ * lock.  It is not @node's back edge.  A back edge is updated lazily.  It can
+ * name a retired holder while the forward path still reaches @node (the STALE
+ * BACK-EDGE arm in _cds_ft_remove_locked).  While @lock_flag's lock is held,
+ * the slot cannot move:
  *
  *  - it holds @node again                     -> retry (the slot came back);
  *  - it holds an INTERNAL node (skip-encoded  -> retry: the key now goes
@@ -8230,13 +9250,13 @@ bool ft_rm_slot_regained(const struct cds_ft *ft, const struct cds_ft_node *node
  *    unless the back edge names a LIVE other holder (a re-home this compare
  *    cannot see), which is a retry.
  *
- * The slot is re-derived under the lock (@key_byte, or the compressed
- * @lock_flag's child when negative): a packed body shifts its slots in place,
- * so a pre-lock slot address is itself a plan read.  Taken and dropped here,
- * with nothing built or reserved: this is not the op-wide hold measured and
- * refuted above.
+ * The slot is re-derived under the lock: from @key_byte, or from the
+ * compressed @lock_flag's child when @key_byte is negative.  A packed body
+ * shifts its slots in place, so a pre-lock slot address is itself a plan
+ * read.  The lock is taken and dropped here, with nothing built or reserved.
+ * This is not the op-wide hold measured and refuted above.
  *
- * Returns true when the op must retry.
+ * Return true when the op must retry.
  */
 static inline
 bool ft_rm_miss_unconfirmed(struct cds_ft *ft, const struct ft_lock_ctx *lctx,
@@ -8259,17 +9279,17 @@ bool ft_rm_miss_unconfirmed(struct cds_ft *ft, const struct ft_lock_ctx *lctx,
 			ft_node_is_removed((struct cds_ft_node *) node))
 		return false;
 	/*
-	 * A RETIRED holder decides nothing: its slots keep what they held, and
-	 * @node may live on in its replacement behind a back edge that is only
-	 * LAZILY updated.  Re-derive: the retry's STALE BACK-EDGE arm descends
-	 * for the live holder by key, and a miss is then confirmed under THAT
-	 * holder's lock -- a live word, so the retry terminates.
+	 * A retired holder decides nothing.  Its slots keep what they held.
+	 * @node may live on in its replacement, behind a back edge that is
+	 * only lazily updated.  Re-derive.  The retry's STALE BACK-EDGE arm
+	 * descends for the live holder by key.  A miss is then confirmed under
+	 * that holder's lock.  That word is live, so the retry terminates.
 	 */
 	if (ft_flag_tombstoned(ft, lock_flag))
 		return true;
 	/*
 	 * Refused: a peer holds the word, or retired it after the test above.
-	 * Either way the tree is moving under the verdict: re-derive.
+	 * In both cases the tree is moving under the verdict.  Re-derive.
 	 */
 	if (ft_acquire_member(ft, lctx, lock_flag, lock_meta, holder_depth, &h))
 		return true;
@@ -8301,10 +9321,10 @@ bool ft_rm_miss_unconfirmed(struct cds_ft *ft, const struct ft_lock_ctx *lctx,
 
 /*
  * Drop the hoisted holder mark on every exit of _cds_ft_remove_locked.
- * ☞ The arms DEDUPE against it (ft_dlm_acquire_set_at -> ft_lock_ctx_holds)
- * rather than taking their own, so no arm's commit terminal releases it -- this
- * is the only release, and it must therefore run on EVERY path.  Guarded the
- * way ft_detach_node's orphan sweep is: never touch a mark this op no longer
+ * ☞ The arms dedupe against it (ft_dlm_acquire_set_at -> ft_lock_ctx_holds).
+ * They do not take their own, so no arm's commit terminal releases it.  This
+ * is the only release, so it must run on every path.  It is guarded the way
+ * ft_detach_node's orphan sweep is.  Never touch a mark this op no longer
  * owns (@shared) or has handed to a txn (@txn_owned).
  */
 #if defined(FT_RM_ACQUIRE_FIRST) && defined(FT_RM_REVALIDATE)
@@ -8313,11 +9333,12 @@ bool ft_rm_miss_unconfirmed(struct cds_ft *ft, const struct ft_lock_ctx *lctx,
 
 #if defined(FT_RM_ACQUIRE_FIRST) || defined(FT_RM_REVALIDATE)
 /*
- * @committed: did THIS op's commit run?  Most uses are bails, retries and
- * re-aims where nothing committed and the fence is provably still ours; the
- * success arm of the exit switch is the one that is not, and it must not ask
- * the word -- a committed terminal may have dropped our LOCK, after which a
- * set bit means a PEER's fence.
+ * @committed: did this op's commit run?
+ *
+ * Most uses are bails, retries and re-aims.  Nothing committed there, and the
+ * fence is provably still ours.  The success arm of the exit switch is the
+ * exception.  It must not ask the word.  A committed terminal may have dropped
+ * our lock, and a set bit then means a peer's fence.
  */
 #define FT_RM_RELEASE_OUTCOME(committed_)	do {			\
 		if (rm_hold && !rm_held.shared && !rm_held.txn_owned) {	\
@@ -8358,17 +9379,20 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	const uint8_t *iter_key;
 	size_t key_len = ft_key_len(ft, ft_iter_resolve_key_len(iter));
 	/*
-	 * POISONED, not zeroed.  Every path assigns @ret today (gcc's
-	 * -Wmaybe-uninitialized agrees), but the terminal switch below ends in
-	 * `default: abort()`, so a path added later that forgets to assign
-	 * decides the op's whole outcome from stack garbage: garbage that lands
-	 * on 0 reports CDS_FT_STATUS_OK for a removal that may not have
-	 * happened -- the defect @2d3b92ea fixed in remove_all -- and any other
-	 * value aborts or not depending on the frame.
+	 * Poisoned, not zeroed.  Every path assigns @ret today, and gcc's
+	 * -Wmaybe-uninitialized agrees.  But the terminal switch below ends in
+	 * `default: abort()`.  A path added later that forgets to assign @ret
+	 * would decide the op's whole outcome from stack garbage:
 	 *
-	 * -EINVAL is deliberately NOT a case in that switch, so an unassigned
-	 * @ret reaches `default:` DETERMINISTICALLY instead of by luck.  The
-	 * unknown is outside the domain and the consumer already refuses it.
+	 *  - garbage that lands on 0 reports CDS_FT_STATUS_OK for a removal
+	 *    that may not have happened.  @2d3b92ea fixed that defect in
+	 *    remove_all;
+	 *  - any other value aborts or not, depending on the frame.
+	 *
+	 * -EINVAL is deliberately not a case in that switch.  An unassigned
+	 * @ret therefore reaches `default:` deterministically, not by luck.
+	 * The unknown is outside the domain and the consumer already refuses
+	 * it.
 	 */
 	int ret = -EINVAL;
 
@@ -8392,32 +9416,33 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	dbg_printf("cds_ft_remove attempt: node %p\n", node);
 
 	/*
-	 * No top-down descent.  @node is application-owned and, with the RCU
-	 * read-side lock held continuously since it was obtained, stays
-	 * alive; node->prev names the node's holder and the slot that holds
-	 * @node can be derived from it directly:
+	 * No top-down descent.  @node is application-owned.  The RCU read-side
+	 * lock has been held continuously since @node was obtained, so @node
+	 * stays alive.  node->prev names the node's holder, and the slot that
+	 * holds @node can be derived from it directly.
 	 *
-	 * ☠ BUT NOT BECAUSE A WRITER MUTEX FREEZES ANYTHING, and this comment
-	 * used to say it did -- "the writer mutex held here freezes the
+	 * ☠ This is not because a writer mutex freezes anything.  This
+	 * comment used to say it did: "the writer mutex held here freezes the
 	 * structure, so node->prev is a settled live pointer".  That was true
-	 * under CDS_FT_WRITER_LOCK_COARSE and is FALSE under the fine-grained
-	 * default, where cds_ft_remove's own header promises it may run
-	 * concurrently with another remove ON THE SAME KEY: there is no mutex
+	 * under CDS_FT_WRITER_LOCK_COARSE.  It is false under the fine-grained
+	 * default.  There, cds_ft_remove's own header promises that it may run
+	 * concurrently with another remove on the same key.  There is no mutex
 	 * here, and a back-pointer is stale at rest, unbounded.  A false
-	 * premise on a CONVERTED path is worse than an unconverted op that
+	 * premise on a converted path is worse than an unconverted op that
 	 * says so, because nothing marks it as owed.
 	 *
-	 * ☞ WHAT ACTUALLY CARRIES IT is the derivation being RE-VALIDATED under
-	 * the holder's lock once taken, with a RETRIABLE bail when the holder
-	 * moved -- ft_chain_head_holder's re-check and ft_unchain_kind's
-	 * under-lock routing, plus the txn's own expected-old.  The derivation
-	 * here is a PLAN, not a conclusion.
+	 * ☞ What carries it: the derivation is re-validated under the
+	 * holder's lock once that lock is taken.  When the holder moved, the op
+	 * bails and can be retried.  This is the work of ft_chain_head_holder's
+	 * re-check, of ft_unchain_kind's under-lock routing and of the txn's
+	 * own expected-old.  The derivation here is a plan, not a conclusion.
 	 *
-	 * ☐ AND THE ALTERNATIVE DISPOSITIONS OF THIS SAME DEFECT ARE DEAD CODE:
-	 * the FT_RM_ACQUIRE_FIRST and FT_RM_REVALIDATE arms below are reachable
-	 * from no build -- neither macro is defined anywhere in the tree, so
-	 * their measurements ("48/160 seeds") describe a path nothing compiles.
-	 * Decide them or delete them; left as-is they read like live coverage.
+	 * ☐ The alternative dispositions of this same defect are dead code.
+	 * No build reaches the FT_RM_ACQUIRE_FIRST and FT_RM_REVALIDATE arms
+	 * below: neither macro is defined anywhere in the tree.  Their
+	 * measurements ("48/160 seeds") describe a path nothing compiles.
+	 * Decide them or delete them.  Left as they are, they read like live
+	 * coverage.
 	 */
 	/*
 	 * The slot derivation itself:
@@ -8426,8 +9451,9 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	 *    metadata (parent + parent_slot_offset), used by ft_detach_node's
 	 *    upward prune walk.
 	 *  - the metadata-less EXTERNAL head's slot in its holder is
-	 *    re-derived from the key here (a compressed holder's &cn->child,
-	 *    or an internal holder's body slot for the key's last byte).
+	 *    re-derived from the key here.  It is a compressed holder's
+	 *    &cn->child, or an internal holder's body slot for the key's last
+	 *    byte.
 	 */
 
 	/*
@@ -8444,70 +9470,85 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		return CDS_FT_STATUS_NOT_FOUND;
 	}
 	/*
-	 * ...AND A MEMBER WHOSE PREDECESSOR NO LONGER OWNS IT IS EQUALLY GONE,
-	 * with no tombstone anywhere to say so.
+	 * A member whose predecessor no longer owns it is equally gone, and
+	 * no tombstone anywhere says so.
 	 *
-	 * The mark above is a PER-NODE fact, and a whole-chain displacement
-	 * cannot write it on every member: cds_ft_insert_replace swings the
-	 * anchor slot to a fresh head and freezes only the OLD HEAD in that
-	 * commit, because a txn is bounded and a chain is not.  Asking the head
-	 * instead does not work either -- the head is a CALLER-OWNED node, and
-	 * re-arming it for reuse (cds_ft_node_init, which the API permits the
-	 * moment the chain is handed back) erases the very mark the question
-	 * reads.
+	 * The mark above is a per-node fact.  A whole-chain displacement
+	 * cannot write it on every member.  cds_ft_insert_replace swings the
+	 * anchor slot to a fresh head.  In that commit it freezes only the old
+	 * head.  A txn is bounded and a chain is not.  Asking the head does
+	 * not work either.  The head is a caller-owned node.  The API permits
+	 * re-arming it for reuse (cds_ft_node_init) the moment the chain is
+	 * handed back.  That erases the mark the question reads.
 	 *
 	 * So ask the structure, not a flag: an interior member is in a live
-	 * chain iff its predecessor still points AT it.  A displaced member's
-	 * @prev names a node that has been recycled or relinked, whose next is
-	 * NULL or someone else -- exactly the condition under which the interior
-	 * lane would record `pred->next: elem -> next` against a slot that can
-	 * never hold @elem, and spin forever (50001 attempts, then a memcg kill;
-	 * five single-threaded calls reproduce it).
+	 * chain iff its predecessor still points at it.  A displaced member's
+	 * @prev names a node that has been recycled or relinked.  The next of
+	 * that node is NULL or someone else.  Under exactly that condition
+	 * the interior lane would record `pred->next: elem -> next` against a
+	 * slot that can never hold @elem, and spin forever.  Measured: 50001
+	 * attempts, then a memcg kill.  Five single-threaded calls reproduce
+	 * it.
 	 *
-	 * Both loads are proxy-resolved and mark-masked, so a peer mid-commit
-	 * reads as the word before or after it, never as a descriptor: a peer
-	 * unlinking @pred has already relinked ITS predecessor at @node, and a
-	 * peer removing @node itself is caught by the mark above.  Unheld, like
-	 * the mark test it follows -- both are statements about the node the
-	 * CALLER handed us, and the answer is NOT_FOUND either way.
+	 * Both loads are proxy-resolved and mark-masked.  A peer mid-commit
+	 * therefore reads as the word before or after its commit, never as a
+	 * descriptor:
+	 *
+	 *  - a peer unlinking @pred has already relinked its own predecessor
+	 *    at @node;
+	 *  - a peer removing @node itself is caught by the mark above.
+	 *
+	 * The loads are unheld, like the mark test they follow.  Both are
+	 * statements about the node the caller handed us, and the answer is
+	 * NOT_FOUND either way.
 	 */
 	{
 		void *nprev = ft_dereference_prev_resolved(node);
 
 		/*
-		 * ☠ AND THE TWO LOADS ARE NOT MUTUALLY CONSISTENT, so the
-		 * predicate needs a THIRD one.  @node->prev and @pred->next are
-		 * read unheld and a PROMOTION writes both: a same-key
+		 * ☠ The two loads are not mutually consistent, so the
+		 * predicate needs a third one.  @node->prev and @pred->next
+		 * are read unheld, and a promotion writes both.  A same-key
 		 * cds_ft_remove that retires the head promotes @node in its
-		 * place, clearing the old head's next and re-homing @node->prev
-		 * onto the flagged parent.  Read @node->prev BEFORE that
-		 * re-home and @pred->next AFTER the clear and the structure
-		 * says "your predecessor does not point at you" about a node
-		 * that is not displaced at all -- it is the new HEAD.
+		 * place.
 		 *
-		 * MEASURED, 3/3 runs of inv_concurrent_same_key_append_nolist:
-		 * at the refusal @pred->next was NULL while an immediate
-		 * re-read of @node->prev already carried the flagged parent
-		 * (tag != external), with no tombstone on @node.  The op then
-		 * answered NOT_FOUND -- a TERMINAL claim -- for a LIVE node,
-		 * sometimes one that still had successors of its own.
+		 *   this remove          peer (same-key cds_ft_remove)
+		 *   -----------          -----------------------------
+		 *   read @node->prev
+		 *                        clear the old head's next
+		 *                        re-home @node->prev onto the
+		 *                        flagged parent
+		 *   read @pred->next
 		 *
-		 * ☠ WHY A FALSE NOT_FOUND IS NOT A HARMLESS REFUSAL: the caller
-		 * is entitled to conclude the node left the trie and to re-arm
-		 * it (cds_ft_node_init, which the API permits the moment the
-		 * chain is handed back).  That wipes prev/next on a node STILL
-		 * LINKED, and the next cds_ft_insert of it descends onto
-		 * ITSELF: ft_chain_head_holder walks a NULL prev, the append
-		 * bails -EAGAIN and re-descends onto the same node forever
-		 * (measured: 230,977,777 retries in ONE call, inside the
-		 * escalation fallback, which then stalls every grace period).
+		 * The structure then says "your predecessor does not point at
+		 * you" about a node that is not displaced at all.  It is the
+		 * new head.
 		 *
-		 * So RE-VALIDATE @node->prev after the @pred->next load and
-		 * refuse only when it is UNCHANGED: a genuine displacement is
-		 * STABLE (nobody relinks a displaced member), while a promotion
+		 * Measured, 3/3 runs of inv_concurrent_same_key_append_nolist.
+		 * At the refusal @pred->next was NULL.  An immediate re-read
+		 * of @node->prev already carried the flagged parent
+		 * (tag != external), and @node had no tombstone.  The op then
+		 * answered NOT_FOUND, a terminal claim, for a live node.
+		 * Sometimes that node still had successors of its own.
+		 *
+		 * ☠ A false NOT_FOUND is not a harmless refusal.  The caller
+		 * is entitled to conclude that the node left the trie.  It
+		 * is also entitled to re-arm it (cds_ft_node_init).  The API
+		 * permits that the moment the chain is handed back.  That wipes
+		 * prev/next on a node that is still linked.  The next
+		 * cds_ft_insert of it descends onto itself:
+		 * ft_chain_head_holder walks a NULL prev, the append bails
+		 * -EAGAIN and re-descends onto the same
+		 * node forever.  Measured: 230,977,777 retries in one call.
+		 * They ran inside the escalation fallback, which then stalls
+		 * every grace period.
+		 *
+		 * So re-validate @node->prev after the @pred->next load, and
+		 * refuse only when it is unchanged.  A genuine displacement is
+		 * stable: nobody relinks a displaced member.  A promotion
 		 * moves @node->prev off the predecessor exactly when it clears
-		 * the predecessor's next.  A prev that moved under us means the
-		 * node was relinked, not dropped -- fall through and let
+		 * the predecessor's next.  A prev that moved under us means
+		 * the node was relinked, not dropped.  Fall through and let
 		 * ft_node_holder re-derive it from the word it now carries.
 		 */
 		if (nprev &&
@@ -8525,9 +9566,13 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	}
 
 	/*
-	 * Resolve @node's holder (its parent), transparently across the cell
-	 * indirection: a head's prev is its cell (parent in cell->parent), a
-	 * non-head duplicate's prev is its predecessor.  NULL => never inserted.
+	 * Resolve @node's holder (its parent).  The cell indirection is
+	 * transparent:
+	 *
+	 *  - a head's prev is its cell (parent in cell->parent);
+	 *  - a non-head duplicate's prev is its predecessor.
+	 *
+	 * NULL => never inserted.
 	 */
 	holder_flag = ft_node_holder(ft, node);
 	if (!holder_flag) {
@@ -8540,24 +9585,30 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		return CDS_FT_STATUS_NOT_FOUND;
 	}
 	/*
-	 * STALE BACK-EDGE (measured: 78% of the cases where this fires).  The
-	 * derivation above trusts @node->prev, and a back-pointer is updated
-	 * LAZILY: a peer that replaced the holder can leave @node->prev naming
-	 * the RETIRED old one while the FORWARD path from the root still
-	 * resolves @node correctly.  The op is then derived against a dead
-	 * node -- ft_meta_lock_acquire refuses a TOMBSTONE word, the caller
-	 * gets -EAGAIN, and the wrapper's retry re-derives the SAME dead
-	 * holder forever, holding the per-trie FIFO fair-mutex turn and
-	 * denying every other writer (measured: 2,000,000+ consecutive
-	 * attempts, 11 of 12 writer threads parked).  Escalation cannot break
-	 * it: a tombstone is permanent, not contention.
+	 * STALE BACK-EDGE (measured: 78% of the cases where this fires).
 	 *
-	 * The FORWARD path is authoritative, so re-derive the holder by a
-	 * key-guided descent -- the same walk ft_detach_at uses -- and carry
-	 * on with the live parent.  A descent that no longer reaches @node
-	 * (the minority shape: the key really is gone) is an idempotent miss,
-	 * reported like the ft_node_is_removed() early-out above rather than
-	 * spun on.
+	 * The derivation above trusts @node->prev, and a back-pointer is
+	 * updated lazily.  A peer that replaced the holder can leave
+	 * @node->prev naming the retired old one.  The forward path from the
+	 * root still resolves @node correctly.  The op is then derived against
+	 * a dead node:
+	 *
+	 *  - ft_meta_lock_acquire refuses a tombstone word;
+	 *  - the caller gets -EAGAIN;
+	 *  - the wrapper's retry re-derives the same dead holder forever.  It
+	 *    holds the per-trie FIFO fair-mutex turn and denies every other
+	 *    writer.
+	 *
+	 * Measured: 2,000,000+ consecutive attempts.  11 of 12 writer threads
+	 * were parked.  Escalation cannot break it: a tombstone is permanent,
+	 * not contention.
+	 *
+	 * The forward path is authoritative.  So re-derive the holder by a
+	 * key-guided descent, the same walk ft_detach_at uses, and carry on
+	 * with the live parent.  A descent may no longer reach @node.  This is
+	 * the minority shape: the key really is gone.  It is an idempotent
+	 * miss.  It is reported like the ft_node_is_removed() early-out above.
+	 * The op does not spin on it.
 	 */
 	if (caa_unlikely(ft_flag_tombstoned(ft, holder_flag))) {
 		const uint8_t *ik = iter_key;
@@ -8568,26 +9619,27 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		ft_anchor_descend(ft, &d, iter_key, key_len, &ik);
 		/*
 		 * ★ THE DESCENT STOPS IN ONE OF TWO PLACES, and this arm knew
-		 * only one of them.  These are the SAME two bullets the coarse
-		 * arm below states and applies (its `prefix` test): the key can
-		 * end AT an internal node whose external_nodes carry the leaf --
-		 * a PREFIX KEY -- and then the holder is @d.nf at @d.depth, not
-		 * @d.pnf.
+		 * only one of them.  These are the SAME two bullets that the
+		 * coarse arm below states and applies (its `prefix` test).  The
+		 * key can end AT an internal node whose external_nodes carry
+		 * the leaf.  That is a PREFIX KEY.  The holder is then @d.nf at
+		 * @d.depth, not @d.pnf.
 		 *
-		 * ☠ TAKING @d.pnf UNCONDITIONALLY IS A KEY LOSS.  A peer
-		 * inserting a key that EXTENDS @node's converts @node's leaf
-		 * into a PREFIX HEAD in place, retiring nothing, and chains
+		 * ☠ Taking @d.pnf unconditionally loses a key.  A peer may
+		 * insert a key that extends @node's.  It converts @node's leaf
+		 * into a prefix head in place and retires nothing.  It chains
 		 * @node into that head's external_nodes (ft-insert.h,
-		 * ft_attach_node).  @node stays LIVE, one hop lower.  Aiming at
-		 * the head's PARENT sends the four-way branch into the
-		 * body-slot arm, whose slot then holds the HEAD and not @node,
-		 * and it answers a PERMANENT NOT_FOUND for a key that exists.
+		 * ft_attach_node).  @node stays live, one hop lower.  Aiming
+		 * at the head's parent sends the four-way branch into the
+		 * body-slot arm.  The slot of that arm then holds the head,
+		 * not @node.  The arm answers a permanent NOT_FOUND for a key
+		 * that exists.
 		 *
-		 * MEASURED (doc/design/ft-stale-disposal-predicate.md §5.20,
-		 * §5.21): at that refusal @d.nf IS the head in 12,450 of 12,451
-		 * samples (0 were @node), and this `prefix` test fires on every
-		 * failing sample, 2,226/2,226.  Selecting @d.nf also makes the
-		 * op acquire the word its writes actually touch -- the head's,
+		 * Measured in doc/design/ft-stale-disposal-predicate.md §5.20
+		 * and §5.21.  At that refusal @d.nf is the head in 12,450 of
+		 * 12,451 samples.  0 were @node.  This `prefix` test fires on
+		 * every failing sample (2,226/2,226).  Selecting @d.nf also
+		 * makes the op acquire the word its writes touch: the head's,
 		 * not its parent's.
 		 */
 		prefix = d.nf && !ft_node_external(d.nf) &&
@@ -8597,14 +9649,15 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		/*
 		 * ☞ A DEAD FORWARD HOLDER IS A RETRY, NOT A MISS -- the second
 		 * half of the same two-arm inconsistency.  The coarse arm below
-		 * answers this very predicate with *need_retry ("nothing is
-		 * reserved or published yet, so re-derive the whole position
-		 * against the settled tree"); this arm answered it with a
-		 * PERMANENT NOT_FOUND.  A tombstone on the freshly descended
-		 * holder means a peer is retiring it RIGHT NOW: transient, and
-		 * the contract forbids refusing for a transient reason.
-		 * MEASURED: 2 of the residual refusals left by this guard and
-		 * BOTH were tombstoned(fwd); neither was !d.nf (§5.23).
+		 * answers this same predicate with *need_retry.  Its reason is
+		 * "nothing is reserved or published yet, so re-derive the whole
+		 * position against the settled tree".  This arm answered it
+		 * with a PERMANENT NOT_FOUND.  A tombstone on the freshly
+		 * descended holder means a peer is retiring it right now.  That
+		 * is transient, and the contract forbids refusing for a
+		 * transient reason.  Measured: this guard left 2 residual
+		 * refusals.  Both were tombstoned(fwd), and neither was !d.nf
+		 * (§5.23).
 		 */
 		if (fwd != NULL && ft_flag_tombstoned(ft, fwd)) {
 			FT_DBG_RETRY_SITE();
@@ -8625,22 +9678,22 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	}
 
 	/*
-	 * The op's lock context.  @d is an anchor source wherever the walk above
-	 * actually RAN -- which is every coarse spacing, since the arm that runs
-	 * it is gated on exactly that -- and NULL under per-node, where it never
-	 * runs and every member anchors on itself anyway.
+	 * The op's lock context.  @d is an anchor source wherever the walk
+	 * above actually RAN.  That is every coarse spacing, since the arm that
+	 * runs it is gated on exactly that.  @d is NULL under per-node.  There
+	 * the walk never runs, and every member anchors on itself anyway.
 	 *
-	 * ☠ "The walk RAN" is not "the walk LOCATED THE HOLDER".  This flag used
-	 * to mean the second, so a holder the two arms above do not match threw a
-	 * perfectly good anchor table away -- and a member dated by the ONE-HOP
-	 * rule (ft_lock_ctx_depth_of_parent needs no descent to answer a DEPTH)
-	 * then reached ft_anchor_meta with no descent to answer its ANCHOR.  That
-	 * is the assert, in ft_chain_compress_fused under
-	 * CDS_FT_LOCK_SPACING=exponential.
+	 * ☠ "The walk ran" is not "the walk located the holder".  This flag
+	 * used to mean the second.  A holder that the two arms above do not
+	 * match then threw a perfectly good anchor table away.  A member dated
+	 * by the one-hop rule then reached ft_anchor_meta with no descent to
+	 * answer its anchor.  (ft_lock_ctx_depth_of_parent needs no descent to
+	 * answer a depth.)  That is the assert, in ft_chain_compress_fused
+	 * under CDS_FT_LOCK_SPACING=exponential.
 	 *
-	 * A descent that does not describe a member reports that PER MEMBER and
-	 * the caller re-plans; withholding it turns "this member" into "every
-	 * member".
+	 * A descent that does not describe a member reports that per member,
+	 * and the caller re-plans.  Withholding the descent turns "this member"
+	 * into "every member".
 	 */
 	struct ft_lock_ctx lctx;
 
@@ -8652,52 +9705,62 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 
 #ifdef FT_RM_ACQUIRE_FIRST
 	/*
-	 * ★ ACQUIRE, THEN SELECT.  Everything below -- the cell capture, the
-	 * four-way branch and its two identity compares -- reads words that
-	 * belong to @holder_flag, which was derived from @node->prev with no
-	 * exclusion held.  A peer that re-homes the head in that window makes
-	 * the branch test the WRONG node and answer NOT_FOUND for a key that
-	 * exists, and the contract forbids refusing for a transient reason.
+	 * ★ ACQUIRE, THEN SELECT.
 	 *
-	 * ☠ RETRYING DOES NOT FIX IT, MEASURED: handing the op back to
-	 * @need_retry is a PRE-COMMIT BAIL, which forfeits the op's lane turn,
-	 * so each restart re-derives against a still-moving tree -- 5 runs in
-	 * 20 died on wall-clock or the memcg.  The exclusion has to be HELD
-	 * ACROSS derive -> select -> compare, which is what this does.
+	 * Everything below reads words that belong to @holder_flag: the cell
+	 * capture, the four-way branch and its two identity compares.
+	 * @holder_flag was derived from @node->prev with no exclusion held.
+	 * A peer that re-homes the head in that window makes the branch test
+	 * the wrong node.  The branch answers NOT_FOUND for a key that exists,
+	 * and the contract forbids refusing for a transient reason.
 	 *
-	 * WHY IT CONVERGES.  The peer that re-homes @node is a holder copier:
-	 * it holds H's FT_STATE_LOCK from mark to commit and retires H in that
-	 * same commit.  So once the acquire succeeds (it refuses a TOMBSTONE)
-	 * AND ft_node_holder(@node) still answers H when re-read AFTER the CAS,
-	 * nothing can move H: a publish into it fails the §4.B guard, and a
-	 * copy of it needs the lock we hold.  The branch then reads FROZEN
-	 * words, so a mismatch below is a fact about the TRIE -- which is a
-	 * refusal the contract allows.
+	 * ☠ Retrying does not fix it (measured).  Handing the op back to
+	 * @need_retry is a pre-commit bail, which forfeits the op's lane turn.
+	 * Each restart then re-derives against a tree that is still moving.
+	 * 5 runs in 20 died on wall-clock or the memcg.  The exclusion has to
+	 * be held across derive -> select -> compare.  This code does that.
 	 *
-	 * The arms re-acquire the same holder; ft_dlm_acquire_set_at DEDUPES
-	 * against the op's held set (ft_lock_ctx_holds), which is why this is
-	 * published into @lctx and why the hoist costs NO extra CAS -- every
-	 * arm already took this lock, one step later.
+	 * Why it converges.  The peer that re-homes @node is a holder copier.
+	 * It holds H's FT_STATE_LOCK from mark to commit and retires H in that
+	 * same commit.  Two conditions are needed: the acquire succeeds (it
+	 * refuses a tombstone), and ft_node_holder(@node) still answers H when
+	 * re-read after the CAS.  Then nothing can move H:
 	 *
-	 * ☠☠☠ BROKEN — DO NOT ENABLE.  MEASURED: ft_inv HANGS deterministically
-	 * in test 44 (inv_insert_replace_splice_window); gdb on the hung process
-	 * puts the spinning thread in the ft_anchor_descend below.  THE LOOP
-	 * ALTERNATES: the descent finds the LIVE holder, the acquire takes it,
-	 * and then the validation asks @node->prev who the holder is -- which
-	 * still names the RETIRED one, because a back-pointer is updated LAZILY
-	 * -- so it mismatches, releases, re-aims at the DEAD holder, refuses it
-	 * as a TOMBSTONE, descends again, forever.
+	 *  - a publish into H fails the §4.B guard;
+	 *  - a copy of H needs the lock we hold.
 	 *
-	 * ★ THE FIX DIRECTION, and it is the same lesson the STALE BACK-EDGE
-	 * note above already teaches: THE FORWARD PATH IS AUTHORITATIVE.  The
-	 * validation must ask whether @holder_flag is still the node's holder
-	 * BY DESCENT, not by ft_node_holder(@node->prev).  Every use of the
-	 * back-pointer as an authority in this function has now been wrong
-	 * twice.
+	 * The branch then reads frozen words.  A mismatch below is a fact
+	 * about the trie, and the contract allows that refusal.
+	 *
+	 * The arms re-acquire the same holder.  ft_dlm_acquire_set_at dedupes
+	 * against the op's held set (ft_lock_ctx_holds).  This is why the hold
+	 * is published into @lctx.  It is also why the hoist costs no extra
+	 * CAS.  Every arm already took this lock, one step later.
+	 *
+	 * ☠☠☠ BROKEN — DO NOT ENABLE.  Measured: ft_inv hangs
+	 * deterministically in test 44 (inv_insert_replace_splice_window).  gdb
+	 * on the hung process puts the spinning thread in the ft_anchor_descend
+	 * below.  The loop alternates forever:
+	 *
+	 *  1. The descent finds the live holder.
+	 *  2. The acquire takes it.
+	 *  3. The validation asks @node->prev who the holder is.  That still
+	 *     names the retired one, because a back-pointer is updated lazily.
+	 *  4. The validation mismatches and releases.
+	 *  5. The loop re-aims at the dead holder and refuses it as a
+	 *     tombstone.
+	 *  6. The loop descends again.
+	 *
+	 * ★ The fix direction is the lesson the STALE BACK-EDGE note above
+	 * already teaches: the forward path is authoritative.  The validation
+	 * must ask whether @holder_flag is still the node's holder by descent,
+	 * not by ft_node_holder(@node->prev).  Every use of the back-pointer
+	 * as an authority in this function has now been wrong twice.
 	 *
 	 * ☐ PER-NODE SPACING ONLY.  A coarse anchor needs a byte-depth for the
-	 * re-derived holder and this loop has none; coarse keeps today's
-	 * behaviour.  Per-node is the default and where the defect is measured.
+	 * re-derived holder, and this loop has none.  Coarse keeps today's
+	 * behaviour.  Per-node is the default, and the defect is measured
+	 * there.
 	 */
 	struct ft_held_anchor rm_held = { 0 };
 	bool rm_hold = false;
@@ -8711,27 +9774,28 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 					ft_flag_to_metadata(ft, holder_flag),
 					holder_depth, &rm_held)) {
 				/*
-				 * ☠☠ -EAGAIN FOLDS THREE FACTS INTO ONE CODE:
-				 * a peer LOCK, a mid-flip PROXY, or a TOMBSTONE.
-				 * Only the first two are transient.  "A TOMBSTONE
-				 * IS PERMANENT, NOT CONTENTION" -- and this file
-				 * already MEASURED what treating it as contention
-				 * costs: 2,000,000+ consecutive attempts with 11
-				 * of 12 writers parked (the STALE BACK-EDGE note
-				 * above, which is the SAME bug at the SAME
-				 * derivation).  Re-deriving from @node->prev
-				 * cannot escape it -- a back-pointer is updated
-				 * LAZILY and goes on naming the retired holder --
-				 * so the loop would refuse the same dead word
-				 * forever.
+				 * ☠☠ -EAGAIN folds three facts into one
+				 * code: a peer LOCK, a mid-flip PROXY, or a
+				 * TOMBSTONE.  Only the first two are transient.
+				 * "A TOMBSTONE IS PERMANENT, NOT CONTENTION".
+				 * This file already measured what treating it
+				 * as contention costs.  It cost 2,000,000+
+				 * consecutive attempts.  11 of 12 writers were
+				 * parked.  See the STALE BACK-EDGE note above.
+				 * It is the same bug at the same derivation.
+				 * Re-deriving from @node->prev cannot escape
+				 * it.  A back-pointer is updated lazily and
+				 * goes on naming the retired holder.  The loop
+				 * would refuse the same dead word forever.
 				 *
-				 * THE FORWARD PATH IS AUTHORITATIVE.  On a dead
-				 * holder re-derive by the key-guided descent, the
-				 * cure that arm already applies, and carry on with
-				 * the live parent.  A descent that no longer
-				 * reaches @node means the key really is gone --
-				 * a fact about the TRIE -- so the branch's own
-				 * compare may then legally answer NOT_FOUND.
+				 * The forward path is authoritative.  On a dead
+				 * holder, re-derive by the key-guided descent
+				 * and carry on with the live parent.  That arm
+				 * already applies this cure.  A descent may no
+				 * longer reach @node.  The key is then really
+				 * gone, which is a fact about the trie.  The
+				 * branch's own compare may then legally answer
+				 * NOT_FOUND.
 				 */
 				if (ft_flag_tombstoned(ft, holder_flag)) {
 					const uint8_t *ik2 = iter_key;
@@ -8766,11 +9830,12 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			if (!fresh || ft_node_external(fresh))
 				break;	/* no state word to hold: as before */
 			/*
-			 * ☞ @holder_depth is NOT re-derived here.  Harmless
-			 * under the PER_NODE gate above (every member anchors
-			 * on itself, the depth unused); it becomes a MIS-ANCHOR
-			 * the moment that gate widens, so widening it means
-			 * routing this through the descent too.
+			 * ☞ @holder_depth is not re-derived here.  This is
+			 * harmless under the PER_NODE gate above: every member
+			 * anchors on itself, and the depth is unused.  It
+			 * becomes a MIS-ANCHOR the moment that gate widens.
+			 * Widening it means routing this through the descent
+			 * too.
 			 */
 			holder_flag = fresh;
 		}
@@ -8781,56 +9846,65 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	/*
 	 * ★ REVALIDATE UNDER THE LOCK, AND RETRY THE WHOLE OP IF IT MOVED.
 	 *
-	 * THE DEFECT (root-caused, doc/design/ft-stale-disposal-predicate.md
-	 * §5.10): everything below -- the cell capture, the four-way branch and
-	 * its two identity compares -- reads words belonging to @holder_flag,
-	 * which was derived from @node->prev at the top of this function with NO
-	 * exclusion held.  The comment there still says "the writer mutex held
-	 * here freezes the structure", which was true under
-	 * CDS_FT_WRITER_LOCK_COARSE and is FALSE under the fine-grained default.
-	 * So the arm is selected from TWO UNLOCKED READS TAKEN IN DIFFERENT
-	 * EPOCHS, and a peer that inserts a key EXTENDING @node's converts
-	 * @node's leaf into a PREFIX HEAD in place on the live holder -- the slot
-	 * edge and @node's back-edge flipping in ONE commit (ft-insert.h:2099-2141)
-	 * -- so the compare below tests the fresh internal node against @node and
-	 * answers NOT_FOUND for a key that is present throughout.
+	 * The defect is root-caused in
+	 * doc/design/ft-stale-disposal-predicate.md §5.10.  Everything below
+	 * reads words belonging to @holder_flag.  They are the cell capture,
+	 * the four-way branch and its two identity compares.  @holder_flag was
+	 * derived from @node->prev at the top of this function with no
+	 * exclusion held.  The comment there used to say "the writer mutex held
+	 * here freezes the structure".  That was true under
+	 * CDS_FT_WRITER_LOCK_COARSE and is false under the fine-grained
+	 * default.  So the arm is selected from two unlocked reads taken in
+	 * different epochs.  A peer may insert a key that extends @node's.  It
+	 * converts @node's leaf into a prefix head in place on the live holder.
+	 * The slot edge and @node's back-edge flip in one commit
+	 * (ft-insert.h:2099-2141).  The compare below then tests the fresh
+	 * internal node against @node.  It answers NOT_FOUND for a key that is
+	 * present throughout.
 	 *
-	 * MEASURED: 48/160 seeds of the rig, 0/160 under
+	 * Measured: 48/160 seeds of the rig, 0/160 under
 	 * CDS_FT_WRITER_LOCK_COARSE (which restores exactly the premise above).
 	 *
-	 * WHY THIS CONVERGES, and why it is NOT the refuted blind retry.  A lap
-	 * happens only when a peer's commit is OBSERVED to have moved the holder,
-	 * so every lap is charged to a distinct peer commit rather than to an
-	 * attempt count -- the refusal-without-a-fact the contract forbids.  And
-	 * the re-derivation is CORRECT rather than lazily stale: the conversion
-	 * parks @node's back-edge into the SAME one-commit as the forward publish
-	 * ("must flip ATOMICALLY with the forward publish", ft-insert.h:2129-2135),
-	 * so once that commit lands, @node->prev names the NEW holder and the next
+	 * Why this converges, and why it is not the refuted blind retry.  A lap
+	 * happens only when a peer's commit is observed to have moved the
+	 * holder.  Every lap is therefore charged to a distinct peer commit,
+	 * not to an attempt count.  An attempt count is the
+	 * refusal-without-a-fact the contract forbids.  The re-derivation is
+	 * also correct, not lazily stale.  The conversion parks @node's
+	 * back-edge into the same commit as the forward publish ("must flip
+	 * ATOMICALLY with the forward publish", ft-insert.h:2129-2135).  Once
+	 * that commit lands, @node->prev names the new holder and the next
 	 * attempt selects the right arm.
 	 *
-	 * ☠ WHY IT IS NOT FT_RM_ACQUIRE_FIRST, which hangs test 44
-	 * DETERMINISTICALLY.  That disposition RE-AIMS IN-LOOP: on a mismatch it
-	 * assigns @holder_flag = fresh and continues, while its tombstone arm
-	 * re-aims from a DESCENT.  The two derivations disagree whenever a
-	 * back-pointer is lazily stale, so the loop alternates -- descent finds
-	 * the live holder, the validation re-aims at the dead one, the acquire
-	 * refuses it as a TOMBSTONE, descend again, forever.  THERE IS NO LOOP
-	 * HERE.  Derivation and validation both read @node->prev, so they can
-	 * only disagree because a peer committed in between, and the answer to
-	 * that is to hand the whole op back and derive once, cleanly.
+	 * ☠ Why it is not FT_RM_ACQUIRE_FIRST, which hangs test 44
+	 * deterministically.  That disposition re-aims in-loop.  On a mismatch
+	 * it assigns @holder_flag = fresh and continues, while its tombstone
+	 * arm re-aims from a descent.  The two derivations disagree whenever a
+	 * back-pointer is lazily stale, so the loop alternates forever:
 	 *
-	 * A TOMBSTONED holder is NOT handled here: the re-derivation runs the
+	 *  1. The descent finds the live holder.
+	 *  2. The validation re-aims at the dead one.
+	 *  3. The acquire refuses it as a tombstone.
+	 *  4. The loop descends again.
+	 *
+	 * There is no loop here.  Derivation and validation both read
+	 * @node->prev.  They can only disagree because a peer committed in
+	 * between.  The answer to that is to hand the whole op back and derive
+	 * once, cleanly.
+	 *
+	 * A tombstoned holder is not handled here.  The re-derivation runs the
 	 * ft_node_is_removed / tombstone recovery arm at the top of this
-	 * function, which descends for a live holder.  That is why a retry
-	 * terminates on a dead word instead of refusing it forever.
+	 * function, and that arm descends for a live holder.  That is why a
+	 * retry terminates on a dead word and does not refuse it forever.
 	 *
 	 * ☐ PER-NODE SPACING ONLY.  A coarser anchor needs a byte-depth for the
-	 * holder and this path derives none (ft-remove.h:5653-5657: it becomes a
-	 * MIS-ANCHOR the moment that gate widens).  Per-node is the default and
-	 * is where the defect is measured.
+	 * holder, and this path derives none (ft-remove.h:5653-5657: it becomes
+	 * a MIS-ANCHOR the moment that gate widens).  Per-node is the default,
+	 * and the defect is measured there.
 	 *
-	 * ☠☠☠ MEASURED AND REFUTED AS WRITTEN — DO NOT ENABLE.  41 seeds of the
-	 * rig (same workload as §5.9/§5.10) against the flag OFF control:
+	 * ☠☠☠ MEASURED AND REFUTED AS WRITTEN — DO NOT ENABLE.  The
+	 * table shows 41 seeds of the rig (same workload as §5.9/§5.10)
+	 * against the flag OFF control.
 	 *
 	 *     rc=124 (HANG)   20 / 41      control ~10 / 160
 	 *     rc=137 (memcg)   7 / 41
@@ -8840,27 +9914,33 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	 *                                 miss (a key LOST) and a wrong identity
 	 *     runs reaching their final line: 0 / 41
 	 *
-	 * ☞ WHY, and it is a fact about the DISPOSITION, not a coding slip.  The
-	 * hold is published into @lctx and therefore spans the WHOLE op, through
+	 * ☞ Why: this is a fact about the disposition, not a coding slip.
+	 * The hold is published into @lctx, so it spans the whole op, through
 	 * the arms and the detach.  Under -DFEATURE_FT_HOLD_TRACE the ledger says
-	 * so directly: peers are refused the word repeatedly --
+	 * so directly.  Peers are refused the word repeatedly.  Each of three
+	 * seeds has the next line three times on one word.
 	 * "FT REFUSED (LOCK, unknown holder): ft_insert_dlm_acquire_split:778"
-	 * three times on ONE word in each of three seeds, plus refusals at
-	 * ft_node_recompact:1405, ft_chain_compress_fused:1315 and at
-	 * _cds_ft_remove_locked:5726 itself.  Every peer INSERT that needs the
-	 * holder's word is blocked for the duration of a remove -- which is the
-	 * FT-wide writer lock re-created one node at a time, with none of its
-	 * ordering.  ☞ This is also the seam rule's territory: no NODE lock may
-	 * be held across a grace period (ft_seam_check, ft-mutation-helpers.h:2592,
-	 * called from ft_writer_lock_gp_wait).
+	 * There are also refusals at ft_node_recompact:1405, at
+	 * ft_chain_compress_fused:1315 and at _cds_ft_remove_locked:5726
+	 * itself.  Every peer insert that needs the holder's word is blocked
+	 * for the duration of a remove.  This re-creates the FT-wide writer
+	 * lock one node at a time, with none of its ordering.  ☞ The seam
+	 * rule also applies here.  No node lock may be held across a grace
+	 * period.  See ft_seam_check (ft-mutation-helpers.h:2592), called from
+	 * ft_writer_lock_gp_wait.
 	 *
-	 * ★ WHAT THIS DOES NOT REFUTE: revalidating under the lock.  The
-	 * measurement indicts the SCOPE of the hold, not the revalidation.  The
-	 * untried refinement is to hold ONLY across derive -> select -> compare
-	 * and release immediately after the compare, WITHOUT publishing into
-	 * @lctx -- letting each arm take its own word as it does today, and
-	 * letting the txn's expected-old catch a move that happens after the
-	 * decision.  That is a different disposition and is NOT measured.
+	 * ★ What this does not refute: revalidating under the lock.  The
+	 * measurement indicts the scope of the hold, not the revalidation.  The
+	 * untried refinement is:
+	 *
+	 *  - hold only across derive -> select -> compare;
+	 *  - release immediately after the compare, without publishing into
+	 *    @lctx;
+	 *  - let each arm take its own word, as it does today;
+	 *  - let the txn's expected-old catch a move that happens after the
+	 *    decision.
+	 *
+	 * That is a different disposition and is not measured.
 	 */
 	struct ft_held_anchor rm_held = { 0 };
 	bool rm_hold = false;
@@ -8871,10 +9951,10 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				ft_flag_to_metadata(ft, holder_flag),
 				holder_depth, &rm_held)) {
 			/*
-			 * -EAGAIN folds LOCK / PROXY / TOMBSTONE.  All three are
-			 * answered the same way: nothing was acquired, so nothing
-			 * is released, and the re-derivation above sorts a dead
-			 * holder out through its own recovery arm.
+			 * -EAGAIN folds LOCK / PROXY / TOMBSTONE.  All three
+			 * get the same answer.  Nothing was acquired, so
+			 * nothing is released.  The re-derivation above sorts
+			 * a dead holder out through its own recovery arm.
 			 */
 			FT_DBG_RETRY_SITE();
 			*need_retry = true;
@@ -8892,11 +9972,12 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			return CDS_FT_STATUS_OK;	/* value unused: wrapper retries */
 		}
 		/*
-		 * Held across derive -> select -> compare.  Published into @lctx so
-		 * the arms DEDUPE against it (ft_dlm_acquire_set_at ->
-		 * ft_lock_ctx_holds) instead of taking their own: no arm's commit
-		 * terminal releases it, so FT_RM_RELEASE is the only release and
-		 * must run on every exit below.
+		 * Held across derive -> select -> compare.  It is published
+		 * into @lctx so that the arms dedupe against it
+		 * (ft_dlm_acquire_set_at -> ft_lock_ctx_holds) and do not take
+		 * their own.  No arm's commit terminal releases it.
+		 * FT_RM_RELEASE is therefore the only release, and it must run
+		 * on every exit below.
 		 */
 		rm_hold = true;
 		lctx.held.extra = &rm_held;
@@ -8908,22 +9989,23 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	 * ★ DERIVE -> SELECT -> COMPARE window (-DFT_DELAY_INJECT only; a no-op
 	 * in every shipping build, fractal-trie-internal.h:4236).
 	 *
-	 * @holder_flag is now fully derived and NOTHING is held.  Every word the
-	 * four arms below read -- the cell capture, the kind dispatch and the two
-	 * identity compares -- belongs to that holder, and a peer INSERT of a key
-	 * that EXTENDS @node's converts @node's leaf into a PREFIX HEAD in place
-	 * on it, flipping the holder's slot and @node's back-edge in one commit
-	 * while retiring nothing (doc/design/ft-stale-disposal-predicate.md
-	 * §5.10).  Measured on the wire, that window is TEN NANOSECONDS wide
-	 * (§5.12), which is why the defect needs 80 seeds of a concurrent rig to
-	 * show up 53 times.
+	 * @holder_flag is now fully derived and nothing is held.  Every word
+	 * the four arms below read belongs to that holder: the cell capture,
+	 * the kind dispatch and the two identity compares.  A peer insert of a
+	 * key that extends @node's converts @node's leaf into a prefix head in
+	 * place on that holder.  It flips the holder's slot and @node's
+	 * back-edge in one commit.  It retires nothing.  See §5.10 of
+	 * doc/design/ft-stale-disposal-predicate.md for this.  Measured on the
+	 * wire (§5.12), that window is ten nanoseconds wide.  This is why
+	 * the defect needs 80 seeds of a concurrent rig to show up 53 times.
 	 *
-	 * Placed AFTER the whole derivation and BEFORE the first read of a
-	 * holder-owned word, i.e. exactly at the epoch boundary the defect
-	 * straddles.
+	 * The delay is placed after the whole derivation and before the first
+	 * read of a holder-owned word.  That is exactly the epoch boundary the
+	 * defect straddles.
 	 *
-	 * ☠ MEASURED NOT TO HELP FOR THIS DEFECT, recorded so the next reader
-	 * does not repeat it.  Against the rig's DETERM=1 case, 10 seeds each:
+	 * ☠ Measured not to help for this defect.  This is recorded so that
+	 * the next reader does not repeat it.  Against the rig's DETERM=1 case,
+	 * 10 seeds each:
 	 *
 	 *     no delay        13/20 fired, mean 253 ms
 	 *     FT_DELAY_US=1    6/10
@@ -8931,50 +10013,65 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	 *     FT_DELAY_US=20   5/10
 	 *     FT_DELAY_US=200  3/5, two runs clean for a full 10 s
 	 *
-	 * Widening the window makes it WORSE, and the reason is instructive: the
-	 * peer's insert of the extension and its own removal both fit inside a
-	 * sleep, so the holder's slot is back to @node by the time the compare
-	 * runs.  The race is self-healing under a long enough delay.  What buys
-	 * the speed is the KEY SHAPE (DETERM=1), not the timing.
+	 * Widening the window makes it worse.  The peer inserts the extension
+	 * and removes it again, both inside one sleep.  The holder's slot is
+	 * then back to @node by the time the compare runs.  The race heals
+	 * itself under a long enough delay.  What buys the speed is the key
+	 * shape (DETERM=1), not the timing.
 	 */
 	ft_delay_writer();
 
 	/*
 	 * Cell-always: @node heads its chain iff its prev is the cell (not an
-	 * external predecessor).  Capture the head's cell + successor BEFORE the
-	 * unlink: a head promotion retargets the cell at the successor (done in
-	 * ft_unchain_node), and a key disappearance (no successor) frees the
-	 * cell after the removal commits (ret == 0).
+	 * external predecessor).  Capture the head's cell + successor before
+	 * the unlink:
+	 *
+	 *  - a head promotion retargets the cell at the successor (done in
+	 *    ft_unchain_node);
+	 *  - a key disappearance (no successor) frees the cell after the
+	 *    removal commits (ret == 0).
 	 */
 	/*
-	 * ONE load of node->prev, RESOLVED, and the successor through the hlist
-	 * resolver: nothing is held here, and a peer remove on the same chain
-	 * can have a flip proxy parked on either word (its promote records the
-	 * successor's prev; its member unlink records the successor's next and
-	 * the predecessor's next).  Two raw loads of prev could disagree with
-	 * each other and with the resolved holder derivation above -- and a raw
-	 * ft_ord_cell_ptr() of a parked proxy is a wild cell.  Resolved, each
-	 * value is the word before or after that peer's commit, never a
-	 * descriptor; a STALE-but-valid routing is what ft_unchain_node's
-	 * under-lock re-validation (ft_unchain_kind) catches and retries.
+	 * Load node->prev once, resolved, and load the successor through the
+	 * hlist resolver.  Nothing is held here.  A peer remove on the same
+	 * chain can have a flip proxy parked on either word:
+	 *
+	 *  - its promote records the successor's prev;
+	 *  - its member unlink records the successor's next and the
+	 *    predecessor's next.
+	 *
+	 * Two raw loads of prev could disagree with each other and with the
+	 * resolved holder derivation above.  A raw ft_ord_cell_ptr() of a
+	 * parked proxy is a wild cell.  Resolved, each value is the word
+	 * before or after that peer's commit, never a descriptor.  The routing
+	 * can still be stale but valid.  ft_unchain_node's under-lock
+	 * re-validation (ft_unchain_kind) catches that and retries.
 	 */
 	void *node_prev = ft_dereference_prev_resolved(node);
 	/*
-	 * ONE read of the successor, for BOTH decisions that depend on it:
-	 * the lane dispatch below (a head with a successor is promoted, one
-	 * without is pruned / cleared) and the fuse decision here (a key that
-	 * disappears takes its cell with it).  Read twice, at two instants,
-	 * the two disagreed under a same-key peer: a successor appended
-	 * between the reads sent a "sole entry" (@fuse_remove, unsplice txn
-	 * reserved) down the PROMOTE lane, which swapped the head's cell for
-	 * a fresh one -- and the two-commit tail then drove the unsplice of
-	 * the swapped-out cell forward forever (its expected-olds can never
-	 * match; measured as a memcg kill within seconds).  A successor
-	 * removed between the reads did the mirror image: a key pruned with
-	 * its cell left in the list (ft_verify "ord-cell list longer than
-	 * trie").  Staleness of this ONE read is what the lanes then catch:
-	 * the promote's under-lock re-validation (ft_unchain_kind) and the
-	 * sole-entry freeze's derived expected-old both retry the op.
+	 * Read the successor once, for both decisions that depend on it:
+	 *
+	 *  - the lane dispatch below: a head with a successor is promoted,
+	 *    one without is pruned / cleared;
+	 *  - the fuse decision here: a key that disappears takes its cell
+	 *    with it.
+	 *
+	 * Read twice, at two instants, the two disagreed under a same-key
+	 * peer:
+	 *
+	 *  - A successor was appended between the reads.  A "sole entry"
+	 *    (@fuse_remove, unsplice txn reserved) then went down the PROMOTE
+	 *    lane, which swapped the head's cell for a fresh one.  The
+	 *    two-commit tail then drove the unsplice of the swapped-out cell
+	 *    forward forever, because its expected-olds can never match.
+	 *    Measured as a memcg kill within seconds.
+	 *  - A successor was removed between the reads.  This is the mirror
+	 *    image: a key was pruned with its cell left in the list
+	 *    (ft_verify "ord-cell list longer than trie").
+	 *
+	 * The lanes then catch a stale value of this one read.  The promote's
+	 * under-lock re-validation (ft_unchain_kind) and the sole-entry
+	 * freeze's derived expected-old both retry the op.
 	 */
 	struct cds_ft_node *succ_node = ft_hlist_next_rcu(node);
 	bool cell_was_head = ft->ordered_list &&
@@ -8993,13 +10090,13 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	struct ft_remove_pub *pubp = fuse_remove ? &pub : NULL;
 	struct ft_ord_cell *fuse_cell = fuse_remove ? dead_cell : NULL;
 	/*
-	 * PRE-RESERVE the dead cell's standalone-unsplice txn here, in the
-	 * fallible prefix BEFORE any structural change: when the structural
-	 * commit cannot fuse the unsplice (a recompaction / external-promote
-	 * shape leaves pub unarmed), the unsplice runs AFTER that commit is
-	 * public -- un-abortable -- so its flip-txn must already be reserved.
-	 * On OOM here the removal aborts cleanly (key untouched).  The fused
-	 * common case frees it unused at the tail.
+	 * Pre-reserve the dead cell's standalone-unsplice txn here, in the
+	 * fallible prefix, before any structural change.  The structural
+	 * commit cannot always fuse the unsplice: a recompaction /
+	 * external-promote shape leaves pub unarmed.  The unsplice then runs
+	 * after that commit is public and cannot abort, so its flip-txn must
+	 * already be reserved.  On OOM here the removal aborts cleanly (key
+	 * untouched).  The fused common case frees the txn unused at the tail.
 	 */
 	struct ft_flip_txn *unsplice_txn = NULL;
 
@@ -9018,9 +10115,9 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		 * node->prev is a cds_ft_node: @node is a non-head duplicate.
 		 * Unlink it from its chain (ft_unchain_node relinks the pinned
 		 * predecessor/successor and tombstones @node).  The key count is
-		 * unchanged (other duplicates remain) and the chain head -- and
-		 * any grandparent skip pointer to it -- is untouched, so no head
-		 * slot is needed.
+		 * unchanged, because other duplicates remain.  The chain head
+		 * is untouched, and so is any grandparent skip pointer to it.
+		 * So no head slot is needed.
 		 */
 		ret = ft_unchain_node(ft, &lctx, NULL, 0, NULL, node,
 			FT_UNCHAIN_INTERIOR);
@@ -9086,13 +10183,13 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			 * free internal nodes.
 			 */
 			/*
-			 * NAME THE DERIVATION.  The freeze this detach fuses is
-			 * given a LITERAL length, so it never passes through
-			 * ft_hlist_chain_len and the tail-why classifier filed it
-			 * as "(unstamped)" -- a bucket that has to be reasoned
-			 * into a site instead of read off the table.  The literal
-			 * is derived HERE, from the @succ_node read above, so
-			 * stamp it here.
+			 * Name the derivation.  The freeze this detach fuses is
+			 * given a literal length, so it never passes through
+			 * ft_hlist_chain_len.  The tail-why classifier filed it
+			 * as "(unstamped)".  That bucket has to be reasoned
+			 * into a site.  It cannot be read off the table.  The
+			 * literal is derived here, from the @succ_node read
+			 * above, so stamp it here.
 			 */
 			FT_HLIST_WHY_STAMP();
 			ret = ft_detach_node(ft, &lctx, head_slot,
@@ -9107,11 +10204,16 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		} else {
 			/*
 			 * Removing the head, duplicates remain: key count unchanged.
-			 * ft_promote_head fuses the cn->child republish with the
-			 * grandparent SKIP_X dual (via _ft_publish_to_parent on cn's
-			 * plain flag) and the cell swap in ONE flip -- so a candidate
-			 * descent or ft_skip_reanchor up-walk never follows the stale
-			 * skip pointer into the about-to-be-freed old head.
+			 * ft_promote_head fuses three edges in one flip:
+			 *
+			 *  - the cn->child republish;
+			 *  - the grandparent SKIP_X dual (via
+			 *    _ft_publish_to_parent on cn's plain flag);
+			 *  - the cell swap.
+			 *
+			 * A candidate descent or an ft_skip_reanchor up-walk
+			 * then never follows the stale skip pointer into the
+			 * old head, which is about to be freed.
 			 */
 			ret = ft_unchain_node(ft, &lctx,
 				ft_compressed_node_flag(cn), holder_depth,
@@ -9137,18 +10239,20 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			bool last_fused = false, fused_declined = false;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			/*
-			 * Fuse the chain-compress prune INTO the key-removal
-			 * commit: when the holder is left a non-root 1-child
-			 * no-external internal, its SKIP_COMPRESSED canonical form
-			 * is a merged compressed node, so build that node and let
-			 * it REPLACE the holder -- subsuming the external_nodes ->
-			 * NULL clear -- carrying @dead_cell's unsplice in the SAME
-			 * flip.  No separate clear, no transient non-canonical
-			 * state.  Allocation failure aborts the whole removal (key
-			 * not removed, count rolled back, retriable MEMORY_ERROR).
-			 * The surviving body child is the holder's sole non-NIL
-			 * branch (the external entry being removed is not a body
-			 * child), stable across the removal.
+			 * Fuse the chain-compress prune into the key-removal
+			 * commit.  The holder may be left a non-root 1-child
+			 * no-external internal.  Its SKIP_COMPRESSED canonical
+			 * form is then a merged compressed node.  So build that
+			 * node and let it replace the holder.  This subsumes
+			 * the external_nodes -> NULL clear and carries
+			 * @dead_cell's unsplice in the same flip.  There is no
+			 * separate clear and no transient non-canonical state.
+			 * Allocation failure aborts the whole removal (key not
+			 * removed, count rolled back, retriable MEMORY_ERROR).
+			 * The surviving body child is the holder's sole
+			 * non-NIL branch, because the external entry being
+			 * removed is not a body child.  It is stable across the
+			 * removal.
 			 */
 			if (ft_group_skip_compressed(ft->group) &&
 			    ft_meta_nr_child(holder_meta) == 1 &&
@@ -9160,16 +10264,18 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				int cret;
 
 				/*
-				 * R3 chain-compress fold: the merged compressed node
-				 * replacing the collapsed 1-child holder is built with the
-				 * retired key's -1 and records the ancestor -1 walk into its
-				 * OWN commit (count_delta -1), so no pre-decrement here.
+				 * R3 chain-compress fold.  The merged
+				 * compressed node replaces the collapsed
+				 * 1-child holder.  It is built with the retired
+				 * key's -1.  It records the ancestor -1 walk
+				 * into its own commit (count_delta -1).  So
+				 * there is no pre-decrement here.
 				 */
 				/*
-				 * INTENT: no body child is detached -- the entry
-				 * being removed is the EXTERNAL one, and this arm
-				 * is the one whose branch condition established
-				 * that the head IS @node.  So @node is what the
+				 * INTENT: no body child is detached.  The entry
+				 * being removed is the external one.  The
+				 * branch condition of this arm established
+				 * that the head is @node.  So @node is what the
 				 * callee must still find under the mark.
 				 */
 				const struct ft_chain_compress_intent intent = {
@@ -9179,21 +10285,27 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				};
 
 				/*
-				 * NO SURVIVOR MEANS A PEER MOVED IT.  The count and
-				 * the scan above are two UNLOCKED reads, and the scan
-				 * reads the body one slot at a time.  With the in-place
-				 * tiers a peer can refill a hole below the child and
-				 * remove the child between two of those slot reads: each
-				 * slot reads empty although the count was right and a
-				 * child existed at every instant (measured, ft_inv 154:
-				 * holder {97 hole, 98 live} -> {97 live, 98 hole}, the
-				 * collapse's `surviving_child` assert).  At rest a count
-				 * of one IS one non-NULL slot, and a child that stays
-				 * put is always found, so a NULL here proves a peer
-				 * committed on the holder since the count was read.
-				 * Re-plan, as the non-fused arm's under-lock re-check
-				 * below does: the collapse re-validates under its locks,
-				 * but it needs a survivor to name.
+				 * No survivor means a peer moved it.  The count
+				 * and the scan above are two unlocked reads,
+				 * and the scan reads the body one slot at a
+				 * time.  With the in-place tiers, a peer can
+				 * refill a hole below the child and remove the
+				 * child between two of those slot reads.  Each
+				 * slot then reads empty, although the count was
+				 * right and a child existed at every instant.
+				 * Measured in ft_inv 154: the holder went from
+				 * {97 hole, 98 live} to {97 live, 98 hole}.
+				 * This tripped the collapse's `surviving_child`
+				 * assert.
+				 *
+				 * At rest a count of one is one non-NULL slot,
+				 * and a child that stays put is always found.
+				 * So a NULL here proves that a peer committed
+				 * on the holder since the count was read.
+				 * Re-plan, as the non-fused arm's under-lock
+				 * re-check below does.  The collapse
+				 * re-validates under its locks, but it needs a
+				 * survivor to name.
 				 */
 				if (caa_unlikely(!s_child))
 					cret = -EAGAIN;
@@ -9231,34 +10343,48 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 #endif
 			if (!last_fused) {
 				/*
-				 * Non-fused: clear external_nodes -> NULL on its own.
-				 * When the ordered list is on (fuse_remove), commit
-				 * that store together with @dead_cell's unsplice in
-				 * ONE flip (a reader never sees the key gone from the
-				 * structural index but present in the ordered list;
-				 * readers resolve a parked proxy on external_nodes via
-				 * ft_dereference_external).  @pub.armed tells the
-				 * deferred-free block below the unsplice happened.
+				 * Non-fused: clear external_nodes -> NULL on
+				 * its own.  When the ordered list is on
+				 * (fuse_remove), commit that store together
+				 * with @dead_cell's unsplice in one flip.  A
+				 * reader then never sees the key gone from the
+				 * structural index but present in the ordered
+				 * list.  Readers resolve a parked proxy on
+				 * external_nodes via ft_dereference_external.
+				 * @pub.armed tells the deferred-free block
+				 * below that the unsplice happened.
 				 */
 				/*
-				 * Fold the prefix key's -1 onto the clear: the holder
-				 * stays in place (keeps its children), so its -1 is the
-				 * holder->root walk -- a multi-edge R1.  Take a caller-
-				 * reserved bounded txn whenever the count must ride
-				 * (ordered_list || rank_stats), record the walk from
-				 * holder_flag, and let ft_remove_one_commit flip the
-				 * external_nodes -> NULL clear, @dead_cell's unsplice
-				 * (list on) and @node's freeze (freeze_leaf) and the
-				 * count edges TOGETHER (ft_ord_cell_flip_into,
-				 * infallible): a reader never sees the key gone from one
-				 * index but present in another, nor a count out of step
-				 * with the structure (parked proxies resolve via
-				 * ft_dereference_external / nr_keys via ft_nr_keys_load).
-				 * No pre-decrement, no OOM rollback -- the pre-reserved
-				 * txn commits infallibly, the only abort is the arm
-				 * (which frees the pre-reserved unsplice txn and leaves
-				 * the key in place).  List off + rank stats off: the
-				 * infallible lone ft_unchain_node store, unchanged.
+				 * Fold the prefix key's -1 onto the clear.  The
+				 * holder stays in place and keeps its children,
+				 * so its -1 is the holder->root walk: a
+				 * multi-edge R1.
+				 *
+				 * Whenever the count must ride (ordered_list ||
+				 * rank_stats), take a caller-reserved bounded
+				 * txn and record the walk from holder_flag.
+				 * Then let ft_remove_one_commit flip these
+				 * together (ft_ord_cell_flip_into, infallible):
+				 *
+				 *  - the external_nodes -> NULL clear;
+				 *  - @dead_cell's unsplice (list on);
+				 *  - @node's freeze (freeze_leaf);
+				 *  - the count edges.
+				 *
+				 * A reader then never sees the key gone from
+				 * one index but present in another, nor a count
+				 * out of step with the structure.  Parked
+				 * proxies resolve via ft_dereference_external,
+				 * and nr_keys via ft_nr_keys_load.
+				 *
+				 * There is no pre-decrement and no OOM
+				 * rollback.  The pre-reserved txn commits
+				 * infallibly.  The only abort is the arm, which
+				 * frees the pre-reserved unsplice txn and
+				 * leaves the key in place.
+				 *
+				 * List off + rank stats off: the infallible
+				 * lone ft_unchain_node store, unchanged.
 				 */
 				if (ft->ordered_list || ft->rank_stats) {
 					struct ft_flip_txn *txn = ft_flip_txn_create_bounded(ft,
@@ -9279,13 +10405,18 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 					holder_flag, holder_depth);
 #ifndef FT_DEBUG_RM_PREFIX_MISS_CARRIES_ON
 					/*
-					 * A MISSED TAKE ENDS THE ATTEMPT HERE.  Carrying on
-					 * recorded the count walk, took @dead_cell's lock-set
-					 * and built the unsplice and freeze edges into a txn
-					 * ft_flip_txn_commit can only discard -- 9 records per
-					 * miss, 21-43k misses per ft_inv leg.  Run that discard
-					 * now: the same call ft_ord_cell_flip_into ends in, so
-					 * the same aging, the same errno and the same exit.
+					 * A missed take ends the attempt here.
+					 * Carrying on recorded the count walk
+					 * and took @dead_cell's lock-set.  It
+					 * also built the unsplice and freeze
+					 * edges.  ft_flip_txn_commit can only
+					 * discard that txn.  The cost was 9
+					 * records per miss, 21-43k misses per
+					 * ft_inv leg.  Run that discard now.
+					 * It is the same call
+					 * ft_ord_cell_flip_into ends in, so
+					 * the aging, the errno and the exit
+					 * are the same.
 					 */
 					if (caa_unlikely(txn->acquire_miss)) {
 						ret = ft_flip_status_to_errno(
@@ -9294,19 +10425,26 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 #endif
 #if defined(FEATURE_FT_SKIP_COMPRESSED) && !defined(FT_DEBUG_PREFIX_CLEAR_RESIDUE)
 					/*
-					 * THE COLLAPSE THE PLAN DID NOT SEE.  The fused arm
-					 * above is chosen from an UNHELD nr_child: this plan
-					 * saw a second child, so a plain clear would leave a
-					 * legal keyless node with two.  A peer that removed that
-					 * second child before our take changes the answer:
-					 * clearing the last external of a 1-child node leaves
-					 * the 1-child keyless internal cds_ft_verify refuses in
-					 * skip mode, and the post-prune below is a separate
-					 * flip that loses under contention -- the
-					 * residue a later remove beneath it livelocks on
-					 * (exponential spacing, owned-key row).  Under the
-					 * holder's lock nr_child is exact: re-plan, and the
-					 * next attempt takes the fused collapse.
+					 * The collapse the plan did not see.
+					 * The fused arm above is chosen from
+					 * an unheld nr_child.  This plan saw a
+					 * second child, so a plain clear would
+					 * leave a legal keyless node with two.
+					 * A peer that removed that second
+					 * child before our take changes the
+					 * answer.  Clearing the last external
+					 * of a 1-child node leaves a 1-child
+					 * keyless internal, which
+					 * cds_ft_verify refuses in skip mode.
+					 * The post-prune below is a separate
+					 * flip that loses under contention.
+					 * That leaves the residue on which a
+					 * later remove beneath it livelocks
+					 * (exponential spacing, owned-key
+					 * row).  Under the holder's lock
+					 * nr_child is exact.  Re-plan, and the
+					 * next attempt takes the fused
+					 * collapse.
 					 */
 					if (!fused_declined &&
 					    ft_group_skip_compressed(ft->group) &&
@@ -9339,11 +10477,12 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				}
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 				/*
-				 * Out-of-bound residue (the merge above did not apply
-				 * because merged_len exceeds the compressed bound):
-				 * best-effort post-prune via the standalone second
-				 * flip, leaving a 1-child internal if it still cannot
-				 * merge.  Only on a successful unlink.
+				 * Out-of-bound residue: the merge above did not
+				 * apply because merged_len exceeds the
+				 * compressed bound.  Post-prune it,
+				 * best-effort, via the standalone second flip.
+				 * This leaves a 1-child internal if it still
+				 * cannot merge.  Only on a successful unlink.
 				 */
 				if (ret == 0 && ft_group_skip_compressed(ft->group) &&
 				    !holder_meta->external_nodes &&
@@ -9427,12 +10566,13 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	}
 
 	/*
-	 * Head with no successor: the key disappeared, so its cell is unspliced
-	 * from the ordered list (when enabled) and freed (deferred, for parked
-	 * up-walkers).  A promotion (cell_succ) keeps the cell in place -- same
-	 * key, only cell->node retargeted in ft_unchain_node -- so no list op.
-	 * An in-place leaf detach already fused the unsplice into its structural
-	 * flip (pub.armed); only the deferred cell free remains here.
+	 * Head with no successor: the key disappeared.  Its cell is unspliced
+	 * from the ordered list (when enabled) and freed.  The free is
+	 * deferred, for parked up-walkers.  A promotion (cell_succ) keeps the
+	 * cell in place: the key is the same, and only cell->node is
+	 * retargeted in ft_unchain_node.  So there is no list op.  An in-place
+	 * leaf detach already fused the unsplice into its structural flip
+	 * (pub.armed).  Only the deferred cell free remains here.
 	 */
 	if (fuse_remove) {
 		/* cell_was_head implies ordered_list, so the list op always runs. */
@@ -9442,15 +10582,15 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			 * txn pre-reserved before the structural change. */
 			if (!pub.armed) {
 				/*
-				 * Two-commit fallback: the structural commit is
-				 * PUBLIC, so this unsplice must complete -- on a
-				 * peer conflict DRIVE IT FORWARD (each ABORT
-				 * means a peer committed: obstruction-free), and
-				 * retry the small bounded re-reservation too
-				 * (the aborted commit consumed the txn); backing
-				 * out would leave the key gone from the
+				 * Two-commit fallback.  The structural commit
+				 * is public, so this unsplice must complete.
+				 * Backing out would leave the key gone from the
 				 * structural index but present in the ordered
-				 * list.
+				 * list.  On a peer conflict, drive it forward:
+				 * each ABORT means a peer committed
+				 * (obstruction-free).  Retry the small bounded
+				 * re-reservation too, because the aborted
+				 * commit consumed the txn.
 				 */
 				while (ft_ord_cell_unsplice(ft, unsplice_txn,
 						dead_cell) > 0) {
@@ -9472,16 +10612,17 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	}
 
 	/*
-	 * -ENOENT (detach's replace reached an emptied FT_NULL slot, or the
-	 * unchain found the node already gone) is NOT a bug under Phase 4.3
-	 * concurrent writers: the position was derived by a NON-exclusive
-	 * traversal, so a peer's recompaction can retype/empty the cached parent
-	 * slot between the derivation and the replace.  That path publishes
-	 * nothing and destroys every pre-reserved txn (see end:), so it is a
-	 * clean abort -- routed to the retry loop below exactly like -EAGAIN
-	 * (re-derive the position from node->prev against the current tree).
-	 * (Under single-writer exclusion the found-implies-replaceable invariant
-	 * still holds, so -ENOENT does not arise there.)
+	 * -ENOENT is not a bug under Phase 4.3 concurrent writers.  It means
+	 * that detach's replace reached an emptied FT_NULL slot, or that the
+	 * unchain found the node already gone.  The position was derived by a
+	 * non-exclusive traversal.  A peer's recompaction can therefore retype
+	 * or empty the cached parent slot between the derivation and the
+	 * replace.  That path publishes nothing and destroys every
+	 * pre-reserved txn (see end:), so it is a clean abort.  It is routed
+	 * to the retry loop below exactly like -EAGAIN: re-derive the position
+	 * from node->prev against the current tree.  Under single-writer
+	 * exclusion the found-implies-replaceable invariant still holds, so
+	 * -ENOENT does not arise there.
 	 */
 
 	/*
@@ -9504,11 +10645,11 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	case -ESTALE:
 		/*
-		 * @node's CHAIN left the trie (a whole-chain displacement
-		 * freezes only its head), established UNDER THE HOLDER by
-		 * ft_unchain_node.  Definitive, so it answers NOT_FOUND rather
-		 * than joining the retry cases below: re-deriving would find the
-		 * same retired chain every lap.
+		 * @node's chain left the trie (a whole-chain displacement
+		 * freezes only its head).  ft_unchain_node established this
+		 * under the holder.  It is definitive, so it answers NOT_FOUND
+		 * and does not join the retry cases below.  Re-deriving would
+		 * find the same retired chain every lap.
 		 */
 		FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 #if defined(FT_ENABLE_TRACING) || defined(FT_DEBUG_RM_SITE)
@@ -9519,22 +10660,26 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	case -EAGAIN:
 	case -ENOENT:
 		/*
-		 * A peer writer won a commit this attempt (ABORT), or moved /
-		 * recompaction-retyped the position pre-commit (-ENOENT: the
-		 * cached slot emptied to FT_NULL, or the node was already
-		 * unchained): NOTHING was published and every fused edge
-		 * (freeze, count, tombstone) was discarded with it.  Signal the
-		 * wrapper's retry loop to re-derive and re-attempt.
+		 * Two cases end here:
+		 *
+		 *  - a peer writer won a commit this attempt (ABORT);
+		 *  - a peer moved / recompaction-retyped the position
+		 *    pre-commit (-ENOENT: the cached slot emptied to FT_NULL,
+		 *    or the node was already unchained).
+		 *
+		 * Nothing was published.  Every fused edge (freeze, count,
+		 * tombstone) was discarded with it.  Signal the wrapper's retry
+		 * loop to re-derive and re-attempt.
 		 */
 		FT_DBG_RETRY_SITE();
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
 		/*
-		 * ★ WHICH of the two.  The exit fuses -EAGAIN (a peer won a
+		 * ★ Which of the two.  The exit fuses -EAGAIN (a peer won a
 		 * commit, or a lock acquire refused) with -ENOENT (the derived
 		 * position emptied / retyped pre-commit).  They have different
-		 * cures -- one is contention, the other a derivation that can be
-		 * STABLY dead -- so a livelock here is undiagnosable until they
-		 * are counted apart.
+		 * cures: one is contention, the other is a derivation that can
+		 * be stably dead.  A livelock here cannot be diagnosed until
+		 * they are counted apart.
 		 */
 		if (ret == -EAGAIN)
 			ft_dbg_rm_eagain++;
@@ -9560,16 +10705,16 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
  * in nanoseconds.  0 compiles them out entirely, leaving only the RETRY CAP's
  * livelock abort.
  *
- * This knob exists because the two existing modes cannot express what a GATE
- * LEG needs.  The gate arms this detector for ONE reason: a remove LIVELOCK
- * must abort loudly instead of expiring as a timeout, because rc=124 cannot be
- * told apart from CPU contention on a box running 25 legs at once.  It does not
- * want the per-op tail data.  And -DFT_REMOVE_TAIL_QUIET cannot silence that
- * data: it deliberately keeps the >1ms metric, which is the metric D.3's A/B
- * measured (doc/design/mw-to-fine-locking-remainder.md §D.3 -- the milestone
- * dump is what biases a control arm, not this).  MEASURED on the imw leg of
- * this very config: 9,799 SLOW pairs and 1.9 MB of stderr in the first 30 s,
- * which drowns the TAP stream the gate greps for its verdict.
+ * This knob exists because the two existing modes cannot express what a gate
+ * leg needs.  The gate arms this detector for one reason: a remove livelock
+ * must abort loudly and not expire as a timeout.  On a box running 25 legs at
+ * once, rc=124 cannot be told apart from CPU contention.  The gate does not
+ * want the per-op tail data.  -DFT_REMOVE_TAIL_QUIET cannot silence that
+ * data.  It deliberately keeps the >1ms metric.  That is the metric D.3's A/B
+ * measured.  doc/design/mw-to-fine-locking-remainder.md §D.3 says that the
+ * milestone dump biases a control arm, not this metric.  Measured on the imw
+ * leg of this very config: 9,799 SLOW pairs and 1.9 MB of stderr in the
+ * first 30 s.  That drowns the TAP stream the gate greps for its verdict.
  *
  * Default 1 ms, i.e. byte-identical to what every existing user compiled.
  */
@@ -9620,26 +10765,30 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			return s;
 	}
 	/*
-	 * FT-owned per-op read-side bracket + retry identity (doc §11): on a
-	 * concurrent trie the body's position derivation, parked records, and
-	 * internal commits must run inside a read-side section so a peer
-	 * writer's call_rcu-deferred frees cannot reclaim under them; a
-	 * caller-held section merely nests.  @node's liveness AT ENTRY remains
-	 * the caller's obligation (a lookup reference, valid only under the
-	 * caller's own section -- the §11 reference-lifetime contract).
+	 * FT-owned per-op read-side bracket + retry identity (doc §11).
 	 *
-	 * RETRY: a peer-conflict attempt (a commit ABORT, or a pre-commit
-	 * position conflict) publishes nothing and signals @need_retry; the
-	 * loop re-derives the position from node->prev against the current
-	 * tree and re-attempts.  The op's internal txns are still standalone
-	 * (the pre-reserved unsplice txn coexists with the main commit txn, so
-	 * they cannot share one handle), so contention aging is carried
-	 * manually on the PERSISTENT @optxn via ft_op_conflict: after
-	 * its lane budget of conflicts this writer escalates into
-	 * the per-trie FIFO fair-mutex lane -- every writer's begin() honors
-	 * domain->active, so the lane drains the contention and the retry
-	 * terminates (no livelock).  Exclusive trie: the bracket opens nothing
-	 * and no conflict ever fires.
+	 * On a concurrent trie, the body's position derivation, parked records
+	 * and internal commits must run inside a read-side section.  A peer
+	 * writer's call_rcu-deferred frees then cannot reclaim under them.  A
+	 * caller-held section merely nests.  @node's liveness at entry remains
+	 * the caller's obligation.  It is a lookup reference, valid only under
+	 * the caller's own section (the §11 reference-lifetime contract).
+	 *
+	 * RETRY: a peer-conflict attempt is a commit ABORT or a pre-commit
+	 * position conflict.  It publishes nothing and signals @need_retry.
+	 * The loop re-derives the position from node->prev against the current
+	 * tree and re-attempts.
+	 *
+	 * The op's internal txns are still standalone.  The pre-reserved
+	 * unsplice txn coexists with the main commit txn, so they cannot share
+	 * one handle.  Contention aging is therefore carried manually on the
+	 * persistent @optxn via ft_op_conflict.  After its lane budget of
+	 * conflicts, this writer escalates into the per-trie FIFO fair-mutex
+	 * lane.  Every writer's begin() honors domain->active, so the lane
+	 * drains the contention and the retry terminates (no livelock).
+	 *
+	 * Exclusive trie: the bracket opens nothing and no conflict ever
+	 * fires.
 	 */
 	FT_SH_STALL_DECL;
 
@@ -9690,9 +10839,9 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				ft_dbg_rm_enoent);
 #ifdef FT_ENABLE_TRACING
 			/*
-			 * The traced build's milestone IS the violation: emit
-			 * the self-diagnosing event, persist the ring, crash
-			 * before the window scrolls out.
+			 * The traced build's milestone is the violation.  Emit
+			 * the self-diagnosing event, persist the ring, and
+			 * crash before the window scrolls out.
 			 */
 			if (ft_remove_attempts == 100 && ft_dbg_last_refused) {
 				const struct cds_ft_metadata *m =
@@ -9798,13 +10947,13 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		uint64_t wall = ft_dbg_now_ns() - ft_remove_t0;
 
 		/*
-		 * ☞ BUSY IS NOT SLOW, and only one of them was reported.
-		 * This block fires on WALL TIME, so a remove that retried two
-		 * thousand times CHEAPLY never printed: the run that measured
-		 * max-retry 38,244 produced exactly ONE "SLOW" line, and it had
-		 * attempts=0 -- a grace-period wait, not a retry storm.  Fire on
-		 * the attempt count too, which is the axis the retry question is
-		 * actually asked on.
+		 * ☞ Busy is not slow, and only one of them was reported.
+		 * This block fires on wall time, so a remove that retried two
+		 * thousand times cheaply never printed.  The run that measured
+		 * max-retry 38,244 produced exactly one "SLOW" line.  That
+		 * line had attempts=0: a grace-period wait, not a retry storm.
+		 * Fire on the attempt count too.  The retry question is asked
+		 * on that axis.
 		 */
 		if (FT_REMOVE_BUSY_ATTEMPTS &&
 				caa_unlikely(ft_remove_attempts >
@@ -9859,18 +11008,24 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
  * ft_locate_chain_head: derive an external chain head's position with no
  * descent, from the head itself (head->prev is its holder) and the key.
  *
- * Sets *holder_flag_p (the head's internal/compressed holder), *is_prefix_p
- * (true when the chain hangs off the holder's external_nodes -- a prefix key --
- * rather than a body/compressed child slot), and, for the non-prefix case,
- * *head_slot_p (the holder slot that holds @head: &cn->child for a compressed
- * holder, or the body slot for the key's last byte for an internal holder).
+ * Set these outputs:
+ * - *holder_flag_p: the head's internal/compressed holder.
+ * - *is_prefix_p: true when the chain hangs off the holder's external_nodes
+ *   (a prefix key).  False when it hangs off a body/compressed child slot.
+ * - *head_slot_p, for the non-prefix case: the holder slot that holds @head.
+ *   This is &cn->child for a compressed holder.  For an internal holder it
+ *   is the body slot for the key's last byte.
  *
- * Returns true iff @head is the live chain head at that position (so a cached
- * iter->node is still current under the writer mutex): the prefix case is
- * validated by holder->external_nodes == head; the leaf case by *head_slot ==
- * head.  Returns false when @head is a non-head duplicate, has no holder, or
- * the holder no longer points at it (stale cache) -- the caller then re-seeds
- * via a fresh lookup.
+ * Return true iff @head is the live chain head at that position.  A cached
+ * iter->node is then still current under the writer mutex.  The prefix case
+ * is validated by holder->external_nodes == head.  The leaf case is
+ * validated by *head_slot == head.
+ *
+ * Return false in these cases:
+ * - @head is a non-head duplicate;
+ * - @head has no holder;
+ * - the holder no longer points at @head (stale cache).
+ * The caller then re-seeds via a fresh lookup.
  */
 static
 bool ft_locate_chain_head(struct cds_ft *ft, struct cds_ft_node *head,
@@ -9908,22 +11063,24 @@ bool ft_locate_chain_head(struct cds_ft *ft, struct cds_ft_node *head,
 			return false;
 	}
 	/*
-	 * /!\ RESOLVE BEFORE COMPARING.  A peer writer's committed-but-unsettled
-	 * txn parks a flip proxy in this very slot, and ft_node_ptr's contract is
-	 * a RESOLVED pointer -- it asserts on a parked one under
-	 * -DFT_DEBUG_PROXY_ASSERT, which is how this was found (9 legs of a gate
-	 * run, deterministically at the same test).
+	 * /!\ RESOLVE BEFORE COMPARING.  A peer writer's txn that is committed
+	 * but not settled parks a flip proxy in this very slot.  ft_node_ptr's
+	 * contract is a RESOLVED pointer.  It asserts on a parked one under
+	 * -DFT_DEBUG_PROXY_ASSERT.  That is how this was found: on 9 legs of a
+	 * gate run, deterministically at the same test.
 	 *
-	 * Read RAW, the mask lands on a DESCRIPTOR, the compare fails, and this
-	 * answers "not the live head" for a head that IS live.  The first caller
-	 * absorbs that as a stale cache and re-seeds, but the second asks again
-	 * AFTER a fresh lookup has already found the node, and turns a false here
-	 * into CDS_FT_STATUS_NOT_FOUND -- a wrong answer for a key that is
-	 * present, and one the oracles cannot see, because a concurrent
-	 * remove_all lane legitimately reports NOT_FOUND too.
+	 * Read RAW, the mask lands on a DESCRIPTOR and the compare fails.  This
+	 * function then answers "not the live head" for a head that IS live.
+	 * The two callers handle that answer differently:
+	 * - The first absorbs it as a stale cache and re-seeds.
+	 * - The second asks again AFTER a fresh lookup has already found the
+	 *   node.  It turns a false here into CDS_FT_STATUS_NOT_FOUND.
+	 * That is a wrong answer for a key that is present.  The oracles cannot
+	 * see it, because a concurrent remove_all lane legitimately reports
+	 * NOT_FOUND too.
 	 *
-	 * A refusal is a claim about the trie; it must not be decided by a word
-	 * that merely happened to be in flight.
+	 * A refusal is a claim about the trie.  A word that merely happened to
+	 * be in flight must not decide it.
 	 */
 	return (struct cds_ft_node *) ft_node_ptr(
 			ft_resolve_flip_proxy(**head_slot_p)) == head;
@@ -9992,19 +11149,24 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		 * (doc/design/ft-lockset-inventory.md §1, row 2).
 		 *
 		 * Both commits below clear the ROOT's @external_nodes and freeze
-		 * the chain it heads, and until now they did it holding nothing
-		 * -- ~58k commits per ft_inv run, at every spacing.  The root is
-		 * the word's owner and, at depth 0, its own anchor under every
-		 * spacing, so this is one acquire with no descent.  It is
-		 * registered in @root_txn with its release, which the commit
-		 * consumes and an early destroy releases.
+		 * the chain it heads.  Until now they did it holding nothing.
+		 * That was ~58k commits per ft_inv run, at every spacing.
 		 *
-		 * Derive, acquire, RE-VALIDATE, bail retriably: a root replaced
-		 * in between (graft_swap, a root recompaction) refuses the
-		 * acquire or fails the identity check, and a chain grown or
-		 * cleared in between fails the head / length check.  Both are
-		 * the retry the callers below already take on an aborted flip.
-		 * An exclusive or COARSE trie has no per-node peer to exclude.
+		 * The root is the word's owner.  At depth 0 it is also its own
+		 * anchor under every spacing.  So this is one acquire with no
+		 * descent.  It is registered in @root_txn with its release.
+		 * The commit consumes that release, and an early destroy
+		 * releases it.
+		 *
+		 * The steps are: derive, acquire, RE-VALIDATE, bail retriably.
+		 * Two things can change in between:
+		 * - The root is replaced (graft_swap, a root recompaction).
+		 *   This refuses the acquire or fails the identity check.
+		 * - The chain grows or is cleared.  This fails the head /
+		 *   length check.
+		 * Both are the retry the callers below already take on an
+		 * aborted flip.  An exclusive or COARSE trie has no per-node
+		 * peer to exclude.
 		 */
 		root_txn = ft_flip_txn_create_bounded(ft,
 			FT_REMOVE_COMMIT_REC_MAX_EDGES +
@@ -10048,22 +11210,27 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		*result_node = external_nodes;
 		/*
 		 * Ordered list on: the NIL key is the global minimum (a prefix of
-		 * every key), so its removal is the prefix-with-siblings clear at
-		 * the root.  Fuse the root external_nodes -> NULL store with the head
-		 * cell's unsplice AND the root nr_keys -1 (rank stats) in ONE flip so
-		 * a reader never sees the key gone from one index but present in the
-		 * other, nor a count out of step with the structure; readers resolve
-		 * a parked proxy on external_nodes via ft_dereference_external and on
-		 * nr_keys via ft_nr_keys_load.  List off, no rank stats: express the
-		 * node -> NULL clear as a lone 1-edge flip (an infallible release
-		 * store) rather than a bare store.
+		 * every key).  So its removal is the prefix-with-siblings clear
+		 * at the root.  Fuse these in ONE flip:
+		 * - the root external_nodes -> NULL store;
+		 * - the head cell's unsplice;
+		 * - the root nr_keys -1 (rank stats).
+		 * A reader then never sees the key gone from one index but
+		 * present in the other.  It never sees a count out of step with
+		 * the structure either.  Readers resolve a parked proxy on
+		 * external_nodes via ft_dereference_external, and on nr_keys
+		 * via ft_nr_keys_load.
+		 *
+		 * List off, no rank stats: express the node -> NULL clear as a
+		 * lone 1-edge flip (an infallible release store) rather than a
+		 * bare store.
 		 */
 		if (ft->ordered_list || ft->rank_stats) {
 			/*
-			 * Read under the root's lock, after the re-check above,
-			 * so this prev is settled (every producer of a parked
-			 * head prev holds the chain holder); resolved anyway, as
-			 * the plan-time read below must be.
+			 * This prev is read under the root's lock, after the
+			 * re-check above.  So it is settled: every producer of
+			 * a parked head prev holds the chain holder.  It is
+			 * resolved anyway, as the plan-time read below must be.
 			 */
 			struct ft_ord_cell *dead = ft->ordered_list ?
 				ft_ord_cell_ptr(ft_dereference_prev_resolved(
@@ -10071,54 +11238,61 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			struct ft_flip_txn *txn = root_txn;
 
 			/*
-			 * R1 count fold: the NIL key lives at the root, so its -1 is a
-			 * single edge on the root's own nr_keys (no ancestors).  Reserve
-			 * it plus the structural + cell edges, record the count walk from
-			 * the root, and let ft_remove_one_commit flip them together --
-			 * exact and atomic (the decrement goes live WITH the detach, not
-			 * before it), so no pre-decrement and no OOM rollback: the pre-
-			 * reserved txn commits infallibly and the arm is the only abort.
-			 * A no-op count record when rank stats are off (list-on path).
+			 * R1 count fold: the NIL key lives at the root.  So its
+			 * -1 is a single edge on the root's own nr_keys (no
+			 * ancestors).  Reserve it plus the structural + cell
+			 * edges.  Record the count walk from the root.  Then
+			 * let ft_remove_one_commit flip them together.
+			 *
+			 * This is exact and atomic: the decrement goes live
+			 * WITH the detach, not before it.  So there is no
+			 * pre-decrement and no OOM rollback.  The pre-reserved
+			 * txn commits infallibly and the arm is the only abort.
+			 * The count record is a no-op when rank stats are off
+			 * (list-on path).
 			 */
 			ft_flip_txn_record_count_parent(ft, txn, ft->root, -1);
 			/*
 			 * ☑ AND THE CHAIN'S FREEZE RIDES THIS FLIP, like the
 			 * leaf and prefix arms.  It used to be a post-commit
-			 * ft_ra_sweep_held, whose acquire is gated on
-			 * `lock_spacing == PER_NODE` -- so above per-node it
-			 * never fired and the marks were bare CASes holding
+			 * ft_ra_sweep_held.  The acquire of that sweep is gated
+			 * on `lock_spacing == PER_NODE`.  So above per-node it
+			 * never fired, and the marks were bare CASes holding
 			 * NOTHING.  MEASURED: UNHELD=1 at exponential AND
 			 * root-only on inv_remove_cross_view_prefix_siblings_all,
-			 * 0 at per-node.  Folding it in is spacing-INDEPENDENT,
-			 * which is why it is the cure rather than widening the
-			 * acquire.
+			 * 0 at per-node.  Folding the freeze in is
+			 * spacing-INDEPENDENT.  That is why it is the cure, and
+			 * widening the acquire is not.
 			 */
 			ft_ch_audit(ft, txn, external_nodes);
 			/*
-			 * The plan IS validated under the lock here already --
-			 * the root acquire above re-reads it and bails retriably
-			 * (doc §1 row 2), which is this class's prescribed shape.
+			 * The plan IS already validated under the lock here.
+			 * The root acquire above re-reads it and bails
+			 * retriably (doc §1 row 2).  That is the shape
+			 * prescribed for this class.
 			 */
 			ft_hlist_freeze_chain_prepare_checked(ft,
 				ft_flip_txn_handle(txn),
 				external_nodes, nr_frozen);
 			/*
-			 * Same rule as the prefix clear below: the pre-reserved
-			 * txn cannot fail to ALLOCATE, but the flip can still
-			 * ABORT, and an aborted flip left the NIL key in the
-			 * trie.  Returning OK there hands the caller a chain it
-			 * may reclaim while the root still points at it -- and
+			 * Same rule as the prefix clear below.  The
+			 * pre-reserved txn cannot fail to ALLOCATE, but the
+			 * flip can still ABORT.  An aborted flip left the NIL
+			 * key in the trie.
+			 * Returning OK there hands the caller a chain it may
+			 * reclaim while the root still points at it.  It also
 			 * frees @dead while it is still spliced into the list.
 			 */
 			/*
-			 * PRE-RESERVED => the commit cannot fail to allocate,
-			 * so its only non-zero is -EAGAIN: a peer won this
-			 * flip and NOTHING was installed (the fused cell and
-			 * count edges were discarded with it).  Reporting that
-			 * as MEMORY_ERROR sent the caller freeing memory over a
-			 * lock it merely lost; it is the NIL key's copy of the
-			 * mislabel the tail below fixed for every other shape.
-			 * Retriable: re-read external_nodes and re-attempt.
+			 * PRE-RESERVED => the commit cannot fail to allocate.
+			 * So its only non-zero status is -EAGAIN: a peer won
+			 * this flip and NOTHING was installed.  The fused cell
+			 * and count edges were discarded with it.  Reporting
+			 * that as MEMORY_ERROR sent the caller freeing memory
+			 * over a lock it merely lost.  It is the NIL key's copy
+			 * of the mislabel that the tail below fixed for every
+			 * other shape.  It is retriable: re-read external_nodes
+			 * and re-attempt.
 			 */
 			if (ft_remove_one_commit(ft,
 					(struct cds_ft_inode_flag **) &metadata->external_nodes,
@@ -10135,20 +11309,21 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		} else {
 			/*
 			 * List off AND rank off.  This was a bare lone flip with
-			 * the tombstones swept afterwards; the sweep could not
-			 * hold anything above per-node (above), so take a
-			 * pre-reserved bounded txn here too and commit the clear
-			 * WITH the chain's marks -- the same shape the prefix
-			 * clear uses for exactly this reason ("no bare lone
+			 * the tombstones swept afterwards.  The sweep could not
+			 * hold anything above per-node (see above).  So take a
+			 * pre-reserved bounded txn here too, and commit the
+			 * clear WITH the chain's marks.  The prefix clear uses
+			 * the same shape for exactly this reason ("no bare lone
 			 * clear even with both flags off").
 			 */
 			struct ft_flip_txn *txn = root_txn;
 
 			ft_ch_audit(ft, txn, external_nodes);
 			/*
-			 * The plan IS validated under the lock here already --
-			 * the root acquire above re-reads it and bails retriably
-			 * (doc §1 row 2), which is this class's prescribed shape.
+			 * The plan IS already validated under the lock here.
+			 * The root acquire above re-reads it and bails
+			 * retriably (doc §1 row 2).  That is the shape
+			 * prescribed for this class.
 			 */
 			ft_hlist_freeze_chain_prepare_checked(ft,
 				ft_flip_txn_handle(txn),
@@ -10176,10 +11351,11 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 
 	/*
 	 * No top-down descent: anchor on the cached chain head (iter->node)
-	 * under the writer mutex.  If it is still the live head at iter->key
-	 * (ft_locate_chain_head validates *head_slot == iter->node), use it;
-	 * otherwise re-seed via a fresh exact lookup (the standard positioning
-	 * descent, NOT a remove-specific re-descent) and locate from there.
+	 * under the writer mutex.  Use it if it is still the live head at
+	 * iter->key: ft_locate_chain_head validates *head_slot == iter->node.
+	 * Otherwise re-seed via a fresh exact lookup and locate from there.
+	 * That lookup is the standard positioning descent, NOT a
+	 * remove-specific re-descent.
 	 */
 	chain_head = NULL;
 	if (iter->cache_valid && iter->node && !ft_node_is_removed(iter->node) &&
@@ -10194,15 +11370,16 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 				key_len, &holder_flag, &head_slot, &is_prefix)) {
 			/*
 			 * ☠ FOUND, THEN NOT LOCATED, IS NOT A MISS.  The lookup
-			 * just reached a live head; ft_locate_chain_head then
-			 * re-derives its position from two more UNHELD reads
-			 * (the back edge, then the holder's slot), and a peer
-			 * re-home between them -- an insert of a key extending
-			 * this one republishing the slot with a junction that
-			 * carries the head -- makes them disagree.  That is the
-			 * identity-bail shape _cds_ft_remove_locked confirms
-			 * under the holder's lock (ft_rm_miss_unconfirmed);
-			 * here nothing is held yet, so re-derive the attempt.
+			 * just reached a live head.  ft_locate_chain_head then
+			 * re-derives its position from two more UNHELD reads:
+			 * the back edge, then the holder's slot.  A peer
+			 * re-home between them makes them disagree.  Such a
+			 * re-home is an insert of a key extending this one.  It
+			 * republishes the slot with a junction that carries the
+			 * head.  That is the identity-bail shape which
+			 * _cds_ft_remove_locked confirms under the holder's
+			 * lock (ft_rm_miss_unconfirmed).  Here nothing is held
+			 * yet, so re-derive the attempt.
 			 */
 #ifndef FT_DEBUG_RA_LOCATE_MISS
 			if (found && !ft_node_is_removed(iter->node)) {
@@ -10224,8 +11401,9 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 	*result_node = chain_head;
 
 	/*
-	 * The holder comes from the cached node's back-pointer; per-node locking
-	 * anchors every member on itself, so no descent (and no depth) is needed.
+	 * The holder comes from the cached node's back-pointer.  Per-node
+	 * locking anchors every member on itself.  So no descent (and no
+	 * depth) is needed.
 	 */
 	struct ft_lock_ctx lctx;
 	unsigned int holder_depth = 0;
@@ -10233,27 +11411,32 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 	ft_lock_ctx_init(&lctx, NULL, NULL, op);
 
 	/*
-	 * Ordered list on: the whole key leaves the trie, so its head's cell is
-	 * unspliced + freed below.  An in-place leaf detach fuses that unsplice
-	 * into its structural flip (pub.armed); the prefix and recompaction /
-	 * compressed-parent shapes stay two-commit (pub unarmed).
+	 * Ordered list on: the whole key leaves the trie.  So its head's cell
+	 * is unspliced + freed below.  The shapes differ:
+	 * - An in-place leaf detach fuses that unsplice into its structural
+	 *   flip (pub.armed).
+	 * - The prefix and recompaction / compressed-parent shapes stay
+	 *   two-commit (pub unarmed).
 	 */
 	struct ft_remove_pub pub = { .armed = false };
 	/*
 	 * THE HEAD'S CELL, FROM ONE RESOLVED LOAD -- cds_ft_remove's discipline.
-	 * Nothing is held here, and a peer that removes the head before
-	 * @chain_head and PROMOTES it parks a flip proxy on @chain_head->prev
-	 * for the length of its commit.  Read raw, ft_ord_cell_ptr() masked the
-	 * proxy's tag into an address INSIDE the peer's descriptor (...0xe), the
-	 * under-lock re-checks passed once the peer had committed, and the cell
-	 * lock take then followed that "cell" into unmapped memory: the zoo's
-	 * SEGV in ft_cell_word_lock (probe: every wild cell ended in 0xe and
-	 * resolved to a real one; the two that got past the re-checks reached
-	 * ft_detach_node's take).  insert_replace had the same raw read
-	 * (f8f6cd3e).
+	 * Nothing is held here.  A peer may remove the head before @chain_head
+	 * and PROMOTE it.  That peer parks a flip proxy on @chain_head->prev
+	 * for the length of its commit.
+	 *
+	 * This is what happened when that word was read raw:
+	 * - ft_ord_cell_ptr() masked the proxy's tag into an address INSIDE the
+	 *   peer's descriptor (...0xe).
+	 * - The under-lock re-checks passed once the peer had committed.
+	 * - The cell lock take then followed that "cell" into unmapped memory.
+	 * That was the zoo's SEGV in ft_cell_word_lock.  A probe showed that
+	 * every wild cell ended in 0xe and resolved to a real one.  The two
+	 * that got past the re-checks reached ft_detach_node's take.
+	 * insert_replace had the same raw read (f8f6cd3e).
 	 *
 	 * Resolved, the value is the word before or after that peer's commit,
-	 * never a descriptor, and a stale-but-real cell is what the under-lock
+	 * never a descriptor.  A stale-but-real cell is what the under-lock
 	 * re-validation (the chain plan, the cell plan) already catches.  A prev
 	 * naming a PREDECESSOR says @chain_head is no longer a head: re-plan.
 	 */
@@ -10277,10 +11460,11 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 #endif
 	/*
 	 * PRE-RESERVE the dead cell's standalone-unsplice txn before any
-	 * structural change (see cds_ft_remove): the prefix / recompaction /
-	 * compressed-parent shapes stay two-commit (pub unarmed) and unsplice
-	 * AFTER the structural commit is public -- un-abortable.  OOM here
-	 * aborts the removal cleanly; the fused case frees it unused.
+	 * structural change (see cds_ft_remove).  The prefix / recompaction /
+	 * compressed-parent shapes stay two-commit (pub unarmed).  They
+	 * unsplice AFTER the structural commit is public, which is
+	 * un-abortable.  OOM here aborts the removal cleanly.  The fused case
+	 * frees the txn unused.
 	 */
 	struct ft_flip_txn *unsplice_txn = NULL;
 
@@ -10300,40 +11484,46 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		 * Propagate -1 before clearing (undercount ordering).
 		 *
 		 * The holder always KEEPS at least one child here.  An is_prefix
-		 * holder is an internal node carrying external_nodes, and by
-		 * construction such a node has nr_child >= 1: a node that holds only
-		 * external keys with no children is never represented as an internal
-		 * node -- it is stored as an external-chain pointer in the parent
-		 * slot (ft_detach_node promotes a childless holder's external_nodes
-		 * to the parent when its last child is removed), and ft_locate_chain
-		 * _head would classify it as a LEAF, not a prefix.  So clearing
-		 * external_nodes leaves a valid branch with children -- never a
-		 * childless (dead-end) internal, which a trie WITHOUT the optional
-		 * ordinal cell list would break on (its ordered traversal descends
-		 * the structure and a dead-end branch has no entry to find).  The
-		 * only follow-up is canonicalizing a now-single-child holder under
-		 * skip builds.
+		 * holder is an internal node carrying external_nodes.  By
+		 * construction such a node has nr_child >= 1.  A node that
+		 * holds only external keys with no children is never
+		 * represented as an internal node.  It is stored as an
+		 * external-chain pointer in the parent slot.
+		 * (ft_detach_node promotes a childless holder's
+		 * external_nodes to the parent when its last child is
+		 * removed.)  ft_locate_chain_head would classify it as a
+		 * LEAF, not a prefix.
+		 *
+		 * So clearing external_nodes leaves a valid branch with
+		 * children.  It never leaves a childless (dead-end) internal.
+		 * A trie WITHOUT the optional ordinal cell list would break
+		 * on such a node.  Its ordered traversal descends the
+		 * structure, and a dead-end branch has no entry to find.  The
+		 * only follow-up is canonicalizing a now-single-child holder
+		 * under skip builds.
 		 */
 		{
 			bool prefix_fused = false, fused_declined = false;
 			/*
 			 * The DERIVATION both arms below freeze against, taken
-			 * once: ft_hlist_freeze_chain_prepare treats it as a
-			 * BOUND, so a duplicate appended since is not this op's
-			 * to retire and instead tears the derived tail's NULL.
+			 * once.  ft_hlist_freeze_chain_prepare treats it as a
+			 * BOUND.  So a duplicate appended since is not this
+			 * op's to retire.  It tears the derived tail's NULL
+			 * instead.
 			 */
 			unsigned int nr_frozen = ft_hlist_chain_len(chain_head);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			/*
 			 * Fuse the chain-compress prune INTO the key-removal
-			 * commit (see cds_ft_remove): when the holder is left a
-			 * non-root 1-child no-external internal, the merged
-			 * compressed node REPLACES the holder -- subsuming the
-			 * external_nodes -> NULL clear -- and carries @dead_cell's
-			 * unsplice in the SAME flip.  No separate clear, no
-			 * transient non-canonical state.  Allocation failure
-			 * aborts the whole removal (key not removed, count rolled
-			 * back, retriable MEMORY_ERROR with a NULL out-param).
+			 * commit (see cds_ft_remove).  This applies when the
+			 * holder is left a non-root 1-child no-external
+			 * internal.  The merged compressed node then REPLACES
+			 * the holder, which subsumes the external_nodes -> NULL
+			 * clear.  It carries @dead_cell's unsplice in the SAME
+			 * flip.  There is no separate clear and no transient
+			 * non-canonical state.  Allocation failure aborts the
+			 * whole removal: key not removed, count rolled back,
+			 * retriable MEMORY_ERROR with a NULL out-param.
 			 */
 			if (ft_group_skip_compressed(ft->group) &&
 			    ft_meta_nr_child(holder_meta) == 1 &&
@@ -10345,16 +11535,18 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 				int cret;
 
 				/*
-				 * R3 chain-compress fold: the merged compressed node
-				 * replacing the collapsed 1-child holder is built with the
-				 * retired key's -1 and records the ancestor -1 walk into its
-				 * OWN commit (count_delta -1), so no pre-decrement here.
+				 * R3 chain-compress fold: the merged compressed
+				 * node replaces the collapsed 1-child holder.
+				 * It is built with the retired key's -1.  It
+				 * records the ancestor -1 walk into its OWN
+				 * commit (count_delta -1).  So there is no
+				 * pre-decrement here.
 				 */
 				/*
-				 * INTENT: as above -- no body child detached, and
-				 * the external entry this op clears is
-				 * @chain_head, the head the is_prefix arm derived
-				 * and is about to unlink.
+				 * INTENT: as above.  No body child is detached.
+				 * The external entry this op clears is
+				 * @chain_head.  The is_prefix arm derived that
+				 * head and is about to unlink it.
 				 */
 				const struct ft_chain_compress_intent intent = {
 					.detach_child = NULL,
@@ -10363,9 +11555,10 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 				};
 
 				/*
-				 * No survivor: a peer edited the holder in place
-				 * between the two unlocked reads above -- re-plan (see
-				 * the same arm in _cds_ft_remove_locked).
+				 * No survivor: a peer edited the holder in
+				 * place between the two unlocked reads above.
+				 * Re-plan.  See the same arm in
+				 * _cds_ft_remove_locked.
 				 */
 				if (caa_unlikely(!s_child))
 					cret = -EAGAIN;
@@ -10393,9 +11586,10 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					 * refuses a tombstone degrades to exactly
 					 * today's unheld sweep".  A freeze that is
 					 * IN the commit needs no acquire afterwards
-					 * and cannot degrade -- and it is atomic
-					 * with the unlink, so no reader sees the
-					 * key gone with the chain still live.
+					 * and cannot degrade.  It is also
+					 * atomic with the unlink.  So no
+					 * reader sees the key gone with the
+					 * chain still live.
 					 */
 					if (ft->ordered_list)
 						pub.armed = true;
@@ -10412,26 +11606,37 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 #endif
 			if (!prefix_fused) {
 				/*
-				 * Non-fused external_nodes -> NULL clear, always on a
-				 * pre-reserved bounded txn (no bare lone clear even with
-				 * both flags off).  ft_remove_one_commit flips the
-				 * external_nodes -> NULL clear, the head cell's unsplice
-				 * (ordered list on; @pub.armed tells the deferred-free
-				 * block below it happened), the prefix key's -1 count
-				 * walk from holder_flag (rank stats on) AND the §4.B
-				 * VALIDATE guard on the LIVE holder TOGETHER in ONE flip
-				 * (ft_ord_cell_flip_into, infallible commit): a reader
-				 * never sees the key gone from one index but present in
-				 * the other, nor a count out of step with the structure
-				 * (parked proxies resolve via ft_dereference_external /
-				 * nr_keys via ft_nr_keys_load), and a concurrent remove
-				 * that froze the holder aborts this clear.  The holder
-				 * stays in place (keeps its children), so its -1 is the
-				 * holder->root walk -- a multi-edge R1.  Pre-reserved =>
-				 * infallible commit: no pre-decrement, no OOM rollback;
-				 * the only abort is the arm, which leaves the key in
-				 * place.  List off + rank off: the forward clear + the
-				 * guard, a 2-record slab-allocated MCAS commit.
+				 * Non-fused external_nodes -> NULL clear,
+				 * always on a pre-reserved bounded txn (no
+				 * bare lone clear even with both flags off).
+				 * ft_remove_one_commit flips these TOGETHER
+				 * in ONE flip (ft_ord_cell_flip_into,
+				 * infallible commit):
+				 * - the external_nodes -> NULL clear;
+				 * - the head cell's unsplice (ordered list
+				 *   on).  @pub.armed tells the deferred-free
+				 *   block below that it happened;
+				 * - the prefix key's -1 count walk from
+				 *   holder_flag (rank stats on);
+				 * - the §4.B VALIDATE guard on the LIVE
+				 *   holder.
+				 * A reader then never sees the key gone from
+				 * one index but present in the other.  It
+				 * never sees a count out of step with the
+				 * structure either.  Parked proxies resolve
+				 * via ft_dereference_external, and nr_keys
+				 * via ft_nr_keys_load.  A concurrent remove
+				 * that froze the holder aborts this clear.
+				 *
+				 * The holder stays in place (it keeps its
+				 * children).  So its -1 is the holder->root
+				 * walk, a multi-edge R1.  Pre-reserved =>
+				 * infallible commit.  So there is no
+				 * pre-decrement and no OOM rollback.  The
+				 * only abort is the arm, which leaves the
+				 * key in place.  List off + rank off: the
+				 * forward clear + the guard, a 2-record
+				 * slab-allocated MCAS commit.
 				 */
 				struct ft_flip_txn *txn = ft_flip_txn_create_bounded(ft,
 					FT_REMOVE_COMMIT_REC_MAX_EDGES + 1 +
@@ -10445,19 +11650,23 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					return CDS_FT_STATUS_MEMORY_ERROR;
 				}
 				/* VALIDATE (§4.B): lock (or guard-fallback) the LIVE
-				 * holder whose external_nodes this clear empties --
-				 * value-swap target (§10.5). */
+				 * holder.  This clear empties its
+				 * external_nodes.  It is the value-swap
+				 * target (§10.5). */
 				ft_flip_txn_lock_or_guard_parent(ft, txn, &lctx,
 					holder_flag, holder_depth);
 				/*
-				 * ☞ A MISSED TAKE ENDS THE ATTEMPT HERE, before the
-				 * count walk and the chain freeze are recorded into a
-				 * txn the commit is bound to discard: the freeze's
-				 * chain records are SW whoever holds the word, so each
-				 * is a stale plan against the holder's own in-flight
-				 * freeze of the same chain (the SW stale-old audit on
-				 * inv_prefix_shape_zoo, the peer's record on the same
-				 * slot, SUCCEEDED).  Same exit as the plan bail below.
+				 * ☞ A MISSED TAKE ENDS THE ATTEMPT HERE.
+				 * That is before the count walk and the
+				 * chain freeze are recorded into a txn the
+				 * commit is bound to discard.  The freeze's
+				 * chain records are SW whoever holds the
+				 * word.  So each is a stale plan against the
+				 * holder's own in-flight freeze of the same
+				 * chain.  (See the SW stale-old audit on
+				 * inv_prefix_shape_zoo: the peer's record on
+				 * the same slot, SUCCEEDED.)  Same exit as
+				 * the plan bail below.
 				 */
 				if (caa_unlikely(txn->acquire_miss)) {
 					ft_flip_txn_destroy(txn);
@@ -10470,19 +11679,26 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 				}
 #if defined(FEATURE_FT_SKIP_COMPRESSED) && !defined(FT_DEBUG_RA_CLEAR_RESIDUE)
 				/*
-				 * THE PLAIN CLEAR MUST NOT STRAND ITS HOLDER -- the
-				 * remove twin of this check (_cds_ft_remove_locked).
-				 * This arm was chosen from an UNHELD read: the holder
-				 * had more than one child, so clearing its key left a
-				 * legal node.  A peer that removed a child before the
-				 * lock above changes the answer, and the clear would
-				 * leave a 1-child keyless internal skip mode refuses;
-				 * the post-prune below is a separate commit that can
-				 * lose to a peer and leave it.  The holder is held and
-				 * nothing is recorded yet: re-plan, and the retry
-				 * reads one child and takes the fused collapse.  Not
-				 * where the fused collapse itself declined (out of
-				 * bound): the retry would decline again.
+				 * THE PLAIN CLEAR MUST NOT STRAND ITS HOLDER.
+				 * The remove twin of this check is in
+				 * _cds_ft_remove_locked.
+				 *
+				 * This arm was chosen from an UNHELD read:
+				 * the holder had more than one child, so
+				 * clearing its key left a legal node.  A
+				 * peer that removed a child before the lock
+				 * above changes the answer.  The clear would
+				 * then leave a 1-child keyless internal,
+				 * which skip mode refuses.  The post-prune
+				 * below is a separate commit.  It can lose
+				 * to a peer and leave that node.
+				 *
+				 * The holder is held and nothing is recorded
+				 * yet: re-plan.  The retry reads one child
+				 * and takes the fused collapse.  This does
+				 * not apply where the fused collapse itself
+				 * declined (out of bound): the retry would
+				 * decline again.
 				 */
 				if (!fused_declined &&
 				    ft_group_skip_compressed(ft->group) &&
@@ -10502,41 +11718,53 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 				ft_flip_txn_record_count_parent(ft, txn,
 					holder_flag, -1);
 				/*
-				 * ☑ AND THE CHAIN'S FREEZE RIDES THIS SAME FLIP.
-				 * Recorded onto @txn -- which already carries the
-				 * §4.B guard and the count walk -- so
-				 * ft_remove_one_commit's ft_ord_cell_flip_into
-				 * commits the external_nodes clear, the unsplice,
-				 * the count and every {v -> MARK(v)} together.
-				 * The holder is LOCKED by the guard above, so the
-				 * whole chain is frozen under its owner; the
-				 * post-commit ft_ra_sweep_held this replaces had
-				 * to re-acquire that word a second time to say
-				 * the same thing, and was not atomic with the
-				 * unlink.  @nr_frozen is the DERIVATION and the
-				 * walk is BOUND by it: a duplicate appended since
-				 * tears the derived tail's NULL and aborts this
-				 * commit, leaving the key in place for the retry.
+				 * ☑ AND THE CHAIN'S FREEZE RIDES THIS SAME
+				 * FLIP.  It is recorded onto @txn, which
+				 * already carries the §4.B guard and the
+				 * count walk.  So ft_remove_one_commit's
+				 * ft_ord_cell_flip_into commits these
+				 * together:
+				 * - the external_nodes clear;
+				 * - the unsplice;
+				 * - the count;
+				 * - every {v -> MARK(v)}.
+				 * The holder is LOCKED by the guard above,
+				 * so the whole chain is frozen under its
+				 * owner.  This replaces the post-commit
+				 * ft_ra_sweep_held.  That sweep had to
+				 * re-acquire that word a second time to say
+				 * the same thing.  It was also not atomic
+				 * with the unlink.
+				 *
+				 * @nr_frozen is the DERIVATION and the walk
+				 * is BOUND by it.  A duplicate appended
+				 * since tears the derived tail's NULL and
+				 * aborts this commit.  The key is then left
+				 * in place for the retry.
 				 */
 				ft_ch_audit_ctx(ft, txn, &lctx, chain_head);
 				/*
-				 * ★ VALIDATE THE PLAN UNDER THE LOCK.  @nr_frozen was
-				 * counted before the §4.B acquire just above, so the
-				 * freeze's derived tail NULL has been standing in for
-				 * an exclusion the count did not have.  We hold the
-				 * holder here; ask the word.  (It shrinks the window
-				 * the install CAS arbitrates -- it does not replace
-				 * the CAS; see ft_hlist_chain_plan_ok's header.)
+				 * ★ VALIDATE THE PLAN UNDER THE LOCK.
+				 * @nr_frozen was counted before the §4.B
+				 * acquire just above.  So the freeze's
+				 * derived tail NULL has been standing in for
+				 * an exclusion that the count did not have.
+				 * We hold the holder here; ask the word.
+				 * (This shrinks the window the install CAS
+				 * arbitrates.  It does not replace the CAS;
+				 * see ft_hlist_chain_plan_ok's header.)
 				 *
-				 * ☠ PRE-COMMIT TERMINAL, BOTH HANDLES.  @txn already
-				 * carries the §4.B guard, the count records and the
-				 * registered holder lock, and @unsplice_txn is a
-				 * reservation this return would otherwise strand -- the
-				 * tail that frees them (and ft_remove_one_commit, which
-				 * drains @txn on a failed commit) is below and is
-				 * skipped by a retry return.  Leaving without both
-				 * destroys is how a bail leaks FT_STATE_LOCK and
-				 * refuses every peer the holder forever.
+				 * ☠ PRE-COMMIT TERMINAL, BOTH HANDLES.  @txn
+				 * already carries the §4.B guard, the count
+				 * records and the registered holder lock.
+				 * @unsplice_txn is a reservation that this
+				 * return would otherwise strand.  The tail
+				 * that frees them is below.  So is
+				 * ft_remove_one_commit, which drains @txn on
+				 * a failed commit.  A retry return skips
+				 * both.  Leaving without both destroys is
+				 * how a bail leaks FT_STATE_LOCK and refuses
+				 * every peer the holder forever.
 				 */
 				if (!ft_hlist_chain_plan_ok(ft, ft_flip_txn_handle(txn),
 						chain_head, nr_frozen)) {
@@ -10554,15 +11782,17 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					nr_frozen);
 				/*
 				 * The commit's status is the ANSWER, not a
-				 * formality: "pre-reserved => infallible" covers
-				 * the ALLOCATION, and the §4.B VALIDATE arm above
-				 * can still abort -- which, as that comment says,
-				 * LEAVES THE KEY IN PLACE.  Discarding it and
-				 * setting ret = 0 reported CDS_FT_STATUS_OK for a
-				 * removal that did not happen, and a caller that
-				 * believes OK reclaims a node still linked in the
-				 * trie.  (The `ret = 0; if (ret == 0)` this
-				 * replaces was the scar of the dropped status.)
+				 * formality.  "pre-reserved => infallible"
+				 * covers the ALLOCATION.  The §4.B VALIDATE
+				 * arm above can still abort.  As that
+				 * comment says, an abort LEAVES THE KEY IN
+				 * PLACE.  Discarding the status and setting
+				 * ret = 0 reported CDS_FT_STATUS_OK for a
+				 * removal that did not happen.  A caller
+				 * that believes OK reclaims a node still
+				 * linked in the trie.  (The
+				 * `ret = 0; if (ret == 0)` this replaces was
+				 * left over from the dropped status.)
 				 */
 				ret = ft_remove_one_commit(ft,
 					(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
@@ -10572,9 +11802,9 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 				if (ret == 0) {
 					/*
 					 * Only a COMMITTED flip carried the
-					 * unsplice; an aborted one leaves the cell
-					 * spliced, and the tail's abort arm
-					 * releases the unused reservation.
+					 * unsplice.  An aborted one leaves the
+					 * cell spliced.  The tail's abort arm
+					 * then releases the unused reservation.
 					 */
 					if (ft->ordered_list)
 						pub.armed = true;
@@ -10582,8 +11812,9 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 					/*
 					 * Out-of-bound residue: best-effort post-prune
-					 * via the standalone second flip (leaves a
-					 * 1-child internal if it still cannot merge).
+					 * via the standalone second flip.
+					 * If it still cannot merge, it
+					 * leaves a 1-child internal.
 					 */
 					if (ft_group_skip_compressed(ft->group) &&
 					    ft_meta_nr_child(holder_meta) == 1 &&
@@ -10597,36 +11828,41 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		}
 	} else {
 		/*
-		 * Leaf key: the whole chain sits at head_slot (a body slot, or
-		 * a compressed holder's &cn->child).  Removing it empties the
-		 * slot, so prune the branch via ft_detach_node bootstrapped from
-		 * the holder (it climbs via metadata->parent).  Propagate -1
-		 * before detach (which may free internal nodes).
+		 * Leaf key: the whole chain sits at head_slot.  That is a body
+		 * slot, or a compressed holder's &cn->child.  Removing it
+		 * empties the slot.  So prune the branch via ft_detach_node,
+		 * bootstrapped from the holder.  It climbs via
+		 * metadata->parent.  Propagate -1 before detach, which may free
+		 * internal nodes.
 		 */
 		/*
 		 * ☑ THE WHOLE CHAIN'S FREEZE RIDES THE DETACH COMMIT, under the
 		 * holder that commit already owns.  It used to be a bare
-		 * ft_chain_mark_removed_flip sweep AFTER the detach returned --
-		 * one unlocked uatomic_cmpxchg per chain node, holding NOTHING
-		 * (the hold audit's only surviving class-A violation: 100%
-		 * NOLOCKS at every row that reached it).
+		 * ft_chain_mark_removed_flip sweep AFTER the detach returned.
+		 * That was one unlocked uatomic_cmpxchg per chain node, holding
+		 * NOTHING.  It was the hold audit's only surviving class-A
+		 * violation: 100% NOLOCKS at every row that reached it.
 		 *
 		 * ☠ AND IT COULD NOT BE FIXED BY TAKING A LOCK, which is why it
 		 * waited for the structural phase.  By sweep time the holder is
-		 * GONE, not contended: the detach retires it IN the very commit
-		 * that unlinks the chain, so the acquire found FT_STATE_TOMBSTONE
-		 * (measured: ok=0, refused=22007, of which 22005 were -EAGAIN on
-		 * a tombstoned word).  Nor could the acquire be hoisted above the
-		 * detach -- unpublished it misses against the op's OWN hold
-		 * (ft_detach_node climbs from holder_meta) and waits on itself
-		 * forever; published into @lctx it becomes the whole-op scope
-		 * -DFT_RM_REVALIDATE was measured and refuted for (20/41 hangs,
-		 * reader-visible key loss).  The lock was never the answer.
+		 * GONE, not contended.  The detach retires it IN the very
+		 * commit that unlinks the chain.  So the acquire found
+		 * FT_STATE_TOMBSTONE (measured: ok=0, refused=22007, of which
+		 * 22005 were -EAGAIN on a tombstoned word).
 		 *
-		 * @nr_frozen is the DERIVATION, and ft_hlist_freeze_chain_prepare
-		 * treats it as a BOUND, not a hint: a duplicate appended since is
-		 * not this op's to retire, and tearing the derived tail's NULL
-		 * aborts the commit so the retry re-derives the longer chain.
+		 * The acquire could not be hoisted above the detach either:
+		 * - Unpublished, it misses against the op's OWN hold
+		 *   (ft_detach_node climbs from holder_meta) and waits on
+		 *   itself forever.
+		 * - Published into @lctx, it becomes the whole-op scope.  That
+		 *   scope was measured with -DFT_RM_REVALIDATE and refuted
+		 *   (20/41 hangs, reader-visible key loss).
+		 * The lock was never the answer.
+		 *
+		 * @nr_frozen is the DERIVATION.  ft_hlist_freeze_chain_prepare
+		 * treats it as a BOUND, not a hint.  A duplicate appended since
+		 * is not this op's to retire.  Tearing the derived tail's NULL
+		 * aborts the commit, so the retry re-derives the longer chain.
 		 */
 		unsigned int nr_frozen = ft_hlist_chain_len(chain_head);
 
@@ -10644,45 +11880,51 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 
 	/*
 	 * -ENOENT (detach's replace reached an emptied FT_NULL slot) is a PEER,
-	 * not a bug, and this used to assert it away on the premise that the
+	 * not a bug.  This used to assert it away.  The premise was that the
 	 * position "has been found by a mutex-protected traversal within this
 	 * function".  No mutex exists here under LOCK_FINE: @head_slot is
-	 * derived by ft_locate_chain_head with NOTHING HELD, so a peer's
+	 * derived by ft_locate_chain_head with NOTHING HELD.  So a peer's
 	 * recompaction can retype or empty that slot between the derivation and
-	 * the replace -- exactly the window cds_ft_remove documents at its own
-	 * tail.  The path publishes nothing, so it joins -EAGAIN in the retry
-	 * below instead of aborting a debug build (and, under NDEBUG, falling
-	 * through to a MEMORY_ERROR no allocation produced).
+	 * the replace.  That is exactly the window cds_ft_remove documents at
+	 * its own tail.
+	 *
+	 * The path publishes nothing, so it joins -EAGAIN in the retry below.
+	 * It no longer aborts a debug build.  Under NDEBUG, it no longer falls
+	 * through to a MEMORY_ERROR that no allocation produced.
 	 */
 
-	/* Ordered list on: the whole key left the trie: its head's cell is
-	 * unspliced and freed (deferred).  chain_head->prev still carries the cell
-	 * (detach reshapes ancestors and head_slot, not the head's prev).  An
-	 * in-place leaf detach already fused the unsplice (pub.armed); only the
-	 * deferred free remains.  List off: chain_head->prev is the flagged
-	 * parent, no cell. */
+	/* Ordered list on: the whole key left the trie.  Its head's cell is
+	 * unspliced and freed (deferred).  chain_head->prev still carries the
+	 * cell: detach reshapes ancestors and head_slot, not the head's prev.
+	 * An in-place leaf detach already fused the unsplice (pub.armed).
+	 * Then only the deferred free remains.  List off: chain_head->prev is
+	 * the flagged parent, no cell. */
 	if (ft->ordered_list) {
 		if (ret == 0) {
-			/* An in-place / fused structural commit already carried the
-			 * unsplice (pub.armed); otherwise commit it now through the
-			 * txn pre-reserved before the structural change. */
+			/* An in-place / fused structural commit may
+			 * already have carried the unsplice (pub.armed).
+			 * Otherwise commit it now, through the txn
+			 * pre-reserved before the structural change. */
 			if (!pub.armed) {
 				/*
 				 * ☠ THIS DISCARDED THE STATUS on the premise
 				 * that an "ABORT [is] unreachable under its
-				 * current exclusion" -- a premise the fine
-				 * locking conversion DELETES.  The op's whole-
-				 * chain standalone marks are already public here,
-				 * so the removal cannot be retried and the
-				 * unsplice MUST complete: an aborted one left the
-				 * key gone from the structural index but present
-				 * in the ordered list, and then freed @dead_cell
+				 * current exclusion".  The fine locking
+				 * conversion DELETES that premise.  The op's
+				 * whole-chain standalone marks are already
+				 * public here.  So the removal cannot be
+				 * retried and the unsplice MUST complete.
+				 * An aborted unsplice left the key gone from
+				 * the structural index but present in the
+				 * ordered list.  @dead_cell was then freed
 				 * while it was still spliced into that list.
-				 * DRIVE IT FORWARD instead -- each ABORT means a
-				 * peer committed (obstruction-free), and the
-				 * aborted commit consumed the txn, so the small
-				 * bounded reservation is retried too.  Byte-for-
-				 * byte the tail cds_ft_remove already runs.
+				 *
+				 * DRIVE IT FORWARD instead.  Each ABORT
+				 * means a peer committed (obstruction-free).
+				 * The aborted commit consumed the txn, so
+				 * the small bounded reservation is retried
+				 * too.  This is byte-for-byte the tail
+				 * cds_ft_remove already runs.
 				 */
 				FT_DBG_RA_UNSPLICE_ARM();
 				while (ft_ord_cell_unsplice(ft, unsplice_txn,
@@ -10700,56 +11942,57 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			}
 			ft_ord_cell_free(ft, dead_cell);
 		} else {
-			/* Removal aborted: the cell stays in the list -- release the
-			 * unused reservation. */
+			/* Removal aborted: the cell stays in the list.
+			 * Release the unused reservation. */
 			ft_flip_txn_destroy(unsplice_txn);
 		}
 	}
 
 	/*
-	 * ☠ KEEP THE KEY.  The retriable exit below re-attempts on the strength
-	 * of "@iter's cache is invalidated just above, so the next attempt
-	 * re-seeds through a fresh lookup" -- and that re-seed reads @iter's
-	 * KEY, which on a keycopy trie is reachable only WHILE @cache_valid
-	 * holds (ft_iter_key_referenced -> @iter->node + speculative_key_offset).
-	 * A bare clear here hands the retry a zeroed key, and the re-seed then
-	 * reports NOT_FOUND for a key that is present -- MEASURED as
+	 * ☠ KEEP THE KEY.  The retriable exit below re-attempts for this
+	 * reason: "@iter's cache is invalidated just above, so the next attempt
+	 * re-seeds through a fresh lookup".  That re-seed reads @iter's KEY.
+	 * On a keycopy trie, the key is reachable only WHILE @cache_valid holds
+	 * (ft_iter_key_referenced -> @iter->node + speculative_key_offset).  A
+	 * bare clear here hands the retry a zeroed key.  The re-seed then
+	 * reports NOT_FOUND for a key that is present.  This was MEASURED as
 	 * inv_compact_keycopy_terminates' drain abort, key 248 of 2000.
 	 */
 	ft_iter_drop_position_keep_key(iter);
 
 	if (ret) {
 		/*
-		 * Leaf-key detach ENOMEM: nothing was published -- the chain is
-		 * still live in the trie, and the -1 count rides the commit
+		 * Leaf-key detach ENOMEM: nothing was published.  The chain is
+		 * still live in the trie.  The -1 count rides the commit
 		 * (ft_flip_txn_record_count_parent), so a failed/aborted commit
-		 * discarded it with the rest: no standalone pre-decrement
-		 * remains to restore (the old "count undo" is gone with the
-		 * R-fold).  Surface the real error with a NULL out-param --
-		 * the header contract -- so the caller cannot reclaim the
+		 * discarded it with the rest.  No standalone pre-decrement
+		 * remains to restore: the old "count undo" is gone with the
+		 * R-fold.  Surface the real error with a NULL out-param, as the
+		 * header contract says.  The caller then cannot reclaim the
 		 * still-reachable chain.
 		 *
 		 * -EAGAIN is a peer, -ENOMEM is memory, and the two report
-		 * differently.  The distinction is only as good as the sources,
-		 * which is what blocked this mapping before -- an acquire that
+		 * differently.  The distinction is only as good as the sources.
+		 * That is what blocked this mapping before.  An acquire that
 		 * could not allocate its own lock txn used to reach the commit
-		 * as @acquire_miss and abort, arriving here as -EAGAIN with no
-		 * allocation failure anywhere in the errno.  That path now
-		 * carries @acquire_enomem and commits MEMORY_ERROR instead, so
+		 * as @acquire_miss and abort.  It arrived here as -EAGAIN, with
+		 * no allocation failure anywhere in the errno.  That path now
+		 * carries @acquire_enomem and commits MEMORY_ERROR instead.  So
 		 * every -EAGAIN landing here is a peer.
 		 *
 		 * ⇒ A PEER IS NOW THIS OP'S OWN PROBLEM, not the caller's.  It
-		 * used to be reported as BUSY_ERROR and handed back, which is
+		 * used to be reported as BUSY_ERROR and handed back.  That is
 		 * why 91% of remove_all calls FAILED under a same-key peer
-		 * (measured: BUSY 25634 vs OK 2473 over 150 rounds) -- the
-		 * caller's own retry cannot fix that, because a fresh urcu_txn
-		 * per attempt ages NO conflict and so never escalates into the
-		 * FIFO lane that drains the contention.  Signal the wrapper's
-		 * retry loop instead: it re-derives the chain head against the
-		 * current tree on the PERSISTENT @optxn.  Nothing was published
-		 * on either errno, so re-attempting is sound (@iter's cache is
-		 * invalidated just above, so the next attempt re-seeds through
-		 * a fresh lookup).
+		 * (measured: BUSY 25634 vs OK 2473 over 150 rounds).  The
+		 * caller's own retry cannot fix that.  A fresh urcu_txn per
+		 * attempt ages NO conflict, so it never escalates into the FIFO
+		 * lane that drains the contention.
+		 *
+		 * Signal the wrapper's retry loop instead.  It re-derives the
+		 * chain head against the current tree on the PERSISTENT @optxn.
+		 * Nothing was published on either errno, so re-attempting is
+		 * sound.  @iter's cache is invalidated just above, so the next
+		 * attempt re-seeds through a fresh lookup.
 		 */
 		*result_node = NULL;
 		if (ret == -EAGAIN || ret == -ENOENT) {
@@ -10767,23 +12010,26 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
  * Public entry: FT-owned per-op read-side bracket + retry identity, mirroring
  * cds_ft_remove and cds_ft_replace.
  *
- * WHAT THIS OP WAS MISSING, and it is not what the other three were.  remove_all
- * already ACQUIRES and RE-VALIDATES everything it derives: the leaf arm goes
- * through ft_detach_node (the same primitive the converted point remove uses),
- * and the prefix arm through ft_flip_txn_lock_or_guard_parent plus a commit
- * whose expected-old IS the re-validation.  Measured against a same-key peer,
- * the structure was never corrupted -- 150 rounds x 64 keys x 3 duplicates lost
- * no node, double-owned no node and verified green every round.  What it lacked
- * was PROGRESS: the body ran EXACTLY ONCE, so every one of those correct,
- * published-nothing aborts was handed to the caller as BUSY_ERROR.  91% of the
- * calls failed that way.
+ * WHAT THIS OP WAS MISSING, and it is not what the other three were.
+ * remove_all already ACQUIRES and RE-VALIDATES everything it derives:
+ * - The leaf arm goes through ft_detach_node, the same primitive the
+ *   converted point remove uses.
+ * - The prefix arm goes through ft_flip_txn_lock_or_guard_parent, plus a
+ *   commit whose expected-old IS the re-validation.
+ * Measured against a same-key peer, the structure was never corrupted.  Over
+ * 150 rounds x 64 keys x 3 duplicates, no node was lost and no node was
+ * double-owned.  Every round verified green.
+ *
+ * What it lacked was PROGRESS.  The body ran EXACTLY ONCE.  Each of those
+ * aborts was correct and had published nothing.  Yet each one was handed to
+ * the caller as BUSY_ERROR.  91% of the calls failed that way.
  *
  * ⇒ the conversion is the LOOP, not new exclusion.  Aging is carried on the
- * PERSISTENT @optxn via ft_op_conflict (ft_txn_attempt_bail): after
- * its lane budget of conflicts this writer escalates into the per-trie
- * FIFO fair-mutex lane, which drains the contention so the retry TERMINATES.
+ * PERSISTENT @optxn via ft_op_conflict (ft_txn_attempt_bail).  After its lane
+ * budget of conflicts, this writer escalates into the per-trie FIFO
+ * fair-mutex lane.  That lane drains the contention, so the retry TERMINATES.
  * That is also why a caller looping on BUSY_ERROR was never an adequate
- * substitute -- a fresh txn per attempt ages nothing and can starve.  An
+ * substitute: a fresh txn per attempt ages nothing and can starve.  An
  * exclusive trie opens nothing and never conflicts.
  *
  * @iter is re-seeded by the body itself: every retriable exit runs after the
@@ -10800,10 +12046,11 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 
 	CDS_FT_SCOPED_WRITER(ft);
 	/*
-	 * Same rule as cds_ft_remove (ft_iter_redescend_node): with a bulk op live
-	 * the cached position may predate its flip.  Dropping it is enough here
-	 * -- the locked body already re-seeds by a fresh lookup from the root
-	 * when the cache is not valid.
+	 * Same rule as cds_ft_remove (ft_iter_redescend_node): with a bulk op
+	 * live, the cached position may predate its flip.  Dropping it is
+	 * enough here.
+	 * When the cache is not valid, the locked body already re-seeds by a
+	 * fresh lookup from the root.
 	 */
 	if (caa_unlikely(ft_bulk_active(ft)))
 		ft_iter_drop_position_keep_key(iter);
