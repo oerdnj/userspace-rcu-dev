@@ -3800,8 +3800,10 @@ int ft_insert_compressed_diverge(struct cds_ft *ft,
  * path.  Split the compressed node into prefix -> junction -> suffix,
  * then attach the new external node at the junction.
  *
- * Returns 0 on success, -EEXIST if duplicate detected (with
- * *unique_node_ret set), or negative errno on failure.
+ * Returns 0 on success, or a negative errno on failure (-EAGAIN when a
+ * peer holds a word it needs).  It never returns -EEXIST: a key that ends
+ * inside a compressed path is always a new key.  @unique_node_ret is
+ * unused.
  */
 static
 int ft_insert_compressed_key_shorter(struct cds_ft *ft,
@@ -5569,19 +5571,14 @@ restart_replace_attempt:
 			 * Key ends at a compressed node's depth.
 			 * Split: internal(external_nodes) + compressed(len-1).
 			 */
+			/*
+			 * A key that ends inside a compressed path is always a
+			 * NEW key, so key_shorter never answers -EEXIST (see
+			 * its header).  There is no chain to replace here.
+			 */
 			ret = ft_insert_compressed_key_shorter(ft, &d, 0,
 				node, old_node_ret, &ic);
-			if (ret == -EEXIST) {
-				ret = 0;	/* Replace handled by key_shorter. */
-				/*
-				 * key_shorter found the key already present and
-				 * left @node uninstalled (*old_node_ret names the
-				 * existing chain, which keeps its own cell).  Drop
-				 * the pre-wired cell from node->prev; insert_replace_done
-				 * frees the now-orphaned @precell.
-				 */
-				node->prev = NULL;
-			}
+			assert(ret != -EEXIST);
 		} else if (!ft_node_external(d.nf)) {
 			struct cds_ft_node *external_nodes;
 			struct cds_ft_metadata *metadata;
