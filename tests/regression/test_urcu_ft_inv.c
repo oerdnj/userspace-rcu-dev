@@ -11860,7 +11860,7 @@ static int inv_concurrent_merge_colliding_chains(void)
 
 		enum cds_ft_status mst;
 
-		rcu_read_lock();
+		/* A bulk op waits for a grace period: no read section here. */
 		mst = cds_ft_merge(c.dst, pfx, 1, src);
 		if (mst == CDS_FT_STATUS_OK) {
 			merged_dups += added;
@@ -11870,14 +11870,12 @@ static int inv_concurrent_merge_colliding_chains(void)
 			 * A refused merge leaves @src intact by contract, so
 			 * drain it rather than counting keys that never moved.
 			 */
-			rcu_read_unlock();
 			ret = -1;
 			report_violation(tname,
 				"cds_ft_merge refused a colliding-key source: "
 				"status %d", (int) mst);
 			goto stop;
 		}
-		rcu_read_unlock();
 		rcu_quiescent_state();
 	}
 stop:
@@ -18615,12 +18613,11 @@ static void *inv_graft_swap_writer(void *arg)
 		 * Swap at root: atomically exchange the live trie's
 		 * content with the swap trie's content.
 		 */
-		rcu_read_lock();
+		/* Bulk ops wait for grace periods: no read section here. */
 		pthread_mutex_lock(&ctx->lock);
 		cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_graft_swap(ctx->live, NULL, 0, swap);
 		pthread_mutex_unlock(&ctx->lock);
-		rcu_read_unlock();
 
 		if (s != CDS_FT_STATUS_OK) {
 			/*
