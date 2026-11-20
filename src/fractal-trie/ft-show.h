@@ -6,14 +6,16 @@
  * src/fractal-trie/ft-show.h
  *
  * Userspace RCU library - Fractal Trie: human-readable trie DISPLAY renderers.
- * The pretty-printer (show_node_recursive / show_pretty) and the JSON emitter
- * (internal_type_name / json_emit_density / json_emit_node / show_json) behind
- * the cds_ft_show dispatcher.  Read-only introspection, off every hot path;
- * the indentation primitive print_indent is shared with the statistics
- * renderer and lives in ft-helpers.h.
+ * The cds_ft_show dispatcher calls one of two renderers:
+ * - the pretty-printer (show_node_recursive / show_pretty);
+ * - the JSON emitter (internal_type_name / json_emit_density /
+ *   json_emit_node / show_json).
+ * This is read-only introspection, off every hot path.  The indentation
+ * primitive print_indent lives in ft-helpers.h.  The statistics renderer
+ * shares it.
  *
- * Implementation unit: #included once into the fractal-trie.c translation unit
- * (preserves cross-module inlining).  Not a standalone header.
+ * Implementation unit: #included once into the fractal-trie.c translation
+ * unit.  This preserves cross-module inlining.  Not a standalone header.
  */
 #ifndef FRACTAL_TRIE_IMPL
 #error "ft-show.h is an implementation unit; #include it from fractal-trie.c only"
@@ -106,7 +108,7 @@ void show_pretty(const struct cds_ft *ft, FILE *out)
 }
 
 /*
- * JSON emitter: walks the same trie structure as show_pretty() and
+ * JSON emitter: walks the same trie structure as show_pretty().  It
  * produces a JSON document describing it.  The output has no trailing
  * newline, so it can be embedded into other JSON contexts if desired.
  *
@@ -123,10 +125,10 @@ static void json_emit_node(const struct cds_ft *ft, FILE *out,
 		struct cds_ft_inode_flag *node_flag, int level);
 
 /*
- * Return a symbolic name for an internal-node type index.  Mirrors
- * the ft_tp_node_kind enum labels but is always compiled in (not
- * gated on FT_ENABLE_TRACING) since the JSON output is a supported
- * interface independent of tracing.
+ * Return a symbolic name for an internal-node type index.  The names
+ * mirror the ft_tp_node_kind enum labels.  Unlike those, this function
+ * is always compiled in, not gated on FT_ENABLE_TRACING.  The reason:
+ * the JSON output is a supported interface, independent of tracing.
  */
 static
 const char *internal_type_name(unsigned int type_index)
