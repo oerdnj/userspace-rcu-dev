@@ -582,9 +582,8 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 					(const void *) detached->root);
 				/*
 				 * This node is now @detached's root: name that
-				 * trie in its back-edge.  Use rcu_assign_pointer
-				 * so read-side parent-pointer walks see a single
-				 * atomic transition.
+				 * trie in its back-edge.  @detached has no
+				 * readers yet, so a plain store is enough.
 				 */
 				{
 					struct cds_ft_metadata *m = cds_ft_item_to_metadata(

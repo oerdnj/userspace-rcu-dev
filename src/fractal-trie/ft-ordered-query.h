@@ -343,7 +343,6 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 			 *     level -= rewind + 1, so that the loop's level++
 			 *     lands the compressed handler at the merged
 			 *     node's depth.  remaining is unchanged.
-			 *   detached / above root: re-find rank @n on the live trie.
 			 */
 			if (caa_unlikely(ft_node_skip_compressed(child))) {
 				unsigned int rewind;

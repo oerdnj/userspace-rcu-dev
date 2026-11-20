@@ -3511,7 +3511,8 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	 * A live (lock-mode, non-exclusive) cross-trie source is REJECTED with
 	 * BUSY before any lock is taken.  The caller makes it exclusive first
 	 * (cds_ft_make_exclusive).  A SAME-trie rekey (src == dst) is excluded:
-	 * it takes one lock reentrantly.  Inert outside lock-mode.
+	 * it takes one lock reentrantly.  The check applies under every
+	 * writer strategy.
 	 */
 	/*
 	 * THE GATE: it makes src exclusivity an invariant for everything

@@ -1395,8 +1395,9 @@ long cds_ft_fault_commit_countdown = -1;
  * ft_unit and ft_inv both, with every arm instrumented and counted.  Two
  * reasons compound:
  *
- *   - The replace family is contract-excluded under LOCK_FINE.  So no peer
- *     ever races it.
+ *   - The replace family was contract-excluded under LOCK_FINE when this
+ *     was measured, so no peer raced it.  It has been FINE-concurrent since
+ *     aa20b4a9.
  *   - Its commits carry only §4.B GUARDS, never an acquire.  So
  *     cds_ft_fault_lock_countdown, which fails an ACQUIRE, cannot reach
  *     them either.

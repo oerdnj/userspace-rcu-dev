@@ -3818,9 +3818,9 @@ skip_copy:
 	 * ADD/SAME/DEL relocation may now carry a @rec for the SKIP_X dual
 	 * alone, while its forward stays local.
 	 *
-	 * For the local-out-param callers the bare release store orders the
-	 * node-body and metadata stores above it.  A plain store would let a
-	 * weakly-ordered architecture expose an unwired copy.
+	 * For the local-out-param callers this is a plain store.  No reader
+	 * loads the local.  The caller's later publish orders the node-body
+	 * and metadata stores above.
 	 */
 	if (mode == FT_RECOMPACT_RELOCATE) {
 		/* SW compaction: *slot == plan old.  Relocating the ROOT node

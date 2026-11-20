@@ -7434,11 +7434,11 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
 	}
 	if (ret == -EAGAIN) {
 		/*
-		 * A commit ABORT: a peer won an expected-value CAS or froze a
-		 * guarded node.  Nothing was published and @node is reusable.
-		 * The catch-all below used to report this as MEMORY_ERROR.  A
-		 * caller cannot act on a peer conflict that is reported as an
-		 * allocation failure.
+		 * Defensive: the inner function retries every -EAGAIN and
+		 * every commit ABORT itself (b18a23ba), so this arm is not
+		 * reached today.  If it ever is, nothing was published and
+		 * @node is reusable.  A peer conflict must not be reported as
+		 * an allocation failure by the catch-all below.
 		 */
 		*result_node = NULL;
 		FT_TP(insert_replace_exit, (int) CDS_FT_STATUS_BUSY_ERROR);

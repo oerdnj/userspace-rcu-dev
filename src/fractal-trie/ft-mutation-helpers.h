@@ -11180,11 +11180,14 @@ enum { FT_RTAKE_CALL, FT_RTAKE_HELD, FT_RTAKE_TOOK, FT_RTAKE_MISS,
  * the word in the root NODE is impossible.  The reasons a lock is the wrong
  * instrument are design reasons rather than impossibilities:
  *
- *   - EVERY OTHER WRITER OF THIS SLOT IS ALREADY MW.  These seven ops all CAS
- *     it: insert, remove, graft, graft_swap, merge, detach and the bulk root
- *     swaps.  So an SW op is the outlier, and this helper is what makes it
- *     conform.  A per-trie lock word is a legitimate alternative.  But it is
- *     a tree-wide protocol change across all seven ops.  It buys uniformity,
+ *   - (Before Stage 5.) EVERY OTHER WRITER OF THIS SLOT WAS MW.  These seven
+ *     ops all CAS'd it: insert, remove, graft, graft_swap, merge, detach and
+ *     the bulk root swaps.  So an SW op was the outlier, and this helper made
+ *     it conform.  That is no longer true: a FINE writer holding @root_lock
+ *     parks SW, a COARSE or EXCLUSIVE trie parks SW, and the list-off root
+ *     swaps (ft_root_edge_flip) are plain release stores.  A per-trie lock
+ *     word is a legitimate alternative.  But it is a tree-wide protocol
+ *     change across all seven ops.  It buys uniformity,
  *     not correctness.
  *   - A node lock buys a LONG UNFAILABLE WINDOW: reserve the set, build
  *     invisibly, park at the end.  The root pointer takes ONE transition per
@@ -27365,11 +27368,13 @@ enum urcu_txn_status ft_glue_lock_anchors(struct cds_ft *ft, struct ft_glue *g)
  *     dst-origin half is recorded by the loop below, the src-origin half by
  *     apply_deferred.
  *
- * Called AFTER the source unlink + drain, where abort is already impossible, so
- * the live back-edge bookkeeping (ft_set_parent_slot inside
- * ft_glue_record_back_edge) runs here rather than during the build -- doing it
- * during the build would corrupt a live node's parent_slot_offset if a later
- * build step OOM'd and aborted.  The build is unchanged: edges queue in
+ * Called AFTER the source unlink + drain.  The commit can still abort: an
+ * anchor take can fail, or a peer can win the flip.  The callers then call
+ * ft_glue_abort (or re-descend) and retry.  The live back-edge bookkeeping
+ * (ft_set_parent_slot inside ft_glue_record_back_edge) runs here rather
+ * than during the build.  Doing it during the build would corrupt a live
+ * node's parent_slot_offset if a later build step OOM'd and aborted.  The
+ * build is unchanged: edges queue in
  * g->deferred, and fresh-to-fresh edges + top->publish_parent are wired during
  * the build.
  *

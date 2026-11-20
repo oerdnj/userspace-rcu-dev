@@ -2387,8 +2387,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 	 * cds_ft_merge_at's whole-source rekey).  It takes one lock
 	 * reentrantly, like the crosstrie guard's a != b test.
 	 *
-	 * Inert outside lock-mode -- optimistic groups have lock_mode ==
-	 * false and never take FT-wide locks for a cross-trie graft.
+	 * The check applies under every writer strategy.
 	 */
 	if (src_ft != dst_ft && !src_ft->exclusive)
 		return CDS_FT_STATUS_BUSY_ERROR;
@@ -4239,7 +4238,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 	 * A LIVE (lock-mode, non-exclusive) @swap_ft is REJECTED with BUSY
 	 * before anything is touched.  The caller makes it exclusive first
 	 * (cds_ft_make_exclusive).  @dst_ft may be a live concurrent trie.
-	 * Inert outside lock-mode.
+	 * The check applies under every writer strategy.
 	 *
 	 * On success @swap_ft inherits @dst_ft's access discipline (see the
 	 * header).  So it may end up concurrent again.
