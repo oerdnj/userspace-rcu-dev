@@ -992,6 +992,36 @@ void cds_ft_iter_bind_key(struct cds_ft_iter *iter)
 	iter->node = NULL;
 }
 
+/*
+ * Keys a library walk visits per read-side section.  A walk over a whole
+ * trie must not hold one section throughout: no grace period of the flavor
+ * could complete until it ends.
+ */
+#define FT_WALK_KEYS_PER_SECTION	1024
+
+/*
+ * Let a grace period complete in the middle of a walk on @iter.  Call it
+ * from inside the walk's read-side section, with @iter on a key.  The next
+ * cds_ft_next() re-descends from that key and returns its successor.
+ *
+ * This only helps when the walk's section is the outermost one.  Inside a
+ * caller's section the unlock drops one nesting level and nothing more.
+ * Under QSBR the unlock is a no-op: only the caller can report a quiescent
+ * state.
+ *
+ * The caller must keep writers out of the walked keys: a walk that drops
+ * its section is not a snapshot.
+ */
+static
+void ft_walk_yield(struct cds_ft_iter *iter)
+{
+	const struct rcu_flavor_struct *flavor = iter->ft->group->flavor;
+
+	cds_ft_iter_bind_key(iter);
+	flavor->read_unlock();
+	flavor->read_lock();
+}
+
 void cds_ft_iter_copy(struct cds_ft_iter *dst, const struct cds_ft_iter *src)
 {
 	dst->status = src->status;

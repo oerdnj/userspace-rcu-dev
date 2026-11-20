@@ -1186,6 +1186,7 @@ enum cds_ft_status ft_recompute_max_used_key_len(struct cds_ft *ft)
 	struct cds_ft_iter *iter;
 	enum cds_ft_status status;
 	size_t max_len = 0;
+	unsigned long nr_keys = 0;
 
 	status = cds_ft_iter_create(ft, &iter);
 	if (status != CDS_FT_STATUS_OK)
@@ -1195,6 +1196,8 @@ enum cds_ft_status ft_recompute_max_used_key_len(struct cds_ft *ft)
 
 		if (klen > max_len)
 			max_len = klen;
+		if (!(++nr_keys % FT_WALK_KEYS_PER_SECTION))
+			ft_walk_yield(iter);
 	}
 	status = cds_ft_iter_status(iter);
 	cds_ft_iter_destroy(iter);

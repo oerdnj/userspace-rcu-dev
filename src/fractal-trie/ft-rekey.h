@@ -9360,7 +9360,8 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	 * re-walking per attempt would be pure cost.  The walk needs a read
 	 * section of its own, because it dereferences.  It takes no grace
 	 * period, so it cannot deadlock against the move gate the caller
-	 * already passed.
+	 * already passed.  It drops its section every FT_WALK_KEYS_PER_SECTION
+	 * keys, so grace periods still complete while it runs.
 	 */
 	if (src_len != dst_len &&
 			ft->group->key_len == CDS_FT_LEN_VARIABLE &&

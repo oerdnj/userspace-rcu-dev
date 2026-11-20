@@ -2224,6 +2224,7 @@ int ft_moved_keys_max_len(struct cds_ft *src_ft, const uint8_t *src_key,
 	enum cds_ft_status s;
 	uint8_t k[FT_MAX_KEY_LEN];
 	size_t klen, max = 0;
+	unsigned long nr_keys = 0;
 
 	if (cds_ft_iter_create(src_ft, &iter) != CDS_FT_STATUS_OK)
 		return -ENOMEM;
@@ -2236,6 +2237,8 @@ int ft_moved_keys_max_len(struct cds_ft *src_ft, const uint8_t *src_key,
 			break;		/* past the moved keys */
 		if (klen > max)
 			max = klen;
+		if (!(++nr_keys % FT_WALK_KEYS_PER_SECTION))
+			ft_walk_yield(iter);
 	}
 	cds_ft_iter_destroy(iter);
 	*max_len = max;
