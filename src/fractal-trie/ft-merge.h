@@ -1664,9 +1664,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		const uint8_t *src_key, size_t src_key_len, unsigned long cnt_src,
 		unsigned int off_src, struct ft_descent *d_dst,
 		unsigned long cnt_dst, unsigned int off_dst,
-		size_t dst_key_len,
-		struct ft_flip_txn **pre_txn, bool *contended,
-		struct ft_op *op)
+		size_t dst_key_len, bool *contended, struct ft_op *op)
 {
 	struct ft_glue gd, gs;
 	struct ft_merge_ctx ctx = { .dst_ft = dst_ft, .gd = &gd, .gs = &gs };
@@ -1693,14 +1691,6 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	unsigned long ms_nsrc = 0;			/* src run cells captured */
 	unsigned int ms_cap = 0;	/* interleave edge cap, set once merged_keys is known */
 	unsigned int ms_n = 0;		/* interleave edges collected (staged pre-commit) */
-	/*
-	 * True when the caller pre-reserved this op's flip-txn.  Such a caller
-	 * is already PAST its own point of no return.  It pre-built everything
-	 * so that this placement cannot fail.  This flag gates the dup-chain
-	 * acquire below, the only step here that can decline.
-	 */
-	bool unfailable = (pre_txn && *pre_txn);
-
 	*contended = false;
 
 	/*
@@ -1742,8 +1732,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 *
 	 * @pub_parent is @d_dst's own parent or grandparent, so the window
 	 * dates it.  Without this, the acquire has no depth under a coarse
-	 * spacing.  Its miss then aborts a commit that the unfailable arm
-	 * cannot retry.  That is a LIVELOCK, not a failure.
+	 * spacing.  Its miss then aborts the commit, and the op retries
+	 * against the same miss.  That is a LIVELOCK, not a failure.
 	 */
 	gd.lock_d = d_dst;
 	/*
@@ -1784,10 +1774,9 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * DLM overlap-spine plan-lock (§9.4 M-2).  Fence each dst overlap node
 	 * before the build reads it, and retire it through the fenced terminal.
 	 * Then a peer growing a node this merge is copying cannot be silently
-	 * retired with it.  Skipped for the unfailable caller, which has no
-	 * bail left to take.
+	 * retired with it.
 	 */
-	ctx.fence_overlap = dst_ft->lock_fine && !unfailable;
+	ctx.fence_overlap = dst_ft->lock_fine;
 	ctx.fence_src = false;		/* cross-trie: the source is exclusive */
 	M = ft_merge_build(&ctx, S, off_src, D, off_dst, 0, d_dst->pdepth,
 			&merged_keys);
@@ -1900,8 +1889,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * post-drain record is allocation-free: the structural edges, the
 	 * INSTALLED-state cell edges and the splice edges.  The splice edges
 	 * append into the reserved head chunk.
-	 * The rekey hands in a pre-reserved txn (cannot fail).  Otherwise
-	 * create one here, where failure aborts the still-invisible build
+	 * Create it here, where failure aborts the still-invisible build
 	 * (both tries pristine).
 	 */
 	{
@@ -1911,52 +1899,46 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		for (j = 0; j < gd.nr_deferred; j++)
 			if (gd.deferred[j].dst_origin)
 				nr_dst++;
-		txn = ft_flip_txn_take(pre_txn);
-		if (!txn) {
-			txn = ft_flip_txn_create(dst_ft);
+		txn = ft_flip_txn_create(dst_ft);
+		/*
+		 * SIZE THE LOCK REGISTRY FROM THE PLAN, here where
+		 * -ENOMEM still propagates.  The fenced overlap retires
+		 * are what load it: ft_glue_tombstone_free_list
+		 * registers one word per !shared fenced holder, on BOTH
+		 * sides.  @cap_free is exactly that plan-time count.
+		 * Without this the registry grows mid-commit, past the
+		 * abort-impossible point.  An allocation failure there
+		 * has nowhere to unwind to.
+		 */
+		if (txn && !ft_flip_txn_reserve_locks(txn,
+				gd.cap_free + gs.cap_free
+					+ FT_FLIP_TXN_FLOOR_LOCKS)) {
+			ft_flip_txn_destroy(txn);
+			txn = NULL;
+		}
+		if (txn && !ft_flip_txn_reserve(txn,
+				nr_dst + 1 + ms_cap + gd.cap_free
+					+ 2 * gd.nr_splices /* forward link + the head's prev */
+					+ 1 /* §4.B parent guard */
+					/* + count walk: the (merged_keys - cnt_dst) nr_keys ancestor
+					 * edges (BULK fold), bounded by the merge-point depth */
+					+ (dst_ft->rank_stats ? (int) dst_key_len + 1 : 0)
+			/* the split-retire terminal's second word, if any */
+			+ ft_glue_split_cn_reserve(dst_ft))) {
+			ft_flip_txn_destroy(txn);
+			txn = NULL;
+		} else if (txn) {
 			/*
-			 * SIZE THE LOCK REGISTRY FROM THE PLAN, here where
-			 * -ENOMEM still propagates.  The fenced overlap retires
-			 * are what load it: ft_glue_tombstone_free_list
-			 * registers one word per !shared fenced holder, on BOTH
-			 * sides.  @cap_free is exactly that plan-time count.
-			 * Without this the registry grows mid-commit, past the
-			 * abort-impossible point.  An allocation failure there
-			 * has nowhere to unwind to.
+			 * The txn was created here, with gd.cap_free
+			 * free-list headroom reserved.  Fuse each
+			 * dst-overlap retire's freeze into @txn (atomic
+			 * detach, §4.B of
+			 * doc/design/mcas-multiwriter-readiness.md).
+			 * Then the whole retired dst spine freezes
+			 * dead atomically with the forward publish
+			 * that unlinks it.
 			 */
-			if (txn && !ft_flip_txn_reserve_locks(txn,
-					gd.cap_free + gs.cap_free
-						+ FT_FLIP_TXN_FLOOR_LOCKS)) {
-				ft_flip_txn_destroy(txn);
-				txn = NULL;
-			}
-			if (txn && !ft_flip_txn_reserve(txn,
-					nr_dst + 1 + ms_cap + gd.cap_free
-						+ 2 * gd.nr_splices /* forward link + the head's prev */
-						+ 1 /* §4.B parent guard */
-						/* + count walk: the (merged_keys - cnt_dst) nr_keys ancestor
-						 * edges (BULK fold), bounded by the merge-point depth */
-						+ (dst_ft->rank_stats ? (int) dst_key_len + 1 : 0)
-				/* the split-retire terminal's second word, if any */
-				+ ft_glue_split_cn_reserve(dst_ft))) {
-				ft_flip_txn_destroy(txn);
-				txn = NULL;
-			} else if (txn) {
-				/*
-				 * The txn was created here, with gd.cap_free
-				 * free-list headroom reserved.  Fuse each
-				 * dst-overlap retire's freeze into @txn (atomic
-				 * detach, §4.B of
-				 * doc/design/mcas-multiwriter-readiness.md).
-				 * Then the whole retired dst spine freezes
-				 * dead atomically with the forward publish
-				 * that unlinks it.  The rekey take() path
-				 * keeps the standalone flip: the rekey
-				 * pre-sized its pre_txn, with no room to grow
-				 * here.
-				 */
-				gd.fuse_free_list = true;
-			}
+			gd.fuse_free_list = true;
 		}
 	}
 	if (!txn) {
@@ -1970,8 +1952,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	/*
 	 * The dst forward publish commits through @txn (step 4 below).  Point
 	 * gd->txn at it.  Then ft_glue_apply_deferred's tombstone_free_list
-	 * records the fused dst retires into the same txn.  This is a no-op
-	 * alias when fuse_free_list stayed false (the rekey take() path).
+	 * records the fused dst retires into the same txn.
 	 */
 	gd.txn = txn;
 
@@ -2281,23 +2262,11 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * That is why contention needs no place in enum cds_ft_status (see
 	 * @contended).
 	 *
-	 * SKIPPED when the CALLER pre-reserved @pre_txn.  That marks a caller which
-	 * has ALREADY passed its own point of no return and pre-built everything so
-	 * this placement cannot fail -- today the staged rekey (detach -> GP ->
-	 * merge back), whose content is already out of the trie and has nowhere to
-	 * go if we bail.  A failable acquire under an unfailable placement is a
-	 * contradiction, and retrying there would re-draw a node reserve that a
-	 * discarded attempt returns to the ARENA, not to the reserve.  Same-trie
-	 * rekey gets its chain exclusion from the in-place one-decide writer's
-	 * up-front DLM lock set instead -- a single commit with reader two-pass
-	 * coherence, no detach and so no unfailable tail -- not from a retrofit
-	 * here.  So this leaves the staged rekey's appends where they are today.
-	 *
 	 * No-op on a non-lock_fine trie or a collision-free merge.  Every merge
 	 * of disjoint key sets is collision-free, so the batch-staging workload
 	 * pays nothing.
 	 */
-	if (!unfailable && ft_glue_acquire_splice_holders(dst_ft, &gd)) {
+	if (ft_glue_acquire_splice_holders(dst_ft, &gd)) {
 		free(ms_src_pool);
 		free(ms_src_caps);
 		free(ms_edges);
@@ -2337,7 +2306,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * A miss here bails exactly like the splice acquire above: both tries
 	 * pristine, contention reported, caller re-descends.
 	 */
-	if (!unfailable && dst_ft->lock_fine && pub_parent) {
+	if (dst_ft->lock_fine && pub_parent) {
 		struct cds_ft_metadata *pm = ft_flag_to_metadata(dst_ft, pub_parent);
 		uintptr_t psnap = 0;
 
@@ -2573,7 +2542,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		 * the two coincide.  Recording its release directly keeps this
 		 * publish off lock_or_guard.  A miss in lock_or_guard would
 		 * abort a commit that has no way left to fail safely.  A NULL
-		 * holder means non-lock_fine or the unfailable caller.  That
+		 * holder means non-lock_fine.  That
 		 * routes to the ordinary acquire-or-guard exactly as before.
 		 */
 		{
@@ -2689,13 +2658,6 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 *
 	 *    Each splice is one forward edge (dst tail -> src run), so only the
 	 *    tail carries a proxy; src_head->next rides along.
-	 *
-	 *    The rekey take() path
-	 *    reaches this too -- cds_ft_rekey_merge unions into an OCCUPIED
-	 *    destination, so a full key present on both sides collides there like
-	 *    any other merge, which is why that path's pre-reservation budgets one
-	 *    splice edge per moved key.  (Only cds_ft_rekey_graft demands an empty
-	 *    destination, and it never reaches the spine copy.)
 	 *
 	 *    Every append here runs under the chain holder's node lock.
 	 *    ft_glue_acquire_splice_holders takes it before the point of no
@@ -3377,27 +3339,10 @@ retry_merge:
 	return CDS_FT_STATUS_OK;
 }
 
-/*
- * @pre_txn carries a flip-txn that the caller reserved before its own last
- * fallible step.  The spine-copy / graft commit below then draws an
- * unfailable txn instead of allocating one.
- *
- * @pre_txn is NULL on the public paths (cds_ft_merge_at and the outer
- * cds_ft_rekey_* call).  Only the same-trie rekey's post-detach re-merge
- * sets it.  That re-merge pre-reserves the txn so that its post-detach merge
- * cannot fail: there is no reader-observable rollback.  The txn is sized
- * from the O(1) subtree key counts:
- * - the structural re-parent + folded ordered-list interleave, or
- * - the graft cluster floor.
- *
- * The consume site NULLs the slot it takes.  So the rekey frees the txn only
- * when a given merge shape left it unused.
- */
 static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		const uint8_t *dst_key, size_t dst_key_len,
 		struct cds_ft *src_ft,
-		const uint8_t *src_key, size_t src_key_len,
-		struct ft_flip_txn **pre_txn)
+		const uint8_t *src_key, size_t src_key_len)
 {
 	struct cds_ft *subtree = NULL;
 	enum cds_ft_status status;
@@ -3732,7 +3677,7 @@ merge_spine_retry:
 		status = ft_merge_spine_copy(dst_ft, src_ft, &d_src,
 				okey_src, src_key_len, cnt_src, off_src,
 				&d_dst, cnt_dst, off_dst, dst_key_len,
-				pre_txn, &md_contended, &optxn);
+				&md_contended, &optxn);
 		if (md_contended) {
 			/*
 			 * Contention, nothing moved.  Re-pin, re-descend
@@ -3821,8 +3766,7 @@ merge_spine_retry:
 		 * body directly.
 		 */
 		/* No read section: see cds_ft_graft. */
-		status = ft_graft_keylen(dst_ft, dst_key, dst_key_len, src_ft,
-				pre_txn);
+		status = ft_graft_keylen(dst_ft, dst_key, dst_key_len, src_ft);
 		FT_TP(merge_exit, (int) status);
 		return status;
 	}
@@ -4136,7 +4080,7 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		 */
 		if (!dst_ft)
 			return ft_merge_at_inner(dst_ft, dst_key, dst_key_len,
-					src_ft, src_key, src_key_len, NULL);
+					src_ft, src_key, src_key_len);
 		/*
 		 * G5.5: @src_ft is exclusive by contract, so only @dst_ft has
 		 * point-op peers to exclude.
@@ -4144,7 +4088,7 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		CDS_FT_SCOPED_BULK_GATE(dst_ft, FT_BULK_WRITER_ONLY);
 
 		st__ = ft_merge_at_inner(dst_ft, dst_key, dst_key_len, src_ft,
-				src_key, src_key_len, NULL);
+				src_key, src_key_len);
 		return st__;
 	}
 #else

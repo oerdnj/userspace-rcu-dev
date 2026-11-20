@@ -4896,27 +4896,6 @@ bool ft_flip_txn_reserve_extra(struct ft_flip_txn *t, unsigned int extra)
 }
 
 /*
- * Take a caller-reserved flip-txn when @pre supplies one.  NULL the caller's
- * slot to transfer ownership.  From here on the consuming bulk op commits
- * and reclaims the txn, and the caller frees only what it still holds.
- * Returns NULL when no txn was reserved (the standalone-op path).  The
- * consumer then creates and reserves its own.  A same-trie rekey
- * pre-reserves the txn before its detach, so that the post-drain commit
- * cannot fail.  A normal op reserves its own where failure is still clean.
- */
-static inline
-struct ft_flip_txn *ft_flip_txn_take(struct ft_flip_txn **pre)
-{
-	if (pre && *pre) {
-		struct ft_flip_txn *t = *pre;
-
-		*pre = NULL;
-		return t;
-	}
-	return NULL;
-}
-
-/*
  * Reclaim deferral passed to urcu_txn_commit_flavor on the exclusive build.
  * There is no concurrent reader, so a committed txn's parked group block is
  * freed in place, with no grace period.  Matches the flavor call_rcu

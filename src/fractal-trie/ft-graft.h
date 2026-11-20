@@ -2350,8 +2350,7 @@ bool ft_moved_keys_overflow(struct cds_ft *src_ft, const uint8_t *src_key,
 static
 enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		const uint8_t *_key, size_t key_len,
-		struct cds_ft *src_ft,
-		struct ft_flip_txn **pre_txn)
+		struct cds_ft *src_ft)
 {
 	/*
 	 * FUNCTION SCOPE on purpose.  The retry loop used to own this
@@ -2474,13 +2473,8 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		/*
 		 * The cross-trie dual root-swap txn.
 		 *
-		 * Take the caller's PRE-RESERVED @pre_txn when one is
-		 * supplied.  cds_ft_merge_at's rekey pre-reserves a glue txn
-		 * before its own fallible steps and passes it down.  That
-		 * makes this forward root swap node-infallible.
-		 *
-		 * Otherwise create and reserve a txn here, while both tries
-		 * are still pristine.  The swap is the op's sole
+		 * Create and reserve it here, while both tries are still
+		 * pristine.  The swap is the op's sole
 		 * reader-visible change, so this is the abort boundary.
 		 *
 		 * The dual always flips both roots.  So it is always
@@ -2492,28 +2486,23 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * §4.B).
 		 *
 		 * A create OOM aborts cleanly: free the fresh root, and both
-		 * tries are untouched.  A taken txn cannot fail.
+		 * tries are untouched.
+		 *
+		 * NAMED FOR @dst_ft, WRITES BOTH ROOTS: the dual flips
+		 * &dst_ft->root AND &src_ft->root in one commit.  The trie
+		 * named here decides only ARMING (ft_txn_content_sw_ok); both
+		 * roots record MW by construction
+		 * (ft_root_list_swap_publish_dual marks them), so the named
+		 * trie need not stand for the foreign one.
 		 */
-		struct ft_flip_txn *dual_txn = ft_flip_txn_take(pre_txn);
+		struct ft_flip_txn *dual_txn = ft_flip_txn_create_bounded(dst_ft,
+			FT_ROOT_LIST_SWAP_DUAL_MAX_EDGES + 1);
 
 		if (!dual_txn) {
-			/*
-			 * NAMED FOR @dst_ft, WRITES BOTH ROOTS: the dual flips
-			 * &dst_ft->root AND &src_ft->root in one commit.  The
-			 * trie named here decides only ARMING
-			 * (ft_txn_content_sw_ok); both roots record MW by
-			 * construction (ft_root_list_swap_publish_dual marks
-			 * them), so the named trie need not stand for the
-			 * foreign one.
-			 */
-			dual_txn = ft_flip_txn_create_bounded(dst_ft,
-				FT_ROOT_LIST_SWAP_DUAL_MAX_EDGES + 1);
-			if (!dual_txn) {
-				if (!dst_root_shared)
-					ft_meta_lock_release(dst_rmeta);
-				free_cds_ft_node_unpublished(dst_ft, fresh_root);
-				return CDS_FT_STATUS_MEMORY_ERROR;
-			}
+			if (!dst_root_shared)
+				ft_meta_lock_release(dst_rmeta);
+			free_cds_ft_node_unpublished(dst_ft, fresh_root);
+			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 
 		/*
@@ -2906,11 +2895,7 @@ retry_attach:
 		 * its ordered-list run-splice then flip atomically.  There
 		 * is no deferred-edge ordering window.
 		 *
-		 * Take the caller's pre-reserved txn.  That caller is the
-		 * rekey.  It pre-sizes the txn before its detach, so that
-		 * the post-drain commit cannot fail.
-		 *
-		 * Otherwise create one here.  Reserve it up front to the
+		 * Create it here and reserve it up front to the
 		 * floor-bounded cluster size.  Records then cannot fail
 		 * mid-build, like the glue floor arrays.
 		 *
@@ -2928,30 +2913,27 @@ retry_attach:
 		 * it.  Post-drain, the commit replays g->deferred through
 		 * it, and the store reserves its slot proxy through it.
 		 */
-		glue.txn = ft_flip_txn_take(pre_txn);
-		if (!glue.txn) {
-			glue.txn = ft_flip_txn_create(dst_ft);
-			if (!glue.txn || !ft_flip_txn_reserve(glue.txn,
-					/* + FLOOR_FREE: fused free-list tombstones (§4.B) */
-					FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE
-					/* +1 fused src-root retire edge (exclusive src, follow-up b) */
-					+ (src_ft->exclusive ? 1 : 0)
-					/* +1 fused nil-key wrapper tombstone (exclusive nil-key src) */
-					+ ((src_ft->exclusive && nil_key_root) ? 1 : 0)
-					/* + count walk: the +src_count nr_keys ancestor edges (BULK fold) */
-					+ (dst_ft->rank_stats ? (int) key_len + 1 : 0)
-					/* the split-retire terminal's second word, if any */
-					+ ft_glue_split_cn_reserve(dst_ft))) {
-				if (glue.txn)
-					ft_flip_txn_destroy(glue.txn);
-				if (already_swapped) {
-					ft_txn_attempt_bail(&optxn, ra_txn);
-					goto retry_attach;	/* src consumed: OOM is transient */
-				}
-				free_cds_ft_node_unpublished(src_ft, fresh_node);
-				ft_txn_attempt_end(&optxn, ra_txn);
-				return CDS_FT_STATUS_MEMORY_ERROR;
+		glue.txn = ft_flip_txn_create(dst_ft);
+		if (!glue.txn || !ft_flip_txn_reserve(glue.txn,
+				/* + FLOOR_FREE: fused free-list tombstones (§4.B) */
+				FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE
+				/* +1 fused src-root retire edge (exclusive src, follow-up b) */
+				+ (src_ft->exclusive ? 1 : 0)
+				/* +1 fused nil-key wrapper tombstone (exclusive nil-key src) */
+				+ ((src_ft->exclusive && nil_key_root) ? 1 : 0)
+				/* + count walk: the +src_count nr_keys ancestor edges (BULK fold) */
+				+ (dst_ft->rank_stats ? (int) key_len + 1 : 0)
+				/* the split-retire terminal's second word, if any */
+				+ ft_glue_split_cn_reserve(dst_ft))) {
+			if (glue.txn)
+				ft_flip_txn_destroy(glue.txn);
+			if (already_swapped) {
+				ft_txn_attempt_bail(&optxn, ra_txn);
+				goto retry_attach;	/* src consumed: OOM is transient */
 			}
+			free_cds_ft_node_unpublished(src_ft, fresh_node);
+			ft_txn_attempt_end(&optxn, ra_txn);
+			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 		/*
 		 * Fuse each retired free-list node's freeze into glue.txn
@@ -2959,13 +2941,8 @@ retry_attach:
 		 * commit as the forward publish that unlinks it.  So the
 		 * retired set freezes dead atomically with the unlink.
 		 *
-		 * Both txn sources carry the <= FT_GLUE_FLOOR_FREE tombstone
-		 * headroom:
-		 *  - the create path reserves + FLOOR_FREE just above;
-		 *  - the rekey take() path's pre_txn is pre-sized to the
-		 *    same floor-bounded cluster + FLOOR_FREE.
-		 *    ft_merge_at_inner's m == 0 graft branch (ft-merge.h)
-		 *    does it.
+		 * The create above reserves the <= FT_GLUE_FLOOR_FREE
+		 * tombstone headroom (+ FLOOR_FREE).
 		 *
 		 * The graft never calls ft_glue_reserve.  So cap_free stays
 		 * FT_GLUE_FLOOR_FREE, and that headroom is the exact bound.
@@ -3191,9 +3168,8 @@ retry_attach:
 		 * The store's flip latches draw from the pre-reserved
 		 * @glue.txn.
 		 *
-		 * Skipped when a caller reserve is already active (the
-		 * rekey).  That reserve and the pre-reserved txn secure the
-		 * store.
+		 * Skipped when a caller reserve is already active: that
+		 * reserve and the pre-reserved txn secure the store.
 		 */
 		if (prep == FT_GRAFT_PREP_NOSPLIT
 				&& !cds_ft_alloc_reserve_covers(dst_ft)) {
@@ -3973,7 +3949,7 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 	 *   read section (ft_op_begin), from descent to commit.
 	 * The src is exclusive, so its frees are synchronous.
 	 */
-	status = ft_graft_keylen(dst_ft, _key, key_len, src_ft, NULL);
+	status = ft_graft_keylen(dst_ft, _key, key_len, src_ft);
 	FT_TP(graft_exit, (int) status);
 	return status;
 }
