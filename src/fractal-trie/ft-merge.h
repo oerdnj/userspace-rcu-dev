@@ -3821,6 +3821,8 @@ merge_spine_retry:
 		if (fence_ret == -EEXIST)
 			goto diverged;
 		if (fence_ret) {
+			/* As in ft_graft_keylen: no attempt owns the refusal. */
+			ft_acq_contended = 0;
 			status = CDS_FT_STATUS_BUSY_ERROR;
 			goto out;
 		}

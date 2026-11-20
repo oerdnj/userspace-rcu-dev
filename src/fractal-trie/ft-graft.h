@@ -2454,8 +2454,14 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			&optxn);
 		if (fence_ret == -EEXIST)
 			return CDS_FT_STATUS_POPULATED_ERROR;
-		if (fence_ret)
+		if (fence_ret) {
+			/*
+			 * No attempt owns the refusal the fence counted.  Drop
+			 * it, or the next op on this thread is aged for it.
+			 */
+			ft_acq_contended = 0;
 			return CDS_FT_STATUS_BUSY_ERROR;
+		}
 
 		/*
 		 * Allocate a fresh empty root for the source before
