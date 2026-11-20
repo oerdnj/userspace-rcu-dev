@@ -8,8 +8,8 @@
  * Userspace RCU library - Fractal Trie: the shared trie descent engine (ft_lookup_inner) and skip-pointer handling.
  *
  * Implementation unit: #included once by fractal-trie.c, in dependency
- * order, into a single translation unit (preserves cross-module inlining).
- * Not a standalone header.
+ * order, into a single translation unit.  This preserves cross-module
+ * inlining.  Not a standalone header.
  */
 #ifndef FRACTAL_TRIE_IMPL
 #error "ft-descent.h is an implementation unit; #include it from fractal-trie.c only"
@@ -22,23 +22,28 @@ enum ft_prefix_tracking {
 };
 
 /*
- * Sentinel value indicating that prefix tracking never recorded a
- * match. Used by FT_PREFIX_TRACK_LONGEST to distinguish "empty trie"
- * from "matched at root with no external nodes" (both have
- * match_node == NULL, but the latter sets match_len = 0).
+ * Sentinel value: prefix tracking never recorded a match.
+ * FT_PREFIX_TRACK_LONGEST uses it to tell two cases apart:
+ * - "empty trie";
+ * - "matched at root with no external nodes".
+ * Both have match_node == NULL.  Only the second sets match_len = 0.
  */
 #define FT_MATCH_LEN_NONE	SIZE_MAX
 
 /*
  * Handle a compressed node during exact lookup descent.
  *
- * Compares key bytes against the compressed path, tracks
- * partial/longest match if requested, advances key/index/node_flag
- * past the compressed path, and fills iter_path entries.
+ * Steps:
+ * - compare key bytes against the compressed path;
+ * - track the partial/longest match if requested;
+ * - advance key/index/node_flag past the compressed path;
+ * - fill iter_path entries.
  *
- * Returns FT_DESCENT_CONTINUE to continue the loop,
- * FT_DESCENT_BREAK to break, or FT_DESCENT_END to jump to
- * the function's end label (with *status_ret and *found_ret set).
+ * Returns one of:
+ * - FT_DESCENT_CONTINUE: continue the loop;
+ * - FT_DESCENT_BREAK: break out of the loop;
+ * - FT_DESCENT_END: jump to the function's end label.  *status_ret
+ *   and *found_ret are set.
  */
 static inline_lookup
 enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag_p,
@@ -71,7 +76,7 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 	}
 
 	/*
-	 * In candidate mode, skip key comparison -- just advance past
+	 * In candidate mode, skip key comparison.  Just advance past
 	 * the compressed path.  The caller verifies the key at the leaf.
 	 */
 	if (!candidate) {
@@ -124,8 +129,10 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 		return FT_DESCENT_BREAK;
 
 	/*
-	 * External child before end of key: record for partial
-	 * tracking, set NOT_FOUND, and tell the caller to end.
+	 * External child before end of key:
+	 * - record it for partial tracking;
+	 * - set NOT_FOUND;
+	 * - tell the caller to end.
 	 */
 	if (key < key_end && ft_node_external(node_flag)) {
 		if (track) {
@@ -137,9 +144,9 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 	}
 
 	/*
-	 * Track prefix match at the child node (the node after the
-	 * compressed path) so callers that skip the normal tracking
-	 * code via continue don't miss it.
+	 * Track the prefix match at the child node, the node after the
+	 * compressed path.  Callers skip the normal tracking code via
+	 * continue, so they would miss it otherwise.
 	 */
 	if (track && key < key_end && !ft_node_external(node_flag)) {
 		struct cds_ft_metadata *metadata =
@@ -160,14 +167,14 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
  * do_cds_ft_lookup_inner: descent template.
  *
  * @descend_cand and @skip_compressed are compile-time constants at
- * every call site (the four specialization wrappers below pass true /
- * false literals).  always_inline + literal arguments lets the compiler
+ * every call site.  The four specialization wrappers below pass true /
+ * false literals.  always_inline + literal arguments lets the compiler
  * constant-fold the per-iter branches on these flags:
  *   - loop-top skip-compressed resolution
  *   - get_nth dispatch
  *   - post-get_nth skip-compressed resolution
- * Eliminates the per-iter `test %sil, %sil` hot spot identified via
- * perf annotate.
+ * This eliminates the per-iter `test %sil, %sil` hot spot.  perf
+ * annotate identified it.
  */
 static inline_lookup
 enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
@@ -178,13 +185,13 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		size_t *tracking_match_len,
 		struct cds_ft_node **tracking_match_node,
 		/*
-		 * COHERENCE witness (NULL -- and a compile-time NULL -- at every
-		 * ordinary call site, so the folds below vanish): when set, every
-		 * node this descent dispatches from, plus the node it lands on,
-		 * is folded in, so a SECOND descent can be compared against the
-		 * first and a view torn across an in-trie move detected.  A MISS
-		 * is covered as well as a hit -- the path is the witness, not the
-		 * result.  See struct ft_visit_witness.
+		 * COHERENCE witness.  It is a compile-time NULL at every
+		 * ordinary call site, so the folds below vanish.  When set, it
+		 * folds in every node this descent dispatches from, plus the
+		 * node it lands on.  A SECOND descent can then be compared
+		 * against the first, to detect a view torn across an in-trie
+		 * move.  A MISS is covered as well as a hit: the path is the
+		 * witness, not the result.  See struct ft_visit_witness.
 		 */
 		struct ft_visit_witness *wit,
 		bool descend_cand,
@@ -196,9 +203,9 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 	/*
 	 * Caller-promised input over-read horizon: @_key_readable_pad
 	 * bytes past @key + @key_len are safely loadable without faulting.
-	 * Used as the input-side contract for ft_key_cmp_ordinals;
-	 * descent through compressed nodes forwards the remaining-safe-
-	 * bytes at each level.
+	 * It is the input-side contract for ft_key_cmp_ordinals.  Descent
+	 * through compressed nodes forwards the remaining safe bytes at
+	 * each level.
 	 */
 	size_t key_readable_pad = _key_readable_pad;
 	const uint8_t *key_safe_end = key_end + key_readable_pad;
@@ -210,10 +217,11 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 	bool track_longest = (tracking == FT_PREFIX_TRACK_LONGEST);
 	/*
 	 * Pointer-form prefix-tracking state.  @match_key_pos == NULL is
-	 * the "no match yet" sentinel (track_longest's initial state, was
-	 * FT_MATCH_LEN_NONE in the size_t form).  Non-NULL points into the
-	 * @orig_key buffer at the matched position; the size_t match_len
-	 * reported to the caller is computed at end: as the difference.
+	 * the "no match yet" sentinel.  It is track_longest's initial
+	 * state.  In the size_t form it was FT_MATCH_LEN_NONE.  Non-NULL
+	 * points into the @orig_key buffer at the matched position.  The
+	 * size_t match_len reported to the caller is the difference,
+	 * computed at end:.
 	 */
 	const uint8_t *match_key_pos = track_longest ? NULL : orig_key;
 	struct cds_ft_node *match_node = NULL;
@@ -225,12 +233,14 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 	{
 	/*
 	 * Whether this iter caches its position for continuation reuse
-	 * (CACHED mode under a continuously-held RCU read lock).  Captured
-	 * before spilling @iter so the terminal path_len computation need
-	 * not rehydrate @iter.  No path array is populated during descent:
-	 * the going-up backtrack recovers per-level nodes from the live
-	 * parent chain, and path_len is derived from the consumed key
-	 * length at the terminal.
+	 * (CACHED mode under a continuously-held RCU read lock).  It is
+	 * captured before spilling @iter, so the terminal path_len
+	 * computation need not rehydrate @iter.  No path array is
+	 * populated during descent:
+	 * - the going-up backtrack recovers per-level nodes from the live
+	 *   parent chain;
+	 * - path_len is derived from the consumed key length at the
+	 *   terminal.
 	 */
 	const bool cache_path =
 		iter && iter->cache_mode == CDS_FT_ITER_CACHED;
@@ -240,7 +250,7 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 	/*
 	 * Spill @iter to its stack slot after the prologue's last
 	 * in-register use of it.  The register holding @iter is then
-	 * free for the rest of the function; the matching reload at
+	 * free for the rest of the function.  The matching reload at
 	 * end: rehydrates it for the epilogue writes.  Validations
 	 * below this line goto-end through the spilled path.
 	 */
@@ -286,12 +296,14 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 	}
 
 	/*
-	 * Root is always internal (the trie-wide invariant: every re-rooting
-	 * mutator -- graft / graft_swap / detach / merge -- publishes an
-	 * internal-tagged root via the build-invisible internal-root builders;
-	 * cds_ft_verify asserts it).  So the hot loop below dispatches from the
-	 * root directly: no pre-loop non-internal-root resolver, no tag-bit
-	 * branch before the first dispatch.
+	 * Root is always internal.  This is a trie-wide invariant:
+	 * - every re-rooting mutator (graft / graft_swap / detach / merge)
+	 *   publishes an internal-tagged root via the build-invisible
+	 *   internal-root builders;
+	 * - cds_ft_verify asserts it.
+	 * So the hot loop below dispatches from the root directly.  There is
+	 * no pre-loop non-internal-root resolver, and no tag-bit branch
+	 * before the first dispatch.
 	 */
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
@@ -302,48 +314,51 @@ descend_loop:
 
 		/*
 		 * Loop top is lean: node_flag is internal.  The first iteration
-		 * dispatches from ft->root (always internal, see above); subsequent
-		 * iterations land here only on the internal fall-through path of the
-		 * post-step merged handler.  No tag-bit branch before dispatch.
+		 * dispatches from ft->root (always internal, see above).  Later
+		 * iterations land here only on the internal fall-through path
+		 * of the post-step merged handler.  No tag-bit branch before
+		 * dispatch.
 		 */
 		if (wit)		/* the descent path */
 			ft_witness_visit(wit, ft_node_ptr(node_flag));
 		iter_key = *(key++);
 		/*
 		 * Dispatch returns the slot value as-is, including any
-		 * skip-encoded high bits.  Skip resolution is handled
-		 * uniformly by the post-step skip handler below (cand
-		 * mode advances key + ft_skip_child_ptr; non-cand mode
-		 * converts to compressed_flag).
+		 * skip-encoded high bits.  The post-step skip handler below
+		 * resolves skips uniformly:
+		 * - cand mode advances key + ft_skip_child_ptr;
+		 * - non-cand mode converts to compressed_flag.
 		 *
 		 * FT_PF_DATA: the prefetch fires on the raw slot value.
-		 * For regular internal/external/compressed children (the
-		 * dominant case -- ~97% on dns) the address is clean and
-		 * the prefetch hits the right target.  For skip-encoded
-		 * children (~3%) the high bits carry skip-length, the
-		 * address is non-canonical, and __builtin_prefetch
-		 * silently drops it (one cheap uop, no fault).
+		 * - Regular internal/external/compressed children are the
+		 *   dominant case (~97% on dns).  Their address is clean,
+		 *   and the prefetch hits the right target.
+		 * - Skip-encoded children are ~3%.  Their high bits carry
+		 *   the skip length, so the address is non-canonical.
+		 *   __builtin_prefetch silently drops it (one cheap uop,
+		 *   no fault).
 		 */
 		{
 			/*
 			 * Eager-split: extract type_index from the tagged
 			 * @node_flag once, then dispatch via the pretyped
-			 * scanner.  The pre-loop normalization (or the
+			 * scanner.  @node_flag is internal here.  The
+			 * pre-loop normalization guarantees it, or the
 			 * internal-fall-through of the post-step merged
-			 * handler) guarantees @node_flag is internal here,
-			 * so the scanner doesn't need to re-check tag bit 0.
-			 * Per-case FT_NODE_SUB_TAG_NOSKIP with a compile-
-			 * time literal folds the SUB into the body load's
-			 * displacement.
+			 * handler does.  So the scanner doesn't need to
+			 * re-check tag bit 0.  Per-case
+			 * FT_NODE_SUB_TAG_NOSKIP with a compile-time literal
+			 * folds the SUB into the body load's displacement.
 			 *
 			 * Precise-descent skip-encoded resolution: validate the
-			 * skip slot against the live compressed node.  On a
-			 * mismatch (a concurrent writer split/merge reparented the
-			 * skip child, possibly while @parent_node_flag was
-			 * recompacted away) re-anchor on the live structure via
-			 * ft_skip_reanchor instead of spinning -- a frozen slot may
-			 * never republish.  Candidate descent doesn't need the cn
-			 * (it advances via ft_skip_child_ptr below), so only the
+			 * skip slot against the live compressed node.  A
+			 * mismatch means a concurrent writer split/merge
+			 * reparented the skip child.  @parent_node_flag may
+			 * have been recompacted away meanwhile.  On a mismatch,
+			 * re-anchor on the live structure via ft_skip_reanchor
+			 * instead of spinning: a frozen slot may never
+			 * republish.  Candidate descent doesn't need the cn: it
+			 * advances via ft_skip_child_ptr below.  So only the
 			 * !descend_cand branch resolves/re-anchors here.
 			 */
 			struct cds_ft_inode_flag *parent_node_flag = node_flag;
@@ -359,11 +374,12 @@ descend_loop:
 			}
 			/*
 			 * A cds_ft_merge_at flip transiently installs a type-7
-			 * proxy in an interior merge-point slot; resolve it to the
-			 * view-appropriate (old or merged) child before the skip /
-			 * kind handlers classify it.  Predicted-not-taken when no
-			 * merge is in flight (the proxy tag 0xF never matches an
-			 * internal / external / compressed / skip child).
+			 * proxy in an interior merge-point slot.  Resolve it to
+			 * the view-appropriate child (old or merged) before the
+			 * skip / kind handlers classify it.  This is
+			 * predicted-not-taken when no merge is in flight.  The
+			 * proxy tag 0xF never matches an internal / external /
+			 * compressed / skip child.
 			 */
 			node_flag = ft_resolve_flip_proxy(node_flag);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
@@ -373,13 +389,19 @@ descend_loop:
 					/*
 					 * Resolve the skip-compressed slot via the live
 					 * skip-child parent chain (ft_skip_reanchor, the
-					 * single skip concurrency mechanism).  Never assume
-					 * the skip child's back-pointer is a compressed node
-					 * and read its len/key_bytes directly: mid-split it
-					 * can transiently be an INTERNAL node (e.g. a
-					 * suffix_len==0 branch re-parenting the old external
-					 * child before the slot's skip pointer is
-					 * republished), which would resolve to a garbage key.
+					 * single skip concurrency mechanism).
+					 *
+					 * Never assume the skip child's
+					 * back-pointer is a compressed node.
+					 * Never read its len/key_bytes
+					 * directly.  Mid-split it can
+					 * transiently be an INTERNAL node.
+					 * An example is a suffix_len==0
+					 * branch that re-parents the old
+					 * external child before the slot's
+					 * skip pointer is republished.
+					 * Reading it would resolve to a
+					 * garbage key.
 					 */
 					unsigned int rewind;
 					struct cds_ft_inode_flag *at_pos;
@@ -389,40 +411,57 @@ descend_loop:
 					assert(anchor != NULL);
 					if (rewind == 0) {
 						/*
-						 * Split (or same-length replace): @at_pos is
-						 * the live node at the failing slot's encoded
-						 * depth -- exactly what the validate-success
-						 * path resolves @cn to.  Descend INTO it by
-						 * falling through to the post-step handler with
-						 * @key unchanged (identical to the
-						 * cn != NULL case, just sourced from the live
-						 * parent-chain walk).  This bypasses the
-						 * holder's stale slot, so we never re-read a
-						 * slot that may mismatch again: each re-anchor
-						 * advances the descent one level -- wait-free.
+						 * Split (or same-length
+						 * replace): @at_pos is the
+						 * live node at the failing
+						 * slot's encoded depth.  It is
+						 * exactly what the
+						 * validate-success path
+						 * resolves @cn to.
+						 * Descend INTO it: fall
+						 * through to the post-step
+						 * handler with @key unchanged.
+						 * This is identical to the
+						 * cn != NULL case, just
+						 * sourced from the live
+						 * parent-chain walk.
+						 * It bypasses the holder's
+						 * stale slot.  So we never
+						 * re-read a slot that may
+						 * mismatch again.  Each
+						 * re-anchor advances the
+						 * descent one level:
+						 * wait-free.
 						 */
 						node_flag = at_pos;
 					} else {
 						/*
-						 * Merge overshoot: the failing level was
-						 * absorbed into a longer compressed that begins
-						 * ABOVE this depth, so @at_pos cannot be entered
-						 * with the unchanged cursor.  Re-anchor at the
-						 * holder and re-descend through the normal loop
-						 * (path bookkeeping stays on the proven path;
-						 * this rarer case remains lock-free).
+						 * Merge overshoot: the failing
+						 * level was absorbed into a
+						 * longer compressed that
+						 * begins ABOVE this depth.
+						 * So @at_pos cannot be entered
+						 * with the unchanged cursor.
+						 * Re-anchor at the holder and
+						 * re-descend through the
+						 * normal loop.  Path
+						 * bookkeeping stays on the
+						 * proven path.  This rarer
+						 * case remains lock-free.
 						 */
 						node_flag = anchor;
 						/*
-						 * The merged run begins within the
-						 * span this descent already consumed:
-						 * a rewind past @orig_key would mean
-						 * the re-anchor walked above the
-						 * search root -- impossible on a
-						 * well-formed trie; catch a
-						 * corruption-driven underflow here
-						 * rather than reading before the
-						 * caller's buffer.
+						 * The merged run begins within
+						 * the span this descent
+						 * already consumed.  A rewind
+						 * past @orig_key would mean
+						 * the re-anchor walked above
+						 * the search root.  That is
+						 * impossible on a well-formed
+						 * trie.  Catch a
+						 * corruption-driven underflow
+						 * here, rather than reading
+						 * before the caller's buffer.
 						 */
 						assert((size_t) (key - orig_key) >=
 							(size_t) rewind + 1);
@@ -443,17 +482,19 @@ descend_loop:
 		 *
 		 * Tempting follow-up that does NOT work: adding a
 		 * ft_maybe_prefetch(node_flag) here to prefetch the skip
-		 * target's body (the 1-step-ahead FT_PF_DATA prefetch saw the
-		 * raw skip pointer and dropped it as non-canonical; node_flag
-		 * is cleared here so it would fire).  Measured a NET LOSS of
-		 * ~10-13% on dns ft_specv at T1 AND T192 (interleaved A/B,
-		 * 2026-05-24).  A prefetch on only ~3% of steps cannot cost
-		 * that directly: adding the instruction perturbs the codegen /
-		 * code layout of this always-inline descent template (which is
-		 * iTLB/layout-sensitive) and regresses every step.  Besides,
-		 * the lead time is tiny -- a skip target is consumed almost
-		 * immediately (validated, for a leaf) -- so it could not hide
-		 * the leaf's DRAM latency anyway.  Do not add a prefetch here.
+		 * target's body.  The 1-step-ahead FT_PF_DATA prefetch saw the
+		 * raw skip pointer and dropped it as non-canonical.  node_flag
+		 * is cleared here, so this one would fire.
+		 *
+		 * It measured a NET LOSS of ~10-13% on dns ft_specv, at T1 AND
+		 * T192 (interleaved A/B, 2026-05-24).  A prefetch on only ~3%
+		 * of steps cannot cost that directly.  Adding the instruction
+		 * perturbs the codegen / code layout of this always-inline
+		 * descent template.  That template is iTLB/layout-sensitive,
+		 * so every step regresses.  Besides, the lead time is tiny.  A
+		 * skip target is consumed almost immediately (validated, for
+		 * a leaf).  So it could not hide the leaf's DRAM latency
+		 * anyway.  Do not add a prefetch here.
 		 */
 		if (skip_compressed && descend_cand && caa_unlikely(ft_node_skip_compressed(node_flag))) {
 			unsigned int skip = ft_skip_len(node_flag);
@@ -470,11 +511,13 @@ descend_loop:
 		/*
 		 * Post-step handler for non-internal results.
 		 *
-		 * Compressed reachable in non-cand mode and also in
-		 * cand mode for compressed paths longer than
-		 * FT_SKIP_LEN_MAX: those keep the regular compressed
-		 * pointer (skip-pointer length encoding wouldn't fit),
-		 * so the slot does not carry a skip pointer and the
+		 * A compressed node is reachable here in two cases:
+		 * - in non-cand mode;
+		 * - in cand mode, for compressed paths longer than
+		 *   FT_SKIP_LEN_MAX.
+		 * Those long paths keep the regular compressed pointer,
+		 * because the skip-pointer length encoding wouldn't fit.
+		 * So the slot does not carry a skip pointer, and the
 		 * pre-step skip handler above didn't resolve it.
 		 * ft_lookup_compressed(candidate=true) advances past
 		 * the compressed path without comparison.
@@ -527,18 +570,20 @@ descend_loop:
 
 terminal:
 	/*
-	 * path_len is the number of path levels (root + one per consumed
-	 * key byte) used by a CACHED iter's continuation fast path; derive
-	 * it from the consumed key length.  Zero for UNCACHED / no-iter
-	 * (unused there: UNCACHED clears cache_valid in the epilogue).
+	 * path_len is the number of path levels: the root, plus one per
+	 * consumed key byte.  A CACHED iter's continuation fast path uses
+	 * it.  Derive it from the consumed key length.  It is zero for
+	 * UNCACHED / no-iter.  It is unused there: UNCACHED clears
+	 * cache_valid in the epilogue.
 	 */
 	if (cache_path)
 		iter_path_len = (size_t) (key - orig_key) + 1;
 	}
 
 	/*
-	 * Reached key_depth, check for terminal node: either external
-	 * nodes or internal/compressed node associated with external nodes.
+	 * Reached key_depth.  Check for a terminal node: either external
+	 * nodes, or an internal/compressed node associated with external
+	 * nodes.
 	 */
 	if (ft_node_internal(node_flag)) {
 		const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
@@ -566,10 +611,10 @@ terminal:
 	} else {
 		found = (struct cds_ft_node *) node_flag;
 		/*
-		 * NULL also matches the external tag: pathological re-anchor
+		 * NULL also matches the external tag.  Pathological re-anchor
 		 * exhaustion can deliver it here.  Report NOT_FOUND rather
-		 * than OK with a NULL result node (an NDEBUG build has no
-		 * assert left to catch the contradiction).
+		 * than OK with a NULL result node.  An NDEBUG build has no
+		 * assert left to catch the contradiction.
 		 */
 		status = found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 		if (track && (found || track_longest)) {
@@ -611,9 +656,9 @@ end:
  * Four specialized instantiations of do_cds_ft_lookup_inner.  Each
  * wrapper passes a const (descend_cand, skip_compressed) pair so the
  * always_inline body collapses to a single specialized descent loop.
- * inline_lookup (always_inline) keeps them inlined into the dispatcher
- * and ultimately into the public entry points, so per-caller constants
- * (iter == NULL, candidate, tracking) also DCE the body.
+ * inline_lookup (always_inline) keeps them inlined into the dispatcher,
+ * and from there into the public entry points.  So per-caller
+ * constants also DCE the body: iter == NULL, candidate, tracking.
  */
 static inline_lookup
 enum cds_ft_status do_cds_ft_lookup_dc_sc(struct cds_ft *ft,
@@ -676,10 +721,10 @@ enum cds_ft_status do_cds_ft_lookup_nodc_nosc(struct cds_ft *ft,
 }
 
 /*
- * WITNESS-CARRYING precise descent, for the rekey-coherent point lookup ONLY:
- * one out-of-line copy with a RUNTIME skip_compressed, so the two coherent
- * specializations share it rather than each inlining a second descent.  The hot
- * paths keep the force-inlined, compile-time-specialized wrappers above.
+ * WITNESS-CARRYING precise descent, for the rekey-coherent point lookup ONLY.
+ * It is one out-of-line copy with a RUNTIME skip_compressed.  The two coherent
+ * specializations share it, rather than each inlining a second descent.  The
+ * hot paths keep the force-inlined, compile-time-specialized wrappers above.
  */
 static
 enum cds_ft_status do_cds_ft_lookup_precise_wit(struct cds_ft *ft,
@@ -734,25 +779,26 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 }
 
 /*
- * Per-API cluster sub-sections.  Each public-API stub lives in
- * .text.hot.cds_ft_<api>.0_stub; its primary inner in
- * .text.hot.cds_ft_<api>.1_primary; secondary variants in
- * .text.hot.cds_ft_<api>.2_secondary.
+ * Per-API cluster sub-sections:
+ * - each public-API stub lives in .text.hot.cds_ft_<api>.0_dispatch;
+ * - its primary inner lives in .text.hot.cds_ft_<api>.1_fast;
+ * - secondary variants live in .text.hot.cds_ft_<api>.2_slow.
  *
- * The linker script ft-lookup-layout.ld groups each cluster
- * (per public API) into one output section, page-aligned, with
- * sub-sections sorted alphabetically -- stub first, primary
- * second, secondary last.  This ensures the bench's hot path
- * (call -> stub -> primary inner) touches a single iTLB page on
- * the critical setup, and primary's tail spilling past 4 KiB
- * doesn't cost an extra iTLB miss on every lookup because the
- * descent's PC stays on page 1 during the first iterations.
+ * The linker script ft-lookup-layout.ld groups each cluster (per
+ * public API) into one page-aligned output section.  Sub-sections are
+ * sorted alphabetically: stub first, primary second, secondary last.
+ * This has two effects:
+ * - the bench's hot path (call -> stub -> primary inner) touches a
+ *   single iTLB page on the critical setup;
+ * - primary's tail may spill past 4 KiB, but this doesn't cost an
+ *   extra iTLB miss on every lookup.  The descent's PC stays on
+ *   page 1 during the first iterations.
  */
 /*
  * Cluster layout: dispatch at page start, fast path next, slow paths
  * trailing.  The linker script (ft-lookup-layout.ld) gathers each
- * cluster's sub-sections in alphabetical name order, page-aligned
- * at the start:
+ * cluster's sub-sections in alphabetical name order.  The cluster
+ * start is page-aligned:
  *
  *   ALIGN(4096) +
  *               |  .text.hot.cds_ft_<api>.0_dispatch  -- public stub
@@ -763,21 +809,24 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
  *               |                                      precise_*, *_nosc,
  *               |                                      *_nonidentity
  *
- * For the bench's hot path (call -> stub -> primary inner), the call
- * lands at the cluster's page boundary; the stub's indirect jmp
+ * On the bench's hot path (call -> stub -> primary inner), the call
+ * lands at the cluster's page boundary.  The stub's indirect jmp
  * forwards into the primary on the same page.  Slow paths trail
  * later in the cluster (later addresses, possibly later pages).
  * The whole cluster shares iTLB/icache locality.
  *
- * Direction of the indirect jmp (forward to primary vs backward to
- * a slow path) is not a factor -- unconditional jmps don't use the
- * "backward predicted taken" heuristic (that applies only to
- * conditional branches with a cold BPB).  Layout experiments
- * 2026-05-22 confirmed stub-FIRST / stub-LAST / stub on different
- * page from primary all measure within ~1 ns on ft_specv_local
- * dns load-names ST.  Dispatch-FIRST was selected for clarity:
- * the bench's CALL lands at the page-aligned cluster start,
- * forward into the next-most-likely target.
+ * The direction of the indirect jmp is not a factor (forward to
+ * primary, or backward to a slow path).  Unconditional jmps don't use
+ * the "backward predicted taken" heuristic.  That heuristic applies
+ * only to conditional branches with a cold BPB.  Layout experiments
+ * on 2026-05-22 compared three layouts on ft_specv_local dns
+ * load-names ST:
+ * - stub-FIRST;
+ * - stub-LAST;
+ * - stub on a different page from primary.
+ * All measured within ~1 ns.  Dispatch-FIRST was
+ * selected for clarity: the bench's CALL lands at the page-aligned
+ * cluster start, and goes forward into the next-most-likely target.
  */
 #define FT_LOOKUP_DISPATCH(name)	\
 	__attribute__((section(".text.hot.cds_ft_" name ".0_dispatch")))
@@ -789,13 +838,15 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 /*
  * Specialized lookup_key/lookup_candidate_key inner functions.
  * Each bakes the (descend_cand, skip_compressed) pair into a
- * literal-arg call to the matching always_inline
- * wrapper -- the wrapper then inlines into the inner with all
- * per-iter branches on those constants folded out.  Each is
- * referenced via the function pointers installed on struct cds_ft
- * by ft_install_lookup_ops (see cds_ft_create), so gcc cannot
- * inline them into the caller -- they exist as real symbols and
- * the public entry point dispatches via an indirect tail call.
+ * literal-arg call to the matching always_inline wrapper.  The
+ * wrapper then inlines into the inner, with all per-iter branches on
+ * those constants folded out.
+ *
+ * Each inner is referenced via the function pointers that
+ * ft_install_lookup_ops installs on struct cds_ft (see cds_ft_create).
+ * So gcc cannot inline them into the caller.  They exist as real
+ * symbols, and the public entry point dispatches via an indirect tail
+ * call.
  *
  * Identity key_map is implied for the four hot-path inners
  * (FT_PREFIX_TRACK_NONE, key passed directly, no ordinals[]).
@@ -868,12 +919,12 @@ enum cds_ft_status ft_lookup_cand_nosc(struct cds_ft *ft,
 
 /*
  * Non-identity key_map fallback (key + candidate variants).
- * Allocates a FT_MAX_KEY_LEN stack buffer for the ordinals[]
- * remap and routes through do_cds_ft_lookup, which re-derives the
- * descend_cand path from group state at runtime.
- * Non-identity maps are rare (only set via
- * cds_ft_group_attr_set_key_map) so the extra dispatch hop is
- * not worth specializing further.
+ * Allocate a FT_MAX_KEY_LEN stack buffer for the ordinals[] remap.
+ * Route through do_cds_ft_lookup.  It re-derives the descend_cand
+ * path from group state at runtime.
+ * Non-identity maps are rare: only cds_ft_group_attr_set_key_map
+ * sets them.  So the extra dispatch hop is not worth specializing
+ * further.
  */
 #ifdef FEATURE_FT_KEY_MAP
 static FT_LOOKUP_SLOW_PATH("lookup_key")
@@ -926,9 +977,11 @@ enum cds_ft_status ft_lookup_candidate_key_nonidentity(struct cds_ft *ft,
  *
  * Reduced to a single indirect tail-call through the function
  * pointer installed on @ft at create time (see
- * ft_install_lookup_ops).  gcc -O2 emits a sibling call
- * (`mov 0x?(%rdi),%rax; jmp *%rax`) -- no stack frame, no
- * callee-save save/restore, no per-call branch on group shape.
+ * ft_install_lookup_ops).  gcc -O2 emits a sibling call:
+ * `mov 0x?(%rdi),%rax; jmp *%rax`.  It has:
+ * - no stack frame;
+ * - no callee-save save/restore;
+ * - no per-call branch on group shape.
  * The branch predictor stores the fn-ptr target once per trie
  * and predicts it for every subsequent lookup.
  */
