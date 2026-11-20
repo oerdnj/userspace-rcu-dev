@@ -25,11 +25,10 @@
  *   - Argument NULL check and the FT_TP_KEY/FT_TP tracepoints are
  *     the public wrapper's responsibility.
  *
- * The detached subtree handle returned for non-root detach in a
- * fixed-length group has keys shorter than the group's fixed length;
- * it is therefore an internal-use-only handle and must be re-grafted
- * (via ft_graft_keylen at the same prefix) before any public API
- * consumer interacts with it.
+ * A non-root detach in a fixed-length group returns a subtree handle
+ * whose keys are shorter than the group's fixed length.  This handle is
+ * for internal use only.  Re-graft it with ft_graft_keylen at the same
+ * prefix before any public API consumer uses it.
  */
 static
 enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
@@ -83,20 +82,21 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		/*
 		 * Carry the source's verify-at-mutation cadence into the
 		 * detached trie.  Otherwise the detached trie would reset
-		 * to the default period of 1 and re-introduce the O(N)
-		 * per-mutation cost on the detached subtree, defeating the
-		 * very reason the source was tuned to a larger period.
-		 * Counter is reset (calloc'd in cds_ft_create).
+		 * to the default period of 1.  That brings back the O(N)
+		 * per-mutation cost on the detached subtree.  The source
+		 * was tuned to a larger period to avoid exactly that cost.
+		 * The counter is reset (calloc'd in cds_ft_create).
 		 */
 		detached->verify_at_mutation_period = ft->verify_at_mutation_period;
 #endif
 
 		/*
 		 * Pre-reserve the root-swap flip-txn (root + head/tail) BEFORE the
-		 * swap, while @ft is still pristine and @detached owns only its own
-		 * empty root: an OOM here aborts cleanly (tear down @detached, @ft
-		 * untouched).  List off uses the lone-edge ft_root_edge_flip below
-		 * (no txn).  This is the whole-trie root detach, not a hot path.
+		 * swap.  At this point @ft is still pristine.  @detached owns
+		 * only its own empty root.  So an OOM here aborts cleanly: tear
+		 * down @detached and leave @ft untouched.  List off uses the
+		 * lone-edge ft_root_edge_flip below (no txn).  This is the
+		 * whole-trie root detach, not a hot path.
 		 */
 		struct ft_flip_txn *root_txn = NULL;
 
@@ -127,10 +127,10 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		 * Move the source root into the detached trie.
 		 * Free the empty root that cds_ft_create allocated for
 		 * the detached trie, and replace it with the source root.
-		 * @detached is a fresh handle not yet returned to the caller, so
-		 * its empty root was never reader-visible: free it UNPUBLISHED
-		 * (immediate, no grace period, no freeze-on-free tombstone -- it
-		 * was never live in any trie).
+		 * @detached is a fresh handle not yet returned to the caller.
+		 * So its empty root was never reader-visible.  Free it
+		 * UNPUBLISHED: immediately, with no grace period and no
+		 * freeze-on-free tombstone.  It was never live in any trie.
 		 */
 		free_cds_ft_node_unpublished(detached, ft_node_ptr(detached->root));
 		/* No readers in detached root yet. */
@@ -156,17 +156,20 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 
 		/*
 		 * Give source a fresh empty root.  A root detach moves the
-		 * WHOLE trie, so when the ordered list is enabled @ft's entire
-		 * ordered cell run becomes @detached's: the cells' internal
-		 * links are unchanged, and @ft's root swap is fused with its
-		 * sentinel clear into ONE flip (ft_root_list_swap_publish, src/
-		 * disappear side) so a concurrent reader never observes @ft with
-		 * its structure emptied but its ordered list still populated (or
-		 * vice versa) -- a reader mid-iteration follows its RCU snapshot
-		 * into @detached.  The run's OUTER links (first->prev, last->next)
-		 * are NOT relinked in that flip (relink_dest NULL): they stay at
-		 * @ft's sentinel, straddler-safe, and re-home to @detached's
-		 * sentinel only after the drain (ft_ord_finalize_circular).
+		 * WHOLE trie.  So when the ordered list is enabled, @ft's
+		 * entire ordered cell run becomes @detached's:
+		 *   - The cells' internal links are unchanged.
+		 *   - @ft's root swap and its sentinel clear are fused into
+		 *     ONE flip (ft_root_list_swap_publish, src/disappear
+		 *     side).  A concurrent reader never sees @ft with its
+		 *     structure emptied but its ordered list still populated,
+		 *     or the reverse.  A reader mid-iteration follows its RCU
+		 *     snapshot into @detached.
+		 *   - The run's OUTER links (first->prev, last->next) are NOT
+		 *     relinked in that flip (relink_dest NULL).  They stay at
+		 *     @ft's sentinel, which is straddler-safe.  They move to
+		 *     @detached's sentinel only after the drain
+		 *     (ft_ord_finalize_circular).
 		 * @detached has no readers yet, so point its sentinel at the run
 		 * with plain stores.
 		 */
@@ -175,14 +178,16 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			struct ft_ord_cell *last = ft_ord_last(ft);
 
 			/*
-			 * relink_dest NULL: clear @ft's sentinel + swap the root, but do
-			 * NOT relink the moved run's outer links in the flip -- they stay
-			 * pointing at @ft's (cleared) sentinel, which an @ft reader
-			 * straddling the move recognises as its own end (a foreign
-			 * @detached sentinel would be dereferenced as a cell).  @detached
-			 * has no readers, so point its sentinel at the run by plain store;
-			 * the run's outer links are finalized to @detached's sentinel after
-			 * the drain below (ft_ord_finalize_circular).
+			 * relink_dest NULL: clear @ft's sentinel and swap
+			 * the root.  Do NOT relink the moved run's outer
+			 * links in the flip.  They stay pointing at @ft's
+			 * (cleared) sentinel.  An @ft reader straddling the
+			 * move recognises that sentinel as its own end.  It
+			 * would dereference a foreign @detached sentinel as
+			 * a cell.  @detached has no readers, so point its
+			 * sentinel at the run by plain store.  The run's
+			 * outer links are finalized to @detached's sentinel
+			 * after the drain below (ft_ord_finalize_circular).
 			 */
 			ft_root_list_swap_publish(ft, root_txn, &ft->root,
 				ft->root, ft_node_flag(fresh_node, 0),
@@ -196,10 +201,11 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		} else {
 			/*
 			 * No ordered list: the root pointer is the only
-			 * reader-visible slot.  Express it as a single-edge flip
-			 * descriptor anyway (commits as one release store, like a
-			 * bare rcu_assign_pointer) so the root swap is
-			 * MCAS-expressible like every other structural publish.
+			 * reader-visible slot.  Still express it as a
+			 * single-edge flip descriptor.  It commits as one
+			 * release store, like a bare rcu_assign_pointer.
+			 * This keeps the root swap MCAS-expressible like
+			 * every other structural publish.
 			 */
 			ft_root_edge_flip(ft, &ft->root, ft->root,
 				ft_node_flag(fresh_node, 0));
@@ -207,21 +213,23 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		FT_TP(root_publish, (const void *) ft, (const void *) ft->root);
 
 		/*
-		 * Drain @ft's readers that entered before the root swap and may
-		 * still be inside the moved subtree (or parked in the moved
-		 * ordered run): the exclusivity promise on @detached -- which a
-		 * subsequent graft relies on to skip ITS grace period, and
-		 * which makes mutation frees on @detached SYNCHRONOUS -- must
-		 * hold at return, not eventually.  Skip for exclusive sources,
-		 * which carry no RCU readers by construction.
+		 * Drain @ft's readers that entered before the root swap.  They
+		 * may still be inside the moved subtree, or parked in the moved
+		 * ordered run.  The exclusivity promise on @detached must hold
+		 * at return, not eventually.  Two things rely on it:
+		 *   - a later graft skips ITS grace period;
+		 *   - mutation frees on @detached are SYNCHRONOUS.
+		 * Skip for exclusive sources, which carry no RCU readers by
+		 * construction.
 		 */
 		if (!ft->exclusive)
 			ft_writer_lock_gp_wait(ft);
 
 		/*
-		 * Drain done: restore @detached's list to circular form (the moved run's
-		 * outer links were left at @ft's sentinel for straddler safety; point
-		 * them at @detached's sentinel now for its own removes / reverse walks).
+		 * Drain done: restore @detached's list to circular form.  The
+		 * moved run's outer links were left at @ft's sentinel for
+		 * straddler safety.  Point them at @detached's sentinel now,
+		 * for its own removes and reverse walks.
 		 */
 		if (ft->group->ordered_list_set)
 			ft_ord_finalize_circular(detached);
@@ -232,11 +240,11 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 
 	/*
 	 * key_len > 0: a plain key-guided descent to the detach target
-	 * @child.  No branch-point snapshot is tracked here: ft_detach_node
-	 * is bootstrapped from @child's own slot and recovers the surviving
-	 * ancestor by climbing parent pointers (the same upward walk used by
-	 * cds_ft_remove's count==1 prune), so the descent only has to locate
-	 * @child, its slot, and its parent.
+	 * @child.  No branch-point snapshot is tracked here.  ft_detach_node
+	 * starts from @child's own slot.  It finds the surviving ancestor by
+	 * climbing parent pointers, the same upward walk as cds_ft_remove's
+	 * count==1 prune.  So the descent only has to locate @child, its
+	 * slot and its parent.
 	 */
 	{
 		struct ft_descent d;
@@ -308,13 +316,13 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			ft_glue_init(&glue);
 			glue.op = &optxn;
 			/*
-			 * The detached trie is returned exclusive: the
+			 * The detached trie is returned exclusive.  The
 			 * synchronize_rcu below drains in-flight readers of
-			 * the source before publishing @child as @detached's
-			 * root, so no RCU reader is inside @detached at
-			 * return.  Callers that publish @detached to
-			 * concurrent readers must call cds_ft_make_shared
-			 * first.
+			 * the source.  Only then is @child published as
+			 * @detached's root.  So no RCU reader is inside
+			 * @detached at return.  Callers that publish
+			 * @detached to concurrent readers must call
+			 * cds_ft_make_shared first.
 			 */
 			detached->exclusive = true;
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
@@ -323,19 +331,20 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 #endif
 
 			/*
-			 * Materialize the detached trie's internal root NOW,
-			 * build-invisibly, while nothing has been published:
-			 * the trie root invariant requires an internal node,
-			 * but a compressed/skip-compressed @child needs fresh
+			 * Materialize the detached trie's internal root NOW.
+			 * Build it invisibly, while nothing has been published.
+			 * The trie root invariant requires an internal node.
+			 * A compressed/skip-compressed @child needs fresh
 			 * allocations to peel its first path byte.  This is
-			 * the LAST fallible step -- doing it after the detach
-			 * publish would have no rollback (the subtree would be
-			 * unreachable from both tries: silent data loss).  The
-			 * fresh nodes are tracked in @glue, the live
-			 * grandchild's back-pointer flip is deferred to the
-			 * post-drain commit below, and the peeled compressed
-			 * node's free is deferred likewise; an abort leaves
-			 * the source pristine.
+			 * the LAST fallible step.  After the detach publish
+			 * there would be no rollback.  The subtree would be
+			 * unreachable from both tries: silent data loss.
+			 *   - @glue tracks the fresh nodes.
+			 *   - The live grandchild's back-pointer flip is
+			 *     deferred to the post-drain commit below.
+			 *   - The peeled compressed node's free is deferred
+			 *     likewise.
+			 * An abort leaves the source pristine.
 			 */
 			if (!ft_node_external(child)) {
 				new_root = ft_make_root_internal_glue(detached,
@@ -356,26 +365,40 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			 */
 			{
 				/*
-				 * Subtree-move detach (free_detached_subtree == false): preserve
-				 * @child as the root of the new @detached trie.  Bootstrapped from
-				 * @child's own slot, ft_detach_node climbs parent pointers to the
-				 * surviving ancestor, unlinks the branch there, and its free-walk
-				 * phase 1 reclaims the intermediate single-child chain (the @nr_clear
-				 * elevated links) while phase 2 -- which would free @child and below
-				 * -- is gated off for move-style.
+				 * Subtree-move detach
+				 * (free_detached_subtree == false): preserve
+				 * @child as the root of the new @detached
+				 * trie.  ft_detach_node starts from @child's
+				 * own slot.  It then does this:
+				 *   - climbs parent pointers to the
+				 *     surviving ancestor and unlinks the
+				 *     branch there;
+				 *   - in free-walk phase 1, reclaims the
+				 *     intermediate single-child chain (the
+				 *     @nr_clear elevated links).
+				 * Phase 2 would free @child and below.  It
+				 * is gated off for move-style.
 				 *
-				 * Ordered list on: the detached subtree's keys form a contiguous run
-				 * in @ft's ordered cell list.  Capture that run's endpoints (the
-				 * structural min/max heads of the intact @child subtree -- a prefix
-				 * key at the detach point, if any, is the run minimum) and hand them,
-				 * with a deferred-publish @pub, to ft_detach_node so the structural
-				 * unlink and the ordered-cell run-detach commit in ONE flip: a reader
-				 * never sees the run gone from the structure but still present in the
-				 * ordered list (or vice versa).  @run.armed reports whether a path
-				 * fused it; the rare unfused shape (compressed fresh-internal root)
-				 * falls back to the standalone two-commit run-detach.  The
-				 * internal-child branch's synchronize_rcu below then drains any @ft
-				 * reader parked in the run.
+				 * Ordered list on: the detached subtree's
+				 * keys form a contiguous run in @ft's
+				 * ordered cell list.  Capture that run's
+				 * endpoints: the structural min/max heads
+				 * of the intact @child subtree.  A prefix
+				 * key at the detach point, if any, is the
+				 * run minimum.  Hand the endpoints to
+				 * ft_detach_node with a deferred-publish
+				 * @pub.  The structural unlink and the
+				 * ordered-cell run-detach then commit in
+				 * ONE flip.  A reader never sees the run
+				 * gone from the structure but still in the
+				 * ordered list, or the reverse.  @run.armed
+				 * reports whether a path fused it.  The
+				 * rare unfused shape (compressed
+				 * fresh-internal root) falls back to the
+				 * standalone two-commit run-detach.  The
+				 * internal-child branch's synchronize_rcu
+				 * below then drains any @ft reader parked
+				 * in the run.
 				 */
 				struct ft_remove_pub pub = { .armed = false };
 				struct ft_detach_run run = { .armed = false };
@@ -391,11 +414,16 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 					pubp = &pub;
 					runp = &run;
 					/*
-					 * Pre-reserve the standalone run-detach txn before the
-					 * structural unlink: the rare unfused shape excises the
-					 * run AFTER ft_detach_node is public -- un-abortable.
-					 * OOM here aborts cleanly (undo propagation, abort the
-					 * build, destroy @detached), leaving @ft pristine.
+					 * Pre-reserve the standalone
+					 * run-detach txn before the
+					 * structural unlink.  The rare
+					 * unfused shape excises the run
+					 * AFTER ft_detach_node is public.
+					 * That step cannot abort.  An OOM
+					 * here aborts cleanly and leaves
+					 * @ft pristine: undo propagation,
+					 * abort the build and destroy
+					 * @detached.
 					 */
 					run_txn = ft_flip_txn_create_bounded(ft,
 						FT_ORD_CELL_RUN_DETACH_MAX_EDGES);
@@ -406,34 +434,41 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 					}
 				}
 				/*
-				 * Fold the whole-subtree count removal onto the structural
-				 * unlink: @count_delta -detached_count rides ft_detach_node's
-				 * own commit, so the surviving ancestor's -detached_count walk
-				 * flips ATOMICALLY with the detach (exact under concurrent
-				 * writers -- the same magnitude-agnostic machinery as the leaf
-				 * -1 fold).  No pre-decrement, no post-detach propagate walk
+				 * Fold the whole-subtree count removal onto
+				 * the structural unlink.  @count_delta
+				 * -detached_count rides ft_detach_node's own
+				 * commit.  So the surviving ancestor's
+				 * -detached_count walk flips ATOMICALLY with
+				 * the detach.  It is exact under concurrent
+				 * writers.  It uses the same
+				 * magnitude-agnostic machinery as the leaf
+				 * -1 fold.  There is no pre-decrement.
+				 * There is no post-detach propagate walk
 				 * over the now-freed intermediate chain.
 				 */
 				struct ft_lock_ctx lctx;
 
 				/*
 				 * JOIN THE ESCALATION DOMAIN for the lock-set this
-				 * detach takes.  The op has no retry loop of its own,
-				 * so it needs no AGING -- what it needs is DEFERENCE:
-				 * begin() honours domain->active, so a peer starving
-				 * on one of these anchors is queued in front of this
-				 * detach instead of being barged past by it.
+				 * detach takes.  The op has no retry loop of
+				 * its own, so it needs no AGING.  It needs
+				 * DEFERENCE.  begin() honours domain->active.
+				 * So a peer starving on one of these anchors
+				 * is queued in front of this detach.  This
+				 * detach does not barge past it.
 				 *
 				 * ★ THE BRACKET IS THIS CALL AND NOTHING MORE.
 				 * ft_detach_keylen waits for three grace periods
-				 * (ft_writer_lock_gp_wait, above and below), and a
-				 * writer parked on the fallback lane is an ONLINE,
-				 * non-quiescent QSBR reader -- precisely what stops the
-				 * grace period it would then wait for.  That is the rule
-				 * ft_writer_lock_gp_wait asserts (!ft_op_in_lane).
-				 * ft_detach_node itself takes no grace period -- there is
-				 * no ft_writer_lock_gp_wait anywhere in ft-remove.h -- so
-				 * a bracket around exactly it is provably clear of one.
+				 * (ft_writer_lock_gp_wait, above and below).  A
+				 * writer parked on the fallback lane is an
+				 * ONLINE, non-quiescent QSBR reader.  Such a
+				 * reader stops the grace period the writer
+				 * would then wait for.  ft_writer_lock_gp_wait
+				 * asserts this rule (!ft_op_in_lane).
+				 * ft_detach_node itself takes no grace period.
+				 * There is no ft_writer_lock_gp_wait anywhere
+				 * in ft-remove.h.  So a bracket around exactly
+				 * this call is provably clear of one.
 				 */
 				ft_op_begin(&optxn);
 				ft_lock_ctx_init(&lctx, &d, NULL, &optxn);
@@ -447,10 +482,13 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				assert(ret != -ENOENT);
 				if (ret < 0) {
 					/*
-					 * Recompaction -ENOMEM: nothing was published (the
-					 * deferred flip never ran, run.armed stays false); the
-					 * folded count edges rode the uncommitted txn (an abort
-					 * applies nothing), so aborting leaves @ft pristine.
+					 * Recompaction -ENOMEM: nothing
+					 * was published.  The deferred
+					 * flip never ran, and run.armed
+					 * stays false.  The folded count
+					 * edges rode the uncommitted txn.
+					 * An abort applies nothing.  So
+					 * aborting leaves @ft pristine.
 					 */
 					if (run_txn)
 						ft_flip_txn_destroy(run_txn);
@@ -486,27 +524,30 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			if (!ft_node_external(child)) {
 				/*
 				 * Drain source-trie readers that entered
-				 * before ft_detach_node published the unlink
-				 * and may still hold pointers into @child's
+				 * before ft_detach_node published the unlink.
+				 * They may still hold pointers into @child's
 				 * subtree.  Without this grace period, such a
-				 * reader's going-up walk can observe the
-				 * @child.parent = NULL store published below
-				 * while its @cur_nf is still a node inside the
-				 * subtree, break out of its walk as if it had
-				 * reached @ft's root, and return a spurious
-				 * result drawn from the now-detached internal
-				 * pointer chain -- the escape that the
+				 * reader's going-up walk can go wrong:
+				 *   - it observes the @child.parent = NULL
+				 *     store published below, while its
+				 *     @cur_nf is still a node inside the
+				 *     subtree;
+				 *   - it breaks out of its walk as if it had
+				 *     reached @ft's root;
+				 *   - it returns a spurious result drawn from
+				 *     the now-detached internal pointer chain.
+				 * This is the escape that the
 				 * inv_ordered_no_escape_graft invariant guards
 				 * against.  Skip for exclusive sources: those
 				 * carry no RCU readers by construction.
 				 *
 				 * After this grace period, no reader holds a
-				 * pointer into @child's subtree; combined with
-				 * @detached being a fresh handle, @detached has
-				 * no concurrent readers and is returned in
-				 * exclusive mode.  A subsequent graft of
-				 * @detached therefore skips its own GP,
-				 * coalescing detach+graft to a single grace
+				 * pointer into @child's subtree.  @detached is
+				 * also a fresh handle.  So @detached has no
+				 * concurrent readers and is returned in
+				 * exclusive mode.  A later graft of @detached
+				 * therefore skips its own GP.  The
+				 * detach+graft pair costs a single grace
 				 * period.
 				 */
 				if (!ft->exclusive)
@@ -516,19 +557,22 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				 * materialized build-invisibly BEFORE the
 				 * detach published anything (see the
 				 * ft_make_root_internal_glue call above).
-				 * Wire the deferred live back-pointer (the
-				 * grandchild moved under the fresh cluster --
-				 * safe now, the drain above guarantees no
-				 * reader still up-walks from inside the
-				 * subtree), install the root, then reclaim the
-				 * peeled-away compressed node.
+				 * Then, in order:
+				 *   - wire the deferred live back-pointer of
+				 *     the grandchild moved under the fresh
+				 *     cluster.  This is safe now: the drain
+				 *     above guarantees no reader still
+				 *     up-walks from inside the subtree;
+				 *   - install the root;
+				 *   - reclaim the peeled-away compressed node.
 				 */
 				ft_glue_apply_deferred(detached, &glue);
 				/*
 				 * @detached is a fresh handle with no readers
-				 * yet; its placeholder empty root was never
-				 * reader-visible, so free it UNPUBLISHED
-				 * (immediate, no tombstone -- never live).
+				 * yet.  Its placeholder empty root was never
+				 * reader-visible.  So free it UNPUBLISHED:
+				 * immediately, with no tombstone.  It was
+				 * never live.
 				 */
 				free_cds_ft_node_unpublished(detached,
 					ft_node_ptr(detached->root));
@@ -557,21 +601,22 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 					ft_root_metadata(detached);
 
 				/*
-				 * Drain source-trie readers here too: they may
-				 * still be parked on the detached external
-				 * chain (a lookup that returned the head, a
-				 * duplicate-chain walk) or in the moved ordered
-				 * run.  The exclusivity promise on @detached
-				 * must hold AT RETURN -- a subsequent graft of
-				 * @detached legitimately skips its own grace
-				 * period, and exclusive-mode mutations free
-				 * SYNCHRONOUSLY, so a parked reader would
-				 * dereference freed memory.  The drain also
-				 * precedes the prev re-point below, so no
-				 * reader's up-walk from the chain head can
-				 * escape into @detached's root.  Skip for
-				 * exclusive sources (no RCU readers by
-				 * construction).
+				 * Drain source-trie readers here too.  They
+				 * may still be parked in one of these places:
+				 *   - on the detached external chain (a
+				 *     lookup that returned the head, or a
+				 *     duplicate-chain walk);
+				 *   - in the moved ordered run.
+				 * The exclusivity promise on @detached must
+				 * hold AT RETURN.  A later graft of @detached
+				 * legitimately skips its own grace period.
+				 * Exclusive-mode mutations free SYNCHRONOUSLY.
+				 * So a parked reader would dereference freed
+				 * memory.  The drain also precedes the prev
+				 * re-point below.  So no reader's up-walk from
+				 * the chain head can escape into @detached's
+				 * root.  Skip for exclusive sources (no RCU
+				 * readers by construction).
 				 */
 				if (!ft->exclusive)
 					ft_writer_lock_gp_wait(ft);
@@ -597,11 +642,12 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		}
 
 		/*
-		 * Restore @detached's ordinal-cell list to its circular form now that
-		 * the drains above have retired any @ft reader straddling the moved run:
-		 * the run-install left the run's outer links at @ft's former neighbours
-		 * (straddler-safe), so point them at @detached's sentinel for the
-		 * exclusive trie's own removes / reverse walks.
+		 * Restore @detached's ordinal-cell list to its circular
+		 * form.  The drains above have retired any @ft reader
+		 * straddling the moved run.  The run-install left the
+		 * run's outer links at @ft's former neighbours, which is
+		 * straddler-safe.  Point them at @detached's sentinel now,
+		 * for the exclusive trie's own removes and reverse walks.
 		 */
 		if (ft->group->ordered_list_set)
 			ft_ord_finalize_circular(detached);
