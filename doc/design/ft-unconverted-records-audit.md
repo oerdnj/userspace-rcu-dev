@@ -5,28 +5,35 @@ pattern is to validate or revalidate under lock. We should audit FT for
 remaining MW or validate or load validate records. Those are unconverted
 sites."*
 
-This is that audit: every record that still installs by CAS (MW) or validates
-`{v -> v}`, with how often it fires on a FINE shared trie under concurrent
-writers, and what converting it means. Companion to the plan of record,
-`mw-to-fine-locking-remainder.md` (its G4 is the MW_ALWAYS lane question).
+This is that audit. It lists every record that still installs by CAS (MW) or
+validates `{v -> v}`. For each one it gives how often it fires on a FINE
+shared trie under concurrent writers. It also says what converting it means.
+This document is a companion to the plan of record,
+`mw-to-fine-locking-remainder.md`. Its G4 is the MW_ALWAYS lane question.
 
 ## Method
 
-- **Static:** every call of `ft_flip_txn_record_tag_mw[_pinned]`,
-  `ft_flip_txn_record_state_mw`, `ft_flip_txn_lock_or_guard_parent*`,
-  `ft_flip_txn_guard_parent*`, `ft_flip_txn_guard_installed_child`,
-  `ft_flip_txn_rebase_state_guard`, `urcu_txn_validate`,
-  `urcu_txn_load_validate*`, `urcu_txn_read`, `ft_acq_guard_add`.
-- **Dynamic:** two census trees, both `--enable-rcu-debug`,
-  `-fno-omit-frame-pointer`, all three lock spacings compiled in:
+- **Static:** every call of these functions:
+  - `ft_flip_txn_record_tag_mw[_pinned]`;
+  - `ft_flip_txn_record_state_mw`;
+  - `ft_flip_txn_lock_or_guard_parent*`;
+  - `ft_flip_txn_guard_parent*`;
+  - `ft_flip_txn_guard_installed_child`;
+  - `ft_flip_txn_rebase_state_guard`;
+  - `urcu_txn_validate`;
+  - `urcu_txn_load_validate*`;
+  - `urcu_txn_read`;
+  - `ft_acq_guard_add`.
+- **Dynamic:** two census trees. Both use `--enable-rcu-debug` and
+  `-fno-omit-frame-pointer`. Both compile in all three lock spacings:
   - `-DFT_DEBUG_TXN_KIND -DFT_DEBUG_STRUCT_ANCHOR`: per-class MW split, MW_STRUCT
     by record pc, and the owner question for every always-MW lane record.
     Per-node and root-only only. At exponential, `ft_sa_check` SEGVs climbing
     the unpublished S_top' copy that the build's absorb acquires (instrument
     gap, not a product crash).
-  - `-DFT_DEBUG_TXN_KIND -DFT_DEBUG_GUARD_AUDIT`: every §4.B parent-guard plant,
-    whether it is on the miss path, and whether the op's frame covers the word.
-    All three spacings.
+  - `-DFT_DEBUG_TXN_KIND -DFT_DEBUG_GUARD_AUDIT`: every §4.B parent-guard
+    plant. It reports whether the plant is on the miss path. It also reports
+    whether the op's frame covers the word. All three spacings.
 - **Workload:** `test_urcu_ft_inv` with `FT_INV_MW=1` (concurrent writers, fine
   shared tries), one full run per spacing. The numbers are records per run.
   ft_unit is mostly exclusive or coarse tries, where MW parks through door 1,
@@ -85,31 +92,37 @@ Totals: **pn 2.14M / ro 431k / ex 1.51M**, OWN_HELD = 0 everywhere. By record pc
 
 ## Status (2026-09-26, after the first two conversions)
 
-- **1 ☑ the §4.B parent guard.** No plant on a missed txn; none under
-  trie-wide exclusion (`ft_flip_txn_excludes_all`: door 1, or the FT-wide
-  lock this thread holds); and `cds_ft_replace`'s `{L}` counts as covering at
-  root-only when it was taken for the parent (`ft_replace_hold_covers`).
-  Installed parent validates per ft_inv MW run: **per-node 0, root-only 0**,
-  exponential ~18-30k (the replace arm, kept: see below).
+- **1 ☑ the §4.B parent guard.** Three changes:
+  - No plant on a missed txn.
+  - No plant under trie-wide exclusion (`ft_flip_txn_excludes_all`: door 1,
+    or the FT-wide lock this thread holds).
+  - `cds_ft_replace`'s `{L}` counts as covering at root-only when it was
+    taken for the parent (`ft_replace_hold_covers`).
+
+  Installed parent validates per ft_inv MW run: **per-node 0, root-only 0**.
+  Exponential has ~18-30k. That is the replace arm, which is kept (see
+  below).
 - **2 ☑ re-parent and installed-child validates** at root-only
   (`ft_flip_txn_owns`' root arm) and under trie-wide exclusion: 20k and 52k to
-  0. **Per-node keeps both**, deliberately: no lock in `{C,P,(GP)}` reaches a
-  child or an installed node, and these validates are the defence against a
-  node retired while still linked (measured through the installed-child
-  guard). The alternative, locking the sweep's children, was implemented and
+  0. **Per-node keeps both**, deliberately. No lock in `{C,P,(GP)}` reaches a
+  child or an installed node. These validates are the defence against a node
+  retired while still linked (measured through the installed-child guard).
+  The alternative was to lock the sweep's children. It was implemented and
   rejected (escalation cannot rescue a contended child). Converting them needs
   that residue proven gone first.
 - **Exponential keeps its validates.** A plan dated before a move can lock the
   old path's anchor while a peer locks the new one. The validate is that gap's
   only defence until a revalidation under the lock replaces it.
-- **Evidence the dropped validates never decided a commit:** with knobs
-  restoring every one of them (`FT_DEBUG_GUARD_ON_MISS`,
-  `FT_DEBUG_GUARD_WHEN_EXCLUSIVE`, `FT_DEBUG_REPLACE_GUARD_ROOT_ONLY`,
-  `FT_DEBUG_VALIDATE_WHEN_COVERED`) and the engine's abort attribution
-  (`-DFT_DEBUG_TXN_KIND -DURCU_TXN_REC_DBG`), 24M plants and 62k
-  installed-child guards reached the engine at root-only, and every aborted
-  commit lost on an ordered-cell record. No validate loss, and the "record that
-  cannot lose, lost" alarm read 0.
+- **Evidence the dropped validates never decided a commit.** The test run
+  used two instruments:
+  - knobs that restore every one of them: `FT_DEBUG_GUARD_ON_MISS`,
+    `FT_DEBUG_GUARD_WHEN_EXCLUSIVE`, `FT_DEBUG_REPLACE_GUARD_ROOT_ONLY`,
+    `FT_DEBUG_VALIDATE_WHEN_COVERED`;
+  - the engine's abort attribution (`-DFT_DEBUG_TXN_KIND -DURCU_TXN_REC_DBG`).
+
+  At root-only, 24M plants and 62k installed-child guards reached the engine.
+  Every aborted commit lost on an ordered-cell record. No validate lost. The
+  "record that cannot lose, lost" alarm read 0.
 - Landed as `05bc8aa4` (parent guard) and `e6f893e0` (re-parent and
   installed-child validates). Gates: gate18 18/18, gate-mw 9/9, full parallel
   gate 117/119. Both reds are pre-existing, attributed by a matched A/B against
@@ -122,8 +135,9 @@ MW CAS records"* -- *"Was useful in the MW CAS era, not anymore with locks. A
 plain load resolve should work."*
 
 - **The orphan freeze** (`ft_detach_freeze_one`) was every OWN_MISS row of
-  the tombstone record: 1.33M `{LOCK|s -> TOMBSTONE|s}` CASes per run at
-  per-node, each on a word the op took itself. That mark deliberately stays
+  the tombstone record. At per-node, that is 1.33M
+  `{LOCK|s -> TOMBSTONE|s}` CASes per run. Each one is on a word the op took
+  itself. That mark deliberately stays
   unregistered (lock budget), so `owns()` said no. Its expected-old was the
   MW-CAS era's detect-and-abort for a peer growing the orphan, which the lock
   now excludes. The txn now holds it through `@covered` (owns, no release
@@ -142,13 +156,16 @@ plain load resolve should work."*
     already parks it SW; the class counter counts it before the kind decision.
   - The re-parent / installed-child validates now fire 0 times at every
     spacing in ft_inv MW.
-- SW safety on the same runs (rcu-debug detectors): 0 stale expected-olds of
-  75-86M SW records, 0 blind records, 0 engine steals, 0 stolen locks.
-- The suites' long-standing `FT LOCK UNDERFLOW` reports were the detector:
-  its address-keyed balance outlived a destroyed trie's embedded lock words,
-  and a later pointer record at the reused address read as a release. Fixed
-  by forgetting those entries at `cds_ft_destroy`. 0 reports since, with the
-  detector's positive control still firing.
+- SW safety on the same runs, from the rcu-debug detectors:
+  - 0 stale expected-olds of 75-86M SW records;
+  - 0 blind records;
+  - 0 engine steals;
+  - 0 stolen locks.
+- The suites' long-standing `FT LOCK UNDERFLOW` reports came from the
+  detector itself. Its address-keyed balance outlived a destroyed trie's
+  embedded lock words. A later pointer record at the reused address then read
+  as a release. Fixed by forgetting those entries at `cds_ft_destroy`. There
+  have been 0 reports since, and the detector's positive control still fires.
 - Landed as the four commits after `c095b5d0`. Gates: gate18 18/18, gate-mw
   9/9 (0 underflow reports), parallel 118/119. The one red is the
   pre-existing `_cds_ft_remove_all_locked` assertion.
@@ -171,14 +188,17 @@ plain load resolve should work."*
    `nr_child--` holder (B, NR_CHILD_DEC). Same shape: a word the op holds or
    should hold, answered from the registry only.
 5. **HEAD_BACK** in the detach paths: lock the holder before recording.
-6. **Design items:** ROOT under `root_lock`, CELL under the list BEGIN/END locks,
-   DUAL plumbing, RANK (Phase E).
+6. **Design items:**
+   - ROOT under `root_lock`;
+   - CELL under the list BEGIN/END locks;
+   - DUAL plumbing;
+   - RANK (Phase E).
 
 ## Side findings (not part of the conversion)
 
 - ~~Every rcu-debug ft_unit leg prints 5-8 `FT LOCK UNDERFLOW` reports.~~
-  Confirmed as the detector (heap reuse of a destroyed trie's lock words) and
-  fixed; see the status section.
+  Confirmed as the detector (heap reuse of a destroyed trie's lock words).
+  Fixed: see the status section.
 - At exponential, the STRUCT_ANCHOR census reports op-vs-trie anchor mismatches
   at `ft_merge_lock_overlap:523` and `ft_glue_acquire_reparent_marks:24909`
   (exponential is experimental).
@@ -187,48 +207,54 @@ plain load resolve should work."*
   run of `inv_prefix_shape_zoo` / `inv_owned_prefix_dense_remove_all`. A/B
   against 3f668cdc: same rate. It fired again in the gate after `e6f893e0`
   (proxyassert, exponential, list on).
-- The `rmcap` config's remove retry cap (`FT_REMOVE_RETRY_CAP` 50000)
-  aborts `inv_prefix_dup_promote_vs_extension` (list off, per-node) under
-  preemption: each run pinned to 2 CPUs, `76801d6d` 220/240 and `e6f893e0`
-  227/240; unpinned, 0/480 each. Pre-existing remove starvation, not a
-  conversion regression.
+- The `rmcap` config has a remove retry cap (`FT_REMOVE_RETRY_CAP` 50000).
+  Under preemption, it aborts `inv_prefix_dup_promote_vs_extension` (list
+  off, per-node). With each run pinned to 2 CPUs: `76801d6d` 220/240 and
+  `e6f893e0` 227/240. Unpinned: 0/480 each. This is pre-existing remove
+  starvation, not a conversion regression.
 
 ## Toward the SW engine: one record per word, locks released after the txn
 
 Status 2026-09-26. The SW engine (`<urcu/rcu-txn-sw.h>`) appends records
-blindly and leaves pairwise-distinct slots to the caller; the MW front end
+blindly. It leaves pairwise-distinct slots to the caller. The MW front end
 fuses a second record on a slot (read-your-own-writes chain at age 1+,
-escalation at age 0), so the `DEBUG_RCU` duplicate scan at commit never sees
+escalation at age 0). So the `DEBUG_RCU` duplicate scan at commit never sees
 one. `-DFT_DEBUG_SAME_SLOT` (221e5b7f) counts them instead.
 
 First census, per run: `ft_inv` MW 12.4M same-slot pairs, `ft_unit` 1.38M.
-Every `ft_inv` pair, and all but 2.5k of `ft_unit`'s, was a lock RELEASE record
-`{LOCK|s -> s}` on a node's state word followed by a content edit chained onto
-it (the tombstone of a retire, a recompact's edits).
+This covers every `ft_inv` pair and all but 2.5k of `ft_unit`'s. Each was a
+lock RELEASE record `{LOCK|s -> s}` on a node's state word. A content edit
+was chained onto it (the tombstone of a retire, a recompact's edits).
 
 **Locks are released after the txn** (Mathieu: "combine the state updates in
 the caller, and split out the lock release after the TXN"). Every state record
-passes `ft_flip_txn_record_state_kind_ctx`; there a terminal (an expected-old
-with LOCK, a new value without it) keeps LOCK and is staged on the txn's
-`rel_after` list, and a pure release records nothing. `ft_flip_txn_commit`
-clears each staged word with `ft_meta_lock_release` after a committed commit
-returns, so every record the lock protects is settled first. On every other
-terminal nothing was applied and the owner releases the lock as before (the
-registry, or the frame's sweep). The questions that used to find the release
-record in the descriptor ask `ft_flip_txn_releases_after` as well:
-`ft_lock_terminal_query`, `ft_lock_terminal_drops_lock`,
-`ft_dlm_covering_release_recorded`, the E2 closing-hold dedupe, the anchored
-retire's held arm, and the §4.B installed-child and rekey re-home guards.
+passes `ft_flip_txn_record_state_kind_ctx`. There, a terminal keeps LOCK and is
+staged on the txn's `rel_after` list. A terminal is an expected-old with LOCK
+and a new value without it. A pure release records nothing.
+`ft_flip_txn_commit` clears each staged word with `ft_meta_lock_release`
+after a committed commit returns. So every record the lock protects is
+settled first. On every other terminal, nothing was applied. The owner then
+releases the lock as before (the registry, or the frame's sweep).
 
-An edit on a staged word that was written against the stripped value the
-release used to leave pending gets LOCK back in both of its values, only when
-the pending word is exactly that value plus LOCK. Without it, the edit's SW
-park settles the stripped value, releases the lock early, and the post-commit
-release then fails `ft_meta_lock_release`'s LOCK assert (measured: the
-normalization ablated, `ft_unit` aborts).
+Some questions used to find the release record in the descriptor. They now
+ask `ft_flip_txn_releases_after` as well:
+- `ft_lock_terminal_query`;
+- `ft_lock_terminal_drops_lock`;
+- `ft_dlm_covering_release_recorded`;
+- the E2 closing-hold dedupe;
+- the anchored retire's held arm;
+- the §4.B installed-child and rekey re-home guards.
 
-Result: `ft_inv` MW 23k same-slot pairs, `ft_unit` 3.8k, every remaining one an
-edit chained under the lock (plus 914 RANK in `ft_unit`). Those are the
+Take an edit on a staged word, written against the stripped value that the
+release used to leave pending. That edit gets LOCK back in both of its
+values. This happens only when the pending word is exactly that value plus
+LOCK. Without it, the edit's SW park settles the stripped value and releases
+the lock early. The post-commit release then fails `ft_meta_lock_release`'s
+LOCK assert. This was measured: with the normalization ablated, `ft_unit`
+aborts.
+
+Result: `ft_inv` MW 23k same-slot pairs, `ft_unit` 3.8k. Every remaining one
+is an edit chained under the lock (plus 914 RANK in `ft_unit`). Those are the
 "combine in the caller" half, still open. `-DFT_DEBUG_RELEASE_IN_TXN` restores
 the recorded release (the A/B control).
 
