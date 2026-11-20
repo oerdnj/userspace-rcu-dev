@@ -11,11 +11,13 @@
  *
  * The Fractal Trie is a concurrent, RCU-protected ordered map from
  * opaque byte keys to application-owned nodes.  Lookups and ordered
- * traversals are wait-free under the RCU read-side lock and run
- * concurrently with mutations; writers are serialized by a
- * caller-provided mutex.  The public contract (semantics, guarantees,
- * locking rules, error codes) lives in <urcu/fractal-trie.h>; this
- * comment is the implementation map.
+ * traversals are wait-free under the RCU read-side lock.  They run
+ * concurrently with mutations.  Writers are serialized by a
+ * caller-provided mutex.
+ *
+ * The public contract lives in <urcu/fractal-trie.h>: semantics,
+ * guarantees, locking rules and error codes.  This comment is the
+ * implementation map.
  *
  * Source layout
  * -------------
@@ -32,71 +34,91 @@
  *
  * Node model
  * ----------
- * Internal nodes self-adapt to child density: cascaded popcount bitmaps
- * for small / medium fan-out and a 256-entry "pigeon" array for dense
- * nodes, sized in powers of two.  The node type / configuration is
- * encoded in the low (tag) bits of the child pointer, so the read path
- * dispatches with no extra load.  External (leaf) nodes are
- * application-owned (they embed struct cds_ft_node); same-key duplicates
- * form a next-linked chain off the head.
+ * Internal nodes adapt to their child density:
+ *   - cascaded popcount bitmaps for small and medium fan-out;
+ *   - a 256-entry "pigeon" array for dense nodes.
+ * Internal nodes are sized in powers of two.  The low (tag) bits of the
+ * child pointer encode the node type and configuration.  So the read
+ * path dispatches with no extra load.
+ *
+ * External (leaf) nodes are application-owned: they embed struct
+ * cds_ft_node.  Same-key duplicates form a next-linked chain off the
+ * head.
  *
  * Path compression
  * ----------------
  * Single-child chains collapse into compressed (Patricia / ART-style)
- * nodes that store the shared bytes inline.  On 64-bit arches with free
- * high pointer bits, the "skip-compressed" encoding packs the skip
- * length and child pointer into the parent slot, so a speculative
- * descent bypasses the compressed node's cache line entirely
- * (FEATURE_FT_SKIP_COMPRESSED; -DNO_FEATURE_FT_COMPRESS disables
- * compression altogether).
+ * nodes that store the shared bytes inline.
+ *
+ * The "skip-compressed" encoding (FEATURE_FT_SKIP_COMPRESSED) goes
+ * further on 64-bit arches with free high pointer bits.  It packs the
+ * skip length and the child pointer into the parent slot.  A speculative
+ * descent then bypasses the compressed node's cache line entirely.
+ *
+ * -DNO_FEATURE_FT_COMPRESS disables compression altogether.
  *
  * Memory layout
  * -------------
  * The internal-node allocator strides item data and metadata onto
- * separate cache lines, so the read hot path touches only the dense item
- * region -- which is why resident memory overstates the cache-hot
- * working set (see fractal-trie-alloc.c).  Internal nodes are reclaimed
- * via call_rcu.
+ * separate cache lines.  The read hot path touches only the dense item
+ * region.  This is why resident memory overstates the cache-hot working
+ * set (see fractal-trie-alloc.c).  Internal nodes are reclaimed via
+ * call_rcu.
  *
  * Ordered iteration
  * -----------------
  * When enabled (the default), the library threads the duplicate-chain
- * heads into a key-ordered list of small library-owned "ordinal cells",
- * kept off the descent hot path; cds_ft_next / cds_ft_prev and the
- * batched cell walk step that list.  Disabling it
- * (cds_ft_group_attr_set_ordered_list false) drops the per-key cell for
- * lower memory and faster mutations, at the cost of ordered iteration.
+ * heads into a key-ordered list of "ordinal cells".  The cells are small
+ * and library-owned.  They are kept off the descent hot path.
+ * cds_ft_next / cds_ft_prev and the batched cell walk step that list.
+ *
+ * Disabling it (cds_ft_group_attr_set_ordered_list false) drops the
+ * per-key cell.  Memory use is lower and mutations are faster, at the
+ * cost of ordered iteration.
  *
  * Read descent
  * ------------
- * Two descent encodings per group (enum cds_ft_lookup_optimization):
- * SPECULATIVE skips per-node byte comparison and returns a candidate the
- * caller (or the speculative-lookup wrapper) validates; EAGER compares
- * exactly at each step.  Both return verified results.  Inequality and
- * rank / skip queries use per-node key counters to skip whole subtrees
- * in O(depth).  Going back up -- for next / prev / remove and for key
- * reconstruction -- follows parent back-pointers (and the cell list for
- * ordered walks) rather than a recorded descent path.
+ * There are two descent encodings per group (enum
+ * cds_ft_lookup_optimization):
+ *   - SPECULATIVE skips the per-node byte comparison.  It returns a
+ *     candidate that the caller (or the speculative-lookup wrapper)
+ *     validates.
+ *   - EAGER compares exactly at each step.
+ * Both return verified results.
+ *
+ * Inequality and rank / skip queries use per-node key counters to skip
+ * whole subtrees in O(depth).
+ *
+ * next / prev / remove and key reconstruction go back up the trie.  They
+ * follow parent back-pointers (and the cell list for ordered walks), not
+ * a recorded descent path.
  *
  * Mutation and concurrency model
  * ------------------------------
- * Writers are serialized by a caller-provided mutex (CDS_FT_SCOPED_WRITER
- * only VALIDATES that exclusion; it is not itself a lock).  Every change
- * to published state follows a build-invisibly -> publish -> reclaim
- * discipline: a new node cluster is assembled where readers cannot reach
- * it, made visible by a single release store (or, for a multi-edge
- * commit such as a non-empty merge, one urcu-flip-latch commit that flips
- * all affected edges at once), and the displaced nodes are freed after a
- * grace period.  A reader therefore always observes a complete
- * prior-or-result state, never a partial one.  The discipline is spelled
- * out in the rcu-mutation rules and checked by the verify-at-mutation
- * build option (-DFEATURE_FT_VERIFY_AT_MUTATION).
+ * Writers are serialized by a caller-provided mutex.
+ * CDS_FT_SCOPED_WRITER only VALIDATES that exclusion; it is not itself a
+ * lock.
  *
- * The bulk ops (graft, graft-swap, detach, merge, merge_at) move or
- * combine whole sub-tries between tries of one group; the union cases
- * spine-copy the overlap and commit through the flip latch.  A trie is
- * either exclusive (no concurrent readers; reclaim is synchronous and a
- * source graft skips its drain) or concurrent (RCU readers permitted).
+ * Every change to published state follows a build-invisibly -> publish
+ * -> reclaim discipline:
+ *   1. Assemble a new node cluster where readers cannot reach it.
+ *   2. Make it visible by a single release store.  A multi-edge commit,
+ *      such as a non-empty merge, instead uses one urcu-flip-latch commit
+ *      that flips all affected edges at once.
+ *   3. Free the displaced nodes after a grace period.
+ * A reader therefore always observes a complete prior-or-result state,
+ * never a partial one.  The rcu-mutation rules spell out the discipline.
+ * The verify-at-mutation build option (-DFEATURE_FT_VERIFY_AT_MUTATION)
+ * checks it.
+ *
+ * The bulk ops move or combine whole sub-tries between tries of one
+ * group.  They are graft, graft-swap, detach, merge and merge_at.  The
+ * union cases spine-copy the overlap and commit through the flip latch.
+ *
+ * A trie is either exclusive or concurrent:
+ *   - exclusive: no concurrent readers.  Reclaim is synchronous and a
+ *     source graft skips its drain.
+ *   - concurrent: RCU readers are permitted.
  *
  * Reclamation
  * -----------
@@ -124,31 +146,36 @@
 #include "urcu-utils.h"
 
 /*
- * ☠ BEFORE fractal-trie-internal.h, which pulls <urcu/rcu-txn.h>: this header
- * DEFINES the engine's abort-attribution hooks, and the engine's static inlines
- * are compiled where that header is parsed.  Included later it would expand to
- * the engine's own inert defaults and the instrument would build clean and
- * count nothing.
+ * ☠ Include this header BEFORE fractal-trie-internal.h, which pulls
+ * <urcu/rcu-txn.h>.  This header DEFINES the engine's abort-attribution
+ * hooks.  The engine's static inlines are compiled where <urcu/rcu-txn.h> is
+ * parsed.  If this header came later, the hooks would expand to the engine's
+ * own inert defaults.  The instrument would then build clean and count
+ * nothing.
  */
 #include "ft-txn-rec-dbg.h"
 /*
  * The bulk-window dump belongs to the TU that owns the FT bodies.
- * fractal-trie-alloc.c includes the same header and would otherwise emit a
- * second, permanently EMPTY report that reads exactly like a configuration
- * miss -- the one misread the instrument exists to prevent.
+ * fractal-trie-alloc.c includes the same header.  Without this define it would
+ * emit a second report that is permanently EMPTY.  An empty report reads
+ * exactly like a configuration miss.  That is the one misread the instrument
+ * exists to prevent.
  */
 #define FT_BW_OWNS_DUMP
 #include "fractal-trie-internal.h"
 
 #ifdef FEATURE_FT_PROBE_REANCHOR
 /*
- * Reanchor level-move coverage.  A descent raises skip_conflict only when a
- * reanchor lands SHALLOWER (rewind != 0) because a peer chain-merge moved the
- * encoded position -- the condition graft and insert bail on and ft-merge.h
- * does not.  Measured over the suite the rewind counters read ZERO against
- * millions of reanchors, so neither the existing bails nor a new one is
- * validated by any test: the counters are here so an oracle built to drive
- * that race can say when it finally does.
+ * Reanchor level-move coverage.
+ *
+ * A descent raises skip_conflict only when a reanchor lands SHALLOWER
+ * (rewind != 0).  This happens because a peer chain-merge moved the encoded
+ * position.  Graft and insert bail on this condition; ft-merge.h does not.
+ *
+ * Measured over the suite, the rewind counters read ZERO against millions of
+ * reanchors.  So no test validates the existing bails, or a new one.  The
+ * counters are here so that an oracle built to drive that race can say when
+ * it finally does.
  */
 unsigned long ft_probe_mrg_desc[3], ft_probe_mrg_conf[3];
 unsigned long ft_probe_ranch[2], ft_probe_rewind[2];
@@ -175,9 +202,10 @@ void ft_probe_mrg_report(void)
 		ft_probe_mspin[1] - ft_probe_mspin[4], ft_probe_mspin[2],
 		ft_probe_mspin[3]);
 	/*
-	 * Each loop's retries split by the contract that decides whether a
-	 * persistent-handle bracket is expressible there at all: excl = the
-	 * retries that landed under it, live = the retries that did not.
+	 * Each loop's retries are split by the contract.  The contract decides
+	 * whether a persistent-handle bracket is expressible there at all:
+	 *   excl = the retries that landed under it;
+	 *   live = the retries that did not.
 	 */
 	fprintf(stderr, "RSPIN retry_merge=%lu deepest=%lu (excl=%lu live=%lu offc=%lu)"
 		" | retry_attach=%lu deepest=%lu (excl=%lu live=%lu offc=%lu)"
@@ -192,7 +220,7 @@ void ft_probe_mrg_report(void)
 		ft_probe_rspin_x[2], ft_probe_rspin[4] - ft_probe_rspin_x[2],
 		ft_probe_rspin_n[2]);
 	/*
-	 * Slot 0 is shared by TWO loops, so its offc cannot say which one ran --
+	 * Slot 0 is shared by TWO loops.  Its offc cannot say which one ran,
 	 * nor whether either ran at all.  Total ENTRIES per site, split by the
 	 * contract, answers both.
 	 */
@@ -210,18 +238,18 @@ void ft_probe_mrg_report(void)
 #include "bitmap.h"
 
 /*
- * The implementation is split into per-module units, #included below in
- * dependency order into this single translation unit -- so the compiler still
- * inlines across module boundaries (e.g. the descent into each lookup), exactly
- * as when this was one 25k-line file.  FRACTAL_TRIE_IMPL gates each unit against
- * stray standalone inclusion.
+ * The implementation is split into per-module units.  They are #included
+ * below, in dependency order, into this single translation unit.  So the
+ * compiler still inlines across module boundaries (e.g. the descent into each
+ * lookup), exactly as when this was one 25k-line file.  FRACTAL_TRIE_IMPL
+ * gates each unit against stray standalone inclusion.
  */
 #define FRACTAL_TRIE_IMPL
 #include "ft-tables.h"
 #include "ft-delay.h"
 #include "ft-helpers.h"
 #include "ft-txn-kind-stats.h"	/* -DFT_DEBUG_TXN_KIND record-kind counters */
-#include "ft-txn-hlist.h"	/* duplicate-chain transactional hlist (unused until wired) */
+#include "ft-txn-hlist.h"	/* duplicate-chain transactional hlist */
 #include "ft-trace-helpers.h"
 #include "ft-lookup-node.h"
 #include "ft-descent.h"
@@ -229,11 +257,11 @@ void ft_probe_mrg_report(void)
 #include "ft-lookup.h"
 
 /*
- * When the inequality descent is shared (FEATURE_INLINE_INEQUALITY_LOOKUP off)
- * it is itself a cold tier-2 path, so route its up/down scanners through the
- * same shared copies the write path uses -- one get_direction / get_minmax for
- * the whole library, not an extra inlined copy in ft_ineq_descend.  With the
- * flag on, the descent inlines them for speed.
+ * With FEATURE_INLINE_INEQUALITY_LOOKUP off, the inequality descent is shared.
+ * It is then itself a cold tier-2 path.  So route its up/down scanners through
+ * the same shared copies that the write path uses.  The whole library then has
+ * one get_direction and one get_minmax, with no extra inlined copy in
+ * ft_ineq_descend.  With the flag on, the descent inlines them for speed.
  */
 #ifndef FEATURE_INLINE_INEQUALITY_LOOKUP
 #define ft_node_get_direction	ft_node_get_direction_shared
@@ -247,13 +275,18 @@ void ft_probe_mrg_report(void)
 
 /*
  * Redirect the write path to the shared, non-inlined copies of the large
- * read-path helpers it would otherwise force-inline at every site: the node
- * scanners (ft-lookup-node.h) and the inequality descent (ft-inequality.h).  The
- * mutation modules call each once instead of duplicating it -- about -23% .text
- * together.  The read modules above keep the inlined originals.  The redirect
- * stays open through every module below -- the mutation path, compaction, and
- * the ft-show.h display renderers are all cold or write paths, so they all
- * share the out-of-line copies; nothing hot follows, so it is never closed.
+ * read-path helpers:
+ *   - the node scanners (ft-lookup-node.h);
+ *   - the inequality descent (ft-inequality.h).
+ * Otherwise the write path would force-inline them at every site.  The
+ * mutation modules call each helper once instead of duplicating it.  Together
+ * this is about -23% .text.  The read modules above keep the inlined
+ * originals.
+ *
+ * The redirect stays open through every module below.  Those are all cold
+ * paths or write paths: the mutation path, compaction and the ft-show.h
+ * display renderers.  So they all share the out-of-line copies.  Nothing hot
+ * follows, so the redirect is never closed.
  */
 #define ft_node_get_nth           ft_node_get_nth_shared
 #define ft_node_get_nth_skip      ft_node_get_nth_skip_shared
@@ -283,12 +316,16 @@ extern long cds_ft_fault_commit_countdown;
 
 /*
  * Public API back-end for cds_ft_node_next_rcu()'s proxy path (declared in
- * <urcu/fractal-trie.h>).  A duplicate successor whose raw "next" value carries
- * the engine proxy tag -- a bulk commit (e.g. a merge appending a src run at
- * this chain's tail) is mid-flight on the slot -- is resolved to the committed
- * successor, with the removal tombstone stripped.  Kept out of line so the
- * transactional engine (and its headers) stay opaque to API users; a
- * duplicate-chain walk is not a fast path, so the call is immaterial.
+ * <urcu/fractal-trie.h>).
+ *
+ * The raw "next" value of a duplicate successor can carry the engine proxy
+ * tag.  The tag means that a bulk commit is mid-flight on the slot, e.g. a
+ * merge appending a src run at this chain's tail.  Resolve such a value to
+ * the committed successor, with the removal tombstone stripped.
+ *
+ * This is kept out of line so that the transactional engine and its headers
+ * stay opaque to API users.  A duplicate-chain walk is not a fast path, so
+ * the cost of the call does not matter.
  */
 urcu_static_assert(CDS_FT_NODE_TXN_PROXY_TAG == URCU_TXN_TAG,
 		"FT public duplicate-next proxy tag must equal the engine proxy tag",
@@ -299,16 +336,20 @@ struct cds_ft_node *cds_ft_node_next_resolve(void *raw)
 }
 
 /*
- * TEST/DEBUG: hold the move mode gate open without performing a move, so a
- * SINGLE-THREADED test can exercise the coherent reader path at all (with no
- * mover the gate is closed and readers correctly take the fast path, which would
- * make the coherence tests assert against dead code).  Same blocking contract as
- * a real move: not from an RCU read-side critical section.
+ * TEST/DEBUG: hold the move mode gate open without performing a move.  A
+ * SINGLE-THREADED test needs this to exercise the coherent reader path at all.
+ * With no mover the gate is closed, and readers correctly take the fast path.
+ * The coherence tests would then assert against dead code.  The blocking
+ * contract is the same as for a real move: do not call this from an RCU
+ * read-side critical section.
  */
 /*
- * Bulk-op nesting depth for THIS thread.  Read by ft_dlm_acquire_set_at to tell
- * a point op that must widen from the bulk op that is holding the gate, which
- * must not widen against itself.  Depth-counted because bulk bodies nest.
+ * Bulk-op nesting depth for THIS thread.  ft_dlm_acquire_set_at reads it to
+ * tell two callers apart:
+ *   - a point op, which must widen;
+ *   - the bulk op that is holding the gate, which must not widen against
+ *     itself.
+ * It is a depth count because bulk bodies nest.
  */
 __thread unsigned long ft_bulk_self_depth;
 /* Escalation lane depth for THIS thread: see ft_op_in_lane. */
@@ -380,17 +421,17 @@ static void ft_wo_dump(void)
 	unsigned int i;
 
 	/*
-	 * THREE ZEROS THAT LOOK ALIKE AND MEAN DIFFERENT THINGS, separated
-	 * here rather than left for a reader to guess:
-	 *   no acquire            the choke point never ran -- a configuration
-	 *                         miss (not a lock_fine trie), everything below
-	 *                         is vacuous;
-	 *   no gate enter         no bulk op ran at all -- a statement about
-	 *                         the ARM;
-	 *   gates but no overlap  bulk ops ran and never coincided with an
-	 *                         acquire -- a statement about the WORKLOAD,
-	 *                         and the only one of the three that is a
-	 *                         result.
+	 * THREE ZEROS LOOK ALIKE AND MEAN DIFFERENT THINGS.  They are
+	 * separated here, not left for a reader to guess:
+	 *   no acquire            The choke point never ran.  This is a
+	 *                         configuration miss (not a lock_fine trie).
+	 *                         Everything below is vacuous.
+	 *   no gate enter         No bulk op ran at all.  This is a statement
+	 *                         about the ARM.
+	 *   gates but no overlap  Bulk ops ran and never coincided with an
+	 *                         acquire.  This is a statement about the
+	 *                         WORKLOAD.  It is the only one of the three
+	 *                         that is a result.
 	 */
 	if (!ft_wo_acq_total) {
 		fprintf(stderr, "FT WIDENOWNER: THE ACQUIRE CHOKE POINT NEVER "
@@ -429,10 +470,10 @@ static void ft_wo_dump(void)
 		ft_wo_led_superseded, ft_wo_led_overflow,
 		ft_wo_led_nr_max, ft_wo_site_overflow);
 	/*
-	 * THE JOINT, because two equal marginals do not make one.  Reading
-	 * "every acquire that can widen lacks an owner" off separate led_ok /
-	 * txn_none totals would be true of an INDEPENDENT population that
-	 * merely happened to be equinumerous.
+	 * THE JOINT, because two equal marginals do not make one.  Separate
+	 * led_ok / txn_none totals cannot show that "every acquire that can
+	 * widen lacks an owner".  An INDEPENDENT population that merely
+	 * happened to be equinumerous would give the same totals.
 	 */
 	fprintf(stderr,
 		"  joint led_ok x txn:  ok+txn=%lu ok+none=%lu bad+txn=%lu "
@@ -483,8 +524,10 @@ void _cds_ft_debug_move_gate_exit(struct cds_ft *ft)
 	ft_move_gate_exit(ft);
 }
 /*
- * TEST/DEBUG (coherent-rekey sub-step 2, NOT public API): read the trie root as
- * an opaque address, so a test can observe a COW relocation moved its identity.
+ * TEST/DEBUG (coherent-rekey sub-step 2, NOT public API).
+ *
+ * Return the trie root as an opaque address.  A test uses it to observe that
+ * a COW relocation moved the root's identity.
  */
 void *_cds_ft_debug_root(struct cds_ft *ft)
 {
@@ -492,18 +535,27 @@ void *_cds_ft_debug_root(struct cds_ft *ft)
 }
 
 /*
- * TEST/DEBUG (coherent-rekey sub-step 2, NOT public API): drive ft_rekey_cow_stop
- * on the trie ROOT as a self-contained in-place clone -- build a fresh-address
- * copy of the root, re-parent its children onto it, retire the old root, and
- * republish at &ft->root, all as ONE mixed SW/MW commit.  This is the smallest
- * complete consumer of the S_top COW primitive: the root has no parent to lock
- * (its forward slot is auto-guarded by its own CAS), so it isolates the COW +
- * interior re-parent + retire from the rest of a rekey stitch.
+ * TEST/DEBUG (coherent-rekey sub-step 2, NOT public API).
  *
- * SINGLE-WRITER use only (no concurrent root relocation).  Returns 0 (root now at
- * a fresh address, contents unchanged), -EINVAL if the root is not an internal
- * POPCOUNT/PIGEON node without a co-located external list (sub-step-2 scope), or a
- * negative errno on a bail (not expected single-threaded).
+ * Drive ft_rekey_cow_stop on the trie ROOT as a self-contained in-place
+ * clone.  All as ONE mixed SW/MW commit:
+ *   - build a fresh-address copy of the root;
+ *   - re-parent its children onto the copy;
+ *   - retire the old root;
+ *   - republish at &ft->root.
+ *
+ * This is the smallest complete consumer of the S_top COW primitive.  The
+ * root has no parent to lock: its forward slot is auto-guarded by its own
+ * CAS.  So this isolates the COW + interior re-parent + retire from the rest
+ * of a rekey stitch.
+ *
+ * SINGLE-WRITER use only (no concurrent root relocation).
+ *
+ * Returns:
+ *   0        The root is now at a fresh address, contents unchanged.
+ *   -EINVAL  The root is not an internal POPCOUNT/PIGEON node without a
+ *            co-located external list (sub-step-2 scope).
+ *   another negative errno on a bail (not expected single-threaded).
  */
 int _cds_ft_debug_cow_replace_root(struct cds_ft *ft)
 {
@@ -566,12 +618,15 @@ int _cds_ft_debug_cow_replace_root(struct cds_ft *ft)
 		ret = 0;
 	} else {
 		/*
-		 * Abort (a peer won a raced slot): the SW parks never flipped, so
-		 * root_prime stayed unpublished -- reclaim it (its shared interior
-		 * children are untouched, still owned by the live old root).
-		 * Unreachable under the single-writer, all-SW, pre-reserved contract
-		 * here (the commit is deterministically OK), but kept leak-free for a
-		 * future concurrent reuse of this path.
+		 * Abort: a peer won a raced slot.  The SW parks never
+		 * flipped, so root_prime stayed unpublished.  Reclaim it.
+		 * Its shared interior children are untouched and still owned
+		 * by the live old root.
+		 *
+		 * This is unreachable under the contract here, which is
+		 * single-writer, all-SW and pre-reserved: the commit is
+		 * deterministically OK.  It is kept leak-free for a future
+		 * concurrent reuse of this path.
 		 */
 		free_cds_ft_node_unpublished(ft, ft_node_ptr(root_prime));
 		ret = -EAGAIN;
@@ -579,9 +634,10 @@ int _cds_ft_debug_cow_replace_root(struct cds_ft *ft)
 
 sweep:
 	/*
-	 * The caller-owned release, on bail/abort paths ONLY: a successful commit already
-	 * released every mark through its state edge, so clearing again would take a
-	 * peer's fresh mark off a node that is LIVE and CLEAN by then.
+	 * The caller-owned release, on bail/abort paths ONLY.  A successful
+	 * commit already released every mark through its state edge.  Clearing
+	 * again would take a peer's fresh mark off a node that is LIVE and
+	 * CLEAN by then.
 	 */
 	if (!marks_consumed)
 		for (i = 0; i < nr_marks; i++)
@@ -593,18 +649,19 @@ sweep:
 			if (!marks[i].shared && !marks[i].txn_owned) {
 				/*
 				 * STRICT: @marks_consumed above already
-				 * excludes the committed case this comment
-				 * describes, so reaching here means the op
-				 * bailed and still holds the mark.  Asking the
-				 * word instead is what took the peer's fresh
-				 * mark the comment warns about.
+				 * excludes the committed case that the
+				 * comment at sweep: describes.  So reaching
+				 * here means that the op bailed and still
+				 * holds the mark.  Asking the word instead
+				 * is what took the peer's fresh mark that
+				 * the comment warns about.
 				 */
 				ft_meta_lock_release(marks[i].lock);
 				/*
-				 * SCRUB only RELEASED-LIVE (finding A); a
+				 * SCRUB only RELEASED-LIVE (finding A).  A
 				 * TOMBSTONED word is a CONSUMED fence and must
-				 * keep answering holds() -- dedupe-on-dead is
-				 * the designed flow, and taking a dead word
+				 * keep answering holds().  Dedupe-on-dead is
+				 * the designed flow.  Taking a dead word
 				 * hard-refuses forever (the exp-MW storm).
 				 */
 				if (!(CMM_LOAD_SHARED(marks[i].lock->state) &
@@ -615,18 +672,21 @@ sweep:
 }
 
 /*
- * TEST/DEBUG (coherent-rekey sub-step 3, NOT public API): descend @key (converted
- * to ordinal) and return the node flag AT that key as an opaque address, so a test
- * can observe that a rekey moved the moved-subtree top (S_top) to a FRESH address.
- * NULL if the key is absent or its path traverses a non-plain-internal node.
+ * TEST/DEBUG (coherent-rekey sub-step 3, NOT public API).
+ *
+ * Descend @key (converted to ordinal) and return the node flag AT that key as
+ * an opaque address.  A test uses it to observe that a rekey moved the
+ * moved-subtree top (S_top) to a FRESH address.  Return NULL if the key is
+ * absent or if its path traverses a non-plain-internal node.
  */
 /*
  * Does @flag (a value from _cds_ft_debug_child_at) carry a CO-LOCATED external
- * chain -- a key ending exactly at this node's position?
+ * chain, i.e. a key ending exactly at this node's position?
  *
- * Test-only, and for the same reason as the compressed query beside it: a test
- * that builds this shape to reach a branch gated on it must be able to say it
- * built it, or asserting the outcome alone passes on any other refusal.
+ * Test-only, for the same reason as the compressed query beside it.  A test
+ * builds this shape to reach a branch gated on it.  The test must be able to
+ * say that it built the shape.  Otherwise asserting the outcome alone passes
+ * on any other refusal.
  */
 int _cds_ft_debug_flag_has_external_chain(struct cds_ft *ft, void *flag)
 {
@@ -645,10 +705,12 @@ int _cds_ft_debug_flag_has_external_chain(struct cds_ft *ft, void *flag)
 /*
  * Is path compression compiled in?
  *
- * Test-only.  A test that builds a compressed shape must tell "this build cannot
- * make one" (skip) from "this build should have made one and did not" (fail) --
- * a bare structural check collapses the two and would skip silently through a
- * regression.
+ * Test-only.  A test that builds a compressed shape must tell two cases
+ * apart:
+ *   - "this build cannot make one": skip;
+ *   - "this build should have made one and did not": fail.
+ * A bare structural check collapses the two.  It would skip silently through
+ * a regression.
  */
 int _cds_ft_debug_compress_enabled(void)
 {
@@ -662,15 +724,17 @@ int _cds_ft_debug_compress_enabled(void)
 /*
  * Is the SKIP-COMPRESSED encoding compiled in?
  *
- * Distinct from path compression: a build can keep compressed runs and still
- * spell every slot plainly.  Shapes whose legality DEPENDS on skip mode -- a
- * one-child keyless internal is canonical without it and illegal with it -- must
- * ask this and not _cds_ft_debug_compress_enabled, which answers a different
- * question and would let such a test skip silently on the wrong build.
+ * This is distinct from path compression: a build can keep compressed runs
+ * and still spell every slot plainly.
  *
- * Test-only, and asked of the LIBRARY rather than reproduced as a
- * #ifdef in the test: the test object and the library can be compiled with
- * different flags.
+ * The legality of some shapes DEPENDS on skip mode.  For example, a one-child
+ * keyless internal is canonical without it and illegal with it.  A test of
+ * such a shape must ask this, not _cds_ft_debug_compress_enabled.  That one
+ * answers a different question.  It would let such a test skip silently on
+ * the wrong build.
+ *
+ * Test-only.  Ask the LIBRARY; do not reproduce this as a #ifdef in the test.
+ * The test object and the library can be compiled with different flags.
  */
 int _cds_ft_debug_skip_compressed_enabled(void)
 {
@@ -684,16 +748,19 @@ int _cds_ft_debug_skip_compressed_enabled(void)
 /*
  * Is the in-place occupancy-bitmap tier compiled in?
  *
- * Test-only, and it must be ASKED OF THE LIBRARY rather than reproduced as a
- * test-side #ifdef: a test that maintains its own copy of a build flag reports
- * on its own copy, and a build whose library and tests disagree reads as a pass.
+ * Test-only.  It must be ASKED OF THE LIBRARY, not reproduced as a test-side
+ * #ifdef.  A test that maintains its own copy of a build flag reports on its
+ * own copy.  A build whose library and tests disagree then reads as a pass.
  *
- * ☠ THE FLAG IS ONLY HALF THE CONDITION FOR THE BULK ARMS.  A graft's reserve
- * vouches ft_in_place_excl_ok(), which also requires an EXCLUSIVE trie, so a
- * test that wants ft_store_at_graft_point_commit's in-place arm must ALSO
- * create one -- which is why an in-place build alone never reached it.
- * Answers for the INSERT tier (the graft reserve's); the delete tier has its
- * own switch, FEATURE_FT_DELETE_IN_PLACE.  The point ops' tier (ft_in_place_ok) is the flag alone.
+ * ☠ THE FLAG IS ONLY HALF THE CONDITION FOR THE BULK ARMS.  A graft's
+ * reserve vouches ft_in_place_excl_ok(), which also requires an EXCLUSIVE
+ * trie.  So a test that wants ft_store_at_graft_point_commit's in-place arm
+ * must ALSO create an exclusive trie.  This is why an in-place build alone
+ * never reached that arm.
+ *
+ * This answers for the INSERT tier (the graft reserve's).  The delete tier
+ * has its own switch, FEATURE_FT_DELETE_IN_PLACE.  The point ops' tier
+ * (ft_in_place_ok) is the flag alone.
  */
 int _cds_ft_debug_in_place_enabled(void)
 {
@@ -707,9 +774,10 @@ int _cds_ft_debug_in_place_enabled(void)
 /*
  * Is @flag (a value from _cds_ft_debug_child_at) a COMPRESSED node?
  *
- * Test-only shape introspection.  A test that builds a geometry to reach a
- * kind-specific branch has to be able to say it built it: without this, asserting
- * only the outcome passes whenever ANY other branch produces the same outcome.
+ * Test-only shape introspection.  A test builds a geometry to reach a
+ * kind-specific branch.  It has to be able to say that it built it.  Without
+ * this, asserting only the outcome passes whenever ANY other branch produces
+ * the same outcome.
  */
 int _cds_ft_debug_flag_is_compressed(void *flag)
 {
@@ -727,9 +795,10 @@ int _cds_ft_debug_flag_is_compressed(void *flag)
 /*
  * Is @flag (a value from _cds_ft_debug_child_at) an EXTERNAL head?
  *
- * The SKIP test comes first and is load-bearing: a skip pointer onto an
- * external leaf carries low tag bits 0, which ft_node_external() matches on the
- * raw value -- the same dispatch order every kind-testing site in the trie uses.
+ * The SKIP test comes first and is load-bearing.  A skip pointer onto an
+ * external leaf carries low tag bits 0, and ft_node_external() matches those
+ * on the raw value.  Every kind-testing site in the trie uses the same
+ * dispatch order.
  */
 int _cds_ft_debug_flag_is_external(void *flag)
 {
@@ -773,77 +842,104 @@ void *_cds_ft_debug_child_at(struct cds_ft *ft, const uint8_t *key,
 
 
 /*
- * TEST/DEBUG (coherent-rekey sub-step 3, NOT public API): the SIMPLEST complete
- * one-decide rekey-graft -- move the subtree "S_top" hanging at @src_key to the
- * ABSENT @dst_key, as ONE mixed SW/MW flip-txn: COW S_top to a fresh S_top' (SW
- * re-parents + retire, locked), graft S_top' at the dst point (MW forward publish,
- * dst parent unlocked), and clear the src slot (MW detach, unlocked) -- all
- * recorded into one txn and committed once, so a reader sees the subtree at src
- * XOR dst atomically.  This is the analog of _cds_ft_debug_cow_replace_root for
- * the full stitch, scoped to the simplest shape so it needs no cell / GLUE / merge
+ * TEST/DEBUG (coherent-rekey sub-step 3, NOT public API): the SIMPLEST
+ * complete one-decide rekey-graft.
+ *
+ * Move the subtree "S_top" hanging at @src_key to the ABSENT @dst_key, as ONE
+ * mixed SW/MW flip-txn:
+ *   1. COW S_top to a fresh S_top' (SW re-parents + retire, locked);
+ *   2. graft S_top' at the dst point (MW forward publish, dst parent
+ *      unlocked);
+ *   3. clear the src slot (MW detach, unlocked).
+ * All three are recorded into one txn and committed once.  So a reader sees
+ * the subtree at src XOR dst atomically.
+ *
+ * This is the analog of _cds_ft_debug_cow_replace_root for the full stitch.
+ * It is scoped to the simplest shape, so it needs no cell / GLUE / merge
  * machinery:
- *   - S_top is a plain internal POPCOUNT/PIGEON node with no co-located external
- *     list (ft_rekey_cow_stop's sub-step-2 scope), hanging at @src_key.
- *   - the SRC JUNCTION BP (= S_top's parent) and the DST PARENT are DISTINCT and
- *     do not alias each other's parent (the shape gate below).  They MAY share a
- *     parent or not: in the default, concurrent-safe build EVERY popcount delete
- *     recompacts, so BP is rebuilt on the removal and republished into its parent,
- *     and that parent is either the node the graft's dst-parent recompaction
- *     already holds the lock -- REUSED via @src_held_hint rather than re-acquired --
- *     or a node this detach acquires itself, guarded.  Both are try-locks that
- *     abort rather than block, so their order is deadlock-free.
- *   - @dst_key is ABSENT and reached by a NOSPLIT graft into a spare slot with
- *     append room (no compressed-divergence GLUE split).
- *   - the trie's ordered list may be ON: the moved subtree's contiguous cell run
- *     unsplices from the src ordered position and re-splices at the dst position
- *     as SIX recorded cell edges in the SAME commit (all MW, so a peer's cell
- *     conflict aborts clean).  The dst splice position must be clear of the run's
- *     own ordered neighbourhood (adjacency guard below).
- * structural_sw STAYS TRUE the whole txn: cow_stop's S_top edges, the graft's
- * dst-parent recompaction, and the detach's BP recompaction all hold their DLM
- * node locks (BP's parent held by the graft via @src_held_hint, or acquired
- * here), so every structural edge is legitimately SW; the mixed engine still
- * sorts the (MW) count edges first.
+ *   - S_top is a plain internal POPCOUNT/PIGEON node with no co-located
+ *     external list (ft_rekey_cow_stop's sub-step-2 scope), hanging at
+ *     @src_key.
+ *   - The SRC JUNCTION BP (= S_top's parent) and the DST PARENT are DISTINCT
+ *     and do not alias each other's parent (the shape gate below).  They MAY
+ *     share a parent or not.  In the default, concurrent-safe build, EVERY
+ *     popcount delete recompacts.  So BP is rebuilt on the removal and
+ *     republished into its parent.  That parent is one of:
+ *       - the node whose lock the graft's dst-parent recompaction already
+ *         holds.  The lock is REUSED via @src_held_hint, not re-acquired.
+ *       - a node that this detach acquires itself, guarded.
+ *     Both are try-locks that abort rather than block, so their order is
+ *     deadlock-free.
+ *   - @dst_key is ABSENT.  It is reached by a NOSPLIT graft into a spare slot
+ *     with append room (no compressed-divergence GLUE split).
+ *   - The trie's ordered list may be ON.  The moved subtree's contiguous cell
+ *     run unsplices from the src ordered position and re-splices at the dst
+ *     position.  This is SIX recorded cell edges in the SAME commit.  They
+ *     are all MW, so a peer's cell conflict aborts clean.  The dst splice
+ *     position must be clear of the run's own ordered neighbourhood
+ *     (adjacency guard below).
  *
- * @src_key / @dst_key are APPLICATION keys (converted to ordinal internally),
- * DISJOINT (neither a prefix of the other), of EQUAL length, on a FIXED-length
- * group -- see the scope checks at the top of the body for why each is required.
+ * structural_sw STAYS TRUE the whole txn.  These all hold their DLM node
+ * locks:
+ *   - cow_stop's S_top edges;
+ *   - the graft's dst-parent recompaction;
+ *   - the detach's BP recompaction.  BP's parent is held by the graft via
+ *     @src_held_hint, or acquired here.
+ * So every structural edge is legitimately SW.  The mixed engine still sorts
+ * the (MW) count edges first.
  *
- * CONCURRENCY.  Abort-clean: every bail leaves the trie byte-for-byte as before.
- * This function is ONE ATTEMPT; ft_rekey_graft_simple_locked wraps it in the
- * retry loop that owns the persistent handle and the escalation turn, and
- * ABSORBS the transient codes -- -EIO (the graft's up-front acquire lost a race)
- * and -EAGAIN (a cow_stop / detach acquire, an incoherently derived splice
- * position, or the final commit aborted).  Callers therefore see 0, -EINVAL
- * (the controlled shape above is not met), or -ENOMEM (reserve).  Retrying
- * externally is NOT equivalent and was the old arrangement: a fresh handle per
- * call never ages, so a contended writer never qualifies for its turn.  The
- * concurrent oracles (inv_rekey_graft_{disjoint,shared,coherent_readers}) exercise
- * exactly that contract.  What is NOT yet multi-writer safe in general: a dst
- * splice neighbour INTERIOR to a peer's concurrently-moving run (see the splice
- * position validation below) -- out of reach in the tested layouts, and closed
- * only by the per-FT move seqcount / relational coherence work.
+ * @src_key and @dst_key are APPLICATION keys (converted to ordinal
+ * internally).  They are DISJOINT (neither a prefix of the other) and of
+ * EQUAL length, on a FIXED-length group.  See the scope checks at the top of
+ * the body for why each is required.
+ *
+ * CONCURRENCY.  Abort-clean: every bail leaves the trie byte-for-byte as
+ * before.  This function is ONE ATTEMPT.  ft_rekey_graft_simple_locked wraps
+ * it in the retry loop that owns the persistent handle and the escalation
+ * turn.  That loop ABSORBS the transient codes:
+ *   -EIO     the graft's up-front acquire lost a race;
+ *   -EAGAIN  a cow_stop / detach acquire, an incoherently derived splice
+ *            position, or the final commit aborted.
+ * Callers therefore see only:
+ *   0
+ *   -EINVAL  the controlled shape above is not met;
+ *   -ENOMEM  reserve.
+ *
+ * Retrying externally is NOT equivalent.  It was the old arrangement.  A
+ * fresh handle per call never ages, so a contended writer never qualifies
+ * for its turn.  The concurrent oracles exercise exactly that contract:
+ * inv_rekey_graft_{disjoint,shared,coherent_readers}.
+ *
+ * One case is NOT yet multi-writer safe in general: a dst splice neighbour
+ * INTERIOR to a peer's concurrently-moving run (see the splice position
+ * validation below).  It is out of reach in the tested layouts.  Only the
+ * per-FT move seqcount / relational coherence work closes it.
  */
 
 
 /*
- * TEST-ONLY: strip @leaf's holder of every child, leaving the holder itself
- * WIRED where it is -- the "dead interior node" shape.
+ * TEST-ONLY: strip @leaf's holder of every child, and leave the holder itself
+ * WIRED where it is.  This is the "dead interior node" shape.
  *
- * Why a hook rather than a test that provokes it: the shape is a library
- * DEFECT's output, so once the defect is fixed no sequence of public calls
- * produces it, and the reader code that copes with it becomes untestable.  It
- * was untested: a counter on ft-inequality.h's empty-subtree arm reads ZERO
- * across ft_unit and ft_inv in every list mode.  That arm decides what an
- * ordered walk does when it descends into a childless internal, and an
- * unexercised arm is where the next defect of this class hides -- the
+ * Why a hook, and not a test that provokes the shape: the shape is the output
+ * of a library DEFECT.  Once the defect is fixed, no sequence of public calls
+ * produces it.  The reader code that copes with it then becomes untestable.
+ *
+ * It was untested.  A counter on ft-inequality.h's empty-subtree arm reads
+ * ZERO across ft_unit and ft_inv in every list mode.  That arm decides what
+ * an ordered walk does when it descends into a childless internal.  An
+ * unexercised arm is where the next defect of this class hides.  The
  * compressed-parent one hid behind a comment claiming zero hits.
  *
- * The holder's external children are handed back through @out rather than
- * freed: they are CALLER-OWNED nodes (the application allocated them), so the
- * library must not free them, and the test needs them to reclaim its own
- * memory.  Returns -1 if the holder is not an internal node, if @out is too
- * small, or if the trie is empty; otherwise 0 with *@out_n set.
+ * The holder's external children are handed back through @out, not freed.
+ * They are CALLER-OWNED nodes (the application allocated them), so the
+ * library must not free them.  The test needs them to reclaim its own
+ * memory.
+ *
+ * Returns 0 with *@out_n set.  Returns -1 if:
+ *   - the holder is not an internal node;
+ *   - @out is too small;
+ *   - the trie is empty.
  *
  * Leaves the trie in a state cds_ft_verify REJECTS, on purpose.  Callers are
  * expected to walk it, assert whatever they are testing, and destroy it.
@@ -864,9 +960,9 @@ int _cds_ft_debug_empty_holder(struct cds_ft *ft, struct cds_ft_node *leaf,
 	meta = cds_ft_item_to_metadata(ft_node_ptr(holder_flag));
 
 	/*
-	 * Collect first, clear after: a slot cleared mid-scan would change what
-	 * the remaining ft_node_get_nth_skip calls see on a popcount layout,
-	 * where the slot index is a rank over the occupancy bitmap.
+	 * Collect first, clear after.  On a popcount layout, the slot index is
+	 * a rank over the occupancy bitmap.  A slot cleared mid-scan would
+	 * change what the remaining ft_node_get_nth_skip calls see there.
 	 */
 	for (b = 0; b < 256; b++) {
 		struct cds_ft_inode_flag **slot = NULL;
@@ -905,22 +1001,22 @@ int _cds_ft_debug_empty_holder(struct cds_ft *ft, struct cds_ft_node *leaf,
 /*
  * Harness-facing violation hook (two-writer external-head campaign, 2026-09-04).
  *
- * A standalone reproducer cannot reach FT_TRACE_FREEZE, and a bare
- * `lttng snapshot record` from the harness is a fork+exec -- MILLISECONDS, in
- * which the ring wraps past the very window the violation names (see the FAST
- * STOP note in fractal-trie-trace.h).  So route it through the library: emit
- * the violation FIRST, then freeze, stop and snapshot.
+ * A standalone reproducer cannot reach FT_TRACE_FREEZE.  A bare
+ * `lttng snapshot record` from the harness is a fork+exec: MILLISECONDS.  In
+ * that time the ring wraps past the very window the violation names (see the
+ * FAST STOP note in fractal-trie-trace.h).  So route it through the library:
+ * emit the violation FIRST, then freeze, stop and snapshot.
  *
- * It lives HERE, not in fractal-trie-alloc.c, because the question the trace has
- * to answer is "where is this node hanging" -- and the resolvers that answer it
- * (ft_node_holder across the cell indirection, the metadata behind a tagged
- * flag) are in this translation unit.  @node's own words say nothing on their
- * own: a lost key's node is typically untouched, and it is the HOLDER's history
+ * It lives HERE, not in fractal-trie-alloc.c.  The question the trace has to
+ * answer is "where is this node hanging".  The resolvers that answer it are
+ * in this translation unit: ft_node_holder across the cell indirection, and
+ * the metadata behind a tagged flag.  @node's own words say nothing on their
+ * own.  A lost key's node is typically untouched.  It is the HOLDER's history
  * that carries the loss.
  *
- * Defensive by construction: a lost key's holder may be retired, so every
- * dereference past @node->prev is guarded and reports 0 rather than faulting --
- * a fault here would take the snapshot with it.
+ * Defensive by construction.  A lost key's holder may be retired.  So every
+ * dereference past @node->prev is guarded and reports 0 rather than
+ * faulting.  A fault here would take the snapshot with it.
  */
 void cds_ft_debug_ext_violation(unsigned int kind, struct cds_ft *ft,
 		struct cds_ft_node *node, uint64_t key0);
@@ -947,8 +1043,8 @@ void cds_ft_debug_ext_violation(unsigned int kind, struct cds_ft *ft,
 		 * holder keeps its single external child in cn->child;
 		 * meta->external_nodes is legitimately NULL there.  Reading the
 		 * metadata field unconditionally reported "the holder's head is
-		 * empty" for every compressed holder and manufactured a whole
-		 * SHAPE that does not exist -- 1 of 4 rows in the first
+		 * empty" for every compressed holder.  That manufactured a
+		 * whole SHAPE that does not exist: 1 of 4 rows in the first
 		 * histogram.  Dispatch on the holder kind exactly as
 		 * cds_ft_remove's own four-way branch does.
 		 */
@@ -968,15 +1064,15 @@ void cds_ft_debug_ext_violation(unsigned int kind, struct cds_ft *ft,
 	}
 	/*
 	 * @self ANCHORS THE ADDRESS SPACE.  item_retire and friends carry a raw
-	 * __builtin_return_address, and ASLR makes that unresolvable after the
-	 * process is gone.  Emitting this function's own address lets the
-	 * analysis recover the .so load base (self - nm offset) and turn every
-	 * caller in the trace into a file:line.
+	 * __builtin_return_address.  ASLR makes that unresolvable after the
+	 * process is gone.  So this function emits its own address.  The
+	 * analysis can then recover the .so load base (self - nm offset) and
+	 * turn every caller in the trace into a file:line.
 	 */
 	/*
-	 * Bounded up-walk.  Runs at abort time on a structure a peer may be
-	 * mutating, so it must not fault and must not spin: every dereference
-	 * is guarded and the hop count is capped at FT_MAX_DEPTH.
+	 * Bounded up-walk.  It runs at abort time on a structure that a peer
+	 * may be mutating, so it must not fault and must not spin.  Every
+	 * dereference is guarded and the hop count is capped at FT_MAX_DEPTH.
 	 */
 	if (holder && !ft_node_external(holder)) {
 		struct cds_ft_inode_flag *nf = holder;
@@ -1005,12 +1101,13 @@ void cds_ft_debug_ext_violation(unsigned int kind, struct cds_ft *ft,
 		(const void *) &cds_ft_debug_ext_violation, key0);
 	/*
 	 * ALSO ON STDERR.  The shape of a loss is (holder tombstoned?, is the
-	 * node still its head?, which refusal site?) and all three are right
-	 * here -- so a plain un-traced run can be classified too.  That matters
-	 * because the reproducer cannot go GREEN while any shape remains, so
-	 * the metric for a candidate fix is a SHAPE HISTOGRAM over many runs,
-	 * and paying for a flight-recorder session per sample would cost more
-	 * than the samples are worth.
+	 * node still its head?, which refusal site?).  All three are right
+	 * here, so a plain un-traced run can be classified too.
+	 *
+	 * That matters because the reproducer cannot go GREEN while any shape
+	 * remains.  So the metric for a candidate fix is a SHAPE HISTOGRAM
+	 * over many runs.  Paying for a flight-recorder session per sample
+	 * would cost more than the samples are worth.
 	 */
 	fprintf(stderr, "EXTVIOL kind=%u node=%p prev=%p holder=%p hext=%p "
 		"hstate=0x%lx rmsite=%u tomb=%d headis=%s anctomb=%d ancroot=%d "
