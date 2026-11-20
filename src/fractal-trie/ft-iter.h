@@ -15,27 +15,31 @@
 #endif
 
 /*
- * Sentinel stored in iter->key_len by the ordinal-cell land for a VARIABLE-
- * length identity group: the length is DEFERRED and resolved on demand by
- * ft_iter_resolve_key_len() -- from the leaf (key_len_offset) when present, else
- * from the parent up-walk -- so a keyless cell walk reads neither key nor length.
- * SIZE_MAX is never a valid key length (bounded by max_key_len), so a consumer
+ * Sentinel stored in iter->key_len: the length is DEFERRED.  The ordinal-cell
+ * land stores it for a VARIABLE-length identity group.
+ * ft_iter_resolve_key_len() resolves it on demand.  The length comes from the
+ * leaf (key_len_offset) when present, else from the parent up-walk.  A keyless
+ * cell walk therefore reads neither the key nor the length.
+ *
+ * SIZE_MAX is never a valid key length (max_key_len bounds it).  A consumer
  * that forgets to resolve hits an obvious overflow, not a silently-stale value.
  */
 #define FT_ITER_KEY_LEN_LAZY	((size_t) -1)
 
 /*
- * Lazy-ref accessor model (scoped to the
- * ordinal-cell ordered list).  In a cell group with a leaf-key offset and an
- * identity key map, the ordered-iteration result key is held as a LIVE
- * REFERENCE into the matched leaf (iter->node + speculative_key_offset) instead
- * of being copied into iter_key(iter) on every cell-walk step.  That removes
- * the per-step key copy -- the cell walk never touches the leaf otherwise (its
- * node + ord_next co-reside in the 32B cell), so unlike the descent path the
- * leaf load is genuinely saved (the descent's going-up anchor would load it
- * regardless, which is why the by-reference key was a wash there).
+ * Lazy-ref accessor model (scoped to the ordinal-cell ordered list).
  *
- * iter_key(iter) is therefore NOT the current key for such a position; every
+ * This applies to a cell group with a leaf-key offset and an identity key
+ * map.  There, the result key of an ordered iteration is held as a LIVE
+ * REFERENCE into the matched leaf (iter->node + speculative_key_offset).  It
+ * is not copied into iter_key(iter) on every cell-walk step.
+ *
+ * That removes the per-step key copy, and it saves a real leaf load.  The
+ * cell walk never touches the leaf otherwise: its node and ord_next co-reside
+ * in the 32B cell.  The descent path differs: its going-up anchor would load
+ * the leaf regardless.  That is why the by-reference key was a wash there.
+ *
+ * iter_key(iter) is therefore NOT the current key for such a position.  Every
  * reader of the current-position key MUST go through ft_iter_read_key().
  * Missing one silently corrupts (e.g. cds_ft_remove_all locating a wrong key).
  */
@@ -49,20 +53,26 @@ bool ft_iter_key_referenced(const struct cds_ft_iter *iter)
 }
 
 /*
- * Resolve the current head's cell for a cell-walk step: use the cached cursor
- * when it still refers to iter->node (no leaf touch), else re-enter the walk
- * via the head's prev (one leaf load -- the per-walk-entry cost).  NULL when
- * there is no cell to re-enter from.
+ * Resolve the current head's cell for a cell-walk step:
+ *  - When the cached cursor still refers to iter->node, use it.  This does
+ *    not touch the leaf.
+ *  - Else re-enter the walk via the head's prev.  This costs one leaf load,
+ *    paid once per walk entry.
+ * Return NULL when there is no cell to re-enter from.
  *
  * ☠ A CHAIN MEMBER'S prev IS A NODE, NOT A CELL.  @iter->node was a head when
- * the reader found it, but a concurrent same-parent rekey merge splices a
- * moved head into an existing chain and so DEMOTES it in place: its prev
- * becomes the new predecessor node.  Cast as a cell, that node's bytes gave
- * the up-walk a NULL "parent" and a heap address as the cell, and
- * cds_ft_item_to_metadata faulted on it (MEASURED:
- * inv_rekey_merge_same_parent_coherent_readers, SIGSEGV in a reader on every
- * run).  A member carries its head's key, so the head's cell is the member's
- * position: hop to it, bounded exactly as ft_ext_head_word bounds the walk.
+ * the reader found it.  But a concurrent same-parent rekey merge splices a
+ * moved head into an existing chain.  This DEMOTES the head in place: its
+ * prev becomes the new predecessor node.
+ *
+ * Cast as a cell, that node's bytes gave the up-walk a NULL "parent" and a
+ * heap address as the cell.  cds_ft_item_to_metadata faulted on it.
+ * MEASURED: inv_rekey_merge_same_parent_coherent_readers, SIGSEGV in a reader
+ * on every run.
+ *
+ * A member carries its head's key, so the head's cell is the member's
+ * position.  Hop to it.  The hop is bounded exactly as ft_ext_head_word
+ * bounds the walk.
  */
 static inline_lookup
 struct ft_ord_cell *ft_ord_cell_cursor(const struct cds_ft_iter *iter)
@@ -105,37 +115,40 @@ struct ft_upwalk_hist {
 #ifdef FT_DEBUG_PARENT_VIOLATION
 #include <stdio.h>
 /*
- * One flag arms BOTH parent-word dumps -- this one and ft_get_parent_rcu's in
- * ft-helpers.h -- because they check the same invariant at the two loads that
- * carry it, and a report from either is only readable beside the other.
+ * One flag arms BOTH parent-word dumps: this one and ft_get_parent_rcu's in
+ * ft-helpers.h.  They check the same invariant at the two loads that carry
+ * it.  A report from either is only readable beside the other.
  *
  * Self-diagnosing form of the parent-word assert below.  The bare assert says
- * only THAT a parent read is illegal; at -O1 every local naming WHICH node
- * produced it is optimized out of the core, so the interesting half -- the node
- * whose @parent_word yielded the bad value, i.e. the one suspected of having
- * been freed while still referenced -- is unrecoverable.  Dump it at the point
- * of detection instead, where the walk is still live.
+ * only THAT a parent read is illegal.  At -O1 every local naming WHICH node
+ * produced it is optimized out of the core.  The interesting half is then
+ * unrecoverable: the node whose @parent_word yielded the bad value.  That
+ * node is the one suspected of having been freed while still referenced.
+ * Dump it at the point of detection instead, where the walk is still live.
  *
  * @from is that node (NULL when the bad value came from @cell->parent itself).
- * The two words at @bad are printed raw because a metadata slot returned to its
- * range freelist has @free_list_next over @parent_word, so a stale parent read
- * lands on a struct cds_ft_metadata_alloc whose rcu_head is {next, func}: a
- * @bad[1] that symbolizes to cds_ft_free_item_rcu is the freed-item signature.
- * Symbolize offline -- that callback is static to fractal-trie-alloc.c.
  *
- * The dump names the node whose parent_word was clobbered, but the DANGLING
- * LINK is one level BELOW that -- on the last node still alive, which is what
- * has to be explained.  @hist therefore carries each level so the live -> freed
- * boundary is visible in the dump instead of inferred from it.
+ * The two words at @bad are printed raw.  A metadata slot returned to its
+ * range freelist has @free_list_next over @parent_word.  A stale parent read
+ * therefore lands on a struct cds_ft_metadata_alloc, whose rcu_head is
+ * {next, func}.  A @bad[1] that symbolizes to cds_ft_free_item_rcu is the
+ * freed-item signature.  Symbolize offline: that callback is static to
+ * fractal-trie-alloc.c.
  *
- * Naming the boundary is still not naming the STALE EDGE: a live node whose
- * parent_word reaches a freed node is equally consistent with (a) a retire that
- * missed this child's back-pointer and (b) a back-pointer that was never stale
- * at all, because the node ABOVE it was itself freed and reallocated under the
- * link that reached it.  The two are told apart by the FORWARD edge: the slot
- * that this node's own (parent, PSO) pair derives must hold this very node.
- * The DEEPEST level whose slot does NOT hold it is where the structure first
- * disagrees with itself, and the level below that names the op to look at.
+ * The dump names the node whose parent_word was clobbered.  But the DANGLING
+ * LINK is one level BELOW that, on the last node still alive.  That link is
+ * what has to be explained.  @hist therefore carries each level.  The
+ * live -> freed boundary is then visible in the dump, not inferred from it.
+ *
+ * Naming the boundary is still not naming the STALE EDGE.  A live node whose
+ * parent_word reaches a freed node is equally consistent with two causes.
+ *  (a) A retire missed this child's back-pointer.
+ *  (b) The back-pointer was never stale at all.  The node ABOVE it was
+ *      itself freed and reallocated under the link that reached it.
+ * The FORWARD edge tells the two apart.  This node's own (parent, PSO) pair
+ * derives a slot.  That slot must hold this very node.  The DEEPEST level
+ * whose slot does NOT hold it is where the structure first disagrees with
+ * itself.  The level below that names the op to look at.
  */
 __attribute__((noinline, cold, unused))
 static void ft_upwalk_parent_violation(const struct cds_ft *ft,
@@ -172,12 +185,13 @@ static void ft_upwalk_parent_violation(const struct cds_ft *ft,
 			level : FT_UPWALK_HIST;
 
 		/*
-		 * DIFFERS is flagged on the RAW words, deliberately: resolving
-		 * a skip form here would dereference a slot that is already
-		 * suspect and could lose the whole dump to a fault.  A slot
-		 * holding the SKIP form of the same node differs raw-wise, so
-		 * decode any flag offline before calling it stale -- both words
-		 * are printed for exactly that.
+		 * DIFFERS is flagged on the RAW words, deliberately.
+		 * Resolving a skip form here would dereference a slot that
+		 * is already suspect.  A fault there could lose the whole
+		 * dump.  A slot holding the SKIP form of the same node
+		 * differs raw-wise.  So decode any flag offline before
+		 * calling the slot stale.  Both words are printed for
+		 * exactly that.
 		 */
 		fprintf(stderr, "  climb (deepest first), TOMB = state bit 1,\n"
 			"  DIFFERS = the slot my own (parent, PSO) pair derives does not hold me (raw):\n");
@@ -213,19 +227,20 @@ static void ft_upwalk_parent_violation(const struct cds_ft *ft,
 #endif
 
 /*
- * Rebuild the ORDINAL key for a cell head @cell of length @key_len by walking
- * UP the parent chain, recovering each level's branch byte structurally:
+ * Rebuild the ORDINAL key for a cell head @cell by walking UP the parent
+ * chain.  Each level's branch byte is recovered structurally:
  *   - external head: its last byte = the head's cell-metadata incoming_byte
  *     (unless its parent is a compressed node, whose key_bytes already span
  *     through the head's position).
  *   - internal node: metadata->incoming_byte (skip the root, which has none).
  *   - compressed node: its key_bytes[] span PLUS metadata->incoming_byte (the
  *     slot byte under which it hangs in its parent -- separate from key_bytes).
- * Fills @out[0..key_len) (caller-sized >= key_len) and returns true when the
- * walk accounts for exactly key_len bytes.
+ * Fill @out from the END (the caller sizes it to @max_len bytes) and return
+ * the key length.  The key occupies @out[@max_len - length .. @max_len).
+ * Return 0 when @cell is NULL or when the key does not fit in @max_len bytes.
  *
- * This is the structural key source for the ordered-list walk that needs NO
- * speculative_key_offset (in-leaf key) and NO parent-bitmap inversion -- it
+ * This is the structural key source for the ordered-list walk.  It needs NO
+ * speculative_key_offset (in-leaf key) and NO parent-bitmap inversion.  It
  * makes the ordered list usable on an EAGER / no-leaf-key trie.  Valid only
  * while the RCU lock that produced @cell is held continuously.
  */
@@ -250,80 +265,92 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 		return 0;
 
 	/*
-	 * Resolve a cds_ft_merge / graft_swap flip proxy on every parent load: a
-	 * concurrent bulk op re-parents nodes via a type-7 proxy installed BEFORE
-	 * its drain, so an up-walk running under the reader's RCU lock would
-	 * otherwise dereference the proxy as a node.  Gives the view-appropriate
-	 * (old-or-merged) parent, consistent across the walk.
+	 * Resolve a cds_ft_merge / graft_swap flip proxy on every parent load.
+	 * A concurrent bulk op re-parents nodes via a type-7 proxy.  The proxy
+	 * is installed BEFORE the op's drain.  Without the resolve, an up-walk
+	 * running under the reader's RCU lock would dereference the proxy as a
+	 * node.  The resolve gives the view-appropriate (old-or-merged) parent,
+	 * consistent across the walk.
 	 */
 	/*
 	 * Launder the head's parent through ft_parent_node() exactly as the climb
-	 * below does.  A parent word at a ROOT POSITION names the owning TRIE, not
-	 * a node, and must never be walked as one; ft_parent_node() turns that
-	 * stamp into NULL, which the root-position arm below already handles.
-	 * Every other parent reader in the tree -- ft-verify, ft-compact,
-	 * ft-insert, and this function's own climb -- goes through it; this load
-	 * was the only one that did not.
+	 * below does.  A parent word at a ROOT POSITION names the owning TRIE,
+	 * not a node.  It must never be walked as a node.  ft_parent_node()
+	 * turns that stamp into NULL, and the root-position arm below already
+	 * handles NULL.  Every other parent reader in the tree goes through it:
+	 * ft-verify, ft-compact, ft-insert and this function's own climb.  This
+	 * load was the only one that did not.
 	 *
-	 * Identity TODAY, and deliberately not left to that: a head always hangs
-	 * under a node (even a lone nil key is held by a childless-internal
-	 * wrapper AT the root), so @cell->parent is an internal or compressed flag
-	 * whose low nibble is never 0, and no writer stamps a cell -- every
-	 * ft_trie_parent() store targets a metadata @parent_word.  Measured: ZERO
-	 * root-position cells in 215 M up-walks across both spacings and ft_unit.
-	 * Written this way so the walk stays correct if cells ever adopt the owner
-	 * stamp the metadata parent words already carry, rather than silently
-	 * dereferencing a struct cds_ft as a node.
+	 * The laundering is an identity TODAY.  The walk deliberately does not
+	 * rely on that.  It is an identity for two reasons:
+	 *  - A head always hangs under a node.  Even a lone nil key is held by
+	 *    a childless-internal wrapper AT the root.  So @cell->parent is an
+	 *    internal or compressed flag, whose low nibble is never 0.
+	 *  - No writer stamps a cell.  Every ft_trie_parent() store targets a
+	 *    metadata @parent_word.
+	 * Measured: ZERO root-position cells in 215 M up-walks across both
+	 * spacings and ft_unit.
+	 *
+	 * The walk is written this way so that it stays correct if cells ever
+	 * adopt the owner stamp that the metadata parent words already carry.
+	 * It would otherwise silently dereference a struct cds_ft as a node.
 	 */
 	nf = ft_parent_node_resolved(rcu_dereference(cell->parent));
 	/*
-	 * A PREFIX head's parent word says so on the word itself
-	 * (FT_PARENT_PREFIX_HEAD, set when the head was installed at the
-	 * holder's external_nodes and carried by every re-home since).  It is
-	 * the head-shape answer, and it stays right on a DEAD head, whose
-	 * holder no longer names it; the node the word names is unchanged.
+	 * A PREFIX head's parent word says so on the word itself, with
+	 * FT_PARENT_PREFIX_HEAD.  The flag was set when the head was installed
+	 * at the holder's external_nodes.  Every re-home since has carried it.
+	 * It is the head-shape answer.  It stays right on a DEAD head, whose
+	 * holder no longer names it: the node the word names is unchanged.
 	 */
 	is_prefix = ft_parent_prefix_head(nf);
 	nf = ft_parent_prefix_strip(nf);
 	/*
 	 * A parent link names an INTERNAL or COMPRESSED node, never an external
-	 * one -- the same invariant ft_get_parent_rcu asserts on its own load,
-	 * asserted here because this walk is the other consumer of a parent word
-	 * and had no check at all.
+	 * one.  ft_get_parent_rcu asserts the same invariant on its own load.
+	 * It is asserted here too: this walk is the other consumer of a parent
+	 * word, and it had no check at all.
 	 *
 	 * It is not a formality.  A metadata slot returned to its range freelist
-	 * has @free_list_next written over @parent_word (they are the same bytes;
-	 * see the layout note on struct cds_ft_metadata), and a freelist link is
-	 * >= 8-byte aligned, so ft_node_external() ACCEPTS it.  Without this the
-	 * walk carries that link into ft_flag_to_metadata below and dies two
-	 * frames later inside cds_ft_item_to_metadata, on an address in the
-	 * metadata region, with nothing left on the stack naming the stale
-	 * reference.  Trap it at the LOAD instead, where @cell and the walk are
-	 * still in the frame.
+	 * has @free_list_next written over @parent_word.  They are the same
+	 * bytes; see the layout note on struct cds_ft_metadata.  A freelist
+	 * link is >= 8-byte aligned, so ft_node_external() ACCEPTS it.
+	 *
+	 * Without this check, the walk carries that link into
+	 * ft_flag_to_metadata below.  It dies two frames later inside
+	 * cds_ft_item_to_metadata, on an address in the metadata region.
+	 * Nothing left on the stack names the stale reference.  Trap it at the
+	 * LOAD instead, where @cell and the walk are still in the frame.
 	 */
 	ft_upwalk_check_parent(ft, cell, NULL, nf, 0, histp);
 
 	/*
-	 * Fill the buffer FROM THE END: write the deepest (leaf-edge) byte at
-	 * out[max_len-1] and grow leftward, so the key ends up in correct order
-	 * occupying out[pos .. max_len) with NO reversal and the length DERIVED
-	 * from the walk (pos drops by however many bytes the walk contributes --
-	 * no key_len needed, so variable-length keys with no in-leaf length work).
-	 * A compressed span lands as one contiguous forward memcpy (its key_bytes
-	 * are already in key order); on underflow past out[0], fail (return 0).
-	 * The key STARTS at out[max_len - returned]; the caller keeps that offset.
+	 * Fill the buffer FROM THE END.  Write the deepest (leaf-edge) byte at
+	 * out[max_len-1] and grow leftward.  The key ends up in correct order
+	 * in out[pos .. max_len), with NO reversal.
 	 *
-	 * Head's last byte: when it hangs off an internal node it sits in a slot
-	 * whose byte is the head's cell-metadata incoming_byte; when its parent is
-	 * a compressed node the head is that node's child and carries no separate
-	 * edge byte (the compressed key_bytes run through the head's position).
+	 * The length is DERIVED from the walk: pos drops by the number of bytes
+	 * the walk contributes.  No key_len is needed, so variable-length keys
+	 * with no in-leaf length work.
+	 *
+	 * A compressed span lands as one contiguous forward memcpy: its
+	 * key_bytes are already in key order.  On underflow past out[0], fail
+	 * (return 0).  The key STARTS at out[max_len - returned]; the caller
+	 * keeps that offset.
+	 *
+	 * Head's last byte:
+	 *  - The head hangs off an internal node: it sits in a slot.  The slot
+	 *    byte is the head's cell-metadata incoming_byte.
+	 *  - The head's parent is a compressed node: the head is that node's
+	 *    child and carries no separate edge byte.  The compressed key_bytes
+	 *    run through the head's position.
 	 */
 	if (!nf) {
 		/*
-		 * Head AT A ROOT POSITION -- @cell->parent was NULL or a trie
-		 * stamp the load above resolved to NULL.  Its byte stands alone.
-		 * Unobserved in practice (see the load's measurement); kept as the
-		 * arm a stamped cell would land in rather than removed.
+		 * Head AT A ROOT POSITION: @cell->parent was NULL, or a trie
+		 * stamp that the load above resolved to NULL.  Its byte stands
+		 * alone.  Unobserved in practice (see the load's measurement).
+		 * The arm is kept, not removed: a stamped cell would land here.
 		 */
 		struct cds_ft_metadata *hmeta = cds_ft_item_to_metadata(cell);
 
@@ -334,43 +361,49 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 		/*
 		 * Parent is an internal (slot-array) node.  Write the head's edge
 		 * byte ONLY when the head hangs off a SLOT.  A PREFIX key sits at the
-		 * parent's external_nodes -- the key ENDS at the parent, so its last
-		 * byte IS the parent's own incoming edge (written when the parent is
-		 * processed below) and must not be double-counted here.  Fixed-length
-		 * tries have no prefix keys, so this is always a slot head there.
+		 * parent's external_nodes: the key ENDS at the parent.  Its
+		 * last byte IS the parent's own incoming edge, which is written
+		 * when the parent is processed below.  It must not be counted
+		 * twice here.  Fixed-length tries have no prefix keys, so this
+		 * is always a slot head there.
 		 *
 		 * ★ ONE WORD ANSWERS IT, and it is the word already loaded above.
-		 * The head's back edge carries its own shape (FT_PARENT_PREFIX_HEAD),
-		 * so the parent it names and the shape it has come from a SINGLE
-		 * load and cannot disagree.  Both inferences this replaces were
-		 * two-word reads, and both were measurably wrong:
+		 * The head's back edge carries its own shape
+		 * (FT_PARENT_PREFIX_HEAD).  The parent it names and the shape
+		 * it has come from a SINGLE load, so they cannot disagree.
+		 * This replaces two inferences.  Both were two-word reads, and
+		 * both were measurably wrong:
 		 *
 		 *  - "not the parent's external_nodes" is NOT "hangs off a slot".  A
 		 *    parked reader legitimately holds the cell of a head whose key a
-		 *    concurrent remove has already taken out -- and the key-
-		 *    disappearing remove of a PREFIX head is an IN-PLACE clear of the
-		 *    holder's external_nodes: the holder stays, its external_nodes
-		 *    reads NULL (or a re-inserted head of the same key), and the
-		 *    inference turns the dead prefix head into a slot head, appending
-		 *    its own last byte a second time.  MEASURED (a key->node oracle
-		 *    over {Bdd,Bds,Bs} with "Bd" churned): ~1.5 M keys per 8 s run
-		 *    spelling "Bdd" on the "Bd" node, 100% from a node whose removal
-		 *    had started, the parent's slot for that byte holding a DIFFERENT
-		 *    node -- a legal key on the wrong node, which a universe check
-		 *    cannot see.
+		 *    concurrent remove has already taken out.  The remove that
+		 *    makes the key of a PREFIX head disappear is an IN-PLACE
+		 *    clear of the holder's external_nodes.  The holder stays.
+		 *    Its external_nodes reads NULL, or a re-inserted head of
+		 *    the same key.  The inference then turns the dead prefix
+		 *    head into a slot head and appends its own last byte a
+		 *    second time.
+		 *    MEASURED with a key->node oracle over {Bdd,Bds,Bs} while
+		 *    "Bd" is churned.  About 1.5 M keys per 8 s run spelled
+		 *    "Bdd" on the "Bd" node.  100% came from a node whose
+		 *    removal had started.  The parent's slot for that byte held
+		 *    a DIFFERENT node.  This is a legal key on the wrong node,
+		 *    which a universe check cannot see.
 		 *  - "is the head in the parent's slot for its byte" tears the same
-		 *    way: a glue commit wrapping a slot head "m" under a fresh
-		 *    internal node as its prefix head (inv_merge_rerooted_nosplit_
-		 *    branch) leaves it "in neither place" for a LIVE head, 39/39.
+		 *    way.  A glue commit wraps a slot head "m" under a fresh
+		 *    internal node as its prefix head
+		 *    (inv_merge_rerooted_nosplit_branch).  That leaves a LIVE
+		 *    head "in neither place", 39/39.
 		 *
 		 * ☠ AND A RE-READ OF THIS WORD IS NOT A REPAIR, it is a second
-		 * straddle.  The re-read that used to back the holder query took the
-		 * SHAPE from a later load while the climb below kept the PARENT from
-		 * the earlier one; once the shape lives on the word, a re-home
-		 * committed between the two hands back "prefix head" for a parent
-		 * that is no longer the one being walked, and the key comes out a
-		 * byte short (inv_merge_rerooted_glue_no_escape, len-0 keys).  Read
-		 * it ONCE.
+		 * straddle.  A re-read used to back the holder query.  It took
+		 * the SHAPE from a later load, while the climb below kept the
+		 * PARENT from the earlier one.  Now the shape lives on the
+		 * word.  A re-home committed between the two loads then hands
+		 * back "prefix head" for a parent that is no longer the one
+		 * being walked.  The key comes out a byte short
+		 * (inv_merge_rerooted_glue_no_escape, len-0 keys).  Read it
+		 * ONCE.
 		 */
 		if (!is_prefix) {
 			struct cds_ft_metadata *hmeta =
@@ -406,10 +439,10 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 			/*
 			 * The forward edge, for the back-edge comparison in the
 			 * dump.  Resolved only while the parent word still names
-			 * a node OR a root position (whose slot is &ft->root): a
-			 * freelist link is 8-mod-16, so it clears neither
+			 * a node OR a root position (whose slot is &ft->root).
+			 * A freelist link is 8-mod-16.  It clears neither
 			 * ft_parent_is_trie's alignment nor ft_node_external's
-			 * tag, and the slot address would be computed off junk.
+			 * tag.  The slot address would be computed off junk.
 			 */
 			if (!pnode || !ft_node_external(pnode)) {
 				hist[level].slot = ft_get_parent_slot(meta,
@@ -428,9 +461,9 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 			unsigned int len = cn->len;
 
 			/*
-			 * Compressed span in key order (key_bytes[0..len)): it sits
-			 * immediately to the LEFT of what we've written so far, so a
-			 * single forward memcpy places it correctly.
+			 * Compressed span in key order (key_bytes[0..len)).
+			 * It sits immediately to the LEFT of what we've written
+			 * so far.  A single forward memcpy places it correctly.
 			 */
 			if (pos < len)
 				return 0;
@@ -439,13 +472,16 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 		}
 		/*
 		 * This node's incoming edge byte (the slot byte in its parent).
-		 * Read meta->parent ONCE (resolving a concurrent bulk op's flip
-		 * proxy) and use it for both the compressed-parent test and the
-		 * advance.  Contributed only when the PARENT is an internal
-		 * (slot-array) node: a compressed parent's last key_byte already IS
-		 * this edge, counted when that parent is processed -- so skip it here
-		 * (mirrors the head's skip when its parent is compressed).  The root
-		 * has no parent and contributes none.
+		 * Read meta->parent_word ONCE (resolving a concurrent bulk op's
+		 * flip proxy).  Use it for both the compressed-parent test and
+		 * the advance.
+		 *
+		 * The byte is contributed only when the PARENT is an internal
+		 * (slot-array) node.  A compressed parent's last key_byte
+		 * already IS this edge, and it is counted when that parent is
+		 * processed.  So skip it here.  This mirrors the head's skip
+		 * when its parent is compressed.  The root has no parent and
+		 * contributes none.
 		 */
 		{
 			struct cds_ft_inode_flag *parent =
@@ -470,11 +506,12 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 
 /*
  * One-shot structural materialization for a VARIABLE-length EAGER ordered-list
- * iterator (no in-leaf key, no key_len_offset): the parent up-walk derives BOTH
- * the key bytes (into iter_key) AND the length in a SINGLE walk.  Caches the
- * length in iter->key_len (clearing the LAZY sentinel) so a later read_key /
- * resolve_key_len in the same step reuses it instead of walking again.  Returns
- * the length (0 on a NIL key / overflow / missing cell).
+ * iterator (no in-leaf key, no key_len_offset).  The parent up-walk derives
+ * BOTH the key bytes (into iter_key) AND the length in a SINGLE walk.
+ *
+ * Cache the length in iter->key_len, which clears the LAZY sentinel.  A later
+ * read_key / resolve_key_len in the same step then reuses it and does not
+ * walk again.  Return the length (0 on a NIL key / overflow / missing cell).
  */
 static inline_lookup
 size_t ft_iter_upwalk_into_buf(struct cds_ft_iter *iter)
@@ -500,24 +537,28 @@ const uint8_t *ft_iter_read_key(const struct cds_ft_iter *iter)
 		return (const uint8_t *) iter->node + group->speculative_key_offset;
 	/*
 	 * EAGER ordered-list walk (no in-leaf key): rematerialize the current
-	 * key STRUCTURALLY via the parent up-walk into iter_key.  Reached only
-	 * when a key consumer asks for the key -- a keyless/count walk never
-	 * calls this, so the O(depth) walk is paid strictly on demand.  The
-	 * walk recovers ORDINAL bytes from the trie structure, which is what
-	 * iter_key holds for ANY key map (consumers remap via
-	 * ft_ordinals_to_key), so no identity requirement.  FIXED-length walks
-	 * into the buffer (length is group->key_len).  VARIABLE-length derives
-	 * the length from the SAME walk, cached via ft_iter_upwalk_into_buf and
-	 * coordinated with ft_iter_resolve_key_len through the LAZY sentinel so
-	 * one walk serves both.
+	 * key STRUCTURALLY via the parent up-walk into iter_key.
+	 *
+	 * This is reached only when a key consumer asks for the key.  A
+	 * keyless/count walk never calls this, so the O(depth) walk is paid
+	 * strictly on demand.
+	 *
+	 * The walk recovers ORDINAL bytes from the trie structure.  That is
+	 * what iter_key holds for ANY key map (consumers remap via
+	 * ft_ordinals_to_key), so there is no identity requirement.
+	 *
+	 *  - FIXED-length: walk into the buffer.  The length is
+	 *    group->key_len.
+	 *  - VARIABLE-length: derive the length from the SAME walk.
+	 *    ft_iter_upwalk_into_buf caches it.  The LAZY sentinel coordinates
+	 *    this with ft_iter_resolve_key_len, so one walk serves both.
 	 */
 	if (group->ordered_list_set && !iter->ft->speculative_key_offset_active &&
 			iter->cache_valid && iter->node) {
 		if (group->key_len == CDS_FT_LEN_VARIABLE) {
 			/*
 			 * The up-walk fills the key at the buffer TAIL and records
-			 * iter->key_off; coordinated with ft_iter_resolve_key_len
-			 * through the LAZY sentinel so one walk serves both.
+			 * iter->key_off.  See above for the LAZY sentinel.
 			 */
 			if (iter->key_len == FT_ITER_KEY_LEN_LAZY)
 				ft_iter_upwalk_into_buf(
@@ -540,14 +581,24 @@ const uint8_t *ft_iter_read_key(const struct cds_ft_iter *iter)
 }
 
 /*
- * Resolve (and cache) the iterator's current-position key length.  For a
- * deferred-length cell position it reads node->key_len from the leaf once and
- * caches it into iter->key_len (and path_len); otherwise returns iter->key_len
- * unchanged (a no-op for fixed-length, non-identity, descent and non-cell
- * positions).  EVERY reader of the current-position length (cds_ft_iter_get_key,
- * cds_ft_remove*, the skip rebuilds, bind, the max-key-len scan) must call this
- * before reading iter->key_len.  The LAZY sentinel is only ever set with
- * cache_valid && node, so the leaf read is safe.
+ * Resolve (and cache) the iterator's current-position key length.
+ *
+ * For a deferred-length cell position, read the length once and cache it
+ * into iter->key_len (and path_len).  The length comes from the leaf, or from
+ * the parent up-walk (see below).  Otherwise return iter->key_len unchanged.
+ * That is a no-op for fixed-length, non-identity, descent and non-cell
+ * positions.
+ *
+ * EVERY reader of the current-position length must call this before reading
+ * iter->key_len:
+ *  - cds_ft_iter_get_key;
+ *  - cds_ft_remove*;
+ *  - the skip rebuilds;
+ *  - bind;
+ *  - the max-key-len scan.
+ *
+ * The LAZY sentinel is only ever set with cache_valid && node, so the leaf
+ * read is safe.
  */
 static inline_lookup
 size_t ft_iter_resolve_key_len(struct cds_ft_iter *iter)
@@ -555,14 +606,15 @@ size_t ft_iter_resolve_key_len(struct cds_ft_iter *iter)
 	if (caa_unlikely(iter->key_len == FT_ITER_KEY_LEN_LAZY)) {
 		/*
 		 * VARIABLE-length EAGER ordered-list (no in-leaf KEY at
-		 * speculative_key_offset): the key source is the iter buffer, and
-		 * clearing the LAZY sentinel doubles as "buffer filled" for
-		 * ft_iter_read_key -- so the length MUST come from the parent
-		 * up-walk, which fills iter_key (+ key_off) in the same walk that
-		 * derives the length, even when an in-leaf LENGTH (key_len_offset)
-		 * is configured.  Only a leaf-referenced key (in-leaf key present)
-		 * may take the leaf-length shortcut: its key reads never touch the
-		 * buffer.
+		 * speculative_key_offset).  The key source is the iter buffer.
+		 * Clearing the LAZY sentinel doubles as "buffer filled" for
+		 * ft_iter_read_key.  So the length MUST come from the parent
+		 * up-walk: the same walk fills iter_key (+ key_off) and derives
+		 * the length.  This holds even when an in-leaf LENGTH
+		 * (key_len_offset) is configured.
+		 *
+		 * Only a leaf-referenced key (in-leaf key present) may take the
+		 * leaf-length shortcut: its key reads never touch the buffer.
 		 */
 		if (!iter->ft->group->key_len_offset_set ||
 				!iter->ft->speculative_key_offset_active) {
@@ -578,10 +630,12 @@ size_t ft_iter_resolve_key_len(struct cds_ft_iter *iter)
 
 /*
  * Copy a live leaf-referenced key into iter_key so it survives the position
- * being detached (UNCACHED auto-invalidate, bind, any cache_valid clear).  A
- * no-op self-copy when the key is already a value there.  Bytes are ordinal
- * (ft_iter_key_referenced requires an identity map).  Resolves the length first
- * so a deferred-length position materializes both before its node is dropped.
+ * being detached (UNCACHED auto-invalidate, bind, any cache_valid clear).
+ * This is a no-op self-copy when the key is already a value there.  Bytes
+ * are ordinal (ft_iter_key_referenced requires an identity map).
+ *
+ * Resolve the length first.  A deferred-length position then materializes
+ * both the key and the length before its node is dropped.
  */
 static inline_lookup
 void ft_iter_materialize_key(struct cds_ft_iter *iter)
@@ -590,13 +644,17 @@ void ft_iter_materialize_key(struct cds_ft_iter *iter)
 	const uint8_t *cur = ft_iter_read_key(iter);
 
 	/*
-	 * Pin the current key at the FRONT of iter_key (key_off = 0).  The hot
-	 * cell-walk read keeps the up-walk key at the buffer TAIL (no move), but
-	 * materialize is the bind / UNCACHED path: the saved key must then be
-	 * re-descended from, and the relational descent reads its search key and
-	 * writes its result into the SAME iter_key buffer -- which is only safe
-	 * (result == search before divergence) when the key starts at offset 0.
-	 * memmove because @cur (the up-walk tail, or a leaf reference) may overlap.
+	 * Pin the current key at the FRONT of iter_key (key_off = 0).
+	 *
+	 * The hot cell-walk read keeps the up-walk key at the buffer TAIL (no
+	 * move).  But materialize is the bind / UNCACHED path: the next
+	 * operation re-descends from the saved key.  The relational descent
+	 * reads its search key from iter_key and writes its result into the
+	 * SAME buffer.  That is only safe when the key starts at offset 0
+	 * (result == search before divergence).
+	 *
+	 * Use memmove because @cur may overlap iter_key.  @cur is the up-walk
+	 * tail or a leaf reference.
 	 */
 	if (cur != iter_key(iter)) {
 		memmove(iter_key(iter), cur, klen);
@@ -633,24 +691,27 @@ enum cds_ft_status ft_ord_cell_iter_land(struct cds_ft *ft,
 	iter->ord_cell_node = node;
 	iter->cache_valid = true;
 	/*
-	 * Materialize as little as possible -- the cell walk's point is that a
-	 * keyless / count traversal touches NO leaf:
+	 * Materialize as little as possible.  The cell walk's point is that a
+	 * keyless / count traversal touches NO leaf.
 	 *
-	 *  - Identity map (key read in place from the leaf when an in-leaf key
-	 *    is configured, see ft_iter_key_referenced) or EAGER group (no
-	 *    in-leaf key; the up-walk in ft_iter_read_key recovers the ordinal
-	 *    bytes structurally, identity or not): no key copy.  A VARIABLE-
-	 *    length group also DEFERS the length: iter->key_len is the LAZY
-	 *    sentinel, resolved on demand by ft_iter_resolve_key_len() only in
-	 *    the key-consuming ops (get_key / remove / skip / bind).  So a
-	 *    keyless variable-length walk reads neither the key nor the length
-	 *    from the leaf.  A FIXED-length group takes its length from
-	 *    group->key_len (no leaf touch either).
+	 *  - Identity map, or EAGER group: no key copy.
+	 *    With an identity map and an in-leaf key, the key is read in place
+	 *    from the leaf (see ft_iter_key_referenced).  In an EAGER group (no
+	 *    in-leaf key), the up-walk in ft_iter_read_key recovers the ordinal
+	 *    bytes structurally, identity or not.
+	 *    A VARIABLE-length group also DEFERS the length.  iter->key_len is
+	 *    the LAZY sentinel.  ft_iter_resolve_key_len() resolves it on
+	 *    demand, only in the key-consuming ops (get_key / remove / skip /
+	 *    bind).  So a keyless variable-length walk reads neither the key
+	 *    nor the length from the leaf.
+	 *    A FIXED-length group takes its length from group->key_len (no
+	 *    leaf touch either).
 	 *  - Non-identity map WITH an in-leaf key: the leaf bytes are in
-	 *    application order, so they must be remapped to ordinal order now,
-	 *    which needs the length now -- read it (leaf, for variable) and copy
-	 *    into iter_key (ft_iter_key_referenced is then false, consumers use
-	 *    the buffer).
+	 *    application order.  They must be remapped to ordinal order now,
+	 *    and that needs the length now.  Read the length (from the leaf,
+	 *    for variable) and copy the key into iter_key.
+	 *    ft_iter_key_referenced is then false, so consumers use the
+	 *    buffer.
 	 */
 	if (caa_likely(ft->group->key_map.identity ||
 			!ft->speculative_key_offset_active)) {
@@ -677,21 +738,24 @@ enum cds_ft_status ft_ord_cell_iter_land(struct cds_ft *ft,
 }
 
 /*
- * True when the ordinal-cell O(1) endpoints / fast path can serve @iter: the
- * list is enabled, the result key + length are recoverable from the leaf, and
- * the traversal is unscoped.
+ * Return true when the ordinal-cell O(1) endpoints / fast path can serve
+ * @iter.  All of these must hold:
+ *  - the list is enabled;
+ *  - the result key and its length are recoverable, from the leaf or from
+ *    the parent up-walk;
+ *  - the traversal is unscoped.
  */
 static inline_lookup
 bool ft_ord_cell_fastpath_ok(const struct cds_ft *ft,
 		const struct cds_ft_iter *iter)
 {
 	/*
-	 * EAGER structural up-walk: an ordered-list group with NO in-leaf key
+	 * EAGER structural up-walk.  An ordered-list group with NO in-leaf key
 	 * (no speculative_key_offset) gets BOTH the result key AND its length
-	 * from the parent up-walk (ft_iter_read_key / ft_iter_resolve_key_len),
-	 * for fixed OR variable length -- no in-leaf key and no key_len_offset
-	 * needed.  The walk recovers ORDINAL bytes, so it serves any key map
-	 * (a non-identity map is applied on result-key copy-out).
+	 * from the parent up-walk (ft_iter_read_key / ft_iter_resolve_key_len).
+	 * This holds for fixed OR variable length.  It needs no in-leaf key and
+	 * no key_len_offset.  The walk recovers ORDINAL bytes, so it serves any
+	 * key map (a non-identity map is applied on result-key copy-out).
 	 */
 	bool up_walk = ft->group->ordered_list_set &&
 		!ft->speculative_key_offset_active;
@@ -753,10 +817,11 @@ enum cds_ft_status cds_ft_iter_get_key(struct cds_ft_iter *iter,
 		return CDS_FT_STATUS_OVERFLOW_ERROR;
 	/*
 	 * Lazy-ref: when the current key is a live reference into iter->node,
-	 * read it from the leaf; else from the iter_key value.  ft_iter_resolve_
-	 * key_len above materialized a deferred (variable-length) length from the
-	 * same leaf.  Same continuous-RCU-lock contract as reusing the cached
-	 * position (cross-CS callers cds_ft_iter_bind_key() first).
+	 * read it from the leaf; else from the iter_key value.
+	 * ft_iter_resolve_key_len above materialized a deferred
+	 * (variable-length) length from the same leaf.  The contract is the
+	 * same as for reusing the cached position: the RCU lock is held
+	 * continuously.  Cross-CS callers call cds_ft_iter_bind_key() first.
 	 */
 	ft_ordinals_to_key(result_key, ft_iter_read_key(iter), klen,
 			&iter->ft->group->key_map);
@@ -786,12 +851,16 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
 	} else {
 		/*
 		 * No in-leaf key: rebuild the ordinal key by the structural parent
-		 * up-walk from the head's cell (the same EAGER source cds_ft_iter_
-		 * get_key uses).  Requires the cell to exist -- i.e. the ordered list
-		 * enabled, since a list-off trie allocates no cells (head->prev is the
-		 * flagged parent directly, which is NOT an up-walk source).  The walk
-		 * fills @scratch from the tail and returns the length; the key starts
-		 * at @scratch[max-len].
+		 * up-walk from the head's cell.  cds_ft_iter_get_key uses the
+		 * same EAGER source.
+		 *
+		 * This requires the cell to exist, i.e. the ordered list
+		 * enabled.
+		 * A list-off trie allocates no cells: head->prev is the flagged
+		 * parent directly, which is NOT an up-walk source.
+		 *
+		 * The walk fills @scratch from the tail and returns the length.
+		 * The key starts at @scratch[max-len].
 		 */
 		if (ft->ordered_list) {
 			struct ft_ord_cell *cell = ft_ord_cell_ptr(
@@ -911,10 +980,10 @@ void cds_ft_iter_bind_key(struct cds_ft_iter *iter)
 	FT_TP(iter_bind_key, (const void *) iter->ft, (const void *) iter);
 	/*
 	 * Materialize a live leaf-referenced key into the iterator's own buffer
-	 * BEFORE detaching, so a cross-critical-section resume re-descends from
-	 * the stable buffer rather than the (post-unlock, possibly reclaimed)
-	 * leaf.  A no-op self-copy for groups whose key is already a value, in
-	 * which case this is a plain invalidate.
+	 * BEFORE detaching.  A resume in another critical section then
+	 * re-descends from the stable buffer, not from the leaf.  The leaf may
+	 * be reclaimed after the unlock.  For groups whose key is already a
+	 * value, this is a no-op self-copy and a plain invalidate.
 	 */
 	ft_iter_materialize_key(iter);
 	iter->cache_valid = false;
@@ -941,16 +1010,17 @@ void cds_ft_iter_copy(struct cds_ft_iter *dst, const struct cds_ft_iter *src)
 #endif
 	/*
 	 * Copy the key buffer only when the source key is a VALUE there.  It is
-	 * NOT one when:
-	 *  - the key is a live leaf reference (identity cell position with an
-	 *    in-leaf key): iter_key(src) is stale; @dst shares src->node +
-	 *    cache_valid, so it reads the key from the same leaf;
-	 *  - the length is the deferred LAZY sentinel (EAGER identity cell
-	 *    position, no in-leaf key): nothing was materialized yet; @dst
-	 *    shares the position and re-derives key + length from the up-walk
-	 *    on demand.  Copying would be a SIZE_MAX memcpy.
-	 * Copy at key_off: an up-walk-materialized key lives at the buffer
-	 * TAIL, mirrored to the same offset in @dst (key_off copied above).
+	 * NOT one in two cases:
+	 *  - The key is a live leaf reference (identity cell position with an
+	 *    in-leaf key).  iter_key(src) is stale.  @dst shares src->node and
+	 *    cache_valid, so it reads the key from the same leaf.
+	 *  - The length is the deferred LAZY sentinel (EAGER identity cell
+	 *    position, no in-leaf key).  Nothing was materialized yet.  @dst
+	 *    shares the position and re-derives the key and the length from
+	 *    the up-walk on demand.  Copying would be a SIZE_MAX memcpy.
+	 * Copy at key_off.  A key materialized by the up-walk lives at the
+	 * buffer TAIL.  It is mirrored to the same offset in @dst (key_off is
+	 * copied above).
 	 */
 	if (!ft_iter_key_referenced(src) &&
 			src->key_len != FT_ITER_KEY_LEN_LAZY)
@@ -965,29 +1035,36 @@ struct cds_ft_node *cds_ft_iter_node(const struct cds_ft_iter *iter)
 
 /*
  * Iterator-free ordered batched gather, shared by cds_ft_cell_next_batch /
- * cds_ft_cell_prev_batch.  Walks @ft's ordered cell list from @cursor (NULL =
- * the list minimum for forward, maximum for reverse), emits up to @cap opaque
- * CELL handles into @buf, and writes the resume cell -- the one after the last
- * emitted, NULL at the end -- to @next_cursor.  The cmm_ptr_eq physical-next
- * prediction (post-compaction the cells are contiguous in key order at @stride,
- * so a cell's ord_next/ord_prev usually resolves to cur +/- stride; cmm_ptr_eq
- * validates the arithmetic guess and lets the compiler address the NEXT load off
- * it, breaking the dependent-load chain so the gather pipelines) pays only on a
- * compacted arena and is a no-op otherwise.  @forward is a literal at both call
- * sites so always_inline folds the direction out.
+ * cds_ft_cell_prev_batch.
  *
- * Cell-native: the cursor, the emitted handles, and the resume cursor are all
- * CELLS, so the walk never touches an external head node -- not to emit, not to
- * resume (no node<->cell round-trip, hence no resume cache is needed).  The
- * caller recovers the node from a cell via cds_ft_cell_node() (an inlined load
- * of the hot cell line, not a cold node->prev) and materializes keys lazily via
- * cds_ft_cell_get_key(); a keyless (no in-leaf key) ordered scan thus touches
- * ZERO external-head cachelines in the library.
+ * Walk @ft's ordered cell list from @cursor.  A NULL @cursor means the list
+ * minimum for forward, the maximum for reverse.  Emit up to @cap opaque CELL
+ * handles into @buf.  Write the resume cell to @next_cursor: the one after
+ * the last emitted, NULL at the end.
  *
- * ORDERED-LIST ONLY: the step IS the cell ord_next / ord_prev walk.  A list-off
- * trie has no cell list, so it yields CDS_FT_STATUS_NOT_SUPPORTED (*count = 0,
- * *next_cursor = NULL): use the iterator (cds_ft_next / cds_ft_prev, structural
- * descent) there.
+ * The walk predicts the physical next cell with cmm_ptr_eq.  Post-compaction
+ * the cells are contiguous in key order at @stride.  A cell's
+ * ord_next/ord_prev then usually resolves to cur +/- stride.  cmm_ptr_eq
+ * validates the arithmetic guess and lets the compiler address the NEXT load
+ * off it.  This breaks the dependent-load chain, so the gather pipelines.
+ * The prediction pays only on a compacted arena and is a no-op otherwise.
+ *
+ * @forward is a literal at both call sites, so always_inline folds the
+ * direction out.
+ *
+ * Cell-native: the cursor, the emitted handles and the resume cursor are all
+ * CELLS.  The walk never touches an external head node, neither to emit nor
+ * to resume.  There is no node<->cell round-trip, hence no resume cache is
+ * needed.  The caller recovers the node from a cell via cds_ft_cell_node().
+ * That is an inlined load of the hot cell line, not a cold node->prev.  The
+ * caller materializes keys lazily via cds_ft_cell_get_key().  A keyless (no
+ * in-leaf key) ordered scan thus touches ZERO external-head cachelines in
+ * the library.
+ *
+ * ORDERED-LIST ONLY: the step IS the cell ord_next / ord_prev walk.  A
+ * list-off trie has no cell list, so it yields CDS_FT_STATUS_NOT_SUPPORTED
+ * (*count = 0, *next_cursor = NULL).  Use the iterator there (cds_ft_next /
+ * cds_ft_prev, structural descent).
  *
  * RCU CONTRACT: @cursor and every emitted cell are valid only while the read
  * lock that produced @cursor is held continuously (see cds_ft_cell_get_key).
@@ -1016,13 +1093,17 @@ enum cds_ft_status ft_cell_batch_dir(struct cds_ft *ft,
 			&ft->ord_sentinel.node.next :
 			&ft->ord_sentinel.node.prev);
 	/*
-	 * Sentinel topology: a link off the end resolves to the trie's own
-	 * sentinel pseudo-cell, or -- transiently, while a cross-trie run move has
-	 * NULL-terminated a moved run before its finalize -- to NULL.  Both are
-	 * ft_ord_is_end, so terminate on that, not on "== sentinel" or "!= NULL".
-	 * @loaded may thus be NULL here; the MLP guess/cmm_ptr_eq stays correct
-	 * because @guess is never NULL, so cmm_ptr_eq(NULL, guess) is false and a
-	 * NULL @loaded falls through to terminate the loop rather than mis-folding.
+	 * Sentinel topology: a link off the end resolves to one of two values.
+	 *  - The trie's own sentinel pseudo-cell.
+	 *  - NULL, transiently, while a cross-trie run move has NULL-terminated
+	 *    a moved run before its finalize.
+	 * Both are ft_ord_is_end.  So terminate on that, not on "== sentinel"
+	 * or "!= NULL".
+	 *
+	 * @loaded may thus be NULL here.  The MLP guess/cmm_ptr_eq stays
+	 * correct because @guess is never NULL: cmm_ptr_eq(NULL, guess) is
+	 * false.  A NULL @loaded falls through and terminates the loop.  It
+	 * does not mis-fold.
 	 */
 	while (n < cap && !ft_ord_is_end(ft, cur)) {
 		struct ft_ord_cell *loaded, *guess;
@@ -1065,9 +1146,9 @@ size_t cds_ft_cell_node_offset(void)
 
 /*
  * Materialize a key from an opaque cell handle (the lazy companion to the cell
- * batch).  Same sources as cds_ft_node_get_key -- in-leaf key when configured,
- * else the parent up-walk -- but driven from the CELL, so the up-walk path never
- * touches the external head node.
+ * batch).  The sources are the same as for cds_ft_node_get_key: the in-leaf
+ * key when configured, else the parent up-walk.  But the CELL drives them, so
+ * the up-walk path never touches the external head node.
  */
 enum cds_ft_status cds_ft_cell_get_key(const struct cds_ft *ft,
 		const struct cds_ft_cell *cell_opaque, uint8_t *result_key,
