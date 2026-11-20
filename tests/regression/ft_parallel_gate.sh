@@ -110,6 +110,7 @@ fi
 
 # name | configure-time CPPFLAGS | tests
 #   u=ft_unit  ion=ft_inv-on  ioff=ft_inv-off  imw=ft_inv-on + FT_INV_MW=1
+#   imb=ft_inv built on urcu-memb (test_urcu_ft_inv_memb) + FT_INV_MW=1
 ALL_CONFIGS=(
 	# DLM (per-node lock-sets) is no longer a build flag: it is the ONLY
 	# multi-writer implementation, selected at RUNTIME by ft->lock_fine
@@ -119,7 +120,11 @@ ALL_CONFIGS=(
 	# build mode first.  "default" keeps imw because the concurrent-writer
 	# and rekey oracles gate on FT_INV_MW at RUNTIME: without it they
 	# compile in and then skip, which reads as coverage and is not.
-	"default||u ion ioff imw imwx"
+	# imb runs ft_inv on urcu-memb.  Under QSBR a read-side section is a
+	# no-op, so the other legs cannot see one held where it must not be:
+	# around a bulk op, or across a nested bulk gate.  Both happened, and
+	# both only showed on memb.
+	"default||u ion ioff imw imwx imb"
 	# Fault injection drives the acquire bail + re-descend paths: those
 	# acquires never miss single-threaded, and the concurrent oracles merge
 	# DISJOINT key sets, so injection is the only thing that reaches them.
@@ -192,7 +197,7 @@ ALL_CONFIGS=(
 	# arbitrates against a peer, so the raw-read class this config exists to
 	# detect is the class the missing leg hid.  The leg costs 82 s, alongside
 	# ioff's 76 s.
-	"txndbg|-DDEBUG_RCU -DURCU_TXN_DEBUG_READ_POLICY -DURCU_TXN_DEBUG_SETTLE -DFEATURE_FT_ANCHOR_VALIDATE|u ion ioff imw sp"
+	"txndbg|-DDEBUG_RCU -DURCU_TXN_DEBUG_READ_POLICY -DURCU_TXN_DEBUG_SETTLE -DFEATURE_FT_ANCHOR_VALIDATE|u ion ioff imw sp imb"
 	# The FT's own resolved-pointer assertion (ft_assert_resolved): a parked
 	# flip proxy handed to an accessor that requires a resolved flag.  It is
 	# the embedder-side counterpart to txndbg's engine-side DEBUG_RCU, and it
@@ -651,6 +656,15 @@ run_one() {	# $1=name $2=tests $3=spacings $4=cppflags -- build lib+tests, run T
 			return
 		fi ;;
 	esac
+	# Likewise the urcu-memb ft_inv: only the configs that list imb.
+	case " $tests " in
+	*" imb "*)
+		if ! make -C "$dir/tests/regression" test_urcu_ft_inv_memb -j"$J" \
+				>>"$GATE/$name.build" 2>&1; then
+			echo "$name: TEST BUILD FAIL (ft_inv memb; see $GATE/$name.build)" >> "$out"
+			return
+		fi ;;
+	esac
 	echo "$name: build ok" >> "$out"
 	local t o ok notok abrt lbl rc plan ran sp rep cdir bin tmo c
 	local env_x
@@ -704,6 +718,7 @@ run_spacing() {	# $1=name $2=tests $3=spacing $4=outfile -- every leg at ONE spa
 	local dir=$GATE/$name
 	local LIB=$dir/src/.libs U=$dir/tests/unit/.libs/test_urcu_ft_unit
 	local I=$dir/tests/regression/.libs/test_urcu_ft_inv
+	local IM=$dir/tests/regression/.libs/test_urcu_ft_inv_memb
 	local SP=$dir/tests/unit/.libs/test_rcu_txn_settle_premise
 	local cores=$GATE/$name.cores
 	local t o ok notok abrt lbl rc plan ran rep cdir bin tmo c mem
@@ -732,6 +747,10 @@ run_spacing() {	# $1=name $2=tests $3=spacing $4=outfile -- every leg at ONE spa
 		# / ioff never exercise them.  They are the long leg -- hence the
 		# larger timeout.
 		imw)  bin=$I; tmo=1800; lbl="ft_inv mw "; env_x=(FT_INV_MW=1) mem=$FT_GATE_MEM_IMW ;;
+		# The same oracles on urcu-memb, where a read-side section is
+		# real.  A section held across a grace period hangs or stalls
+		# reclaim here; under QSBR it is invisible.
+		imb)  bin=$IM; tmo=1800; lbl="ft_inv memb"; env_x=(FT_INV_MW=1) mem=$FT_GATE_MEM_IMW ;;
 		# The settle-premise DETECTOR's own validation.  It belongs to a
 		# config that DEFINES -DURCU_TXN_DEBUG_SETTLE and nowhere else:
 		# without the flag it skips, and a detector whose self-test only
