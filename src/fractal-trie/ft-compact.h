@@ -27,8 +27,9 @@
  * BFS+DFS and density-DFS all tie.  The win is to recover the locality lost
  * to churn/graft, so we use plain DFS.
  *
- * Concurrency: the caller's writer exclusion keeps the trie quiescent w.r.t.
- * other writers for the whole walk.  Concurrent RCU readers are fine.  Each
+ * Concurrency: the caller excludes the point writers.  A bulk op may run
+ * between two steps (see cds_ft_compact_step).  Concurrent RCU readers are
+ * fine.  Each
  * node is republished (ft_node_recompact) and its old copy is RCU-freed
  * (cds_ft_free_item).  So a reader observes the old or the new node, never a
  * freed one.
@@ -1221,14 +1222,16 @@ enum cds_ft_compact_status cds_ft_compact_step(struct cds_ft_compact_state *st,
 	 * grace period covers the batch.  A bulk op that starts between two
 	 * steps makes the next step queue.
 	 *
-	 * Sampling once for a whole cds_ft_compact pass would not do:
-	 * - the pass drops the read lock between steps;
-	 * - the gate's grace period completes in that gap;
-	 * - the bulk body would then run beside a compaction that holds no
-	 *   FT-wide lock.
-	 *
+	 * Sampling once for a whole cds_ft_compact pass would not do.  The
+	 * gate's grace period could then complete between two steps, and the
+	 * bulk body would run beside a compaction that holds no FT-wide lock.
 	 * Excluding that case is what lets bulk ops take no node lock of their
 	 * own.
+	 *
+	 * So no scope may span the pass either.  On a FINE trie a scope that
+	 * samples the gate clear keeps a read-side section until it exits.  A
+	 * pass-long scope would then stop every grace period of the flavor
+	 * for the whole pass: reclaim, the bulk gate and synchronize_rcu.
 	 *
 	 * The step's DLM locks (the relocations' lock sets) stay.  In bulk
 	 * mode a step takes BOTH, like a point op.  The reason is that at the
@@ -1330,10 +1333,14 @@ void cds_ft_compact_end(struct cds_ft_compact_state *st)
 
 enum cds_ft_compact_status cds_ft_compact(struct cds_ft *ft)
 {
-	CDS_FT_SCOPED_WRITER(ft);
-	struct cds_ft_compact_state *st = cds_ft_compact_begin(ft);
+	struct cds_ft_compact_state *st;
 	enum cds_ft_compact_status s;
 
+	/*
+	 * No writer scope here: each step enters its own (see
+	 * cds_ft_compact_step), so grace periods complete between steps.
+	 */
+	st = cds_ft_compact_begin(ft);
 	if (!st)
 		return CDS_FT_COMPACT_OOM;	/* could not start the pass */
 	/*

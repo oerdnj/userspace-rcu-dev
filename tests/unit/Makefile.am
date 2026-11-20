@@ -25,6 +25,7 @@ noinst_PROGRAMS = \
 	test_uatomic_cxx \
 	test_urcu_ft_unit \
 	test_urcu_ft_unit_cxx \
+	test_urcu_ft_memb \
 	test_rcu_txn_sw \
 	test_rcu_mcas \
 	test_rcu_txn \
@@ -74,6 +75,7 @@ TESTS = \
 	test_uatomic_cxx \
 	test_urcu_ft_unit \
 	test_urcu_ft_unit_cxx \
+	test_urcu_ft_memb \
 	test_rcu_txn_sw \
 	test_rcu_mcas \
 	test_rcu_txn \
@@ -148,6 +150,10 @@ test_urcu_ft_unit_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(URCU_CDS_LIB) $(
 test_urcu_ft_unit_cxx_SOURCES = test_urcu_ft_unit_cxx.cpp
 test_urcu_ft_unit_cxx_CFLAGS = -DRCU_QSBR $(AM_CFLAGS)
 test_urcu_ft_unit_cxx_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(URCU_CDS_LIB) $(TAP_LIB)
+
+test_urcu_ft_memb_SOURCES = test_urcu_ft_memb.c
+test_urcu_ft_memb_CFLAGS = -DRCU_MEMB $(AM_CFLAGS)
+test_urcu_ft_memb_LDADD = $(URCU_LIB) $(URCU_COMMON_LIB) $(URCU_CDS_LIB) $(TAP_LIB)
 
 test_rcu_txn_sw_SOURCES = test_rcu_txn_sw.c
 test_rcu_txn_sw_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)

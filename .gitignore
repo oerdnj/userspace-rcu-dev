@@ -16,6 +16,7 @@ tests/unit/test_uatomic
 tests/unit/test_uatomic_cxx
 tests/unit/test_urcu_ft_unit
 tests/unit/test_urcu_ft_unit_cxx
+tests/unit/test_urcu_ft_memb
 tests/unit/test_rcu_txn_sw
 tests/unit/test_rcu_mcas
 tests/unit/test_rcu_mcas_aba
