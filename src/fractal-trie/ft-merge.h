@@ -3632,7 +3632,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	 * recursive ft_merge_at_inner() call was inside that block.
 	 */
 
-	bool md_rlock = false;
+	bool md_open = false;
 	bool md_contended;
 	unsigned long md_spin = 0;	/* this op's merge_spine_retry depth (probe) */
 	/*
@@ -3645,14 +3645,10 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	 * 585250 declined lock sets over 235141 merges, one op re-descending
 	 * 348 times.
 	 *
-	 * It is bound and bracketed ONLY on the arm that takes the read pin
-	 * below.  That is not an optimization.  urcu_txn_begin() enters the RCU
-	 * read side.  The SAME-TRIE rekey shares this body with a LIVE src
-	 * whose ft_writer_lock_gp_wait calls do run.  A read section held
-	 * across one is a writer waiting on its own grace period.  The condition
-	 * `dst_ft->lock_fine && src_ft->exclusive` is exactly the source
-	 * contract that syncs nowhere.  Every one of those 585250 declines was
-	 * measured under it (livesrc=0).
+	 * It is bracketed only on a FINE dst.  urcu_txn_begin() enters the RCU
+	 * read side, so the bracket must not span a grace period.  The src is
+	 * exclusive here (a live src is refused with BUSY), so the spine copy
+	 * waits for none.
 	 */
 	struct ft_op optxn;
 
@@ -3671,40 +3667,23 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	 */
 merge_spine_retry:
 	/*
-	 * §11 cross-trie RCU-pinning.  The spine-copy path below descends the
-	 * live dst here.  It then node locks a descent-captured dst node
-	 * (@d_dst->pnf / ->ppnf) inside ft_merge_spine_copy.  A node lock
-	 * false-succeeds on a reclaimed+recycled node (arena re-zeroes
-	 * metadata).  So pin the captured nodes with the flavor read side
-	 * across descent -> lock, as cds_ft_graft does.  The dup-chain holders
-	 * that the splice lock set acquires are captured during that same
-	 * window, so this pin covers them too.
+	 * The spine-copy path below descends the live dst here.  It then node
+	 * locks descent-captured dst nodes (@d_dst->pnf / ->ppnf, the dup-chain
+	 * holders) inside ft_merge_spine_copy.  Two things keep them from being
+	 * freed in between:
+	 * - the dst writer scope holds the FT-wide lock, so no peer writer
+	 *   runs;
+	 * - on a shared dst, the attempt's op handle holds a read section
+	 *   (ft_op_begin), from descent to commit.
+	 * An exclusive dst has no readers and frees synchronously.
 	 *
-	 * With an EXCLUSIVE src, the spine-copy's only grace period (its src
-	 * drain) is !src_ft->exclusive-gated and skipped.  So the whole
-	 * ft_merge_spine_copy runs GP-free under the read lock.
-	 *
-	 * The pin is released:
-	 * - before the spine-copy return;
-	 * - on the fall-through to the detach/graft paths;
-	 * - before each retry above (a retry re-descends, so it must re-pin
-	 *   what it re-reads).
+	 * @md_open marks an open attempt.  Every site that clears it closes
+	 * the attempt: before the spine-copy return, on the fall-through to
+	 * the detach/graft paths, and before each retry.
 	 */
 	if (dst_ft->lock_fine) {		/* src exclusive: gated above */
-		/*
-		 * Open the attempt on the persistent handle FIRST.  A retry
-		 * that has aged escalates here.  Escalation blocks on the
-		 * domain's fair mutex, and that must not happen while holding
-		 * the pin below.  The explicit read_lock stays: it is what
-		 * pins the descent-captured dst nodes.  It must not become
-		 * conditional on the handle having a flavour bound
-		 * (ft_txn_op_init binds NULL on an exclusive dst).  RCU read
-		 * sections nest.  @md_rlock now marks both, and every site
-		 * that releases it closes the txn too.
-		 */
 		ft_op_begin(&optxn);
-		dst_ft->group->flavor->read_lock();
-		md_rlock = true;
+		md_open = true;
 	}
 	kd = ft_merge_descend(dst_ft, okey_dst, dst_key_len, &d_dst,
 			&off_dst, &cnt_dst);
@@ -3717,17 +3696,16 @@ merge_spine_retry:
 	 * bail on this; merge read it and continued.
 	 *
 	 * Re-descend down the SAME unwind that the spine copy's contention
-	 * path uses.  Nothing is built here: the label is above the read-lock
-	 * pin, and the detach branch returned long before.  So this is the
-	 * state that path already returns to.  Release the pin first: a retry
-	 * re-reads, so it must re-pin.
+	 * path uses.  Nothing is built here: the label is above the attempt's
+	 * open, and the detach branch returned long before.  So this is the
+	 * state that path already returns to.  Close the attempt first: the
+	 * retry opens a new one.
 	 */
 	if (caa_unlikely(d_dst.skip_conflict)) {
-		if (md_rlock) {
-			dst_ft->group->flavor->read_unlock();
+		if (md_open) {
 			/* Nothing moved: age the conflict, close the attempt. */
 			ft_txn_attempt_bail(&optxn, true);
-			md_rlock = false;
+			md_open = false;
 		}
 		md_spin++;
 		MRG_SPIN_PROBE(2);
@@ -3761,8 +3739,7 @@ merge_spine_retry:
 			 * Contention, nothing moved.  Re-pin, re-descend
 			 * and rebuild.
 			 */
-			if (md_rlock) {
-				dst_ft->group->flavor->read_unlock();
+			if (md_open) {
 				/*
 				 * AGE IT.  This is the arm that spun 348 deep
 				 * with nothing to make it terminate.
@@ -3776,7 +3753,7 @@ merge_spine_retry:
 				 * insert livelock.
 				 */
 				ft_txn_attempt_bail(&optxn, true);
-				md_rlock = false;
+				md_open = false;
 			}
 			md_spin++;
 			MRG_SPIN_PROBE(1);
@@ -3803,10 +3780,9 @@ merge_spine_retry:
 				uatomic_store(&dst_ft->max_used_key_len, nm,
 					CMM_RELAXED);
 		}
-		if (md_rlock) {
-			dst_ft->group->flavor->read_unlock();
+		if (md_open) {
 			ft_op_end(&optxn);
-			md_rlock = false;
+			md_open = false;
 		}
 		FT_TP(merge_exit, (int) status);
 		return status;
@@ -3814,14 +3790,13 @@ merge_spine_retry:
 	/*
 	 * Fall-through: the spine-copy shape did not apply.  This is a
 	 * whole-source move, or an empty dst under @dst_key (the detach graft
-	 * below).  Release the spine-copy descent pin here.  The
-	 * src_key_len==0 graft re-descends under its own bracket above.  The
-	 * detach-graft path re-resolves its own (parent, slot).
+	 * below).  Close the spine-copy attempt here.  The src_key_len==0
+	 * graft re-descends in its own attempts.  The detach-graft path
+	 * re-resolves its own (parent, slot).
 	 */
-	if (md_rlock) {
-		dst_ft->group->flavor->read_unlock();
+	if (md_open) {
 		ft_op_end(&optxn);
-		md_rlock = false;
+		md_open = false;
 	}
 
 	/*
@@ -3846,41 +3821,9 @@ merge_spine_retry:
 		 * an exclusive source, and ft_graft_keylen runs its fused
 		 * body directly.
 		 */
-		if (dst_ft->lock_fine) {		/* src exclusive: gated above */
-			const struct rcu_flavor_struct *flavor =
-				dst_ft->group->flavor;
-
-			/*
-			 * §11 cross-trie RCU-pinning: this is the SAME
-			 * live-dst descent + node lock as cds_ft_graft.  It
-			 * is reached through cds_ft_merge / cds_ft_merge_at.
-			 * So it needs the same read-side bracket, which pins
-			 * descent-captured dst spine nodes against a peer
-			 * relocate+free+recycle (see the bracket in
-			 * cds_ft_graft).  With an EXCLUSIVE src the fused
-			 * body takes no grace period
-			 * (ft_writer_lock_gp_wait is !exclusive-gated).  So
-			 * the whole-op read lock cannot self-deadlock.
-			 *
-			 * That is the SAME condition, and the same reason,
-			 * as the spine-copy pin above.  Both branches
-			 * read_lock() under exactly
-			 * `dst_ft->lock_fine && src_ft->exclusive`.  What
-			 * decides it is the SOURCE CONTRACT, not the branch.
-			 * A cross-trie src is exclusive, or the op was
-			 * already refused with BUSY.  Every grace period on
-			 * that path is !exclusive-gated.  Only the same-trie
-			 * rekey (src == dst, a LIVE src) actually runs those
-			 * waits.  This condition excludes exactly that case
-			 * from the read section.
-			 */
-			flavor->read_lock();
-			status = ft_graft_keylen(dst_ft, dst_key, dst_key_len,
-					src_ft, pre_txn);
-			flavor->read_unlock();
-		} else
-			status = ft_graft_keylen(dst_ft, dst_key, dst_key_len,
-					src_ft, pre_txn);
+		/* No read section: see cds_ft_graft. */
+		status = ft_graft_keylen(dst_ft, dst_key, dst_key_len, src_ft,
+				pre_txn);
 		FT_TP(merge_exit, (int) status);
 		return status;
 	}

@@ -2847,8 +2847,6 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * src drain.  That drain is gated on !src_ft->exclusive.
 		 * And dst_ft->lock_fine is what binds the escalation lane at
 		 * all.  So the conjunction IS the GP-free contract.
-		 * ft_merge_at_inner already read_lock()s this call under the
-		 * same condition.
 		 *
 		 * The condition covers every retry the loop takes.  The same
 		 * run counted excl=679819 live=0, against 225 ops that
@@ -3794,8 +3792,8 @@ retry_attach:
 		 *
 		 * The retry terminates.  A peer committed a conflicting
 		 * flip, so it made progress.  {p}'s LOCK try-lock guarantees
-		 * a winner each round.  The whole-op RCU pin spans the
-		 * retry.
+		 * a winner each round.  The re-descent runs inside the
+		 * next attempt's read section.
 		 */
 		if (store_cst != URCU_TXN_STATUS_OK) {
 			/*
@@ -3959,49 +3957,21 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 	}
 
 	/*
-	 * G5.5: BEFORE the read_lock below -- the gate waits a grace period,
-	 * which would otherwise wait on our own read section.
+	 * G5.5: the gate waits a grace period, so no read section may be held
+	 * here.
 	 */
 	CDS_FT_SCOPED_BULK_GATE(dst_ft, FT_BULK_WRITER_ONLY);
 
-	if (dst_ft->lock_fine) {
-		const struct rcu_flavor_struct *flavor = dst_ft->group->flavor;
-
-		/*
-		 * FT-wide-lock drop RCU-pinning (§11 cross-trie).
-		 *
-		 * A FINE cross-trie graft descends the SHARED dst WITHOUT the
-		 * FT-wide mutex.  It captures spine nodes (d->pnf / ppnf /
-		 * pppnf).  Its recompact / Fix-A fence takes their node locks
-		 * later.
-		 *
-		 * A node lock rejects a relocated-but-LIVE (tombstoned) node.
-		 * It does NOT reject a reclaimed-and-recycled one: the arena
-		 * re-zeroes a slot's metadata on reallocation.  So
-		 * ft_lock_member false-succeeds on a recycled node.  The
-		 * result is a wild store into an unrelated live node.
-		 *
-		 * Nothing else pins the captured nodes:
-		 * - ft_graft_keylen builds its txn with ft_flip_txn_create()
-		 *   (flavor NULL, "the caller brackets the RCU read side");
-		 * - ft_writer_lock_scope no-ops under the drop.
-		 *
-		 * Provide that bracket here.  Then no grace period can reclaim
-		 * a captured node across descent->lock->commit.  Insert gets
-		 * the same read section from urcu_txn_begin.
-		 *
-		 * The read lock is safe to hold across the whole op:
-		 * - a FINE cross-trie graft REQUIRES an exclusive src
-		 *   (BUSY_ERROR otherwise, ft_graft_keylen);
-		 * - every grace period in the body (ft_writer_lock_gp_wait)
-		 *   is !exclusive-gated.
-		 * So nothing synchronizes under the read lock.
-		 */
-		flavor->read_lock();
-		status = ft_graft_keylen(dst_ft, _key, key_len, src_ft, NULL);
-		flavor->read_unlock();
-	} else
-		status = ft_graft_keylen(dst_ft, _key, key_len, src_ft, NULL);
+	/*
+	 * No read section spans the op.  The dst nodes the descent captures
+	 * are safe without one:
+	 * - the dst writer scope sees the gate raised and takes the FT-wide
+	 *   lock, so no peer writer can free them;
+	 * - on a FINE trie, each attach attempt runs inside its op handle's
+	 *   read section (ft_op_begin), from descent to commit.
+	 * The src is exclusive, so its frees are synchronous.
+	 */
+	status = ft_graft_keylen(dst_ft, _key, key_len, src_ft, NULL);
 	FT_TP(graft_exit, (int) status);
 	return status;
 }
@@ -4485,7 +4455,6 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		struct cds_ft_alloc_reserve gs_reserve;
 		bool gs_reserved = false;
 		bool empty_pruned = false;
-		bool gs_rlock = false;
 #ifdef FEATURE_FT_PROBE_GRAFT_SWAP
 		/* What this attempt published into the graft-point slot. */
 		struct cds_ft_inode_flag *gs_top = NULL;
@@ -4498,29 +4467,11 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * leaves both tries pristine.
 		 */
 		/*
-		 * §11 cross-trie RCU-pinning.  This descent captures live-dst
-		 * spine nodes (d.pnf ...).  The extract-side detach and the
-		 * insert-side publish-replace take their node locks below.  A
-		 * node lock rejects a relocated-but-live node but NOT a
-		 * reclaimed+recycled one: the arena re-zeroes metadata on
-		 * realloc -> false-success -> wild store.  So pin the captured
-		 * nodes with the flavor read side across descent->lock, exactly
-		 * as cds_ft_graft does.
-		 *
-		 * SCOPED, not whole-op.  graft_swap drains dst readers with
-		 * ft_writer_lock_gp_wait(dst_ft) before its extract-side root
-		 * install.  A grace period under a read section self-deadlocks.
-		 * So the section is RELEASED just before that dst drain.  Every
-		 * descent-captured dst node is LOCK-locked by then.
-		 *
-		 * The consumed @swap_ft is exclusive (BUSY_ERROR otherwise), so
-		 * its own ft_writer_lock_gp_wait is !exclusive-gated and
-		 * skipped.  Nothing else synchronizes inside the section.
+		 * The dst nodes this descent captures need no read section of
+		 * the op's own.  The dst writer scope holds the FT-wide lock,
+		 * so no peer writer can free them.  On a FINE trie each attempt
+		 * also runs inside its op handle's read section (ft_op_begin).
 		 */
-		if (dst_ft->lock_fine && swap_ft->exclusive) {
-			dst_ft->group->flavor->read_lock();
-			gs_rlock = true;
-		}
 	unsigned long rs_depth __attribute__((unused)) = 0;
 
 	/*
@@ -4583,8 +4534,7 @@ retry_swap:
 		 *
 		 * Reset every per-attempt build-product handle: the declaration
 		 * initializers ran once, and a goto here does not re-run them.
-		 * The §11 RCU pin stays held across attempts.  A re-descend
-		 * under the same read section re-pins.
+		 * The re-descent runs inside the next attempt's read section.
 		 */
 		fresh = NULL;
 		fresh_meta = NULL;
@@ -4647,8 +4597,6 @@ retry_swap:
 			enum cds_ft_status s = cds_ft_graft(dst_ft, _key, _key_len,
 					swap_ft);
 
-			if (gs_rlock)
-				dst_ft->group->flavor->read_unlock();
 			FT_TP(graft_swap_exit, (int) s);
 			ft_txn_attempt_end(&optxn, gs_open);
 			gs_open = false;
@@ -5574,28 +5522,15 @@ retry_swap:
 		 * skipped in that case.
 		 */
 		/*
-		 * Release the §11 RCU-pin BEFORE this dst grace period.  Every
-		 * descent-captured dst node has been LOCK-locked by the
-		 * extract/insert commits above.  So it can no longer be
-		 * reclaimed out from under us.  And a grace period inside a
-		 * read section would self-deadlock.  The extract-side root
-		 * install below re-parents only the already-detached displaced
-		 * subtree, which needs no descent-capture pin.
-		 */
-		/*
 		 * Close the escalation bracket BEFORE the dst drain below.
 		 * ft_writer_lock_gp_wait() waits a grace period.  A writer
 		 * parked on the domain's FIFO lane is an ONLINE, non-quiescent
 		 * reader that holds that grace period open.  This is why that
-		 * function asserts !ft_op_in_lane().  The read section is
-		 * released immediately below for the same reason.
+		 * function asserts !ft_op_in_lane().  Closing the attempt also
+		 * closes its read section.
 		 */
 		ft_txn_attempt_end(&optxn, gs_open);
 		gs_open = false;
-		if (gs_rlock) {
-			dst_ft->group->flavor->read_unlock();
-			gs_rlock = false;
-		}
 		if (!dst_ft->exclusive)
 			ft_writer_lock_gp_wait(dst_ft);
 
@@ -5826,15 +5761,11 @@ retry_swap:
 		 * ft_writer_lock_gp_wait() waits a grace period.  A writer
 		 * parked on the domain's FIFO lane is an ONLINE, non-quiescent
 		 * reader that holds that grace period open.  This is why that
-		 * function asserts !ft_op_in_lane().  The read section is
-		 * released immediately below for the same reason.
+		 * function asserts !ft_op_in_lane().  Closing the attempt also
+		 * closes its read section.
 		 */
 		ft_txn_attempt_end(&optxn, gs_open);
 		gs_open = false;
-		if (gs_rlock) {
-			dst_ft->group->flavor->read_unlock();
-			gs_rlock = false;
-		}
 		ft_glue_abort(dst_ft, &glue_insert);
 		ft_glue_abort(swap_ft, &glue_extract);
 		if (glue_insert.txn)

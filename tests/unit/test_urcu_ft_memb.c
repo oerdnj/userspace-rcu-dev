@@ -28,7 +28,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	8
+#define NR_TESTS	10
 
 #define KEY_LEN		8
 /*
@@ -582,6 +582,79 @@ out:
 	return ret;
 }
 
+/*
+ * Grace periods must complete while a graft repairs its source's key-length
+ * hint.  The source holds NR_KEYS keys of KEY_LEN bytes, and a removed
+ * LONG_KEY_LEN key left its hint stale.  Grafting it at {7, 7} would
+ * overflow by the hint alone, so the graft walks the whole source.  No read
+ * section may span the graft, or the walk cannot yield.
+ */
+static int test_graft_walk_gp_progress(enum cds_ft_writer_strategy strategy,
+		const char *name)
+{
+	static const uint8_t dst_key[] = { 7, 7 };
+	struct cds_ft_group *group;
+	struct cds_ft *dst = create_rekey_ft(strategy, &group);
+	uint8_t long_key[LONG_KEY_LEN] = { 9 };
+	struct cds_ft *src;
+	enum cds_ft_status s;
+	pthread_t gp;
+	uint64_t t0, t1;
+	int ret = 0;
+
+	if (cds_ft_create(group, NULL, &src) < 0)
+		abort();
+	if (populate(src) < 0 ||
+			insert_one(src, long_key, LONG_KEY_LEN, UINT32_MAX) < 0 ||
+			remove_key(src, long_key, LONG_KEY_LEN) < 0) {
+		fprintf(stderr, "%s: populate failed\n", name);
+		ret = -1;
+		goto out;
+	}
+	cds_ft_make_exclusive(src);
+	if (cds_ft_max_used_key_len(src) != LONG_KEY_LEN) {
+		fprintf(stderr, "%s: hint %zu before the graft, expected %d\n",
+			name, cds_ft_max_used_key_len(src), LONG_KEY_LEN);
+		ret = -1;
+		goto out;
+	}
+	uatomic_set(&op_phase, 0);
+	gp_inside = gp_total = 0;
+	if (pthread_create(&gp, NULL, gp_thread, NULL))
+		abort();
+	while (!uatomic_read(&gp_total))
+		caa_cpu_relax();
+	t0 = now_ns();
+	uatomic_set(&op_phase, 1);
+	s = cds_ft_graft(dst, dst_key, sizeof(dst_key), src);
+	uatomic_set(&op_phase, 2);
+	t1 = now_ns();
+	if (pthread_join(gp, NULL))
+		abort();
+	diag("%s: graft %" PRIu64 " us, %lu grace periods inside it (%lu total)",
+		name, (t1 - t0) / 1000, gp_inside, gp_total);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: graft: %s\n", name,
+			cds_ft_status_to_string(s));
+		ret = -1;
+		goto out;
+	}
+	if (gp_inside < MIN_GP_INSIDE_REKEY) {
+		fprintf(stderr, "%s: only %lu grace periods completed inside the graft\n",
+			name, gp_inside);
+		ret = -1;
+	}
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK)
+		ret = -1;
+	if (verify_moved_keys(dst, dst_key, sizeof(dst_key)) < 0)
+		ret = -1;
+out:
+	cds_ft_destroy(src);
+	if (drain_and_destroy(dst, group) < 0)
+		ret = -1;
+	return ret;
+}
+
 int main(void)
 {
 	if (create_all_cpu_call_rcu_data(0))
@@ -613,6 +686,12 @@ int main(void)
 	ok(test_rekey_walk_gp_progress(CDS_FT_WRITER_LOCK_COARSE,
 			REKEY_WALK_MOVED_KEYS, "rekey_moved_coarse") == 0,
 		"rekey: grace periods complete during the moved-keys walk (COARSE)");
+	ok(test_graft_walk_gp_progress(CDS_FT_WRITER_LOCK_FINE,
+			"graft_repair_fine") == 0,
+		"graft: grace periods complete during the hint repair walk (FINE)");
+	ok(test_graft_walk_gp_progress(CDS_FT_WRITER_LOCK_COARSE,
+			"graft_repair_coarse") == 0,
+		"graft: grace periods complete during the hint repair walk (COARSE)");
 
 	rcu_unregister_thread();
 	return exit_status();

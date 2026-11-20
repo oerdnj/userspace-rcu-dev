@@ -3188,8 +3188,7 @@ extern unsigned long ft_probe_rspin[6];
  *   ft_writer_lock_gp_wait() asserts !ft_op_in_lane() under it.
  * So a bracket may only span a body that takes NO grace period.  Every
  * grace period on these three paths is gated on a source being LIVE.  The
- * conditions below are exactly those under which the three bodies already
- * read_lock() (ft-merge.h's spine pin, ft-graft.h's @gs_rlock):
+ * conditions below exclude a live source:
  *
  *   [0] retry_merge   dst_ft->lock_fine && src_ft->exclusive
  *   [1] retry_attach  dst_ft->lock_fine && src_ft->exclusive
