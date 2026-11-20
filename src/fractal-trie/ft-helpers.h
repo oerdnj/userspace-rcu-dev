@@ -768,6 +768,9 @@ void iter_auto_invalidate_cache(struct cds_ft_iter *iter)
 		iter->cache_valid = false;
 		iter->path_len = 0;
 		iter_debug_path_clear(iter);
+		/* The cached cell too: see cds_ft_iter_bind_key. */
+		iter->ord_cell = NULL;
+		iter->ord_cell_node = NULL;
 	}
 }
 

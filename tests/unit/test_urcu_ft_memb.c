@@ -30,7 +30,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	13
+#define NR_TESTS	14
 
 #define KEY_LEN		8
 /*
@@ -852,6 +852,93 @@ static int test_max_used_key_len_concurrent(void)
 	return low ? -1 : 0;
 }
 
+/*
+ * An iterator caches the ordered-list cell it last landed on.  A caller that
+ * binds, leaves its read-side section and comes back with a point lookup must
+ * not walk from that cell: compaction may have relocated it and freed the old
+ * copy in between.  cds_ft_next must still return the true successor.
+ */
+#define NR_CELL_ROUNDS	64
+#define NR_CELL_FILL	4096
+
+static uint32_t node_index(struct cds_ft_node *n)
+{
+	return caa_container_of(n, struct test_node, node)->key;
+}
+
+static int test_iter_cell_cache_across_compact(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_ft(CDS_FT_WRITER_LOCK_FINE, &group);
+	struct cds_ft_iter *iter;
+	unsigned int round, wrong = 0;
+	int ret = 0;
+
+	if (populate(ft) < 0 || cds_ft_iter_create(ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	for (round = 0; round < NR_CELL_ROUNDS; round++) {
+		uint32_t steps = (round * 7919u) % 4096u, k, got;
+		enum cds_ft_status s;
+		uint32_t i;
+
+		/* Land on key k through the cell walk, then bind and leave. */
+		rcu_read_lock();
+		s = cds_ft_lookup_first(ft, iter);
+		for (i = 0; s == CDS_FT_STATUS_OK && i < steps; i++)
+			s = cds_ft_next(ft, iter);
+		if (s != CDS_FT_STATUS_OK)
+			abort();
+		k = node_index(cds_ft_iter_node(iter));
+		cds_ft_iter_bind_key(iter);
+		rcu_read_unlock();
+
+		/* Relocate every cell, and let the old copies be freed. */
+		if (cds_ft_compact(ft) != CDS_FT_COMPACT_DONE)
+			abort();
+		synchronize_rcu();
+		rcu_barrier();
+		if (cds_ft_compact(ft) != CDS_FT_COMPACT_DONE)
+			abort();
+		/*
+		 * New keys in a separate range (first byte 5) allocate new
+		 * cells, which can reuse the freed slots.  A walk from a stale
+		 * cell then lands in that range.
+		 */
+		for (i = 0; i < NR_CELL_FILL; i++) {
+			uint8_t nk[KEY_LEN];
+
+			index_to_key(round * NR_CELL_FILL + i, nk);
+			nk[0] = 5;
+			if (insert_one(ft, nk, KEY_LEN, NR_KEYS + i) < 0)
+				abort();
+		}
+
+		/* Come back with a point lookup of k, then step once. */
+		rcu_read_lock();
+		if (cds_ft_lookup(ft, iter) != CDS_FT_STATUS_OK ||
+				node_index(cds_ft_iter_node(iter)) != k)
+			abort();
+		s = cds_ft_next(ft, iter);
+		got = s == CDS_FT_STATUS_OK ?
+			node_index(cds_ft_iter_node(iter)) : UINT32_MAX;
+		rcu_read_unlock();
+		if (got != k + 1) {
+			if (!wrong++)
+				fprintf(stderr, "cell cache: next after key %" PRIu32
+					" returned %" PRIu32 " (status %d)\n",
+					k, got, (int) s);
+		}
+	}
+	diag("cell cache: %u of %u rounds stepped to the wrong key", wrong,
+		NR_CELL_ROUNDS);
+	if (wrong)
+		ret = -1;
+	cds_ft_iter_destroy(iter);
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	return ret;
+}
+
 int main(void)
 {
 	if (create_all_cpu_call_rcu_data(0))
@@ -897,6 +984,8 @@ int main(void)
 		"graft_swap: a delegate beside a rekey completes (COARSE)");
 	ok(test_max_used_key_len_concurrent() == 0,
 		"insert: concurrent inserts keep max_used_key_len at the longest key");
+	ok(test_iter_cell_cache_across_compact() == 0,
+		"iter: a point lookup after compaction does not walk from a stale cell");
 
 	rcu_unregister_thread();
 	return exit_status();

@@ -959,6 +959,8 @@ void cds_ft_iter_reset(struct cds_ft_iter *iter)
 {
 	FT_TP(iter_reset, (const void *) iter->ft, (const void *) iter);
 	iter->cache_valid = false;
+	iter->ord_cell = NULL;
+	iter->ord_cell_node = NULL;
 	iter_debug_path_clear(iter);
 	iter->status = CDS_FT_STATUS_OK;
 	iter->path_len = 0;
@@ -990,6 +992,14 @@ void cds_ft_iter_bind_key(struct cds_ft_iter *iter)
 	iter_debug_path_clear(iter);
 	iter->path_len = 0;
 	iter->node = NULL;
+	/*
+	 * Drop the cached cell too.  It is valid only inside the read-side
+	 * section that landed on it: compaction or a head change can free it
+	 * after that.  ft_ord_cell_cursor trusts it whenever its node matches
+	 * @node, and a later point lookup can land on that same node again.
+	 */
+	iter->ord_cell = NULL;
+	iter->ord_cell_node = NULL;
 }
 
 /*
