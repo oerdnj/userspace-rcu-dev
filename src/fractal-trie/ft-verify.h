@@ -34,8 +34,9 @@
  * @ft: the Fractal Trie (for group/flag access).
  * @out: file stream for diagnostic output (may be NULL to suppress).
  * @node_flag: tagged pointer to the node being verified.
- * @expected_parent: tagged pointer that the node's metadata->parent
- *                   should match (NULL for root).
+ * @expected_parent: tagged pointer that the node's
+ *                   metadata->parent_word should match
+ *                   (ft_trie_parent(@ft) for the root).
  * @depth: current depth (used for diagnostics).
  * @out_nr_keys: output -- total nr_keys in the subtree rooted here
  *               (written on success for parent aggregation).
@@ -46,10 +47,12 @@
  * Linear-probing open-addressing hash table keyed by node allocation
  * address (low tag bits stripped via ft_node_ptr).  Only used while a
  * single verify walk is in progress; the entire table is freed at the
- * end of cds_ft_verify.  Catches accidental sharing of a subtree
- * between two parents (a rebase/recompact bug class) and detects
- * parent-pointer cycles before the upward adjacency walk in
- * ft_verify_node_compressed gets a chance to loop forever.
+ * end of cds_ft_verify.  It catches two bug classes:
+ *
+ * - A subtree shared by accident between two parents (a
+ *   rebase/recompact bug class).
+ * - A parent-pointer cycle.  It is detected before the upward
+ *   adjacency walk in ft_verify_node_compressed can loop forever.
  */
 struct ft_visited_set {
 	void **slots;		/* NULL = empty bucket. */
@@ -62,8 +65,8 @@ static
 size_t ft_visited_hash(void *p)
 {
 	/*
-	 * Drop the low alignment bits (arena items are at least 16-byte
-	 * aligned, so the low 4 bits are zero), then mix with the 64-bit
+	 * Drop the low alignment bits.  Arena items are at least 16-byte
+	 * aligned, so the low 4 bits are zero.  Then mix with the 64-bit
 	 * golden-ratio multiplier.
 	 */
 	uintptr_t v = (uintptr_t) p >> 4;
@@ -144,16 +147,20 @@ int ft_visited_add(struct ft_visited_set *vs, void *key)
 }
 
 /*
- * Flip-proxy-at-rest check.  cds_ft_verify runs under writer exclusion
- * (FEATURE_FT_VERIFY_AT_MUTATION calls it after the writer's mutation
- * completes), and a urcu flip parks a type-7 proxy in a slot only
- * transiently -- between its park and its settle, inside a single mutator.
+ * Flip-proxy-at-rest check.
+ *
+ * cds_ft_verify runs under writer exclusion:
+ * FEATURE_FT_VERIFY_AT_MUTATION calls it after the writer's mutation
+ * completes.  A urcu flip parks a type-7 proxy in a slot only
+ * transiently: between its park and its settle, inside a single mutator.
  * So once the writer is between operations, NO reachable slot may hold a
- * flip proxy: one found here is a fused flip that left a slot UNSETTLED
- * (the "frozen-stale" slot that dangles after its batch is reclaimed).
- * Reports the exact slot deterministically, single-threaded, with no
- * trace-window dependence -- the recommended way to localize a remove /
- * splice fusion bug.
+ * flip proxy.  A proxy found here is a fused flip that left a slot
+ * UNSETTLED.  This is the "frozen-stale" slot that dangles after its
+ * batch is reclaimed.
+ *
+ * The check reports the exact slot.  It is deterministic and
+ * single-threaded, and it does not depend on a trace window.  It is the
+ * recommended way to localize a remove / splice fusion bug.
  */
 static
 int ft_verify_no_proxy_at_rest(FILE *out, const char *what,
@@ -201,18 +208,25 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
  * NULL.
  */
 /*
- * Speculative leaf-key correctness: when this trie reads leaf keys for result
- * capture (ft->speculative_key_offset_active), every external leaf's STORED key
- * must equal its STRUCTURAL position -- the ordinal path @path[0..@depth) to the
- * leaf.  The library only ever reads that app-owned field; it cannot rewrite it
- * across a re-keying move (graft / graft_swap / merge_at with src!=dst), so a
- * mis-stamped or un-restamped leaf would make a speculative lookup return the
- * wrong key.  Catching it here, in the verifier (and thus under
- * FEATURE_FT_VERIFY_AT_MUTATION after every mutation), turns that silent
- * corruption into a loud, located failure -- the verify-time check for the
- * staging-graft workflow where the app stamps each leaf with its destination
- * key.  EAGER tries (cds_ft_attr_set_speculative_keys false) never read the leaf
- * key, so they are exempt.
+ * Speculative leaf-key correctness.
+ *
+ * This applies when the trie reads leaf keys for result capture
+ * (ft->speculative_key_offset_active).  Every external leaf's STORED key
+ * must then equal its STRUCTURAL position: the ordinal path
+ * @path[0..@depth) to the leaf.
+ *
+ * The stored key is an app-owned field.  The library only ever reads it.
+ * It cannot rewrite it across a re-keying move (graft / graft_swap /
+ * merge_at with src!=dst).  So a mis-stamped or un-restamped leaf would
+ * make a speculative lookup return the wrong key.
+ *
+ * The verifier catches it here, and thus after every mutation under
+ * FEATURE_FT_VERIFY_AT_MUTATION.  The silent corruption becomes a loud,
+ * located failure.  This is the verify-time check for the staging-graft
+ * workflow, where the app stamps each leaf with its destination key.
+ *
+ * EAGER tries (cds_ft_attr_set_speculative_keys false) never read the
+ * leaf key, so they are exempt.
  */
 static
 int ft_verify_speculative_key(const struct cds_ft *ft, FILE *out,
@@ -253,20 +267,26 @@ int ft_verify_speculative_key(const struct cds_ft *ft, FILE *out,
 /*
  * THE PREFIX-HEAD BIT, CHECKED AT REST (FT_PARENT_PREFIX_HEAD).
  *
- * A head's back-edge word answers the shape question the up-walks ask -- am I
- * @owner_flag's external_nodes (my key ENDS there), or a child in one of its
- * body slots?  The answer must travel with the head because a remove destroys
- * the holder's copy of it in place; that is precisely what makes it
- * unverifiable from the reader side, and enumerable from here:
+ * A head's back-edge word answers the shape question the up-walks ask.
+ * Am I @owner_flag's external_nodes (my key ENDS there)?  Or am I a child
+ * in one of its body slots?
+ *
+ * The answer must travel with the head, because a remove destroys the
+ * holder's copy of it in place.  For that reason it cannot be verified
+ * from the reader side.  It can be enumerated from here:
  *
  *	bit(head's parent word) == (owner->external_nodes == head)
  *
- * on every LIVE head, in both list modes.  An install site that forgets to set
- * the bit, or a re-home that carries a stale one, is a structural error at the
- * next cds_ft_verify -- not a rare wrong-node lookup under a parked reader.
+ * This holds on every LIVE head, in both list modes.  An install site may
+ * forget to set the bit, or a re-home may carry a stale one.  Either is a
+ * structural error at the next cds_ft_verify.  It is not a rare wrong-node
+ * lookup under a parked reader.
  *
- * A COMPRESSED owner is skipped: it has no external_nodes, its flag's bit 4 is
- * address, and ft_head_parent_word drops the bit into it by construction.
+ * A COMPRESSED owner is skipped:
+ *
+ * - It has no external_nodes.
+ * - Bit 4 of its flag is part of the address.
+ * - ft_head_parent_word drops the bit into it by construction.
  */
 static
 int ft_verify_head_prefix_bit(FILE *out, struct cds_ft_inode_flag *owner_flag,
@@ -309,12 +329,12 @@ int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
 
 	/*
 	 * Every external leaf reached at @depth represents a key of
-	 * length @depth (NIL terminator at metadata depth, or full key
-	 * at slot depth -- both produce the same external chain).  That
-	 * length must respect the group's max_key_len bound.  When the
-	 * group is configured with CDS_FT_MAX_LEN_UNLIMITED
-	 * (max_key_len == SIZE_MAX) this is a no-op since @depth is at
-	 * most FT_MAX_KEY_LEN.
+	 * length @depth.  This holds for a NIL terminator at metadata
+	 * depth and for a full key at slot depth: both produce the same
+	 * external chain.  That length must respect the group's
+	 * max_key_len bound.  When the group is configured with
+	 * CDS_FT_MAX_LEN_UNLIMITED (max_key_len == SIZE_MAX), this is a
+	 * no-op since @depth is at most FT_MAX_KEY_LEN.
 	 */
 	if (head && (size_t) depth > group->max_key_len) {
 		if (out)
@@ -348,32 +368,40 @@ int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
 
 			/*
 			 * ☞ THE BACK CHANNEL IS CHECKED FOR A PARKED PROXY
-			 * BEFORE IT IS COMPARED, and that ordering is the whole
+			 * BEFORE IT IS COMPARED.  That order is the whole
 			 * point of these two lines.
 			 *
 			 * ft_verify_no_proxy_at_rest() was applied only to the
-			 * FORWARD edges -- root, child slot, cn->child,
-			 * compressed skip_slot, external_nodes -- so the words
-			 * that name a node's PARENT were the one reachable class
-			 * it never looked at.  Those are exactly the words the
-			 * ordered-cell SW conversion moved onto the engine, and
-			 * a raw compare of an unresolved type-7 proxy against a
-			 * resolved owner cannot match, so the failure surfaced
-			 * as the generic mismatch below:
+			 * FORWARD edges:
+			 *
+			 * - root,
+			 * - child slot,
+			 * - cn->child,
+			 * - compressed skip_slot,
+			 * - external_nodes.
+			 *
+			 * So the words that name a node's PARENT were the one
+			 * reachable class it never looked at.  Those are
+			 * exactly the words the ordered-cell SW conversion
+			 * moved onto the engine.  A raw compare of an
+			 * unresolved type-7 proxy against a resolved owner
+			 * cannot match.  So the failure surfaced as the
+			 * generic mismatch below:
 			 *
 			 *   head ... cell ... {parent 0x..3bf, node N}
 			 *         != expected {owner 0x..c0b, node N}
 			 *
-			 * -- a line that names neither the class nor the cure,
-			 * and whose low three bits (7) were the only thing that
-			 * distinguished "an unsettled slot" from "a mis-wired
-			 * trie".  Every live reader of this word resolves first
+			 * That line names neither the class nor the cure.
+			 * Only its low three bits (7) distinguished "an
+			 * unsettled slot" from "a mis-wired trie".
+			 *
+			 * Every live reader of this word resolves first
 			 * (ft-iter.h, ft-lookup-helpers.h, ft-helpers.h: the
-			 * RESOLVE-FIRST contract in ft-helpers.h); the verifier
-			 * deliberately does NOT, because at rest -- and
-			 * cds_ft_verify runs with the writer between operations
-			 * -- a proxy here IS the defect rather than a value to
-			 * be resolved through.  So report it as itself.
+			 * RESOLVE-FIRST contract in ft-helpers.h).  The
+			 * verifier deliberately does NOT.  cds_ft_verify runs
+			 * with the writer between operations.  At rest, a
+			 * proxy here IS the defect.  It is not a value to be
+			 * resolved through.  So report it as itself.
 			 */
 			if (ft_verify_no_proxy_at_rest(out,
 					"external head prev (cell link)",
@@ -422,9 +450,9 @@ int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
 		} else {
 			/*
 			 * Interior chain link.  Same reason as the two head
-			 * branches: an unresolved proxy here would be reported
-			 * as "prev != predecessor", which reads as a broken
-			 * chain rather than an unsettled slot.
+			 * branches.  An unresolved proxy here would be
+			 * reported as "prev != predecessor".  That reads as a
+			 * broken chain, not as an unsettled slot.
 			 */
 			if (ft_verify_no_proxy_at_rest(out,
 					"external chain node prev",
@@ -450,17 +478,20 @@ int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
 }
 
 /*
- * If @slot_val is skip-encoded, verify the encoded slen equals
- * cn->len of the underlying compressed node.  Returns 0 when the
- * slot is not skip-encoded or the slen matches; -1 on mismatch
+ * If @slot_val is skip-encoded, verify that the encoded slen equals
+ * cn->len of the underlying compressed node.  Return 0 when the
+ * slot is not skip-encoded or the slen matches.  Return -1 on mismatch
  * (with diagnostic to @out).  No-op on architectures without
  * FEATURE_FT_SKIP_COMPRESSED (ft_node_skip_compressed is constant
  * false and the body is dead-coded).
  *
- * Catches double-wrap of an already-skip-encoded child, stale skip
- * pointers left behind by a recompact that did not refresh the
- * encoded slen, and the parent-depth-span class of bug: a hop up past a
- * skip-encoded child must move the byte-depth by the target's whole run.
+ * This catches three bug classes:
+ *
+ * - A double-wrap of an already-skip-encoded child.
+ * - A stale skip pointer left behind by a recompact that did not
+ *   refresh the encoded slen.
+ * - The parent-depth-span class of bug: a hop up past a skip-encoded
+ *   child must move the byte-depth by the target's whole run.
  */
 static
 int ft_verify_skip_encoding(const struct cds_ft *ft, FILE *out, struct cds_ft_inode_flag *slot_val,
@@ -484,10 +515,15 @@ int ft_verify_skip_encoding(const struct cds_ft *ft, FILE *out, struct cds_ft_in
 }
 
 /*
- * Verify a compressed node's invariants (cn->len >= 1, no
- * external_nodes, nr_child <= 1, parent pointer matches), recurse
- * into its child, and check the stored nr_keys against the child's
- * subtree count plus any local end-of-path key.
+ * Verify a compressed node's invariants:
+ *
+ * - cn->len >= 1,
+ * - no external_nodes,
+ * - nr_child <= 1,
+ * - the parent pointer matches.
+ *
+ * Then recurse into its child.  Finally check the stored nr_keys
+ * against the child's subtree count plus any local end-of-path key.
  */
 static
 int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
@@ -517,10 +553,10 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 	 * key_bytes[] must fit in the allocated slot.  The arena
 	 * allocation order encodes the slot size; subtract the fixed
 	 * header (offsetof(..., key_bytes)) to get the capacity, then
-	 * assert cn->len fits.  Catches a stale len byte after a
-	 * size-class mismatch (e.g. a chain-compress that grew len
-	 * without reallocating into a larger size class), which would
-	 * otherwise silently overrun key_bytes[] on lookup.
+	 * assert cn->len fits.  This catches a stale len byte after a
+	 * size-class mismatch.  An example is a chain-compress that
+	 * grew len without reallocating into a larger size class.
+	 * Lookup would otherwise silently overrun key_bytes[].
 	 */
 	{
 		size_t alloc_size = 1UL << cds_ft_item_order(cn);
@@ -553,12 +589,17 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 		return -1;
 	}
 	/*
-	 * FT_STATE_LOCK is the REVERSIBLE per-node writer lock: at rest (all-updater
-	 * quiescence) every copier has committed (fence consumed by the
-	 * {LOCK|s -> TOMBSTONE|s} transition) or unwound (fence cleared by
-	 * the txn wrapper's registry).  A set bit here is a leaked fence -- a
-	 * bail path that skipped ft_meta_lock_release -- which would make
-	 * every future peer publish into this node abort forever.
+	 * FT_STATE_LOCK is the REVERSIBLE per-node writer lock.  At rest
+	 * (all-updater quiescence) every copier has done one of two
+	 * things:
+	 *
+	 * - It committed: the {LOCK|s -> TOMBSTONE|s} transition consumed
+	 *   the fence.
+	 * - It unwound: the txn wrapper's registry cleared the fence.
+	 *
+	 * A set bit here is a leaked fence: a bail path skipped
+	 * ft_meta_lock_release.  Every future peer publish into this node
+	 * would then abort forever.
 	 */
 	if (cn_meta->state & FT_STATE_LOCK) {
 		if (out)
@@ -567,11 +608,12 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 		return -1;
 	}
 	/*
-	 * A REACHABLE node is never retired.  FT_STATE_TOMBSTONE is set by the
-	 * commit that unlinks the node (freeze-on-free, doc §4.B), so a tombstone
-	 * found by a walk from the root is a node some commit retired while a
-	 * slot still names it -- the reclaim will free it under that slot, and
-	 * every op that reaches it is refused (or, before the refusal, misled).
+	 * A REACHABLE node is never retired.  The commit that unlinks a
+	 * node sets FT_STATE_TOMBSTONE (freeze-on-free, doc §4.B).  So a
+	 * tombstone found by a walk from the root means that some commit
+	 * retired the node while a slot still names it.  The reclaim will
+	 * free the node under that slot.  Every op that reaches it is
+	 * refused (or, before the refusal, misled).
 	 */
 	if (cn_meta->state & FT_STATE_TOMBSTONE) {
 		if (out)
@@ -583,10 +625,10 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 	 * cn->child / nr_child bookkeeping must agree:
 	 *   nr_child == 1 implies cn->child is non-NULL (the one child);
 	 *   nr_child == 0 implies cn->child is NULL.
-	 * A drift between the two is a publish/clear bug that the
-	 * subtree-key recursion would not catch on its own -- the
-	 * key-aggregation path simply skips a NULL cn->child and would
-	 * accept a stored nr_child of 1 with cn->child = NULL as long
+	 * A drift between the two is a publish/clear bug.  The
+	 * subtree-key recursion would not catch it on its own.  The
+	 * key-aggregation path simply skips a NULL cn->child.  It would
+	 * accept a stored nr_child of 1 with cn->child = NULL, as long
 	 * as nr_keys also dropped to 0 in lockstep.
 	 */
 	if ((ft_meta_nr_child(cn_meta) == 1) != (ft_node_ptr(cn->child) != NULL)) {
@@ -608,15 +650,15 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 	 * directions of the adjacency at every visited compressed:
 	 *
 	 *  - ancestor-chain (works in both modes, including skip-compress):
-	 *    walk metadata->parent upward; every consecutive compressed
-	 *    ancestor is part of an adjacency run.  The chain walk is
-	 *    necessary in skip-compress mode because a single skip pointer
-	 *    can bypass two (or more) compresseds at once: the slot's
-	 *    metadata-parent chase from the deepest underlying child only
-	 *    surfaces the innermost compressed-being-skipped, so the
-	 *    walker visits that one but not its compressed ancestor(s).
-	 *    Walking the parent chain at the visited compressed re-exposes
-	 *    every adjacency in the bypassed run.
+	 *    walk metadata->parent_word upward.  Every consecutive
+	 *    compressed ancestor is part of an adjacency run.  The chain
+	 *    walk is necessary in skip-compress mode, because a single
+	 *    skip pointer can bypass two (or more) compresseds at once.
+	 *    The slot's metadata-parent chase from the deepest underlying
+	 *    child only surfaces the innermost compressed-being-skipped.
+	 *    So the walker visits that one but not its compressed
+	 *    ancestor(s).  Walking the parent chain at the visited
+	 *    compressed re-exposes every adjacency in the bypassed run.
 	 *
 	 *  - child-side (cheap and direct, primary in non-skip mode):
 	 *    cn->child must not be a (raw or skip-encoded) compressed.  In
@@ -624,9 +666,9 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 	 *    skip-compressed disjunct is defensive.
 	 *
 	 * Chain-compress is responsible for fusing adjacencies into a
-	 * single compressed; a violation here means the canonicalization
-	 * walk missed a case (and skip mode would silently double-wrap the
-	 * grandparent's skip pointer).
+	 * single compressed.  A violation here means the canonicalization
+	 * walk missed a case.  Skip mode would then silently double-wrap
+	 * the grandparent's skip pointer.
 	 */
 	{
 		struct cds_ft_inode_flag *child_in_chain = node_flag;
@@ -660,15 +702,20 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 	/*
 	 * Parent-slot offset round-trip.  Each compressed node records a
 	 * pointer-stride offset from its parent to the slot that holds the
-	 * pointer to itself (skip-encoded under FEATURE_FT_SKIP_COMPRESSED,
-	 * a raw compressed flag otherwise).  ft_publish_to_parent uses it to
-	 * refresh the slot when cn->child is replaced, and the parent-pointer
-	 * backtrack (e.g. position-based remove) uses it to recover the slot.
+	 * pointer to itself.  That pointer is skip-encoded under
+	 * FEATURE_FT_SKIP_COMPRESSED, and a raw compressed flag otherwise.
+	 * The offset has two users:
+	 *
+	 * - ft_publish_to_parent uses it to refresh the slot when
+	 *   cn->child is replaced.
+	 * - The parent-pointer backtrack (e.g. position-based remove)
+	 *   uses it to recover the slot.
+	 *
 	 * Verify the offset still resolves to a slot whose contents encode
-	 * this very compressed.  A stale offset left after a recompact /
-	 * graft / relocate is surfaced at the mutation that introduced it
-	 * rather than as a corrupted slot at lookup / remove time.  Checked
-	 * on every build (the offset is no longer skip-specific).
+	 * this very compressed.  A recompact / graft / relocate can leave a
+	 * stale offset.  This check reports it at the mutation that
+	 * introduced it, not as a corrupted slot at lookup / remove time.
+	 * Checked on every build (the offset is no longer skip-specific).
 	 *
 	 * NULL slot means the offset was never set (offset == 0 with a
 	 * non-NULL parent).  No round-trip to verify in that case.
@@ -701,12 +748,12 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 			/*
 			 * A ROUND-TRIP IS NOT AN EQUALITY.  The check above
 			 * resolves the slot through ft_skip_to_compressed,
-			 * which follows the CHILD's parent_word -- and a
-			 * RETIRED former child still names @cn there.  So a
-			 * dual left encoding a superseded child passes it,
-			 * while every later publish into @cn->child plans its
+			 * which follows the CHILD's parent_word.  A RETIRED
+			 * former child still names @cn there.  So a dual left
+			 * encoding a superseded child passes the check.
+			 * Every later publish into @cn->child then plans its
 			 * expected-old against the value the dual does NOT
-			 * hold and aborts forever.
+			 * hold, and aborts forever.
 			 *
 			 * What the publisher actually maintains is the
 			 * equality: the dual encodes the CURRENT cn->child
@@ -759,9 +806,9 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 	/*
 	 * Verify nr_keys -- only when the trie maintains order statistics.
 	 * With rank stats off the field is never written, so it carries no
-	 * meaning; report the structurally-computed count upward instead so a
-	 * caller that does check (it never will, the gate is group-wide) sees a
-	 * consistent value.
+	 * meaning.  Report the structurally-computed count upward instead.
+	 * A caller that does check then sees a consistent value.  No caller
+	 * ever will: the gate is group-wide.
 	 */
 	if (ft->rank_stats) {
 		stored_nr_keys = ft_nr_keys_get(cn_meta);
@@ -793,11 +840,14 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 	/*
 	 * Subtree-uniqueness / cycle check.  Every traversable node
 	 * (compressed, internal) must be reached exactly once from
-	 * the root.  A duplicate visit means either two
-	 * parents share the same child subtree (rebase/recompact bug)
-	 * or a parent-pointer cycle has been introduced -- bail out
-	 * before recursing further so the upward parent walks in the
-	 * adjacency check cannot loop forever.
+	 * the root.  A duplicate visit means one of two things:
+	 *
+	 * - two parents share the same child subtree (rebase/recompact
+	 *   bug);
+	 * - a parent-pointer cycle has been introduced.
+	 *
+	 * Bail out before recursing further, so that the upward parent
+	 * walks in the adjacency check cannot loop forever.
 	 */
 	{
 		void *node_addr = ft_node_ptr(node_flag);
@@ -845,7 +895,7 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		unsigned int counted_children = 0;
 		unsigned int key;
 
-		/* Parent pointer check (root has NULL parent). */
+		/* Parent pointer check (the root's parent is its trie). */
 		if (metadata->parent_word != expected_parent) {
 			if (out)
 				fprintf(out, "ft_verify: depth %u: internal node %p parent mismatch: "
@@ -855,12 +905,13 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			return -1;
 		}
 		/*
-		 * Slot-offset round-trip (non-root): the recorded
+		 * Slot-offset round-trip (non-root).  The recorded
 		 * parent_slot_offset must resolve, in the parent body, to the
-		 * slot that holds this node.  Catches a stale/unset offset
-		 * (e.g. a placement that passed a NULL slot to ft_set_parent)
-		 * at the mutation that introduced it, rather than as a
-		 * corrupted parent-pointer backtrack later.
+		 * slot that holds this node.  This catches a stale/unset
+		 * offset at the mutation that introduced it.  An example is a
+		 * placement that passed a NULL slot to ft_set_parent.  Without
+		 * the check, it would show later as a corrupted
+		 * parent-pointer backtrack.
 		 */
 		if (ft_parent_node(metadata->parent_word)) {
 			struct cds_ft_inode_flag **slot =
@@ -881,11 +932,12 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		 * Check parent target is not poisoned (freed).
 		 *
 		 * ☠ THIS BLOCK DID NOT COMPILE, so the whole testing mode did
-		 * not: it still named @metadata->parent, a field that became
-		 * @parent_word.  Nothing else reads the field under this ifdef,
-		 * so the rename passed every build the gate runs and took the
-		 * POISON-ON-FREE DETECTOR with it -- a use-after-free class the
-		 * arena's 0xfe fill exists to catch had no way to be seen.
+		 * not.  It still named @metadata->parent, a field that became
+		 * @parent_word.  Nothing else reads the field under this
+		 * ifdef, so the rename passed every build the gate runs.  The
+		 * POISON-ON-FREE DETECTOR was lost with it.  The arena's 0xfe
+		 * fill exists to catch a use-after-free class.  That class
+		 * had no way to be seen.
 		 */
 		if (ft_parent_node(metadata->parent_word)) {
 			unsigned char *p = (unsigned char *) ft_node_ptr(
@@ -901,12 +953,16 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 #endif
 		/*
 		 * Type / alloc_index sanity.  ft_node_type already asserts
-		 * the tag bits decode within FT_TYPE_BITS, but it does not
-		 * verify the entry is a real internal class, that the arena
-		 * order matches the type's expected order, or that nr_child
-		 * fits the type's capacity.  A corrupted tag/bitfield write
-		 * would otherwise survive verify and only manifest later as
-		 * a wrong-sized scan or a min_child assertion.
+		 * the tag bits decode within FT_TYPE_BITS.  It does not
+		 * verify that:
+		 *
+		 * - the entry is a real internal class,
+		 * - the arena order matches the type's expected order,
+		 * - nr_child fits the type's capacity.
+		 *
+		 * A corrupted tag/bitfield write would otherwise survive
+		 * verify.  It would only manifest later as a wrong-sized scan
+		 * or a min_child assertion.
 		 */
 		{
 			unsigned int type_index = ft_node_type(node_flag);
@@ -1049,25 +1105,29 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			return -1;
 		}
 		/*
-		 * A reachable non-root internal must hold at least one key: a child
-		 * slot, or an external_nodes chain of its own.  With neither it is a
-		 * DEAD END -- an interior node that carries nothing, still wired into
-		 * its parent's slot.
+		 * A reachable non-root internal must hold at least one key: a
+		 * child slot, or an external_nodes chain of its own.  With
+		 * neither it is a DEAD END: an interior node that carries
+		 * nothing, still wired into its parent's slot.
 		 *
-		 * The nr_child cross-check above cannot see this: an emptied node has
-		 * stored 0 and counted 0, and agrees with itself.  Every other
-		 * structural check passes too (parent pointer, slot round-trip, skip
-		 * encoding), so before this the state was verify-clean.
+		 * The nr_child cross-check above cannot see this.  An emptied
+		 * node has stored 0 and counted 0, and agrees with itself.
+		 * Every other structural check passes too: parent pointer,
+		 * slot round-trip and skip encoding.  So before this check
+		 * the state was verify-clean.
 		 *
-		 * ft-inequality.h's empty-subtree arm relies on the absence of such a
-		 * node BY NAME: "quiescently, reachable internal nodes have nr_child
-		 * >= 1 (the upward walk prunes single-child chains wholesale ... so a
-		 * slot-emptied internal is never left in place)", and on that premise
-		 * treats an empty node as "empty at this step" and climbs.  When the
-		 * premise breaks, the ordered walk either re-enters the same branch
-		 * forever or skips the remaining subtree -- while exact-key lookup
-		 * still finds every key, which is why nothing else reports it.  So the
-		 * validator has to be the one that names it.
+		 * ft-inequality.h's empty-subtree arm relies on the absence
+		 * of such a node BY NAME.  It says: "quiescently, reachable
+		 * internal nodes have nr_child >= 1 (the upward walk prunes
+		 * single-child chains wholesale ... so a slot-emptied
+		 * internal is never left in place)".  On that premise it
+		 * treats an empty node as "empty at this step" and climbs.
+		 *
+		 * When the premise breaks, the ordered walk either re-enters
+		 * the same branch forever or skips the remaining subtree.
+		 * Exact-key lookup still finds every key, which is why
+		 * nothing else reports it.  So the validator has to be the
+		 * one that names it.
 		 *
 		 * The root is exempt: an empty trie is exactly this shape.
 		 */
@@ -1089,18 +1149,23 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			return -1;
 		}
 		/*
-		 * Pigeon bitmap consistency: pigeon nodes maintain a
-		 * 256-bit occupancy bitmap (allocated alongside the node
-		 * via ft_alloc_item with type->bitmap=true) that the
-		 * directional / bitmap-scan readers consult.  The bitmap is
-		 * a HINT, with the pointer array as the sole truth: a
-		 * non-NULL node->data[i] MUST have bit i set (else the
-		 * directional scan would skip a live child), but a set bit
-		 * over a NULL slot is allowed -- a sticky soft-delete hole
-		 * the scan rescans past (ft_pigeon_node_get_direction) and
-		 * a recompact rebuilds away.  So cross-check the weaker
-		 * slot_set => bit_set, surfacing only a live child missing
-		 * its bit (a desync that would lose directional results).
+		 * Pigeon bitmap consistency.  Pigeon nodes maintain a
+		 * 256-bit occupancy bitmap.  It is allocated alongside the
+		 * node via ft_alloc_item with type->bitmap=true.  The
+		 * directional / bitmap-scan readers consult it.
+		 *
+		 * The bitmap is a HINT.  The pointer array is the sole truth:
+		 *
+		 * - A non-NULL node->data[i] MUST have bit i set.  Otherwise
+		 *   the directional scan would skip a live child.
+		 * - A set bit over a NULL slot is allowed.  It is a sticky
+		 *   soft-delete hole.  The scan rescans past it
+		 *   (ft_pigeon_node_get_direction) and a recompact rebuilds
+		 *   it away.
+		 *
+		 * So cross-check the weaker slot_set => bit_set.  This reports
+		 * only a live child missing its bit, a desync that would lose
+		 * directional results.
 		 */
 		{
 			unsigned int t = ft_node_type(node_flag);
@@ -1135,28 +1200,29 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		}
 #ifdef FEATURE_FT_COMPRESS
 		/*
-		 * Canonicalization (skip-compressed mode, non-root): a
+		 * Canonicalization (skip-compressed mode, non-root).  A
 		 * single-child internal node with no external_nodes attached
-		 * should have been replaced by a 1-byte compressed node -- in
+		 * should have been replaced by a 1-byte compressed node.  In
 		 * skip mode the compressed publishes as a skip-encoded
-		 * pointer (zero read-side cost), strictly cheaper than the
-		 * 1-child internal it stands in for.  The external_nodes
-		 * carve-out is mandatory: compressed nodes cannot carry
-		 * external_nodes, so an internal that hosts a NIL-key
-		 * end-of-path and a single non-NIL branch must remain
-		 * internal.
+		 * pointer (zero read-side cost).  This is strictly cheaper
+		 * than the 1-child internal it replaces.
 		 *
-		 * The root is exempt: ft->root is read directly by the
-		 * traversal entry, so the skip-encoded pointer's zero
-		 * read-side cost has nowhere to attach (there is no parent
-		 * slot to encode the slen into).  A 1-byte compressed at
-		 * root costs the same CL as a 1-child internal, so the
-		 * canonicalization policy is allowed to keep it internal.
+		 * The external_nodes carve-out is mandatory.  Compressed
+		 * nodes cannot carry external_nodes.  So an internal that
+		 * hosts a NIL-key end-of-path and a single non-NIL branch
+		 * must remain internal.
+		 *
+		 * The root is exempt.  The traversal entry reads ft->root
+		 * directly.  There is no parent slot to encode the slen into,
+		 * so the skip-encoded pointer's zero read-side cost has
+		 * nowhere to attach.  A 1-byte compressed at root costs the
+		 * same CL as a 1-child internal, so the canonicalization
+		 * policy is allowed to keep it internal.
 		 *
 		 * In non-skip mode, ft_build_ordinal_chain keeps a 1-byte
-		 * compressed floor at len >= 2, so a 1-child internal at
+		 * compressed floor at len >= 2.  So a 1-child internal at
 		 * the head of a length-1 chain is canonical and must not
-		 * trip this check; the runtime gate handles the distinction.
+		 * trip this check.  The runtime gate handles the distinction.
 		 *
 		 * Dual of the existing "no two adjacent compresseds" check.
 		 */
@@ -1194,17 +1260,22 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 /*
  * ft_verify_ord_cells: verify the ordinal-cell list against the trie.
  *
- * Walks the trie in key order via the relational descent and the cell list in
- * lockstep, asserting: the list visits exactly the trie's distinct-key heads
- * in the same order; each visited cell is the head's own cell (head->prev) and
- * cell->node points back at that head; the back-edge invariant
- * ord_next(c)->ord_prev == c holds; the minimum cell's ord_prev is the sentinel,
- * the walk terminates at the sentinel, and ft_ord_first / ft_ord_last equal the
- * trie minimum / maximum (an empty list = the sentinel pointing at itself).
+ * Walk the trie in key order via the relational descent, and the cell
+ * list in lockstep.  Assert that:
  *
- * The oracle stays independent of the cell list (cache_valid cleared before
- * each step forces the full descent).  Runs under the caller's writer
- * exclusion.  Returns 0 on success, -1 on the first violation.
+ * - the list visits exactly the trie's distinct-key heads, in the same
+ *   order;
+ * - each visited cell is the head's own cell (head->prev), and
+ *   cell->node points back at that head;
+ * - the back-edge invariant ord_next(c)->ord_prev == c holds;
+ * - the minimum cell's ord_prev is the sentinel;
+ * - the walk terminates at the sentinel;
+ * - ft_ord_first / ft_ord_last equal the trie minimum / maximum (an
+ *   empty list = the sentinel pointing at itself).
+ *
+ * The oracle stays independent of the cell list: cache_valid is cleared
+ * before each step, which forces the full descent.  The caller must hold
+ * writer exclusion.  Return 0 on success, -1 on the first violation.
  */
 static
 int ft_verify_ord_cells(const struct cds_ft *cft, FILE *out)
@@ -1260,12 +1331,13 @@ int ft_verify_ord_cells(const struct cds_ft *cft, FILE *out)
 		}
 		max_cell = cell;
 		/*
-		 * At the list tail next_cell resolves to the sentinel (verify runs
-		 * under writer exclusion, so the list is fully circular here -- no
-		 * transient NULL termination).  The back-edge check below is SKIPPED
-		 * for that end (ft_ord_is_end short-circuits); the tail boundary
-		 * (sentinel.prev == the maximum cell) is validated separately by the
-		 * ft_ord_last() check after the loop.
+		 * At the list tail next_cell resolves to the sentinel.  Verify
+		 * runs under writer exclusion, so the list is fully circular
+		 * here: there is no transient NULL termination.  The back-edge
+		 * check below is SKIPPED for that end (ft_ord_is_end
+		 * short-circuits).  The tail boundary (sentinel.prev == the
+		 * maximum cell) is validated separately by the ft_ord_last()
+		 * check after the loop.
 		 */
 		next_cell = ft_ord_cell_resolve_ord(&cell->lnode.next);
 		if (!ft_ord_is_end(ft, next_cell) &&
@@ -1315,12 +1387,13 @@ int ft_verify_one(const struct cds_ft *ft, FILE *out,
 	unsigned long root_nr_keys = 0;
 	uint8_t path_buf[FT_MAX_KEY_LEN];
 	/*
-	 * Track the structural key down to each leaf ONLY when this trie reads
-	 * leaf-stored keys (ft->speculative_key_offset_active): the external-chain
-	 * walk then compares each leaf's stored speculative key against its
-	 * position (ft_verify_speculative_key).  For an EAGER trie the leaf key is
-	 * not consulted, so path tracking is left off and every path write/compare
-	 * short-circuits, exactly as before this check existed.
+	 * Track the structural key down to each leaf ONLY when this trie
+	 * reads leaf-stored keys (ft->speculative_key_offset_active).  The
+	 * external-chain walk then compares each leaf's stored speculative
+	 * key against its position (ft_verify_speculative_key).  An EAGER
+	 * trie does not consult the leaf key.  Path tracking is then left
+	 * off and every path write/compare short-circuits, exactly as
+	 * before this check existed.
 	 */
 	uint8_t *path = ft->speculative_key_offset_active ? path_buf : NULL;
 	int ret;
@@ -1328,15 +1401,22 @@ int ft_verify_one(const struct cds_ft *ft, FILE *out,
 	if (ft_verify_no_proxy_at_rest(out, "root", root, NULL, 0))
 		return -1;
 	/*
-	 * Root-is-internal invariant.  ft->root must ALWAYS tag a plain internal
-	 * node -- never compressed / skip-compressed / external -- which the read
-	 * path's hot descent relies on.  Every mutator that re-roots the trie
-	 * (graft / graft_swap / detach / merge) materializes the new root through
-	 * the build-invisible internal-root builders (ft_make_root_internal_glue /
-	 * ft_build_extracted_root_glue), so no compressed root is ever published.
-	 * Asserted here so any future mutator that violates it is caught at the
-	 * next mutation point (and so the descent's defensive non-internal-root
-	 * resolver can be retired once this is proven 0 across the bulk-op suite).
+	 * Root-is-internal invariant.  ft->root must ALWAYS tag a plain
+	 * internal node, never compressed / skip-compressed / external.
+	 * The read path's hot descent relies on it.
+	 *
+	 * Every mutator that re-roots the trie (graft / graft_swap /
+	 * detach / merge) materializes the new root through the
+	 * build-invisible internal-root builders:
+	 * ft_make_root_internal_glue and ft_build_extracted_root_glue.
+	 * So no compressed root is ever published.
+	 *
+	 * The invariant is asserted here for two reasons:
+	 *
+	 * - Any future mutator that violates it is caught at the next
+	 *   mutation point.
+	 * - The descent's defensive non-internal-root resolver can be
+	 *   retired once this is proven 0 across the bulk-op suite.
 	 */
 	if (!ft_node_internal(root)) {
 		if (out)
@@ -1347,16 +1427,16 @@ int ft_verify_one(const struct cds_ft *ft, FILE *out,
 		return -1;
 	}
 	/*
-	 * @path is non-NULL only for a speculative-key-active trie (above), in
-	 * which case the leaf walk validates each stored key against its
-	 * position; otherwise it is NULL and all path-tracking writes / compares
-	 * short-circuit.
+	 * @path is non-NULL only for a speculative-key-active trie (above).
+	 * The leaf walk then validates each stored key against its
+	 * position.  Otherwise @path is NULL and all path-tracking writes /
+	 * compares short-circuit.
 	 */
 	/*
 	 * The root's expected parent is THIS trie.  That is what makes the
-	 * depth-0 check discriminating: with NULL the expected value was a
-	 * constant every trie shared, so two tries rooted at one node agreed
-	 * with their own expectation and both passed.
+	 * depth-0 check discriminating.  With NULL, the expected value was
+	 * a constant that every trie shared.  Two tries rooted at one node
+	 * then agreed with their own expectation and both passed.
 	 */
 	ret = ft_verify_node_recursive(ft, out, visited, path, root,
 			ft_trie_parent(ft), 0, &root_nr_keys);
@@ -1370,29 +1450,41 @@ int ft_verify_one(const struct cds_ft *ft, FILE *out,
 /*
  * cds_ft_verify - Verify integrity of the entire Fractal Trie.
  *
- * Recursively walks every internal and compressed node starting
- * from the root, checking that nr_child, nr_keys, and parent
- * pointers are self-consistent.
+ * Walk every internal and compressed node recursively, starting from
+ * the root.  Check that nr_child, nr_keys and parent pointers are
+ * self-consistent.
  *
  * Must be called with mutual exclusion wrt ALL updaters (writer
- * quiescence).  This is stronger than "the caller is a writer": the
- * walk reads slots and state words raw -- no MCAS proxy resolution --
- * and ft_verify_no_proxy_at_rest treats ANY reachable in-flight proxy
- * as an integrity error, because at rest a committed txn leaves none.
- * Its checks are also inherently AT-REST checks: the global/cross-word
- * invariants (nr_keys sums, nr_child vs actual slot population, parent
- * symmetry, ord-list<->trie agreement) span words that different peer
- * txns commit independently, so no per-slot resolution can make them
- * meaningful mid-flight -- resolution yields old-XOR-new per WORD,
- * never a global snapshot.
+ * quiescence).  This is stronger than "the caller is a writer", for
+ * two reasons.
  *
- * The multi-writer counterpart is a (future) CONCURRENT VERIFIER: a
- * §9-disciplined walk (resolve every slot; an in-flight proxy is
- * normal, not an error) restricted to invariants stable under peer
- * commits -- per-node body-local checks on RCU-live immutable bodies,
- * plus word-sets that commit atomically in ONE txn and have a
- * dedicated consistent resolver (the (parent, offset) pair, the state
- * word).  See the verify-at-mutation hook note below.
+ * First, the walk reads slots and state words raw, with no MCAS proxy
+ * resolution.  ft_verify_no_proxy_at_rest treats ANY reachable
+ * in-flight proxy as an integrity error, because at rest a committed
+ * txn leaves none.
+ *
+ * Second, its checks are inherently AT-REST checks.  The
+ * global/cross-word invariants are:
+ *
+ * - nr_keys sums,
+ * - nr_child vs actual slot population,
+ * - parent symmetry,
+ * - ord-list<->trie agreement.
+ *
+ * They span words that different peer txns commit independently.  So
+ * no per-slot resolution can make them meaningful mid-flight.
+ * Resolution yields old-XOR-new per WORD, never a global snapshot.
+ *
+ * The multi-writer counterpart is a (future) CONCURRENT VERIFIER.  It
+ * is a §9-disciplined walk: it resolves every slot, and an in-flight
+ * proxy is normal, not an error.  It is restricted to invariants that
+ * are stable under peer commits:
+ *
+ * - per-node body-local checks on RCU-live immutable bodies;
+ * - word-sets that commit atomically in ONE txn and have a dedicated
+ *   consistent resolver (the (parent, offset) pair, the state word).
+ *
+ * See the verify-at-mutation hook note below.
  *
  * The visited set is PER CALL, so this validates one trie against
  * itself only.  A node reachable from two tries of the same group is
@@ -1421,25 +1513,28 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
 }
 
 /*
- * cds_ft_verify_disjoint - cds_ft_verify over @nr_fts tries at once, plus
- * the invariant no single-trie walk can express: the tries are NODE-DISJOINT.
+ * cds_ft_verify_disjoint - Run cds_ft_verify over @nr_fts tries at once.
+ * Also check the invariant no single-trie walk can express: the tries
+ * are NODE-DISJOINT.
  *
- * The cross-trie ops MOVE nodes between tries of a group (graft, graft_swap,
- * merge_at with src != dst); none of them SHARES one.  A node left reachable
- * from two tries is internally consistent in both -- each trie's own parent
- * pointers, nr_child and nr_keys still agree -- so cds_ft_verify passes on
- * every trie individually.  The damage only surfaces when a mutation in one
- * trie rewrites the shared node and the OTHER trie goes dirty underneath its
- * owner, far from the op that aliased it.
+ * The cross-trie ops MOVE nodes between tries of a group (graft,
+ * graft_swap, merge_at with src != dst); none of them SHARES one.  A
+ * node left reachable from two tries is internally consistent in both.
+ * Each trie's own parent pointers, nr_child and nr_keys still agree.
+ * So cds_ft_verify passes on every trie individually.  The damage only
+ * surfaces when a mutation in one trie rewrites the shared node.  The
+ * OTHER trie then goes dirty underneath its owner, far from the op that
+ * aliased it.
  *
- * One visited set spans all @nr_fts walks, so the existing "reached twice"
- * diagnostics (subtree and external-chain) fire on the second trie to reach a
- * shared node.  Order-dependent in reporting only: whichever trie is walked
- * later names the node.
+ * One visited set spans all @nr_fts walks.  So the existing "reached
+ * twice" diagnostics (subtree and external-chain) fire on the second
+ * trie to reach a shared node.  Order-dependent in reporting only:
+ * whichever trie is walked later names the node.
  *
- * Same at-rest / writer-quiescence contract as cds_ft_verify, and the tries
- * must be quiescent TOGETHER -- an in-flight cross-trie op legitimately has a
- * node in hand between the two.
+ * The at-rest / writer-quiescence contract is the same as for
+ * cds_ft_verify.  The tries must also be quiescent TOGETHER: an
+ * in-flight cross-trie op legitimately has a node in hand between the
+ * two.
  *
  * @fts:    array of @nr_fts tries; no NULL entries.  Passing the same trie
  *          twice is a caller error and reports as a self-alias.
@@ -1498,22 +1593,25 @@ enum cds_ft_status cds_ft_verify_disjoint(struct cds_ft *const *fts,
  * @period mutations.  The counter is incremented and reset on the
  * boundary so it never exceeds @period - 1, avoiding any overflow /
  * cadence-drift issue on long-running workloads.  Period 0 disables
- * the walk entirely (only the increment-and-compare runs).  On
- * mismatch, abort with diagnostic.
+ * the walk entirely: the hook returns before it touches the counter.
+ * On mismatch, abort with diagnostic.
  *
  * MULTI-WRITER: "verify-at-mutation" is a MISNOMER under concurrent
- * writers -- the name describes the trigger cadence, but the hook
+ * writers.  The name describes the trigger cadence.  But the hook
  * fires under ONE writer's scope, so what runs here is inherently a
- * CONCURRENT verifier: peers may be mid-commit, and their parked
- * proxies / half-visible txns are normal states, not corruption.  The
- * contract therefore holds under MW only once this hook runs the
- * concurrent-verifier subset (resolve every slot per doc §9; check
- * only invariants stable under peer commits -- see the cds_ft_verify
- * header for the split).  TODAY it still calls the full at-rest
- * cds_ft_verify, whose global checks need all-updater quiescence, so
- * until that subset is split out, enable FEATURE_FT_VERIFY_AT_MUTATION
- * only with externally-serialized writers -- an implementation gap,
- * not a design restriction.
+ * CONCURRENT verifier.  Peers may be mid-commit, and their parked
+ * proxies / half-visible txns are normal states, not corruption.
+ *
+ * The contract therefore holds under MW only once this hook runs the
+ * concurrent-verifier subset.  That subset resolves every slot per
+ * doc §9.  It checks only invariants stable under peer commits (see
+ * the cds_ft_verify header for the split).
+ *
+ * TODAY the hook still calls the full at-rest cds_ft_verify, whose
+ * global checks need all-updater quiescence.  Until that subset is
+ * split out, enable FEATURE_FT_VERIFY_AT_MUTATION only with
+ * externally-serialized writers.  This is an implementation gap, not
+ * a design restriction.
  */
 void ft_writer_scope_verify(struct cds_ft *ft)
 {
