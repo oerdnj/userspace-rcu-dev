@@ -8,10 +8,10 @@
  * Userspace RCU library - Fractal Trie: optional race-window delay injection.
  *
  * Manual debugging aid, compiled out unless -DFT_DELAY_INJECT is defined.  It
- * widens reader/writer race windows by inserting env-gated usleeps at the
- * ft_delay_writer() / ft_delay_reader() hooks (declared in
- * fractal-trie-internal.h, called at the critical descent / publish points).
- * This unit holds the runtime state and the env-var (FT_DELAY_MODE /
+ * widens reader/writer race windows.  It inserts env-gated usleeps at the
+ * ft_delay_writer() / ft_delay_reader() hooks.  The hooks are defined in
+ * fractal-trie-internal.h and called at the critical descent / publish
+ * points.  This unit holds the runtime state and the env-var (FT_DELAY_MODE /
  * FT_DELAY_US) constructor.
  *
  * Implementation unit: #included once into the fractal-trie.c translation unit.
