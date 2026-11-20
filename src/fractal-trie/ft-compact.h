@@ -771,7 +771,7 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
 			if (ft_debug_counters())
 				uatomic_inc(&ft->group->nr_cells_freed);
 			cds_ft_free_item_unpublished(ft, meta);
-			*bail = -EAGAIN;
+			*bail = sret == -ENOMEM ? -ENOMEM : -EAGAIN;
 			return old;
 		}
 		/*

@@ -20245,10 +20245,12 @@ int ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 		};
 		enum urcu_txn_status st;
 		unsigned int n;
+		int lret;
 
-		if (ft_cell_lockset_take(ft, NULL, t, &plan)) {
+		lret = ft_cell_lockset_take(ft, NULL, t, &plan);
+		if (lret) {
 			ft_flip_txn_destroy(t);
-			return -EAGAIN;
+			return lret == -ENOMEM ? -ENOMEM : -EAGAIN;
 		}
 		n = ft_ord_cell_swap_edges(ft, old_cell, new_cell, edges, 0);
 		ft_ord_cell_record_into_ft(ft, t, edges, n);
