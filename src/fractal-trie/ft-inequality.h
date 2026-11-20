@@ -17,9 +17,11 @@
 
 /*
  * Iterator-based inequality lookup. The input key and key_len are read
- * from @iter (set via cds_ft_iter_set_key). On success the result key,
- * key length, node, status, and path are written back into @iter so that
- * subsequent iteration / backtracking calls can reuse the state.
+ * from @iter (set via cds_ft_iter_set_key). On success these are written
+ * back into @iter:
+ *  - the result key and key length;
+ *  - the node, the status and the path.
+ * Subsequent iteration / backtracking calls can then reuse the state.
  *
  * @limit overrides the key: FT_LOOKUP_LIMIT_FIRST uses key_len
  * prefix_len, FT_LOOKUP_LIMIT_LAST uses max_key_len.
@@ -123,13 +125,18 @@ enum ft_descent_action ft_inequality_compressed(struct cds_ft_inode_flag **node_
 			/*
 			 * Going-up: the whole compressed subtree is on the wrong
 			 * side of the key, so back-track from the compressed node
-			 * itself.  Return its SHALLOW boundary depth (@level, where
-			 * its internal parent is the dispatcher at @level-1), not the
-			 * interior divergence position @level+mpos: the divergence
-			 * offset inside a compressed span is irrelevant to going-up
-			 * (a compressed node has no within-span siblings).  The
-			 * parent-pointer cursor seeds up_parent = the internal parent
-			 * directly and proceeds to the sibling search.
+			 * itself.
+			 *
+			 * Return its SHALLOW boundary depth: @level, where
+			 * its internal parent is the dispatcher at @level-1.
+			 * Do not return the interior divergence position
+			 * @level+mpos.  The divergence offset inside a
+			 * compressed span is irrelevant to going-up: a
+			 * compressed node has no within-span siblings.
+			 *
+			 * The parent-pointer cursor seeds up_parent = the
+			 * internal parent directly and proceeds to the
+			 * sibling search.
 			 */
 			*level_p = level;
 			iter_debug_path_snapshot(iter);
@@ -147,11 +154,11 @@ enum ft_descent_action ft_inequality_compressed(struct cds_ft_inode_flag **node_
 		node_flag = ft_cn_child_dereference_acquire_prefetch(cn);
 		assert(node_flag != NULL);	/* compressed node always has a live child */
 		/*
-		 * The descent result at this position is cn->child -- the
-		 * dispatcher for the byte at index level - 1 (the byte AFTER
-		 * the compressed prefix), not the compressed node itself.
-		 * going_up relies on this to find the sibling of the failing
-		 * byte in cn->child.
+		 * The descent result at this position is cn->child, not the
+		 * compressed node itself.  cn->child is the dispatcher for
+		 * the byte at index level - 1, the byte AFTER the compressed
+		 * prefix.  going_up relies on this to find the sibling of
+		 * the failing byte in cn->child.
 		 */
 		*skip_eq_external_nodes_p = false;
 		*node_flag_p = node_flag;
@@ -219,11 +226,13 @@ out_break:
 /*
  * Handle a compressed node during the inequality minmax descent.
  *
- * On LEFTMOST (GE/GT) descent, check external_nodes at the
- * compressed node's entry depth first; if present and not
- * suppressed, return FT_DESCENT_FOUND_MINMAX with *ret_node_p
- * set and *level_p decremented by one, so the caller can jump
- * straight to found_minmax.
+ * On a LEFTMOST (GE/GT) descent, first check external_nodes at
+ * the entry depth of the compressed node.  If they are present
+ * and not suppressed:
+ *  - set *ret_node_p;
+ *  - decrement *level_p by one;
+ *  - return FT_DESCENT_FOUND_MINMAX.
+ * The caller can then jump straight to found_minmax.
  *
  * Otherwise fill ordinal_key and iter_path across every level
  * spanned by the compressed path, advance @level to the span's
@@ -271,20 +280,24 @@ enum ft_descent_action ft_inequality_minmax_compressed(
 	if (!node_flag) {
 		/*
 		 * Invariant violation: a reachable compressed node always
-		 * has a non-NULL child, *even transiently*.  cn->child is
-		 * wired before the compressed is published to its parent's
-		 * slot and is never cleared in place (empty compresseds
-		 * are pruned by replacing the parent's slot with the
-		 * compressed's external_nodes, or by detaching the whole
-		 * branch -- either way the compressed itself is no longer
-		 * reachable when it becomes empty).
+		 * has a non-NULL child, *even transiently*.
 		 *
-		 * Unlike the internal minmax == NULL case (transiently
-		 * observable and handled via going_up above/below), there
-		 * is no race window in which a reachable compressed has
-		 * cn->child == NULL.  Observing NULL here is a real bug:
-		 * abort loudly instead of silently propagating a corrupt
-		 * node_flag.
+		 * cn->child is wired before the compressed node is
+		 * published to its parent's slot.  It is never cleared in
+		 * place.  An empty compressed node is pruned in one of two
+		 * ways:
+		 *  - the parent's slot is replaced with the compressed
+		 *    node's external_nodes;
+		 *  - the whole branch is detached.
+		 * Either way the compressed node itself is no longer
+		 * reachable when it becomes empty.
+		 *
+		 * The internal minmax == NULL case is different.  It is
+		 * transiently observable, and it is handled via going_up
+		 * above/below.  Here there is no race window in which a
+		 * reachable compressed node has cn->child == NULL.
+		 * Observing NULL here is a real bug.  Abort loudly instead
+		 * of silently propagating a corrupt node_flag.
 		 */
 		fprintf(stderr,
 			"BUG: cds_ft_lookup_inequality minmax: "
@@ -301,13 +314,19 @@ enum ft_descent_action ft_inequality_minmax_compressed(
 }
 
 /*
- * Tier-2 inequality descent: the relational key seek (LE/GE/LT/GT/first/last)
- * and the up/down tree traversal it uses to cross subtree boundaries.  Reached
- * only when the tier-1 ordered-cell fast path in cds_ft_lookup_inequality_impl
- * did not apply (an uncached / scoped / first-or-last / seed-from-node entry, or
- * a relational seek from a key).  Inlining governed by inline_ineq: default-off
- * it is one shared, runtime-mode copy; with FEATURE_INLINE_INEQUALITY_LOOKUP it
- * is force-inlined and per-mode specialized at each caller, as before.
+ * Tier-2 inequality descent.  It does the relational key seek
+ * (LE/GE/LT/GT/first/last) and the up/down tree traversal which the seek
+ * uses to cross subtree boundaries.
+ *
+ * It is reached only when the tier-1 ordered-cell fast path in
+ * cds_ft_lookup_inequality_impl did not apply:
+ *  - an uncached / scoped / first-or-last / seed-from-node entry;
+ *  - a relational seek from a key.
+ *
+ * inline_ineq governs the inlining.  By default (feature off) there is one
+ * shared copy, which takes the mode at run time.  With
+ * FEATURE_INLINE_INEQUALITY_LOOKUP it is force-inlined and specialized per
+ * mode at each caller, as before.
  */
 static inline_ineq
 enum cds_ft_status ft_ineq_descend(struct cds_ft *ft,
@@ -317,11 +336,14 @@ enum cds_ft_status ft_ineq_descend(struct cds_ft *ft,
 		const bool use_keycopy,
 		const bool seed_from_node __attribute__((unused)),
 		/*
-		 * COHERENCE witness (NULL for every ordinary traversal, and a
-		 * compile-time NULL at those call sites, so the accumulation below
-		 * folds away entirely): when set, every node this traversal visits
-		 * is folded into @wit so a SECOND traversal can be compared against
-		 * the first and a torn read detected.  See struct ft_visit_witness.
+		 * COHERENCE witness.  When set, every node this traversal
+		 * visits is folded into @wit.  A SECOND traversal can then be
+		 * compared against the first, and a torn read detected.  See
+		 * struct ft_visit_witness.
+		 *
+		 * It is NULL for every ordinary traversal.  Those call sites
+		 * pass a compile-time NULL, so the accumulation below folds
+		 * away entirely.
 		 */
 		struct ft_visit_witness *wit)
 {
@@ -331,33 +353,42 @@ enum cds_ft_status ft_ineq_descend(struct cds_ft *ft,
 	uint8_t ordinal_key[FT_MAX_KEY_LEN];
 	/*
 	 * OFF-KEY BOUNDARY: the shallowest level at which the traversal stopped
-	 * following the search key and took a branch of its own -- a going-up
-	 * sibling, or a min/max child in the descend_children descent.  SSIZE_MAX
-	 * = still on the key.
+	 * following the search key and took a branch of its own.  Such a branch
+	 * is one of:
+	 *  - a going-up sibling;
+	 *  - a min/max child in the descend_children descent.
+	 * SSIZE_MAX means the traversal is still on the key.
 	 *
-	 * At and below it the going-up sibling scan must start from the byte the
-	 * traversal ACTUALLY took (ordinal_key[level - 1]), never from the search
-	 * key: the key names a branch that is already behind us, so scanning from
-	 * it hands back a subtree the traversal has already consumed.  Above it
-	 * the two agree by construction (the descent fills ordinal_key with the
-	 * key's own bytes), and the search key is the cheaper source -- it needs
-	 * no ordinal_key under @keep_ordinal == false.
+	 * At and below it, the going-up sibling scan must start from the byte
+	 * the traversal ACTUALLY took (ordinal_key[level - 1]).  It must never
+	 * start from the search key.  The key names a branch that is already
+	 * behind us.  A scan from it hands back a subtree the traversal has
+	 * already consumed.
 	 *
-	 * Declared at the top of the function: every `goto` into going_up /
-	 * descend_children is backward or forward past this point, so no jump
-	 * skips the init.
+	 * Above it the two agree by construction: the descent fills ordinal_key
+	 * with the key's own bytes.  The search key is the cheaper source
+	 * there.  It needs no ordinal_key under @keep_ordinal == false.
+	 *
+	 * Declared at the top of the function, so that no jump skips the init.
+	 * Every `goto` into going_up / descend_children is backward, or
+	 * forward past this point.
 	 */
 	ssize_t off_key_level = SSIZE_MAX;
 	/*
 	 * @keep_ordinal: compile-time true for every instantiation EXCEPT
-	 * (use_keycopy && limit == LIMIT_NONE).  In that one case the matched leaf
-	 * is the sole result-key source (ft_speculative_keycopy_unconditional) and
-	 * on-key going-up dispatch reads input_key, so ordinal_key is dead ABOVE
-	 * @off_key_level: its memset, per-level descent fills (here and in the
-	 * compressed helpers via fill_ordinal), and fallback copies all DCE.  The
-	 * two off-key byte-record slots -- the going-up sibling scan and the minmax
-	 * scan -- are written on both paths: they are what @off_key_level reads
-	 * back, and the store costs the same as a scratch byte.
+	 * (use_keycopy && limit == LIMIT_NONE).  In that one case:
+	 *  - the matched leaf is the sole result-key source
+	 *    (ft_speculative_keycopy_unconditional);
+	 *  - on-key going-up dispatch reads input_key.
+	 * So ordinal_key is dead ABOVE @off_key_level.  The compiler then
+	 * eliminates (DCE) its memset, its per-level descent fills and its
+	 * fallback copies.  The fills are here and in the compressed helpers,
+	 * via fill_ordinal.
+	 *
+	 * Two slots record the off-key byte: the going-up sibling scan and the
+	 * minmax scan.  They are written on both paths.  They are what
+	 * @off_key_level reads back.  The store costs the same as a scratch
+	 * byte.
 	 */
 	const bool keep_ordinal = !(use_keycopy &&
 			limit == FT_LOOKUP_LIMIT_NONE);
@@ -369,37 +400,47 @@ enum cds_ft_status ft_ineq_descend(struct cds_ft *ft,
 	/*
 	 * Did the key walk already step STRICTLY PAST the search key before
 	 * entering the min/max descent?  A compressed divergence does exactly
-	 * that: ft_inequality_compressed() answers DESCEND_CHILDREN having
-	 * followed cn->child on the greater side of the mismatch, so every key
-	 * at or below that child -- INCLUDING the child's own external_nodes --
-	 * is already strictly greater than the search key.  Distinct from
-	 * @going_up, which records the same fact for the backtracking route.
+	 * that.  ft_inequality_compressed() follows cn->child on the greater
+	 * side of the mismatch, then answers DESCEND_CHILDREN.  So every key at
+	 * or below that child is already strictly greater than the search key.
+	 * This INCLUDES the child's own external_nodes.
+	 *
+	 * Distinct from @going_up, which records the same fact for the
+	 * backtracking route.
 	 */
 	bool descended_past_key = false;
 	/*
 	 * Parent-pointer going-up cursor (structural up_node form,
-	 * mirroring the iter_skip walk-up).  @up_node is the deepest live
-	 * node descent established; @up_node_lo is the shallowest depth it
-	 * covers -- its TRUE shallow boundary (several levels below @up_node
-	 * for a compressed run).  Tracked as descent proceeds so the going-up
-	 * seed is live (taken from the descent, not read back from a
-	 * recorded path), then climbed via ft_get_parent_rcu up to the
-	 * going-up @level.  Seeding from the
-	 * deepest node + true shallow boundary (rather than from @node_flag
-	 * and the end-of-key-adjusted @level) avoids both the level
-	 * adjustment desync and the compressed-span boundary ambiguity.
+	 * mirroring the iter_skip walk-up).
+	 *  - @up_node is the deepest live node the descent established.
+	 *  - @up_node_lo is the shallowest depth it covers: its TRUE
+	 *    shallow boundary.  For a compressed run it is several levels
+	 *    below @up_node.
+	 *
+	 * Both are tracked as the descent proceeds.  So the going-up seed is
+	 * live: it is taken from the descent, not read back from a recorded
+	 * path.  The cursor is then climbed via ft_get_parent_rcu up to the
+	 * going-up @level.
+	 *
+	 * The seed could instead be @node_flag and the end-of-key-adjusted
+	 * @level.  Seeding from the deepest node and its true shallow
+	 * boundary avoids two problems of that choice:
+	 *  - the level adjustment desync;
+	 *  - the compressed-span boundary ambiguity.
 	 */
 	struct cds_ft_inode_flag *up_node = NULL;
 	ssize_t up_node_lo = 0;
 	/*
 	 * @use_keycopy is a compile-time literal at each instantiation (see the
-	 * two cds_ft_lookup_inequality_impl callers in the dispatcher below), so
-	 * always_inline constant-folds every per-call gate on it.  When set, a
-	 * configured speculative skip-compressed group recovers the result key
-	 * from the matched leaf and the min-descent follows skip pointers without
-	 * reading the compressed node or filling ordinal_key; otherwise the
-	 * descent rebuilds ordinal_key from the live compressed nodes (the fill +
-	 * re-anchor path).
+	 * two cds_ft_lookup_inequality_impl callers in the dispatcher below).
+	 * So always_inline constant-folds every per-call gate on it.
+	 *
+	 * When set, on a configured speculative skip-compressed group:
+	 *  - the result key is recovered from the matched leaf;
+	 *  - the min-descent follows skip pointers.  It does not read the
+	 *    compressed node and does not fill ordinal_key.
+	 * Otherwise the descent rebuilds ordinal_key from the live compressed
+	 * nodes (the fill + re-anchor path).
 	 */
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
@@ -407,10 +448,10 @@ enum cds_ft_status ft_ineq_descend(struct cds_ft *ft,
 	switch (limit) {
 	case FT_LOOKUP_LIMIT_NONE:
 		/*
-		 * Continuation from the current position: its length may be the
-		 * deferred LAZY sentinel (a cell walk that fell to the descent on a
-		 * scoped step) -- resolve it from the leaf.  No-op for fixed /
-		 * descent / set_key positions.
+		 * Continuation from the current position.  Its length may be
+		 * the deferred LAZY sentinel.  A cell walk that fell to the
+		 * descent on a scoped step leaves it.  Resolve it from the
+		 * leaf.  No-op for fixed / descent / set_key positions.
 		 */
 		key_len = ft_key_len(ft, ft_iter_resolve_key_len(iter));
 		if (!valid_key_len(ft, key_len)) {
@@ -443,19 +484,23 @@ enum cds_ft_status ft_ineq_descend(struct cds_ft *ft,
 
 	/*
 	 * Read the input key in place from the iterator buffer -- no snapshot
-	 * copy.  Every write to iter_key(iter) (the result) is terminal (goto
-	 * end) or sourced from the separate ordinal_key / leaf-copy buffer, and
-	 * all input reads (the descent and the going-up backtrack) precede any
-	 * terminal write, so the input bytes are never overwritten while still
-	 * needed.  The lone self-aliasing case -- the equal-match write below --
-	 * is a no-op and is guarded.
+	 * copy.  The input bytes are never overwritten while still needed:
+	 *  - Every write to iter_key(iter) (the result) is terminal (goto
+	 *    end) or sourced from the separate ordinal_key / leaf-copy buffer.
+	 *  - All input reads (the descent and the going-up backtrack) precede
+	 *    any terminal write.
+	 * The lone self-aliasing case is the equal-match write below.  It is a
+	 * no-op and is guarded.
 	 *
-	 * Input-key source: only a LIMIT_NONE continuation (cds_ft_next/prev, the
-	 * relational lookups) iterates from the iterator's CURRENT key, which on a
-	 * lazy-ref cell group is read IN PLACE from the live node (no prior copy).
-	 * LIMIT_FIRST/LIMIT_LAST are absolute and key off the prefix in iter_key,
-	 * NOT the current position, so they must NOT reference the node (a reused
-	 * iterator's stale node would mis-seed the search).
+	 * Input-key source:
+	 *  - Only a LIMIT_NONE continuation (cds_ft_next/prev, the relational
+	 *    lookups) iterates from the iterator's CURRENT key.  On a lazy-ref
+	 *    cell group that key is read IN PLACE from the live node (no prior
+	 *    copy).
+	 *  - LIMIT_FIRST/LIMIT_LAST are absolute.  They key off the prefix in
+	 *    iter_key, NOT the current position.  So they must NOT reference
+	 *    the node: a reused iterator's stale node would mis-seed the
+	 *    search.
 	 */
 	if (limit == FT_LOOKUP_LIMIT_NONE)
 		input_key = ft_iter_read_key(iter);
@@ -512,13 +557,18 @@ enum cds_ft_status ft_ineq_descend(struct cds_ft *ft,
 	iter_debug_path_check(iter);
 	/*
 	 * Continuation fast path: recover the position from iter->node by
-	 * backtracking up the live parent chain.  Reuse it only when the
-	 * cached position is EXACTLY at this key (path_len == key_depth and
-	 * iter->node set) -- iter->node is then the deepest position for the
-	 * key.  A deeper cached position (path_len > key_depth, e.g. an
-	 * inequality result that landed on a longer key) is not the right
-	 * cursor for this key and falls to slow_path.  The caller must hold
-	 * the RCU read-side lock continuously for iter->node to stay valid.
+	 * backtracking up the live parent chain.
+	 *
+	 * Reuse the cached position only when it is EXACTLY at this key
+	 * (path_len == key_depth and iter->node set).  iter->node is then
+	 * the deepest position for the key.
+	 *
+	 * A cached position can be deeper (path_len > key_depth), e.g. an
+	 * inequality result that landed on a longer key.  It is not the
+	 * right cursor for this key, and falls to slow_path.
+	 *
+	 * The caller must hold the RCU read-side lock continuously for
+	 * iter->node to stay valid.
 	 */
 	if (iter->cache_valid && iter->node &&
 			(ssize_t)iter->path_len == key_depth &&
@@ -576,57 +626,71 @@ enum cds_ft_status ft_ineq_descend(struct cds_ft *ft,
 				 * ☠ NEITHER SHAPE: DO NOT INFER "SLOT LEAF"
 				 * FROM THE FAILED external_nodes EQUALITY.
 				 *
-				 * The arm below reads a failed equality as "then
-				 * @cur is a leaf child", which is a negative
-				 * inference over two DIFFERENT shapes.  It is
-				 * wrong for a PREFIX-KEY HEAD whose holder has
-				 * just had its external_nodes cleared by a
-				 * concurrent remove (ft-remove.h, the in-place
-				 * one-key clear): the head is still linked and
-				 * still reachable, the equality fails, and the
-				 * head is then treated as a leaf.  A leaf's
-				 * holder sits one level ABOVE it; a prefix-key
-				 * head's holder sits AT its own depth.  So the
-				 * going-up seed below is planted one level too
-				 * shallow, and every key the iteration
-				 * reconstructs from there is short by one or
-				 * more LEADING bytes -- on the correct node,
-				 * with CDS_FT_STATUS_OK, and cached so the next
-				 * step inherits it.
+				 * The arm below reads a failed equality as
+				 * "then @cur is a leaf child".  That is a
+				 * negative inference over two DIFFERENT
+				 * shapes.
 				 *
-				 * Ask the POSITIVE question instead: a genuine
-				 * slot leaf is the value the holder's slot for
-				 * this key's last byte actually holds -- asked
-				 * with the READER accessor
-				 * (ft_node_get_nth_reanchor; ft_node_get_nth is
-				 * documented writer/debug-only), and a non-zero
-				 * @rewind is itself a "cannot classify", handled
+				 * It is wrong for a PREFIX-KEY HEAD whose
+				 * holder has just had its external_nodes
+				 * cleared by a concurrent remove
+				 * (ft-remove.h, the in-place one-key clear).
+				 * The head is still linked and still
+				 * reachable.  The equality fails.  The head
+				 * is then treated as a leaf.
+				 *
+				 * A leaf's holder sits one level ABOVE it.
+				 * A prefix-key head's holder sits AT its own
+				 * depth.  So the going-up seed below is
+				 * planted one level too shallow.  Every key
+				 * the iteration reconstructs from there is
+				 * short by one or more LEADING bytes.  This
+				 * happens on the correct node, with
+				 * CDS_FT_STATUS_OK.  The result is cached,
+				 * so the next step inherits it.
+				 *
+				 * Ask the POSITIVE question instead.  A
+				 * genuine slot leaf is the value which the
+				 * holder's slot for this key's last byte
+				 * actually holds.  Ask with the READER
+				 * accessor, ft_node_get_nth_reanchor:
+				 * ft_node_get_nth is documented
+				 * writer/debug-only.  A non-zero @rewind is
+				 * itself a "cannot classify".  It is handled
 				 * exactly as the descent's own reanchor call
 				 * below handles it.
 				 *
 				 * ☠ THE INDEX IS @key_depth - 2, NOT - 1.
-				 * @key_depth is key_len + 1 (see its assignment),
-				 * and the slow-path loop consumes
+				 * @key_depth is key_len + 1 (see its
+				 * assignment).  The slow-path loop consumes
 				 * input_key[level - 1] for level in
-				 * 1 .. key_depth - 1, so the DEEPEST dispatched
-				 * byte -- the one a leaf's holder keys on -- is
-				 * input_key[key_depth - 2].  @key_depth - 1 is
-				 * one PAST the key: it reads the buffer's
-				 * FT_KEY_READABLE_PAD on the buffer source and
-				 * runs off the allocation on the IN-LEAF source
-				 * (ASAN heap-buffer-overflow), and its stale byte
-				 * mismatches most live leaves, dumping ~70% of
-				 * leaf continuations onto slow_path.  When
-				 * neither shape answers, the cached position
-				 * cannot be classified at all -- re-descend from
-				 * the root, which is authoritative.
+				 * 1 .. key_depth - 1.  So the DEEPEST
+				 * dispatched byte is
+				 * input_key[key_depth - 2].  It is the byte
+				 * a leaf's holder keys on.
 				 *
-				 * Compressed / skip-compressed holders keep the
-				 * old arm verbatim: they are not implicated
-				 * (measured zero on the failing leg) and the
-				 * slot question is not asked the same way of a
-				 * run.  A holder that is absent or external
-				 * likewise falls through unchanged.
+				 * @key_depth - 1 is one PAST the key:
+				 *  - On the buffer source, it reads the
+				 *    buffer's FT_KEY_READABLE_PAD.
+				 *  - On the IN-LEAF source, it runs off the
+				 *    allocation (ASAN
+				 *    heap-buffer-overflow).
+				 *  - Its stale byte mismatches most live
+				 *    leaves.  This dumps ~70% of leaf
+				 *    continuations onto slow_path.
+				 *
+				 * When neither shape answers, the cached
+				 * position cannot be classified at all.
+				 * Re-descend from the root, which is
+				 * authoritative.
+				 *
+				 * Compressed / skip-compressed holders keep
+				 * the old arm verbatim.  They are not
+				 * implicated (measured zero on the failing
+				 * leg).  The slot question is not asked the
+				 * same way of a run.  A holder that is
+				 * absent or external likewise falls through
+				 * unchanged.
 				 */
 				node_flag = ft_root_dereference_prefetch(ft);
 				iter_key = input_key;
@@ -723,15 +787,21 @@ slow_path:
 				/*
 				 * A compressed full-match consumed the whole key and
 				 * landed on cn->child (which may hold this key as a
-				 * prefix-key external).  For GE/GT (RIGHT) descend into
-				 * that subtree: its leftmost is the smallest key >= the
-				 * search key.  But for LE/LT (LEFT) every key in the
-				 * subtree is >= the search key, so descending would
-				 * return the subtree MAX, which is strictly greater --
-				 * wrong.  Break to post_traversal instead, exactly as the
-				 * non-compressed path does: it returns cn->child's own
-				 * external_nodes for LE (the equal match) and climbs for
-				 * LT's strict predecessor.
+				 * prefix-key external).
+				 *
+				 * For GE/GT (RIGHT), descend into that
+				 * subtree.  Its leftmost is the smallest key
+				 * >= the search key.
+				 *
+				 * For LE/LT (LEFT), every key in the subtree
+				 * is >= the search key.  Descending would
+				 * return the subtree MAX, which is strictly
+				 * greater: wrong.  Break to post_traversal
+				 * instead, exactly as the non-compressed
+				 * path does.  post_traversal returns
+				 * cn->child's own external_nodes for LE (the
+				 * equal match).  It climbs for LT's strict
+				 * predecessor.
 				 */
 				if (mode == FT_LOOKUP_LE || mode == FT_LOOKUP_LT)
 					break;
@@ -812,14 +882,18 @@ post_traversal:
 	/*
 	 * If the descent consumed the whole key, normalize @level to the
 	 * end-of-key depth (key_depth - 1) BEFORE the equal-match check below.
-	 * The loop overshoots by one when the key terminates on an INTERNAL
-	 * node (level reaches key_depth) rather than breaking on an external
-	 * leaf (level == key_depth - 1): an internal node that holds the key as
-	 * a prefix-key external (it also has a longer-key subtree) is the exact
-	 * match, and the LE/GE arm's ft_node_internal branch returns its
-	 * external_nodes.  Without this normalization that arm is skipped and
-	 * the exact prefix-key match is missed (the non-compressed analogue of
-	 * the compressed full-match handled in the slow-path loop above).
+	 *
+	 * At the end of the key, the loop stops in one of two ways:
+	 *  - it breaks on an external leaf, with level == key_depth - 1;
+	 *  - the key terminates on an INTERNAL node, and level reaches
+	 *    key_depth.  The loop overshoots by one.
+	 *
+	 * Such an internal node may hold the key as a prefix-key external (it
+	 * also has a longer-key subtree).  It is then the exact match.  The
+	 * LE/GE arm's ft_node_internal branch returns its external_nodes.
+	 * Without this normalization that arm is skipped, and the exact
+	 * prefix-key match is missed.  This is the non-compressed analogue of
+	 * the compressed full-match handled in the slow-path loop above.
 	 */
 	if (level >= key_depth)
 		level = key_depth - 1;
@@ -843,13 +917,19 @@ post_traversal:
 				external_nodes = (struct cds_ft_node *) node_flag;
 			}
 			if (external_nodes) {
-				/* End of key lookup succeded. We got an equal match.
-				 * The result key equals the input, which is read in
-				 * place from iter_key(iter), so the copy is a no-op
-				 * self-copy unless a separate buffer is in use.
-				 * memmove: @input_key may be the up-walk key at this
-				 * same buffer's TAIL (iter_key + key_off), which the
-				 * front write overlaps. */
+				/*
+				 * End of key lookup succeeded.  We got an
+				 * equal match.
+				 *
+				 * The result key equals the input, which is
+				 * read in place from iter_key(iter).  So the
+				 * copy is a no-op self-copy unless a separate
+				 * buffer is in use.
+				 *
+				 * memmove: @input_key may be the up-walk key
+				 * at this same buffer's TAIL (iter_key +
+				 * key_off), which the front write overlaps.
+				 */
 				iter->key_len = key_len;
 				iter->key_off = 0;
 				if (!ft_speculative_keycopy(ft, external_nodes,
@@ -874,21 +954,26 @@ post_traversal:
 
 	/*
 	 * LE/LT dead-ended at an external LEAF that is a PROPER PREFIX of the
-	 * search key: the descent matched the leaf's whole key (depth @level)
-	 * but the search key is longer, so leaf_key < search_key.  A leaf has
-	 * no extensions, so no key lies strictly between it and the search key
-	 * on this path -- it is the largest key <= the search key, larger than
-	 * any left-sibling branch (which diverges at a smaller byte).  going_up
-	 * skips external leaves (it only returns internal/compressed nodes'
-	 * external_nodes), so return the leaf here.  The exact-length match
-	 * (@level == key_depth - 1) is already handled by the LE/GE arm above
-	 * (LE) or excluded by strictness (LT), so this is only the proper-prefix
-	 * case.
+	 * search key.  The descent matched the leaf's whole key (depth @level)
+	 * but the search key is longer, so leaf_key < search_key.
 	 *
-	 * node_flag may be NULL here (the descent's empty-slot break), which
-	 * ft_node_external() also matches: that is a mid-key dead-end, NOT a
-	 * proper-prefix leaf -- fall through to going_up, which backtracks to
-	 * the nearest lesser key.
+	 * The leaf is the largest key <= the search key:
+	 *  - A leaf has no extensions.  So no key lies strictly between it and
+	 *    the search key on this path.
+	 *  - It is larger than any left-sibling branch, which diverges at a
+	 *    smaller byte.
+	 *
+	 * going_up skips external leaves: it only returns the external_nodes
+	 * of internal/compressed nodes.  So return the leaf here.
+	 *
+	 * This is only the proper-prefix case.  The exact-length match
+	 * (@level == key_depth - 1) is already handled by the LE/GE arm above
+	 * for LE.  For LT, strictness excludes it.
+	 *
+	 * node_flag may be NULL here (the descent's empty-slot break).
+	 * ft_node_external() also matches NULL.  That is a mid-key dead-end,
+	 * NOT a proper-prefix leaf.  Fall through to going_up, which
+	 * backtracks to the nearest lesser key.
 	 *
 	 * Scoped traversal: a leaf above the scope prefix (level < prefix_len)
 	 * is outside the scope.  The scope guard before descend_children
@@ -936,8 +1021,8 @@ post_traversal:
 	 * prevent the minmax descent from returning this node's own
 	 * external_nodes (which are the equal match, not GT).
 	 *
-	 * LE/LT do not need this: their upward backtracking already
-	 * checks external_nodes at each internal node going up, which is
+	 * LE/LT do not need this.  Their upward backtracking already
+	 * checks external_nodes at each internal node going up.  That is
 	 * the correct direction to find shorter (lesser) prefix keys.
 	 */
 	if ((mode == FT_LOOKUP_GT || mode == FT_LOOKUP_GE) &&
@@ -946,13 +1031,19 @@ post_traversal:
 
 	/*
 	 * LE/LT, relational (LIMIT_NONE), with the search key exhausted at or
-	 * above the prefix boundary: the empty key (level == prefix_len == 0), or
-	 * a query equal to the scope prefix.  The going-up loop below would not
-	 * run (no shorter key to back-track to) and control would fall through to
-	 * descend_children, wrongly returning the subtree MAX.  No key is strictly
-	 * less than the boundary; the only <= match is the boundary node's own
-	 * external_nodes, which LE returns and LT excludes -> NOT_FOUND otherwise.
-	 * (LIMIT_FIRST/LAST want the subtree min/max here, so they are excluded.)
+	 * above the prefix boundary.  This is one of:
+	 *  - the empty key (level == prefix_len == 0);
+	 *  - a query equal to the scope prefix.
+	 *
+	 * The going-up loop below would not run: there is no shorter key to
+	 * back-track to.  Control would fall through to descend_children and
+	 * wrongly return the subtree MAX.
+	 *
+	 * No key is strictly less than the boundary.  The only <= match is the
+	 * boundary node's own external_nodes.  LE returns them.  LT excludes
+	 * them.  Otherwise the result is NOT_FOUND.
+	 *
+	 * LIMIT_FIRST/LAST want the subtree min/max here, so they are excluded.
 	 */
 	if (limit == FT_LOOKUP_LIMIT_NONE &&
 			(mode == FT_LOOKUP_LE || mode == FT_LOOKUP_LT) &&
@@ -1000,11 +1091,12 @@ going_up:
 
 	/*
 	 * Find highest value left/right of current node.
-	 * Start at current level. If we cannot find any key left/right
-	 * of ours, go one level up, seek highest value left/right of
-	 * current (recursively), and when we find one, get the
-	 * rightmost/leftmost child of its rightmost/leftmost child
-	 * (recursively).
+	 *  1. Start at current level.
+	 *  2. If we cannot find any key left/right of ours, go one level
+	 *     up and seek highest value left/right of current
+	 *     (recursively).
+	 *  3. When we find one, get the rightmost/leftmost child of its
+	 *     rightmost/leftmost child (recursively).
 	 *
 	 * Prefix-scoped traversal: backtracking stops at
 	 * iter->prefix_len instead of 0, confining the search to the
@@ -1024,23 +1116,29 @@ going_up:
 		assert(0);
 	}
 	/*
-	 * Parent-pointer going-up cursor.  The node at @level and the
-	 * dispatcher at @level-1 (scanned for a sibling) are obtained via live
-	 * back-pointer reads,
-	 * which may observe a fresher version than the descent snapshot
-	 * (intentional -- freshness -- and semantically valid).
+	 * Parent-pointer going-up cursor.  Two nodes are obtained via live
+	 * back-pointer reads:
+	 *  - the node at @level;
+	 *  - the dispatcher at @level-1, which is scanned for a sibling.
+	 * These reads may observe a fresher version than the descent
+	 * snapshot.  This is intentional (freshness) and semantically valid.
 	 *
-	 * Anchor on @up_parent = node at depth @level-1: it is always valid
-	 * for level > prefix_len (descent filled it), unlike node-at-level
-	 * which is NULL on a dead-end descent.  @up_parent_lo is the shallowest
-	 * depth @up_parent covers (> 1 for a compressed run).  As the loop
-	 * decrements @level, climb @up_parent to its own parent via
-	 * ft_get_parent_rcu once @level-1 drops below @up_parent_lo, accumulating
-	 * span (compressed = cn->len, internal = 1).  @up_node (node at @level)
-	 * is carried from the previous iteration's @up_parent -- the node we
-	 * just climbed past -- so it is never derived by dereferencing a
-	 * possibly-NULL node-at-level.  It is read only inside the LE/LT block
-	 * below, which the first iteration (going_up == false) skips.
+	 * Anchor on @up_parent = node at depth @level-1.  It is always valid
+	 * for level > prefix_len, because the descent filled it.
+	 * Node-at-level is not: it is NULL on a dead-end descent.
+	 * @up_parent_lo is the shallowest depth @up_parent covers (> 1 for a
+	 * compressed run).
+	 *
+	 * The loop decrements @level.  Once @level-1 drops below
+	 * @up_parent_lo, climb @up_parent to its own parent via
+	 * ft_get_parent_rcu.  The climb accumulates the span: cn->len for a
+	 * compressed node, 1 for an internal node.
+	 *
+	 * @up_node (node at @level) is carried from the previous iteration's
+	 * @up_parent, the node we just climbed past.  So it is never derived
+	 * by dereferencing a possibly-NULL node-at-level.  It is read only
+	 * inside the LE/LT block below, which the first iteration
+	 * (going_up == false) skips.
 	 */
 	{	/* Scope the going-up cursor locals so they fall out of scope before descend_children/end (avoids -Wjump-misses-init false positives). */
 		struct cds_ft_inode_flag *up_parent;
@@ -1048,11 +1146,14 @@ going_up:
 		bool up_first = true;
 
 		/*
-		 * Climb @up_node (the deepest live node descent established) up to
-		 * the node covering the going-up @level: the loop @level may have
-		 * been knocked back one by the end-of-key adjustment, and a
-		 * compressed run spans several levels.  @up_node then is node-at-level
-		 * (read by the LE/LT block, carried by the loop).
+		 * Climb @up_node (the deepest live node the descent
+		 * established) up to the node covering the going-up @level.
+		 * The climb is needed for two reasons:
+		 *  - the end-of-key adjustment may have knocked the loop
+		 *    @level back by one;
+		 *  - a compressed run spans several levels.
+		 * @up_node is then node-at-level.  The LE/LT block reads it
+		 * and the loop carries it.
 		 */
 		while (level < up_node_lo) {
 			struct cds_ft_inode_flag *gp;
@@ -1066,11 +1167,16 @@ going_up:
 			up_node = gp;
 		}
 		/*
-		 * Derive @up_parent = node at @level-1 (the dispatcher scanned for a
-		 * sibling).  If @up_node already covers @level-1 it IS the dispatcher
-		 * -- a compressed run (no within-span sibling, skipped by the
-		 * !ft_node_internal test below) or a dead-end whose dispatcher we
-		 * never descended past.  Otherwise it is @up_node's parent, one depth
+		 * Derive @up_parent = node at @level-1 (the dispatcher
+		 * scanned for a sibling).
+		 *
+		 * If @up_node already covers @level-1, it IS the dispatcher.
+		 * It is then one of:
+		 *  - a compressed run.  It has no within-span sibling, and
+		 *    the !ft_node_internal test below skips it.
+		 *  - a dead-end whose dispatcher we never descended past.
+		 *
+		 * Otherwise the dispatcher is @up_node's parent, one depth
 		 * shallower (parenthood is by slot).
 		 */
 		if (up_node_lo <= level - 1) {
@@ -1088,9 +1194,10 @@ going_up:
 			ft_delay_reader();
 			if (!up_first) {
 				/*
-				 * Climbed one level (level-- since last iter): the old
-				 * dispatcher becomes the new node-at-level, and the new
-				 * dispatcher is its parent once we cross below its span.
+				 * Climbed one level (level-- since last
+				 * iter).  The old dispatcher becomes the new
+				 * node-at-level.  The new dispatcher is its
+				 * parent once we cross below its span.
 				 */
 				up_node = up_parent;
 				if (level - 1 < up_parent_lo) {
@@ -1177,24 +1284,28 @@ going_up:
 				continue;
 			}
 			/*
-			 * OFF-KEY LEVEL: the traversal already left the search key
-			 * here (a sibling take, or a min/max step of the
-			 * descend_children descent), so the key names a branch behind
-			 * us.  Scan from the byte actually taken instead; being
-			 * strictly ordered, ft_node_get_leftright then returns the
-			 * next branch and the scan always advances.
+			 * OFF-KEY LEVEL: the traversal already left the
+			 * search key here.  It took a sibling, or a min/max
+			 * step of the descend_children descent.  So the key
+			 * names a branch behind us.  Scan from the byte
+			 * actually taken instead.  ft_node_get_leftright is
+			 * strictly ordered, so it then returns the next
+			 * branch and the scan always advances.
 			 *
-			 * Placed after the non-internal skip, not before: only a level
-			 * that scans needs an origin, and only such a level is
-			 * guaranteed to HAVE the byte -- it is the level whose internal
-			 * parent a scan dispatched through, which is where the two
-			 * byte-record slots write.  The interior levels of a compressed
-			 * span have no ordinal byte under @keep_ordinal == false, and
-			 * they take the skip above.
+			 * Placed after the non-internal skip, not before:
+			 *  - Only a level that scans needs an origin.
+			 *  - Only such a level is guaranteed to HAVE the
+			 *    byte.  It is the level whose internal parent a
+			 *    scan dispatched through.  That is where the two
+			 *    byte-record slots write.
+			 * The interior levels of a compressed span have no
+			 * ordinal byte under @keep_ordinal == false.  They
+			 * take the skip above.
 			 *
-			 * The switch above still runs on every level: it carries the
-			 * LIMIT_NONE iter_key back-step that the shallower, on-key
-			 * levels of this same climb read.
+			 * The switch above still runs on every level.  It
+			 * carries the LIMIT_NONE iter_key back-step, which
+			 * the shallower, on-key levels of this same climb
+			 * read.
 			 */
 			if (caa_unlikely(level >= off_key_level))
 				key_value = ordinal_key[level - 1];
@@ -1211,9 +1322,10 @@ going_up:
 			 * @level and recompute the dispatch byte at the new level.
 			 * ft_skip_reanchor never returns NULL on a well-formed trie.
 			 *
-			 * Under use_keycopy the skip-encoded sibling is left raw and
-			 * followed by the descend_children skip-follow (the leaf copy
-			 * supplies the spanned bytes), so no re-anchor is needed here.
+			 * Under use_keycopy the skip-encoded sibling is left
+			 * raw.  The descend_children skip-follow follows it,
+			 * and the leaf copy supplies the spanned bytes.  So
+			 * no re-anchor is needed here.
 			 */
 			while (!use_keycopy && node_flag &&
 					caa_unlikely(ft_node_skip_compressed(node_flag))) {
@@ -1225,13 +1337,16 @@ going_up:
 				assert(anchor != NULL);
 				if (caa_likely(rewind == 0)) {
 					/*
-					 * Surgical: @at_pos is the live resolved sibling at
-					 * this depth that re-scanning @anchor for the
-					 * unchanged dispatch byte ordinal_key[level - 1] would
-					 * find -- the sibling byte was already recorded by the
-					 * ft_node_get_leftright above, so use @at_pos directly
-					 * instead of re-scanning.  Keep the path's parent entry
-					 * live.
+					 * Surgical: @at_pos is the live
+					 * resolved sibling at this depth.
+					 * A re-scan of @anchor for the
+					 * unchanged dispatch byte
+					 * ordinal_key[level - 1] would find
+					 * it.  The ft_node_get_leftright
+					 * above already recorded the sibling
+					 * byte.  So use @at_pos directly
+					 * instead of re-scanning.  Keep the
+					 * path's parent entry live.
 					 */
 					node_flag = at_pos;
 					break;
@@ -1242,12 +1357,16 @@ going_up:
 				 */
 				level -= (ssize_t) rewind;
 				/*
-				 * The merge rewound @level and re-anchored the live
-				 * holder at the new level-1.  Re-sync the parent cursor to
-				 * @anchor (an internal node, span 1).  If the re-scan below
-				 * finds no sibling, the for-loop's level-- then carries
-				 * up_node = anchor = node at the new level, keeping the walk
-				 * consistent with the rewound descent position.
+				 * The merge rewound @level and re-anchored
+				 * the live holder at the new level-1.
+				 * Re-sync the parent cursor to @anchor (an
+				 * internal node, span 1).
+				 *
+				 * The re-scan below may find no sibling.
+				 * The for-loop's level-- then carries
+				 * up_node = anchor = node at the new level.
+				 * This keeps the walk consistent with the
+				 * rewound descent position.
 				 */
 				up_parent = anchor;
 				up_parent_lo = level - 1;
@@ -1279,33 +1398,40 @@ going_up:
 			if (node_flag) {
 				/* Record the sibling in the path. */
 				/*
-				 * Seed the cursor at the found sibling (depth @level, its
-				 * shallow boundary) before descend_children -> minmax, so a
-				 * transiently-empty first minmax step re-enters going-up
-				 * with the cursor live.
+				 * Seed the cursor at the found sibling
+				 * (depth @level, its shallow boundary)
+				 * before descend_children -> minmax.  A
+				 * transiently-empty first minmax step then
+				 * re-enters going-up with the cursor live.
 				 */
 				up_node = node_flag;
 				up_node_lo = level;
 				/*
-				 * The sibling is this traversal's own branch, not the
-				 * search key's: from here down, a later climb scans from
-				 * ordinal_key.
+				 * The sibling is this traversal's own
+				 * branch, not the search key's.  From here
+				 * down, a later climb scans from ordinal_key.
 				 */
 				if (level < off_key_level)
 					off_key_level = level;
 				/*
-				 * Reaching a sibling IS backtracking (up to the
-				 * parent, then over to a strictly-greater/lesser
-				 * sibling subtree), even when the sibling is found on
-				 * the first iteration without climbing further.  Mark
-				 * @going_up so the minmax descent below does NOT set
-				 * skip_eq_external_nodes: the sibling subtree's first
-				 * external_nodes is a different (strictly greater for
-				 * GT) prefix key, not the search key's equal match, so
-				 * it must not be skipped.  Without this, GT into an
-				 * immediate sibling whose subtree root is a prefix key
-				 * (e.g. next("y") with keys "z" < "zz1") skips that
-				 * prefix key entirely.
+				 * Reaching a sibling IS backtracking: up to
+				 * the parent, then over to a
+				 * strictly-greater/lesser sibling subtree.
+				 * This holds even when the sibling is found
+				 * on the first iteration without climbing
+				 * further.
+				 *
+				 * Mark @going_up so the minmax descent below
+				 * does NOT set skip_eq_external_nodes.  The
+				 * sibling subtree's first external_nodes is
+				 * a different prefix key (strictly greater
+				 * for GT).  It is not the search key's equal
+				 * match, so it must not be skipped.
+				 *
+				 * Without this, GT into an immediate sibling
+				 * whose subtree root is a prefix key skips
+				 * that prefix key entirely.  Example:
+				 * next("y") with keys "z" < "zz1".
 				 */
 				going_up = true;
 				if (keep_ordinal)
@@ -1341,13 +1467,17 @@ going_up:
 		if (going_up && level == (ssize_t) iter->prefix_len) {
 			if (dir == FT_LEFT) {
 				/*
-				 * Node at prefix_len is the going-up cursor's @up_parent.
-				 * This block is reached only via normal loop exit (no
-				 * sibling found while backtracking down to prefix_len),
-				 * whose last iteration ran at level == prefix_len + 1 with
-				 * the invariant up_parent == node at level - 1 ==
-				 * node at prefix_len.  Obtained via a live back-pointer
-				 * read.
+				 * Node at prefix_len is the going-up cursor's
+				 * @up_parent.  It is obtained via a live
+				 * back-pointer read.
+				 *
+				 * This block is reached only via normal loop
+				 * exit: no sibling was found while
+				 * backtracking down to prefix_len.  The last
+				 * iteration ran at level == prefix_len + 1,
+				 * with the invariant:
+				 *   up_parent == node at level - 1
+				 *             == node at prefix_len.
 				 */
 				struct cds_ft_inode_flag *pfx_flag = up_parent;
 
@@ -1401,15 +1531,17 @@ going_up:
 	}
 
 	/*
-	 * Fall-through dead-end within the scope prefix: the descent broke
-	 * on an empty slot at level <= prefix_len (the prefix path itself
-	 * does not exist), so the going-up loop above -- bounded at
-	 * prefix_len -- never ran and the going_up NOT_FOUND arm did not
-	 * trigger.  descend_children below would misread the NULL (tag 0)
-	 * as an external-node match and return OK with iter->node == NULL.
-	 * No key with the scope prefix exists: report NOT_FOUND.  Every
-	 * `goto descend_children` jumps past this guard with a non-NULL
-	 * @node_flag; only the fall-through path can carry NULL.
+	 * Fall-through dead-end within the scope prefix.  The descent broke
+	 * on an empty slot at level <= prefix_len: the prefix path itself
+	 * does not exist.  The going-up loop above is bounded at prefix_len.
+	 * So it never ran, and the going_up NOT_FOUND arm did not trigger.
+	 *
+	 * descend_children below would misread the NULL (tag 0) as an
+	 * external-node match and return OK with iter->node == NULL.  No key
+	 * with the scope prefix exists: report NOT_FOUND.
+	 *
+	 * Every `goto descend_children` jumps past this guard with a non-NULL
+	 * @node_flag.  Only the fall-through path can carry NULL.
 	 */
 	if (!node_flag) {
 		iter->node = NULL;
@@ -1451,9 +1583,10 @@ going_up:
 
 descend_children:
 	/*
-	 * A skip-encoded sibling carried over from going_up (use_keycopy) is
-	 * resolved by the loop's skip-follow below, not tested as external here
-	 * -- its tag bits would otherwise be misread as an external node.
+	 * A skip-encoded sibling may be carried over from going_up
+	 * (use_keycopy).  The loop's skip-follow below resolves it.  It is
+	 * not tested as external here: its tag bits would otherwise be
+	 * misread as an external node.
 	 */
 	if (!(use_keycopy && ft_node_skip_compressed(node_flag))
 			&& ft_node_external(node_flag)) {
@@ -1484,9 +1617,10 @@ descend_children:
 
 	/*
 	 * The min/max descent below picks its own branch at every level it
-	 * reaches, so all of them are off-key.  A descent entered straight from
-	 * the key walk (GE/GT past the end of the key, or a compressed
-	 * divergence) has taken no sibling and so has not marked one yet.
+	 * reaches, so all of them are off-key.  A descent can be entered
+	 * straight from the key walk: GE/GT past the end of the key, or a
+	 * compressed divergence.  It has then taken no sibling, and so has
+	 * not marked one yet.
 	 */
 	if (level < off_key_level)
 		off_key_level = level;
@@ -1502,23 +1636,27 @@ descend_children:
 	 * Find rightmost/leftmost child of rightmost/leftmost child
 	 * (recursively).
 	 *
-	 * skip_eq_external_nodes: when entering the minmax descent
+	 * skip_eq_external_nodes: set when the minmax descent is entered
 	 * without backtracking (going_up == false) and the mode is
-	 * strictly GT, the external_nodes at the first node are at the
-	 * same position as the search key -- equal, not strictly
-	 * greater. Skip them on the first iteration so the descent
+	 * strictly GT.  The external_nodes at the first node are then at
+	 * the same position as the search key: equal, not strictly
+	 * greater.  Skip them on the first iteration so the descent
 	 * continues to a proper child.
 	 */
 	/*
 	 * ☠ @descended_past_key is the third case, and leaving it out SKIPPED A
 	 * LIVE KEY.  The skip is only correct when this node's external_nodes
-	 * sit AT the search key -- the end-of-key stop, and the compressed
-	 * FULL MATCH that lands on cn->child.  After a compressed DIVERGENCE
-	 * the descent is already strictly past the key, so the first node's
-	 * external_nodes are the GT answer and skipping them returns the next
-	 * key instead: cds_ft_lookup_gt("aa") over {"ab","abb"} answered
-	 * "abb".  ft_inequality_compressed() had cleared the flag on that
-	 * path; this assignment used to overwrite the answer.
+	 * sit AT the search key.  That holds for:
+	 *  - the end-of-key stop;
+	 *  - the compressed FULL MATCH that lands on cn->child.
+	 *
+	 * After a compressed DIVERGENCE the descent is already strictly past
+	 * the key.  The first node's external_nodes are then the GT answer.
+	 * Skipping them returns the next key instead.  Example:
+	 * cds_ft_lookup_gt("aa") over {"ab","abb"} answered "abb".
+	 *
+	 * ft_inequality_compressed() had cleared the flag on that path.  This
+	 * assignment used to overwrite the answer.
 	 */
 	skip_eq_external_nodes = (!going_up && !descended_past_key &&
 			mode == FT_LOOKUP_GT);
@@ -1540,16 +1678,22 @@ descend_children:
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		/*
 		 * Skip-encoded compressed child: follow it directly without
-		 * reading the compressed node.  The spanned length is in the
-		 * pointer's upper bits (ft_skip_len == cn->len), so this
-		 * reproduces ft_inequality_minmax_compressed's level advance
-		 * exactly; the only thing dropped is the ordinal_key span fill,
-		 * which the leaf-key copy supplies for the result.  A
-		 * skip-compressed node cannot carry external_nodes (a terminating
-		 * fork the encoding cannot express), so nothing terminates inside
-		 * the span -- no min/max candidate is skipped.  Resolving here, at
-		 * the loop top, also keeps the external / internal tests below
-		 * from misreading the skip pointer's tag bits.
+		 * reading the compressed node.
+		 *
+		 * The spanned length is in the pointer's upper bits
+		 * (ft_skip_len == cn->len).  So this reproduces the level
+		 * advance of ft_inequality_minmax_compressed exactly.  The
+		 * only thing dropped is the ordinal_key span fill.  The
+		 * leaf-key copy supplies those bytes for the result.
+		 *
+		 * A skip-compressed node cannot carry external_nodes: that
+		 * is a terminating fork, which the encoding cannot express.
+		 * So nothing terminates inside the span, and no min/max
+		 * candidate is skipped.
+		 *
+		 * Resolving here, at the loop top, also keeps the external /
+		 * internal tests below from misreading the skip pointer's
+		 * tag bits.
 		 */
 		if (use_keycopy && caa_unlikely(ft_node_skip_compressed(node_flag))) {
 			level += (ssize_t) ft_skip_len(node_flag) - 1;
@@ -1558,10 +1702,12 @@ descend_children:
 			up_node = node_flag;	/* live child below the span */
 			up_node_lo = level;
 			/*
-			 * Mirror ft_inequality_minmax_compressed: an external child
-			 * is the leaf at the span end -- break with @level already at
-			 * the key length (no loop level++); an internal child
-			 * continues the descent (the loop level++ lands on it).
+			 * Mirror ft_inequality_minmax_compressed:
+			 *  - An external child is the leaf at the span end.
+			 *    Break with @level already at the key length
+			 *    (no loop level++).
+			 *  - An internal child continues the descent (the
+			 *    loop level++ lands on it).
 			 */
 			if (ft_node_external(node_flag))
 				break;
@@ -1590,18 +1736,19 @@ descend_children:
 		if (ft_node_external(node_flag))
 			break;
 		/*
-		 * Resolve a skip-encoded node to its compressed form.  No-op under
-		 * use_keycopy (skip pointers were already followed at the loop
-		 * top); on the fill path it converts a skip pointer so the
-		 * compressed handler can read cn->key_bytes.
+		 * Resolve a skip-encoded node to its compressed form.
+		 *  - Under use_keycopy this is a no-op: skip pointers were
+		 *    already followed at the loop top.
+		 *  - On the fill path it converts a skip pointer, so that
+		 *    the compressed handler can read cn->key_bytes.
 		 */
 		node_flag = ft_resolve_skip_compressed(ft, node_flag);
 		/*
 		 * Compressed node: traverse the compressed path to reach the
-		 * child, filling ordinal_key.  Under use_keycopy this is only the
-		 * regular (non-skip-encoded) form for spans longer than
-		 * FT_SKIP_LEN_MAX, and the fill is harmless (the result key comes
-		 * from the leaf copy).
+		 * child, filling ordinal_key.  Under use_keycopy this is only
+		 * the regular (non-skip-encoded) form, for spans longer than
+		 * FT_SKIP_LEN_MAX.  The fill is then harmless: the result key
+		 * comes from the leaf copy.
 		 */
 		if (ft_node_compressed(node_flag)) {
 			enum ft_descent_action act;
@@ -1624,24 +1771,33 @@ descend_children:
 				&ordinal_key[level - 1], dir,
 				true /* validate_lookup */);
 		/*
-		 * Prefetch the min/max child's body for the next iteration's scan.
-		 * ft_maybe_prefetch fires only on internal/compressed children
-		 * (external/NULL/non-canonical-skip are dropped), so it never
-		 * reintroduces the harmful external-leaf prefetch.  The lead comes
-		 * from the GE/GT external-nodes metadata read at the loop top, which
-		 * is enough to overlap the body miss: measured ~+3-4% on
-		 * single-thread cds_ft_next over the 1M-key DNS set (the going-up
-		 * sibling scan has no such lead and did NOT benefit -- not added).
+		 * Prefetch the min/max child's body for the next iteration's
+		 * scan.
+		 *
+		 * ft_maybe_prefetch fires only on internal/compressed
+		 * children.  It drops external, NULL and non-canonical-skip
+		 * children.  So it never reintroduces the harmful
+		 * external-leaf prefetch.
+		 *
+		 * The lead comes from the GE/GT external-nodes metadata read
+		 * at the loop top.  It is enough to overlap the body miss.
+		 * Measured: ~+3-4% on single-thread cds_ft_next over the
+		 * 1M-key DNS set.
+		 *
+		 * The going-up sibling scan has no such lead and did NOT
+		 * benefit, so the prefetch was not added there.
 		 */
 		ft_maybe_prefetch(node_flag);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		if (node_flag && caa_unlikely(ft_node_skip_compressed(node_flag))) {
 			if (use_keycopy) {
 				/*
-				 * Leaf-copy path: a skip-encoded min/max child is returned
-				 * raw and followed at the loop top next iteration -- the
-				 * key drives the descent and the leaf copy supplies the
-				 * spanned bytes, so no re-anchor.
+				 * Leaf-copy path: a skip-encoded min/max
+				 * child is returned raw.  The loop top
+				 * follows it on the next iteration.  The key
+				 * drives the descent and the leaf copy
+				 * supplies the spanned bytes, so no
+				 * re-anchor.
 				 */
 				up_node = node_flag;
 				up_node_lo = level;
@@ -1649,13 +1805,18 @@ descend_children:
 			}
 			{
 				/*
-				 * Fill path (no leaf-key offset): ordinal_key must be
-				 * filled from the live compressed node, so re-anchor the
-				 * scanned node on the live structure via the child's parent
-				 * chain and re-scan, rather than spin.  @rewind > 0 (merge)
-				 * re-anchors shallower; @level -= rewind + 1 then the loop's
-				 * level++ nets a -rewind step.  ft_skip_reanchor never
-				 * returns NULL on a well-formed trie.
+				 * Fill path (no leaf-key offset): ordinal_key
+				 * must be filled from the live compressed
+				 * node.  So re-anchor the scanned node on
+				 * the live structure via the child's parent
+				 * chain and re-scan, rather than spin.
+				 *
+				 * @rewind > 0 (merge) re-anchors shallower.
+				 * @level -= rewind + 1, then the loop's
+				 * level++, nets a -rewind step.
+				 *
+				 * ft_skip_reanchor never returns NULL on a
+				 * well-formed trie.
 				 */
 				unsigned int rewind;
 				struct cds_ft_inode_flag *at_pos;
@@ -1676,41 +1837,53 @@ descend_children:
 		}
 #endif
 		/*
-		 * Transiently empty internal node (popcount/pigeon): a reader may
-		 * observe every slot of a reachable internal node as
-		 * NULL in the narrow window between a writer's per-slot
-		 * detach and the upward walk's slot-replace at a higher
-		 * ancestor.  Quiescently, reachable internal nodes have
-		 * nr_child >= 1 (the upward walk prunes single-child
-		 * chains wholesale and replaces at the first multi-child
-		 * ancestor, so a slot-emptied internal is never left in
-		 * place).  Treat as "empty at this step" and let
-		 * going_up find the next sibling at a higher level.
-		 * Back level one step so the going-up cursor resumes at
-		 * the parent.
+		 * Transiently empty internal node (popcount/pigeon).  A
+		 * reader may observe every slot of a reachable internal
+		 * node as NULL.  The window is narrow: it is between a
+		 * writer's per-slot detach and the upward walk's
+		 * slot-replace at a higher ancestor.
+		 *
+		 * Quiescently, reachable internal nodes have nr_child >= 1.
+		 * The upward walk prunes single-child chains wholesale and
+		 * replaces at the first multi-child ancestor.  So a
+		 * slot-emptied internal node is never left in place.
+		 *
+		 * Treat as "empty at this step" and let going_up find the
+		 * next sibling at a higher level.  Back level one step so
+		 * the going-up cursor resumes at the parent.
 		 */
 		if (caa_unlikely(!node_flag)) {
 			level--;
 			/*
-			 * The climb out of the empty subtree must EXCLUDE the branch
-			 * that led into it, or the going-up scan re-derives it
-			 * forever.  @off_key_level, set on the way in, already covers
-			 * every level of this descent: each one scans from the byte it
-			 * took (ordinal_key[level - 1]), and ft_node_get_leftright is
-			 * strictly ordered (smallest v > n for RIGHT), so the origin
-			 * advances at every level and the climb is monotone.
+			 * The climb out of the empty subtree must EXCLUDE
+			 * the branch that led into it.  Otherwise the
+			 * going-up scan re-derives it forever.
 			 *
-			 * That is the cross-trie oracle's long-standing STALL: LTTng
-			 * caught 100001 byte-identical going_up steps (same level,
-			 * same parent, same ord_key, found_sibling=1) with no peer
-			 * event interleaved -- a self-contained infinite loop, not a
-			 * contention livelock.  The comment above assumes going_up
-			 * "find[s] the NEXT sibling", which holds only if the scan
-			 * starts PAST the exhausted branch AT EVERY LEVEL IT CLIMBS:
-			 * a level whose dispatcher is compressed cannot scan at all,
-			 * so an exclusion bound to one level is dropped there and the
-			 * next level up falls back to the search key -- which names
-			 * the emptied subtree again.
+			 * @off_key_level, set on the way in, already covers
+			 * every level of this descent:
+			 *  - Each level scans from the byte it took
+			 *    (ordinal_key[level - 1]).
+			 *  - ft_node_get_leftright is strictly ordered
+			 *    (smallest v > n for RIGHT).
+			 * So the origin advances at every level and the
+			 * climb is monotone.
+			 *
+			 * That endless re-derivation is the long-standing
+			 * STALL of the cross-trie oracle.  LTTng caught
+			 * 100001 byte-identical going_up steps.  Each had
+			 * the same level, the same parent, the same ord_key
+			 * and found_sibling=1.  No peer event was
+			 * interleaved.  It was a self-contained infinite
+			 * loop, not a contention livelock.
+			 *
+			 * The comment above assumes going_up "find[s] the
+			 * NEXT sibling".  That holds only if the scan starts
+			 * PAST the exhausted branch AT EVERY LEVEL IT
+			 * CLIMBS.  A level whose dispatcher is compressed
+			 * cannot scan at all.  So an exclusion bound to one
+			 * level is dropped there.  The next level up then
+			 * falls back to the search key, which names the
+			 * emptied subtree again.
 			 */
 			going_up = true;
 			goto going_up;
@@ -1731,7 +1904,7 @@ descend_children:
 	 * validated external (compressed-branch external child or
 	 * minmax-branch external return).  Transiently-empty
 	 * intermediate steps (non-root minmax == NULL above) do not
-	 * reach this assert -- they jump to going_up and re-enter the
+	 * reach this assert.  They jump to going_up and re-enter the
 	 * search at a higher level.
 	 */
 	assert(ft_node_ptr(node_flag));
@@ -1776,11 +1949,11 @@ end:
 /*
  * Inequality lookup entry point: tier-1 ordered-cell fast path, then the tier-2
  * descent.  cds_ft_next / cds_ft_prev on a cached cursor (GT/LT, LIMIT_NONE)
- * resolve the successor / predecessor cell with a single dependent load and
- * never touch the tree; everything else (uncached / scoped / first / last /
- * seed / relational seek) falls through to ft_ineq_descend.  Always inlined
- * under FEATURE_INLINE_LOOKUP, so the cell hop stays a few loads regardless of
- * the tier-2 inlining choice.
+ * resolve the successor / predecessor cell with a single dependent load.  They
+ * never touch the tree.  Everything else falls through to ft_ineq_descend.
+ * That is: uncached, scoped, first, last, seed and relational seek.  Always
+ * inlined under FEATURE_INLINE_LOOKUP.  So the cell hop stays a few loads,
+ * whatever the tier-2 inlining choice.
  */
 static inline_lookup
 enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
@@ -1799,7 +1972,7 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 	 * Tier-1 ordered-cell fast path.  Hoisted above the key_len computation:
 	 * it advances via ord_next / ord_prev and never resolves the (deferred,
 	 * LAZY) length.  @seed_from_node suppresses it for the splice-time
-	 * predecessor seed (a FRESH head whose cell is not yet spliced); that
+	 * predecessor seed (a FRESH head whose cell is not yet spliced).  That
 	 * caller wants the cross-call node-recovery path in the descent instead.
 	 */
 	if (!seed_from_node &&
@@ -1846,20 +2019,21 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 }
 
 /*
- * Dispatcher: resolve the immutable @use_keycopy config (a speculative
- * skip-compressed group with a leaf-key offset) once, then tail-call the
- * matching always_inline instantiation so each variant's hot loop has the
- * per-call use_keycopy gates constant-folded away.  Mirrors the
- * do_cds_ft_lookup_inner (descend_cand, skip_compressed) specialization.
- * The config is immutable after group create, so this branch is perfectly
- * predicted and amortized over a full traversal.
+ * Dispatcher: resolve the immutable @use_keycopy config once, then tail-call
+ * the matching always_inline instantiation.  @use_keycopy is true for a
+ * speculative skip-compressed group with a leaf-key offset.  Each variant's
+ * hot loop then has the per-call use_keycopy gates constant-folded away.
+ * Mirrors the do_cds_ft_lookup_inner (descend_cand, skip_compressed)
+ * specialization.  The config is immutable after group create, so this branch
+ * is perfectly predicted and amortized over a full traversal.
  *
- * inline_lookup (force-inline) into each entry point: cds_ft_lookup_le/ge/lt/gt
- * pass compile-time-constant @mode and @limit (and cds_ft_next/prev resolve to
- * _gt/_lt), so inlining lets @mode AND @limit -- not just @use_keycopy -- DCE
- * each wrapper down to its single arm.  The six specialized bodies cost .so size
- * but the HOT footprint shrinks (a workload runs one DCE'd wrapper, smaller than
- * the shared generic): measured ~+10% ST and +4-22% MT on 1M-key DNS iterate.
+ * inline_lookup (force-inline) into each entry point.
+ * cds_ft_lookup_le/ge/lt/gt pass compile-time-constant @mode and @limit.
+ * cds_ft_next/prev resolve to _gt/_lt.  So inlining lets @mode AND @limit --
+ * not just @use_keycopy -- DCE each wrapper down to its single arm.  The six
+ * specialized bodies cost .so size, but the HOT footprint shrinks.  A
+ * workload runs one DCE'd wrapper, which is smaller than the shared generic.
+ * Measured: ~+10% ST and +4-22% MT on 1M-key DNS iterate.
  */
 static inline_lookup
 enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
@@ -1877,11 +2051,12 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 
 /*
  * Limit-none relational specializations, installed as fn-pointers by
- * ft_install_lookup_ops.  Each bakes its mode, LIMIT_NONE, and use_keycopy
- * into the force-inline cds_ft_lookup_inequality_impl so the body DCEs to a
- * single arm; referenced only via the installed pointer, so they stay real
- * out-of-line symbols and the public entry is a bare indirect tail-call.  The
- * RCU read lock is taken here (mirroring the lookup-API inners).
+ * ft_install_lookup_ops.  Each bakes three constants into the force-inline
+ * cds_ft_lookup_inequality_impl: its mode, LIMIT_NONE and use_keycopy.  So
+ * the body DCEs to a single arm.  They are referenced only via the installed
+ * pointer.  So they stay real out-of-line symbols, and the public entry is a
+ * bare indirect tail-call.  The RCU read lock is taken here (mirroring the
+ * lookup-API inners).
  */
 #define FT_INEQ_SPEC(name, mode, kc)					\
 	static enum cds_ft_status name(struct cds_ft *ft,		\
@@ -1908,38 +2083,46 @@ FT_INEQ_SPEC(ft_ineq_gt_eager,   FT_LOOKUP_GT, false)
  * ===========================================================================
  *
  * The reader half of the in-trie-move coherence design.  A relational answer is
- * a statement about the trie's SHAPE (the neighbour of a key), so unlike an
- * exact lookup it cannot be validated against the key it was asked for: a
+ * a statement about the trie's SHAPE (the neighbour of a key).  So unlike an
+ * exact lookup, it cannot be validated against the key it was asked for.  A
  * traversal that STRADDLES a move's commit can return a node that is a real,
- * live neighbour of nothing -- the trie never held that relation at any instant.
+ * live neighbour of nothing.  The trie never held that relation at any
+ * instant.
  *
- * The check is therefore a REPETITION, not a validation: run the whole traversal
- * TWICE and accept only if both passes visited exactly the same nodes in the
- * same order (struct ft_visit_witness) and landed on the same result.  Sound
- * because a single traversal can witness a torn view only by straddling a
- * commit, and two SEQUENTIAL traversals cannot both straddle the same commit
- * (the second starts after the first ended) -- the antisymmetry the exact-key
- * proof gets from descend-then-up-walk comes here from pass1-before-pass2.  This
- * is the same primitive the rekey WRITER already uses to derive its splice
- * position (ft_ord_cell_find_splice_pos_coherent).
+ * The check is therefore a REPETITION, not a validation.  Run the whole
+ * traversal TWICE.  Accept only if both passes visited exactly the same nodes
+ * in the same order (struct ft_visit_witness) and landed on the same result.
+ * This is sound for two reasons:
+ *
+ *  - a single traversal can witness a torn view only by straddling a commit;
+ *  - two SEQUENTIAL traversals cannot both straddle the same commit (the
+ *    second starts after the first ended).
+ *
+ * The exact-key proof gets this antisymmetry from descend-then-up-walk.  Here
+ * it comes from pass1-before-pass2.  This is the same primitive the rekey
+ * WRITER already uses to derive its splice position
+ * (ft_ord_cell_find_splice_pos_coherent).
  *
  * Comparing the visited ADDRESSES rather than just the result is what makes it
- * work: a torn pass can land on a stable node (so results alone agree), but a
- * move COWs the stitch points it moves (junction, subtree top, boundary cells)
- * into FRESH addresses, so any pass that saw the neighbourhood mid-move folds a
- * different address set.  It is also ABA-immune: RCU will not hand an address
- * back inside a read section, so an oscillating rekey cannot forge agreement.
+ * work.  A torn pass can land on a stable node, so results alone agree.  But a
+ * move COWs the stitch points it moves into FRESH addresses.  The stitch
+ * points are the junction, the subtree top and the boundary cells.  So any
+ * pass that saw the neighbourhood mid-move folds a different address set.  It
+ * is also ABA-immune: RCU will not hand an address back inside a read section,
+ * so an oscillating rekey cannot forge agreement.
  *
- * COST: gated by struct cds_ft::move_active (ft_move_active) -- with no move in
- * flight these entry points tail-call the ordinary specialization and the whole
- * mechanism costs ONE load of a quiet word.  The doubled traversal (and its
- * doubled tracepoints) is paid only inside a move window.
+ * COST: gated by struct cds_ft::move_active (ft_move_active).  With no move in
+ * flight these entry points tail-call the ordinary specialization.  The whole
+ * mechanism then costs ONE load of a quiet word.  The doubled traversal (and
+ * its doubled tracepoints) is paid only inside a move window.
  *
- * NOT COVERED (both need design step 4's linearizability oracle, not more
- * checking here): a walker parked ON a moving run's interior cell steps out
- * through the new outer link and skips the keys in between; and a leaf that only
- * changes KEY (not address, not neighbourhood) between the two passes is
- * accepted with the pass-2 key.
+ * NOT COVERED.  Two cases need design step 4's linearizability oracle, not
+ * more checking here:
+ *
+ *  - a walker parked ON a moving run's interior cell steps out through the new
+ *    outer link and skips the keys in between;
+ *  - a leaf that only changes KEY (not address, not neighbourhood) between
+ *    the two passes is accepted with the pass-2 key.
  */
 
 /* Defined below; the coherent path uses the ONE shared out-of-line descent
@@ -1951,9 +2134,10 @@ static enum cds_ft_status cds_ft_lookup_inequality_impl_shared(struct cds_ft *ft
 
 /*
  * Everything a relational lookup READS from and WRITES to the iterator.  The
- * two passes must be fed byte-identical input, and pass 1 has already
- * overwritten that input with its RESULT by the time pass 2 starts (the search
- * key, the cached position, the cell cursor), so the input is snapshotted once
+ * two passes must be fed byte-identical input.  But by the time pass 2 starts,
+ * pass 1 has already overwritten that input with its RESULT.  This covers
+ * the search key, the cached position and the cell cursor.  So the input is
+ * snapshotted once
  * and restored between passes.  @key covers the whole key buffer because the
  * descent both reads its search key from it and writes its result key into it.
  */
@@ -2015,8 +2199,8 @@ void ft_ineq_iter_state_restore(struct cds_ft_iter *iter,
  * Will the tier-1 ordered-cell hop serve this call?  Mirrors the gate at the top
  * of cds_ft_lookup_inequality_impl (with seed_from_node false, which every
  * public relational entry passes).  Only used to decide whether the search key
- * gets read at all -- a drift from the real gate costs the hop, never
- * correctness (the descent answers the same relational question).
+ * gets read at all.  A drift from the real gate costs the hop, never
+ * correctness: the descent answers the same relational question.
  */
 static
 bool ft_ineq_cell_hop_applies(const struct cds_ft *ft,
@@ -2030,9 +2214,9 @@ bool ft_ineq_cell_hop_applies(const struct cds_ft *ft,
 }
 
 /*
- * Derive the CURRENT position's key from the structure, twice, accepting it only
- * if both walks agree -- the repetition argument applied to the up-walk.  On
- * success @out[0 .. *@out_len) holds the key, moved to the front.  @torn
+ * Derive the CURRENT position's key from the structure, twice.  Accept it only
+ * if both walks agree: this is the repetition argument applied to the up-walk.
+ * On success @out[0 .. *@out_len) holds the key, moved to the front.  @torn
  * separates "the walks disagreed" (re-derive) from "no key to derive here".
  */
 static
@@ -2046,10 +2230,10 @@ bool ft_ineq_upwalk_key_twice(struct cds_ft *ft, struct cds_ft_iter *iter,
 
 	*torn = false;
 	/*
-	 * Cell-sourced: on a list-off trie a head's ->prev is its HOLDER, not a
-	 * cell, so there is nothing to walk from here.  Nothing is lost -- a
-	 * list-off continuation's search key is already a VALUE in iter_key (the
-	 * previous descent wrote it there), which is the carried key.
+	 * Cell-sourced.  On a list-off trie a head's ->prev is its HOLDER, not
+	 * a cell, so there is nothing to walk from here.  Nothing is lost.  A
+	 * list-off continuation's search key is already a VALUE in iter_key:
+	 * the previous descent wrote it there.  That value is the carried key.
 	 */
 	if (!ft->ordered_list)
 		return false;
@@ -2073,10 +2257,10 @@ bool ft_ineq_upwalk_key_twice(struct cds_ft *ft, struct cds_ft_iter *iter,
 
 /*
  * CONFIRM the position a traversal just returned, so the next continuation step
- * has a baseline.  Free and drift-free: an EAGER traversal already wrote the
- * answer's key into iter_key as it walked it, so the key the answer was FOUND
- * UNDER is right there -- no up-walk, and therefore no chance of carrying a key
- * the leaf only acquired after the answer.
+ * has a baseline.  Free and drift-free.  An EAGER traversal already wrote the
+ * answer's key into iter_key as it walked it.  So the key the answer was FOUND
+ * UNDER is right there.  No up-walk is needed.  Therefore there is no chance
+ * of carrying a key the leaf only acquired after the answer.
  */
 static
 void ft_ineq_carry_traversed_key(struct cds_ft_iter *iter)
@@ -2089,26 +2273,27 @@ void ft_ineq_carry_traversed_key(struct cds_ft_iter *iter)
  * PIN the search key of a CONTINUATION (a relational step taken from the
  * iterator's current position rather than from a set_key bound).
  *
- * On a coherence-capable trie there is no in-leaf key, so ft_iter_read_key()
+ * On a coherence-capable trie there is no in-leaf key.  So ft_iter_read_key()
  * rematerializes the current key STRUCTURALLY by walking the position's parent
- * chain -- a long multi-read that a move can tear, and one that each pass would
- * redo, so a torn walk would feed BOTH passes the same bogus key and they would
- * agree on the wrong answer.  The witness cannot see it either: it folds the
- * nodes the TRAVERSAL visits, and this walk happens before the traversal starts.
+ * chain.  That walk is a long multi-read that a move can tear.  It is also
+ * one that each pass would redo.  So a torn walk would feed BOTH passes the
+ * same bogus key, and they would agree on the wrong answer.  The witness
+ * cannot see it either: it folds the nodes the TRAVERSAL visits, and this
+ * walk happens before the traversal starts.
  *
- * So the key is derived here instead, by the same repetition argument (two
- * sequential up-walks that agree cannot have straddled a commit), pinned as a
- * VALUE at the front of the iterator buffer, and the cached position is cleared
- * so the descent reads that buffer -- which also makes both passes a clean
- * top-descent from the root, the design's uniform shape.
+ * So the key is derived here instead, by the same repetition argument: two
+ * sequential up-walks that agree cannot have straddled a commit.  The key is
+ * pinned as a VALUE at the front of the iterator buffer.  The cached position
+ * is cleared so that the descent reads that buffer.  This also makes both
+ * passes a clean top-descent from the root, the design's uniform shape.
  *
  * Returns false when the two walks disagree: a move is restructuring this
  * position's ancestry, so the caller must re-derive.  Returns true WITHOUT
  * pinning whenever the search key is already a stable value in the buffer (a
  * set_key bound, a LIMIT_FIRST/LAST endpoint).  A continuation that HAS a
- * carried key never reaches here (the caller turns it into a descent from that
- * key); this derives one for a position that does not, which is why it must be
- * the two-walk form and not a single materialize.
+ * carried key never reaches here: the caller turns it into a descent from that
+ * key.  This function derives a key for a position that has none.  That is
+ * why it must be the two-walk form and not a single materialize.
  */
 static
 bool ft_ineq_pin_search_key(struct cds_ft *ft, struct cds_ft_iter *iter,
@@ -2123,9 +2308,9 @@ bool ft_ineq_pin_search_key(struct cds_ft *ft, struct cds_ft_iter *iter,
 	if (!ft_ineq_upwalk_key_twice(ft, iter, iter_key(iter), &n, &torn))
 		return !torn;		/* torn -> re-derive; else nothing to pin */
 	/*
-	 * Defensive: on a FIXED-length group the descent validates the search
-	 * length against the group's (ft_key_len), and ft_iter_read_key's own
-	 * fixed-length branch leaves iter->key_len alone -- so a walk that
+	 * Defensive, for a FIXED-length group.  The descent validates the
+	 * search length against the group's (ft_key_len).  ft_iter_read_key's
+	 * own fixed-length branch leaves iter->key_len alone.  So a walk that
 	 * accounted for a different number of bytes must not be pinned as the
 	 * length here.
 	 */
@@ -2141,14 +2326,14 @@ bool ft_ineq_pin_search_key(struct cds_ft *ft, struct cds_ft_iter *iter,
 
 /*
  * The two-pass relational lookup itself.  Runs under the caller's RCU read-side
- * lock (both passes and the input snapshot must be one section: the compared
- * addresses are only meaningful, and the pointers only valid, within it).
+ * lock.  Both passes and the input snapshot must be one section.  Only within
+ * it are the compared addresses meaningful and the pointers valid.
  *
  * Retries on disagreement rather than reporting an error: an incoherent
  * derivation cannot be repaired, only re-taken.  That makes a reader LOCK-FREE
  * (not wait-free) for as long as moves keep restructuring the neighbourhood it
- * is reading, which is the price the design accepts inside a move window, and
- * only there.
+ * is reading.  The design accepts this price inside a move window, and only
+ * there.
  */
 static
 enum cds_ft_status ft_ineq_two_pass(struct cds_ft *ft, struct cds_ft_iter *iter,
@@ -2163,24 +2348,26 @@ enum cds_ft_status ft_ineq_two_pass(struct cds_ft *ft, struct cds_ft_iter *iter,
 	ft_ineq_iter_state_save(iter, &in);
 	/*
 	 * AGREED DESIGN (with Mathieu, 2026-07-25): A CONTINUATION DOES NOT HOP
-	 * THE ORDERED-LIST CELLS WHILE A MOVE IS IN FLIGHT -- it re-descends from
-	 * the key the last confirmed step produced.
+	 * THE ORDERED-LIST CELLS WHILE A MOVE IS IN FLIGHT.  It re-descends
+	 * from the key the last confirmed step produced.
 	 *
 	 * The move is made detectable by the COW of the moved subtree's TOP, and
 	 * that is ALL the COW that is needed.  But detectability only reaches
-	 * traversals that read the TREE: the cell hop deliberately bypasses it
-	 * (that is its whole point), and the link it reads is one the move rewrites
-	 * IN PLACE on a cell the graft SHARES rather than replaces.  So a walker
-	 * parked on the moved run's last cell hops into the run's new
-	 * neighbourhood and skips every key in between -- and no reader can detect
-	 * that, at any number of passes, because nothing it observed changed
-	 * address.  Re-descending puts the step back on the path where the COW is
-	 * visible, and the two-pass then covers it like any other descent.
+	 * traversals that read the TREE.  The cell hop deliberately bypasses
+	 * the tree: that is its whole point.  The link it reads is one the
+	 * move rewrites IN PLACE, on a cell the graft SHARES rather than
+	 * replaces.  So a walker parked on the moved run's last cell hops into
+	 * the run's new neighbourhood and skips every key in between.  No
+	 * reader can detect that, at any number of passes, because nothing it
+	 * observed changed address.  Re-descending puts the step back on the
+	 * path where the COW is visible.  The two-pass then covers it like any
+	 * other descent.
 	 *
 	 * REJECTED on the way here (do not re-attempt): COWing the cells instead.
-	 * Boundary-only cell COW does not work -- giving the run's last cell an old
-	 * copy forces its predecessor's link to be rewritten in place, so the
-	 * escape point just moves inward, and induction takes it to the whole run.
+	 * Boundary-only cell COW does not work.  Giving the run's last cell an
+	 * old copy forces its predecessor's link to be rewritten in place.  So
+	 * the escape point just moves inward, and induction takes it to the
+	 * whole run.
 	 * Full-run cell COW would work but makes a move O(n) in the moved subtree's
 	 * keys, which is the property rekey exists to avoid.  Measured: a
 	 * reader-side hop validation does NOT substitute (residual unchanged per
@@ -2222,17 +2409,19 @@ enum cds_ft_status ft_ineq_two_pass(struct cds_ft *ft, struct cds_ft_iter *iter,
 }
 
 /*
- * REKEY-coherent relational specializations, installed on
- * ft->lookup_{le,ge,lt,gt}_fn in place of the ft_ineq_*_eager ones when
- * ft->rekey_coherence (ft_install_lookup_ops).  Only the EAGER (no in-leaf key)
- * variants have coherent siblings: rekey_coherence implies
- * !speculative_key_offset_active, hence use_keycopy false -- a speculative trie
- * can never host a move (the library cannot rewrite an application-stored key).
+ * REKEY-coherent relational specializations.  When ft->rekey_coherence is
+ * set, ft_install_lookup_ops installs them on ft->lookup_{le,ge,lt,gt}_fn.
+ * They replace the ft_ineq_*_eager ones.  Only the EAGER (no in-leaf key)
+ * variants have coherent siblings.  rekey_coherence implies
+ * !speculative_key_offset_active, hence use_keycopy false.  A speculative
+ * trie can never host a move: the library cannot rewrite an
+ * application-stored key.
  *
- * The gate sample rides the CALLER's read-side critical section, the same one
- * the traversal below runs in, which is what makes one sample per call sound
- * (struct cds_ft::move_active).  Fast mode tail-calls the ordinary
- * specialization so no second copy of the force-inlined descent is emitted.
+ * The gate sample rides the CALLER's read-side critical section.  The
+ * traversal below runs in that same section.  That is what makes one sample
+ * per call sound (struct cds_ft::move_active).  Fast mode tail-calls the
+ * ordinary specialization so no second copy of the force-inlined descent is
+ * emitted.
  */
 #define FT_INEQ_SPEC_COHERENT(name, fast, mode)				\
 	static enum cds_ft_status name(struct cds_ft *ft,		\
@@ -2253,8 +2442,10 @@ FT_INEQ_SPEC_COHERENT(ft_ineq_gt_coherent, ft_ineq_gt_eager, FT_LOOKUP_GT)
 /*
  * Iterator-based inequality lookup public API.
  * The caller sets the key via cds_ft_iter_set_key() before calling.
- * On return the iterator holds the result key, key length, node, path,
- * and status.
+ * On return the iterator holds the result:
+ *   - key and key length;
+ *   - node and path;
+ *   - status.
  */
 enum cds_ft_status cds_ft_lookup_le(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
@@ -2297,7 +2488,7 @@ enum cds_ft_status cds_ft_lookup_first(struct cds_ft *ft,
 	 * Resolve a flip proxy: head/tail transition atomically with the
 	 * neighbour edges during a concurrent splice/unsplice/run move.
 	 * iter_auto_invalidate_cache: honour the UNCACHED contract like every
-	 * other epilogue -- materialize the lazy leaf-referenced key and drop
+	 * other epilogue.  Materialize the lazy leaf-referenced key and drop
 	 * the cached position so it is not reused across a lock window. */
 	if (ft_ord_cell_fastpath_ok(ft, iter)) {
 		/* ft_ord_first: NULL when the list is empty (iter_land -> NOT_FOUND). */
@@ -2310,9 +2501,11 @@ enum cds_ft_status cds_ft_lookup_first(struct cds_ft *ft,
 	 * When prefix_len == 0 this corresponds to a traversal of the
 	 * entire trie.
 	 * When prefix_len > 0 it descends through the prefix key
-	 * bytes, then the GE post-traversal returns the prefix key
-	 * itself if it has external_nodes, or the LEFTMOST minmax
-	 * descent finds the smallest descendant.
+	 * bytes.  Then one of two things happens:
+	 *   - the GE post-traversal returns the prefix key itself if
+	 *     it has external_nodes;
+	 *   - or the LEFTMOST minmax descent finds the smallest
+	 *     descendant.
 	 */
 	iter->key_len = iter->prefix_len;
 	/* Scoped endpoint: a real relational traversal, so it takes the
@@ -2352,7 +2545,7 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
 	 * LIMIT_LAST always uses key_len = max_key_len. When
 	 * prefix_len > 0, the traversal uses actual prefix key bytes
 	 * for levels 1..prefix_len then 0xFF for the remaining
-	 * levels, descending as deep as possible along the rightmost
+	 * levels.  It thus descends as deep as possible along the rightmost
 	 * path within the prefix subtree. LE backtracking (bounded
 	 * at prefix_len) then finds the greatest actual key.
 	 */
@@ -2374,11 +2567,11 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
  * ordered-cell maintenance in ft-detach (ft_ord_cell_find_rel,
  * ft_ord_cell_find_pred_from_head, ft_merge_ord_interleave) reaches
  * cds_ft_lookup_inequality_impl at five sites.  The impl is force-inlined for
- * the read hot path -- the ft_ineq_* specializations DCE it on constant
- * mode/limit -- so without this each of those write-side sites inlined the full
- * ~20 KB descent, ~90 KB total.  The mutation modules are redirected to this one
- * shared copy via #define in fractal-trie.c; read-side callers keep the inlined
- * original.
+ * the read hot path.  The ft_ineq_* specializations DCE it on constant
+ * mode/limit.  Without this copy, each of those write-side sites inlined the
+ * full ~20 KB descent, ~90 KB total.  A #define in fractal-trie.c redirects
+ * the mutation modules to this one shared copy.  Read-side callers keep the
+ * inlined original.
  */
 static enum cds_ft_status cds_ft_lookup_inequality_impl_shared(struct cds_ft *ft,
 		struct cds_ft_iter *iter, enum ft_lookup_inequality mode,
