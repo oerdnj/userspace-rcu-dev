@@ -92,7 +92,7 @@
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
 /* +1 inv_graft_swap_whole_seam_points */
-#define NR_TESTS	(143 + NR_TESTS_REKEY_DLM)	/* +1: inv_owned_long_runs; +1: inv_owned_prefix_dense_remove_all; +1: inv_ir_prefix_roundtrip; +1: inv_owned_prefix_dense_replace; +1: inv_owned_prefix_dense; +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension; +1: inv_prefix_shape_zoo */
+#define NR_TESTS	(144 + NR_TESTS_REKEY_DLM)	/* +1: inv_owned_long_runs; +1: inv_owned_prefix_dense_remove_all; +1: inv_ir_prefix_roundtrip; +1: inv_owned_prefix_dense_replace; +1: inv_owned_prefix_dense; +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension; +1: inv_prefix_shape_zoo */
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -22342,6 +22342,349 @@ static int inv_rekey_no_escape(void)
 
 /* ================================================================== */
 /*                                                                    */
+/*   INVARIANT 11d: a rekey to a SHORTER key does not strand a reader  */
+/*   that resolves a skip pointer through the moved subtree           */
+/*                                                                    */
+/*   The subtree under the 12-byte prefix "Kabcdefghijk" sits behind  */
+/*   the root's 'K' slot, which is skip-compressed.  The writer moves  */
+/*   it to the 1-byte key "Q" and back.  A reader resolves a skip     */
+/*   pointer by walking up from its child until it has covered the    */
+/*   encoded length (ft_skip_reanchor).  A reader that loaded the 'K'  */
+/*   slot before the move walks up from a child that now sits under   */
+/*   "Q": the chain is shorter than the encoded length.  Every other  */
+/*   rekey oracle moves between keys of EQUAL length.                 */
+/* ================================================================== */
+
+#define RKS_LONG	"Kabcdefghijk"
+#define RKS_SHORT	"Q"
+
+static const char *const rks_suffixes[] = { "mnopq1", "mnopq2", "r", "st" };
+#define RKS_NSUF	(sizeof(rks_suffixes) / sizeof(rks_suffixes[0]))
+
+struct rks_reader_arg {
+	struct cds_ft *ft;
+	unsigned int id;
+	unsigned long ops;
+};
+
+static unsigned long rks_moves;
+
+/* Is @k (@kl bytes) a key this test ever holds? */
+static bool rks_key_allowed(const uint8_t *k, size_t kl)
+{
+	unsigned int i;
+
+	if (kl == 2 && !memcmp(k, "Z1", 2))
+		return true;
+	for (i = 0; i < RKS_NSUF; i++) {
+		size_t sl = strlen(rks_suffixes[i]);
+
+		if (kl == sizeof(RKS_LONG) - 1 + sl &&
+		    !memcmp(k, RKS_LONG, sizeof(RKS_LONG) - 1) &&
+		    !memcmp(k + sizeof(RKS_LONG) - 1, rks_suffixes[i], sl))
+			return true;
+		if (kl == sizeof(RKS_SHORT) - 1 + sl &&
+		    !memcmp(k, RKS_SHORT, sizeof(RKS_SHORT) - 1) &&
+		    !memcmp(k + sizeof(RKS_SHORT) - 1, rks_suffixes[i], sl))
+			return true;
+	}
+	return false;
+}
+
+static void rks_check_iter(struct cds_ft_iter *iter, const char *what)
+{
+	uint8_t k[32];
+	size_t kl;
+
+	if (cds_ft_iter_get_key(iter, k, sizeof(k), &kl) != CDS_FT_STATUS_OK ||
+	    !rks_key_allowed(k, kl)) {
+		fprintf(stderr, "inv_rekey_shorter_reanchor: %s returned an "
+			"out-of-namespace key (len %zu)\n", what, kl);
+		atomic_fetch_add(&violation_count, 1);
+	}
+}
+
+/* Key order: bytewise, a prefix before its extensions. */
+static int rks_cmp(const uint8_t *a, size_t al, const uint8_t *b, size_t bl)
+{
+	int c = memcmp(a, b, al < bl ? al : bl);
+
+	if (c)
+		return c;
+	return al < bl ? -1 : al > bl;
+}
+
+/*
+ * Check that the key @iter holds is in the namespace, and on @side of the
+ * probe @k: above it for 1, below it for -1.  @strict excludes the probe
+ * itself (gt / lt).
+ */
+static void rks_check_order(struct cds_ft_iter *iter, const char *what,
+		const uint8_t *k, size_t kl, int side, bool strict)
+{
+	uint8_t r[32];
+	size_t rl = 0;
+	int c;
+
+	if (cds_ft_iter_get_key(iter, r, sizeof(r), &rl) != CDS_FT_STATUS_OK ||
+	    !rks_key_allowed(r, rl)) {
+		fprintf(stderr, "inv_rekey_shorter_reanchor: %s returned an "
+			"out-of-namespace key (len %zu)\n", what, rl);
+		atomic_fetch_add(&violation_count, 1);
+		return;
+	}
+	c = rks_cmp(r, rl, k, kl);
+	if ((side > 0 && (strict ? c <= 0 : c < 0)) ||
+	    (side < 0 && (strict ? c >= 0 : c > 0))) {
+		fprintf(stderr, "inv_rekey_shorter_reanchor: %s returned %.*s "
+			"for probe %.*s: wrong side\n", what, (int) rl, r,
+			(int) kl, k);
+		atomic_fetch_add(&violation_count, 1);
+	}
+}
+
+static void *rks_reader(void *arg)
+{
+	struct rks_reader_arg *ra = (struct rks_reader_arg *) arg;
+	struct cds_ft_iter *iter = NULL;
+	unsigned int round = ra->id;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ra->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		rcu_quiescent_state();
+	while (!test_stop) {
+		uint8_t k[32];
+		size_t kl;
+		unsigned int i = round % RKS_NSUF;
+		bool longk = (round / RKS_NSUF) & 1;
+		const char *pfx = longk ? RKS_LONG : RKS_SHORT;
+
+		kl = strlen(pfx);
+		memcpy(k, pfx, kl);
+		memcpy(k + kl, rks_suffixes[i], strlen(rks_suffixes[i]));
+		kl += strlen(rks_suffixes[i]);
+
+		/* Point lookup: the exact descent. */
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, k, kl);
+		cds_ft_lookup(ra->ft, iter);
+		if (cds_ft_iter_node(iter))
+			rks_check_iter(iter, "lookup");
+		rcu_read_unlock();
+		rcu_quiescent_state();
+
+		/*
+		 * Inequality, all four modes, probing one byte short of a key
+		 * so the answer is a neighbour, not the probe itself.  The
+		 * answer must lie on the right side of the probe.
+		 */
+		{
+			static const struct {
+				const char *name;
+				enum cds_ft_status (*fn)(struct cds_ft *,
+					struct cds_ft_iter *);
+				int side;
+				bool strict;
+			} ops[] = {
+				{ "lookup_ge", cds_ft_lookup_ge, 1, false },
+				{ "lookup_gt", cds_ft_lookup_gt, 1, true },
+				{ "lookup_le", cds_ft_lookup_le, -1, false },
+				{ "lookup_lt", cds_ft_lookup_lt, -1, true },
+			};
+			unsigned int o;
+
+			for (o = 0; o < 4; o++) {
+				rcu_read_lock();
+				cds_ft_iter_set_key(iter, k, kl - 1);
+				if (ops[o].fn(ra->ft, iter) == CDS_FT_STATUS_OK)
+					rks_check_order(iter, ops[o].name, k,
+						kl - 1, ops[o].side,
+						ops[o].strict);
+				rcu_read_unlock();
+				rcu_quiescent_state();
+			}
+		}
+
+		/*
+		 * Ordered walks: the climb in the inequality descent, which
+		 * cds_ft_next / cds_ft_prev run on every step during a move.
+		 * Each step must land on a key of the namespace.  The steps'
+		 * ORDER is not checked: a walk across a move can step back
+		 * into the other namespace, a separate open question.
+		 */
+		{
+			unsigned int step;
+
+			rcu_read_lock();
+			if (cds_ft_lookup_first(ra->ft, iter) == CDS_FT_STATUS_OK) {
+				rks_check_iter(iter, "first");
+				for (step = 0; step < 6 &&
+				     cds_ft_next(ra->ft, iter) == CDS_FT_STATUS_OK;
+				     step++)
+					rks_check_iter(iter, "next");
+			}
+			rcu_read_unlock();
+			rcu_quiescent_state();
+			rcu_read_lock();
+			if (cds_ft_lookup_last(ra->ft, iter) == CDS_FT_STATUS_OK) {
+				rks_check_iter(iter, "last");
+				for (step = 0; step < 6 &&
+				     cds_ft_prev(ra->ft, iter) == CDS_FT_STATUS_OK;
+				     step++)
+					rks_check_iter(iter, "prev");
+			}
+			rcu_read_unlock();
+			rcu_quiescent_state();
+		}
+
+		ra->ops++;
+		round++;
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *rks_writer(void *arg)
+{
+	struct cds_ft *ft = (struct cds_ft *) arg;
+
+	rcu_register_thread();
+	while (!test_go)
+		rcu_quiescent_state();
+	while (!test_stop) {
+		enum cds_ft_status s;
+
+		s = cds_ft_rekey_graft(ft, (const uint8_t *) RKS_SHORT,
+				sizeof(RKS_SHORT) - 1, (const uint8_t *) RKS_LONG,
+				sizeof(RKS_LONG) - 1);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "inv_rekey_shorter_reanchor: long->short: "
+				"%s\n", cds_ft_status_to_string(s));
+			atomic_fetch_add(&violation_count, 1);
+			break;
+		}
+		rcu_quiescent_state();
+		s = cds_ft_rekey_graft(ft, (const uint8_t *) RKS_LONG,
+				sizeof(RKS_LONG) - 1, (const uint8_t *) RKS_SHORT,
+				sizeof(RKS_SHORT) - 1);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "inv_rekey_shorter_reanchor: short->long: "
+				"%s\n", cds_ft_status_to_string(s));
+			atomic_fetch_add(&violation_count, 1);
+			break;
+		}
+		rcu_quiescent_state();
+		rks_moves += 2;
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int rks_run(bool rank)
+{
+	struct cds_ft_group_attr *gattr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct rks_reader_arg rargs[2 * NR_READERS_DEFAULT];
+	pthread_t readers[2 * NR_READERS_DEFAULT], writer;
+	struct timespec t0;
+	unsigned long ops = 0, ms;
+	const char *env = getenv("FT_INV_REKEY_SHORTER_MS");
+	unsigned int i;
+	int ret = 0;
+
+	ms = env ? strtoul(env, NULL, 10) : DEFAULT_DURATION_MS;
+	if (cds_ft_group_attr_create(&gattr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_max_key_len(gattr, 32) < 0 ||
+	    cds_ft_group_attr_set_ordered_list(gattr, true) < 0 ||
+	    cds_ft_group_attr_set_rekey(gattr, true) < 0 ||
+	    (rank && cds_ft_group_attr_set_rank_stats(gattr, true) < 0))
+		abort();
+	if (cds_ft_group_create(gattr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(gattr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+
+	rcu_read_lock();
+	for (i = 0; i < RKS_NSUF; i++) {
+		uint8_t k[32];
+		size_t kl = sizeof(RKS_LONG) - 1;
+		struct ft_test_node *n = node_alloc(i);
+
+		memcpy(k, RKS_LONG, kl);
+		memcpy(k + kl, rks_suffixes[i], strlen(rks_suffixes[i]));
+		kl += strlen(rks_suffixes[i]);
+		if (cds_ft_insert(ft, k, kl, &n->node) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	if (cds_ft_insert(ft, (const uint8_t *) "Z1", 2,
+			&node_alloc(99)->node) != CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_unlock();
+
+	rks_moves = 0;
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < 2 * NR_READERS_DEFAULT; i++) {
+		rargs[i].ft = ft;
+		rargs[i].id = i;
+		rargs[i].ops = 0;
+		pthread_create(&readers[i], NULL, rks_reader, &rargs[i]);
+	}
+	pthread_create(&writer, NULL, rks_writer, ft);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < (long) ms)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	pthread_join(writer, NULL);
+	for (i = 0; i < 2 * NR_READERS_DEFAULT; i++) {
+		pthread_join(readers[i], NULL);
+		ops += rargs[i].ops;
+	}
+	rcu_thread_online();
+
+	rcu_read_lock();
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+	    cds_ft_count_keys(ft) != RKS_NSUF + 1) {
+		fprintf(stderr, "inv_rekey_shorter_reanchor: final trie wrong "
+			"(count %lu)\n", cds_ft_count_keys(ft));
+		ret = -1;
+	}
+	rcu_read_unlock();
+	fprintf(stderr, "# inv_rekey_shorter_reanchor[%s]: moves=%lu reader "
+		"rounds=%lu violations=%lu -> %s\n", rank ? "rank" : "plain",
+		rks_moves, ops, atomic_load(&violation_count),
+		(ret || atomic_load(&violation_count)) ? "RED" : "ok");
+	if (atomic_load(&violation_count) > 0 || !rks_moves)
+		ret = -1;
+
+	drain_trie_local(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int inv_rekey_shorter_reanchor(void)
+{
+	int ret = rks_run(false);
+
+	return rks_run(true) | ret;
+}
+
+/* ================================================================== */
+/*                                                                    */
 /*   INVARIANT 12: Merge into a COMPRESSED dst merge point never       */
 /*   escapes (the M_slot skip-encoded interior publish via flip proxy) */
 /*                                                                    */
@@ -28909,6 +29252,9 @@ int main(int argc, char **argv)
 
 	diag("11c. Same-trie rekey never escapes / corrupts");
 	RUN_TEST(inv_rekey_no_escape);
+
+	diag("11d. A rekey to a shorter key does not strand a reader");
+	RUN_TEST(inv_rekey_shorter_reanchor);
 
 	diag("12. Merge into a compressed destination never escapes");
 	RUN_TEST(inv_merge_compressed_dst_no_escape);

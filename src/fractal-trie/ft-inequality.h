@@ -314,6 +314,26 @@ enum ft_descent_action ft_inequality_minmax_compressed(
 }
 
 /*
+ * A climb in ft_ineq_descend ran out of ancestors before it reached its
+ * level.  On a trie at rest that cannot happen: the climb stops at or
+ * below the scope's prefix, never above the root.  It happens to a pass
+ * that straddles a move to a key of a different length (see struct
+ * ft_visit_witness).  Only the coherent two-pass runs during a move, and
+ * it passes a witness.  So tear the witness and end the pass.  Without a
+ * witness this is a bug: assert, and fail the lookup rather than
+ * dereference NULL.
+ */
+#define FT_INEQ_CLIMB_TORN()						\
+	do {								\
+		assert(wit);						\
+		if (wit)						\
+			ft_witness_tear(wit);				\
+		iter->node = NULL;					\
+		iter->status = CDS_FT_STATUS_NOT_FOUND;			\
+		goto end;						\
+	} while (0)
+
+/*
  * Tier-2 inequality descent.  It does the relational key seek
  * (LE/GE/LT/GT/first/last) and the up/down tree traversal which the seek
  * uses to cross subtree boundaries.
@@ -1161,8 +1181,10 @@ going_up:
 			if (wit)		/* the climb */
 				ft_witness_visit(wit, ft_node_ptr(up_node));
 			gp = ft_get_parent_rcu(ft, up_node);
+			if (caa_unlikely(!gp))
+				FT_INEQ_CLIMB_TORN();
 
-			up_node_lo -= (gp && ft_node_compressed(gp)) ?
+			up_node_lo -= ft_node_compressed(gp) ?
 				(ssize_t) ft_compressed_node_ptr(gp)->len : 1;
 			up_node = gp;
 		}
@@ -1184,6 +1206,9 @@ going_up:
 			up_parent_lo = up_node_lo;
 		} else {
 			up_parent = ft_get_parent_rcu(ft, up_node);
+			if (caa_unlikely(!up_parent &&
+					level > (ssize_t) iter->prefix_len))
+				FT_INEQ_CLIMB_TORN();
 			up_parent_lo = (up_parent && ft_node_compressed(up_parent)) ?
 				level - (ssize_t) ft_compressed_node_ptr(up_parent)->len :
 				level - 1;
@@ -1204,7 +1229,9 @@ going_up:
 					struct cds_ft_inode_flag *gp =
 						ft_get_parent_rcu(ft, up_parent);
 
-					up_parent_lo -= (gp && ft_node_compressed(gp)) ?
+					if (caa_unlikely(!gp))
+						FT_INEQ_CLIMB_TORN();
+					up_parent_lo -= ft_node_compressed(gp) ?
 						(ssize_t) ft_compressed_node_ptr(gp)->len : 1;
 					up_parent = gp;
 				}

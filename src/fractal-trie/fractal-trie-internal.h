@@ -4674,10 +4674,20 @@ void ft_writer_lock_gp_wait(struct cds_ft *ft)
  *   - order-sensitive: two passes over an unchanged structure visit the same
  *     nodes in the same order.
  * A hash collision would accept a torn pass, at ~2^-64 per comparison.
+ *
+ * @torn marks a pass that could not finish.  A walk that climbs parent
+ * pointers counts levels from the depth it descended to.  A move to a key
+ * of a different length re-parents the moved nodes at a new depth.  So a
+ * pass that straddles such a move can run out of ancestors before it
+ * reaches its level.  It then stops and tears its witness, and a torn
+ * witness never compares equal.  Such a pass always crossed the move's
+ * fresh copy, so the retry it forces is the one the address compare would
+ * have forced had the pass finished.
  */
 struct ft_visit_witness {
 	uint64_t h;
 	unsigned long n;
+	bool torn;
 };
 
 static inline
@@ -4685,6 +4695,13 @@ void ft_witness_init(struct ft_visit_witness *w)
 {
 	w->h = 0xcbf29ce484222325ULL;	/* FNV-1a offset basis */
 	w->n = 0;
+	w->torn = false;
+}
+
+static inline
+void ft_witness_tear(struct ft_visit_witness *w)
+{
+	w->torn = true;
 }
 
 static inline
@@ -4709,7 +4726,7 @@ static inline
 bool ft_witness_equal(const struct ft_visit_witness *a,
 		const struct ft_visit_witness *b)
 {
-	return a->h == b->h && a->n == b->n;
+	return !a->torn && !b->torn && a->h == b->h && a->n == b->n;
 }
 
 /*
