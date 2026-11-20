@@ -715,109 +715,130 @@ run_one() {	# $1=name $2=tests $3=spacings $4=cppflags -- build lib+tests, run T
 
 run_spacing() {	# $1=name $2=tests $3=spacing $4=outfile -- every leg at ONE spacing
 	local name=$1 tests=$2 sp=$3 out=$4
+	local t rep
+	: > "$out"
+	# REPEAT: an intermittent defect is a coin flip at one run.  The two
+	# measured instances of the raw-read class fired at ~10% and ~8%, so a
+	# single green leg is not evidence.  Opt-in (default 1) because it
+	# multiplies the whole matrix; use it when hunting, not on every commit.
+	#
+	# The legs of one config run IN PARALLEL.  They are separate processes
+	# with separate cwds over one read-only build, like the spacings above.
+	# Run one after another, a config's wall time was the SUM of its legs,
+	# and the machine sat mostly idle (measured: 14% busy on 384 CPUs).
+	# Each leg writes its own result file.  They are joined in DECLARED
+	# order, for the same reason as the spacing files.
+	for rep in $(seq 1 "${FT_GATE_REPEAT:-1}"); do
+	for t in $tests; do
+		run_test_leg "$name" "$t" "$sp" "$rep" "$out.$rep.$t" &
+	done
+	done
+	wait
+	for rep in $(seq 1 "${FT_GATE_REPEAT:-1}"); do
+	for t in $tests; do
+		cat "$out.$rep.$t" >> "$out" 2>/dev/null
+		rm -f "$out.$rep.$t"
+	done
+	done
+}
+
+run_test_leg() {	# $1=name $2=test $3=spacing $4=rep $5=outfile -- ONE leg
+	local name=$1 t=$2 sp=$3 rep=$4 out=$5
 	local dir=$GATE/$name
 	local LIB=$dir/src/.libs U=$dir/tests/unit/.libs/test_urcu_ft_unit
 	local I=$dir/tests/regression/.libs/test_urcu_ft_inv
 	local IM=$dir/tests/regression/.libs/test_urcu_ft_inv_memb
 	local SP=$dir/tests/unit/.libs/test_rcu_txn_settle_premise
 	local cores=$GATE/$name.cores
-	local t o ok notok abrt lbl rc plan ran rep cdir bin tmo c mem
+	local o ok notok abrt lbl rc plan ran cdir bin tmo c mem
 	local env_x
 	: > "$out"
-	# REPEAT: an intermittent defect is a coin flip at one run.  The two
-	# measured instances of the raw-read class fired at ~10% and ~8%, so a
-	# single green leg is not evidence.  Opt-in (default 1) because it
-	# multiplies the whole matrix; use it when hunting, not on every commit.
-	for rep in $(seq 1 "${FT_GATE_REPEAT:-1}"); do
-	for t in $tests; do
-		cdir=$cores/$sp-$t-$rep
-		mkdir -p "$cdir"
-		# The multi-process arm reports per copy and keeps its own cores, so
-		# it bypasses the single-process parsing below entirely.
-		if [ "$t" = imwx ]; then
-			run_leg_multi "$name" "$cdir" "$sp" "$I" "$LIB" "$out"
-			continue
+	cdir=$cores/$sp-$t-$rep
+	mkdir -p "$cdir"
+	# The multi-process arm reports per copy and keeps its own cores, so
+	# it bypasses the single-process parsing below entirely.
+	if [ "$t" = imwx ]; then
+		run_leg_multi "$name" "$cdir" "$sp" "$I" "$LIB" "$out"
+		return 0
+	fi
+	case $t in
+	u)    bin=$U; tmo=900;  lbl="ft_unit   "; env_x=() mem=$FT_GATE_MEM_U ;;
+	ion)  bin=$I; tmo=300;  lbl="ft_inv on "; env_x=() mem=$FT_GATE_MEM_INV ;;
+	ioff) bin=$I; tmo=300;  lbl="ft_inv off"; env_x=(FT_INV_NO_ORDERED_LIST=1) mem=$FT_GATE_MEM_INV ;;
+	# The concurrent-writer oracles (MW writers, coherent rekey) all
+	# gate on FT_INV_MW at runtime and are otherwise skipped, so ion
+	# / ioff never exercise them.  They are the long leg -- hence the
+	# larger timeout.
+	imw)  bin=$I; tmo=1800; lbl="ft_inv mw "; env_x=(FT_INV_MW=1) mem=$FT_GATE_MEM_IMW ;;
+	# The same oracles on urcu-memb, where a read-side section is
+	# real.  A section held across a grace period hangs or stalls
+	# reclaim here; under QSBR it is invisible.
+	imb)  bin=$IM; tmo=1800; lbl="ft_inv memb"; env_x=(FT_INV_MW=1) mem=$FT_GATE_MEM_IMW ;;
+	# The settle-premise DETECTOR's own validation.  It belongs to a
+	# config that DEFINES -DURCU_TXN_DEBUG_SETTLE and nowhere else:
+	# without the flag it skips, and a detector whose self-test only
+	# ever skips is indistinguishable from one that is blind.  It
+	# constructs its violation rather than waiting for one, so it is
+	# ~20 ms and carries no spacing dependence.
+	sp)   bin=$SP; tmo=120; lbl="txn settle"; env_x=() mem=$FT_GATE_MEM_SP ;;
+	esac
+	o=$(run_leg "$cdir" "$tmo" "$mem" env LD_LIBRARY_PATH="$LIB" \
+		${env_x[@]+"${env_x[@]}"} "$bin"); rc=$?
+	# The SPACING rides every label below: a red that names only the
+	# suite is unattributable when three spacings run the same leg.
+	lbl="$lbl $sp"
+	ok=$(printf '%s' "$o" | grep -c '^ok ')
+	notok=$(printf '%s' "$o" | grep -c '^not ok ')
+	abrt=$(printf '%s' "$o" | grep -c -i 'assert')
+	printf '  [%-11s] %s ok=%s notok=%s abrt=%s\n' "$name" "$lbl" "$ok" "$notok" "$abrt" >> "$out"
+	# NAME the failures, do not just count them.  An INTERMITTENT red is
+	# unattributable from a count alone: you cannot tell a known flake
+	# from a new regression without re-running and hoping it recurs.
+	# (Cost real time once: a fault-audit red that never reproduced.)
+	if [ "$notok" -gt 0 ]; then
+		printf '%s' "$o" | grep '^not ok ' | sed "s/^/      [$name] $lbl /" >> "$out"
+	fi
+	# A HUNG suite used to score GREEN.  The run is killed, its PARTIAL
+	# ok-count is reported, and with no 'not ok ' line and no abort the
+	# config passed -- so a single-threaded DLM self-deadlock rode in on
+	# a "GATE PASS" while dlm's ft_unit silently fell from 290 tests to
+	# 36.  The count drop was the only signal and nothing checked it.
+	# Two independent checks now, because each catches what the other
+	# misses: a non-zero exit (124 == timeout kill, or a crash after the
+	# last emitted line), and a run that never reached its TAP plan
+	# (self-maintaining -- the plan is the suite's own test count, so
+	# adding tests needs no gate update).
+	# Most-specific diagnosis first: a timeout and a plan shortfall have
+	# very different causes (hang vs retired-but-still-planned test), and
+	# libtap's exit_status() is planned-minus-run, so a bare "exit 3"
+	# would report the shortfall in its least legible form.
+	plan=$(printf '%s' "$o" | sed -n 's/^1\.\.\([0-9]\{1,\}\)$/\1/p' | head -1)
+	ran=$((ok + notok))
+	if [ "$rc" -eq 124 ]; then
+		echo "$name: $lbl INCOMPLETE (TIMEOUT/hang after $ran tests)" >> "$out"
+	elif [ "$rc" -gt 128 ]; then
+		echo "$name: $lbl INCOMPLETE (killed by signal $((rc - 128)) after $ran tests)" >> "$out"
+	elif [ -z "$plan" ]; then
+		echo "$name: $lbl NO TAP PLAN (completeness unverifiable)" >> "$out"
+	elif [ "$ran" -ne "$plan" ]; then
+		echo "$name: $lbl INCOMPLETE (ran $ran of $plan planned)" >> "$out"
+	elif [ "$rc" -ne 0 ]; then
+		echo "$name: $lbl NONZERO EXIT ($rc) with a complete run" >> "$out"
+	fi
+	# Keep this leg's directory iff it went red, and say where the core
+	# is (see the KEEP THE CORE note above).  "Red" is deliberately
+	# WIDER here than the RESULTS grep below: a leg killed by a timeout
+	# or a signal leaves a core too, and that core is the entire point
+	# of having kept the directory.
+	if [ "$notok" -gt 0 ] || [ "$abrt" -gt 0 ] || [ "$rc" -ne 0 ] \
+			|| [ -z "$plan" ] || [ "$ran" -ne "$plan" ]; then
+		c=$(ls "$cdir"/core* 2>/dev/null | head -1)
+		if [ -n "$c" ]; then
+			echo "$name: $lbl CORE kept -- LD_LIBRARY_PATH=$LIB gdb $bin $c" >> "$out"
 		fi
-		case $t in
-		u)    bin=$U; tmo=900;  lbl="ft_unit   "; env_x=() mem=$FT_GATE_MEM_U ;;
-		ion)  bin=$I; tmo=300;  lbl="ft_inv on "; env_x=() mem=$FT_GATE_MEM_INV ;;
-		ioff) bin=$I; tmo=300;  lbl="ft_inv off"; env_x=(FT_INV_NO_ORDERED_LIST=1) mem=$FT_GATE_MEM_INV ;;
-		# The concurrent-writer oracles (MW writers, coherent rekey) all
-		# gate on FT_INV_MW at runtime and are otherwise skipped, so ion
-		# / ioff never exercise them.  They are the long leg -- hence the
-		# larger timeout.
-		imw)  bin=$I; tmo=1800; lbl="ft_inv mw "; env_x=(FT_INV_MW=1) mem=$FT_GATE_MEM_IMW ;;
-		# The same oracles on urcu-memb, where a read-side section is
-		# real.  A section held across a grace period hangs or stalls
-		# reclaim here; under QSBR it is invisible.
-		imb)  bin=$IM; tmo=1800; lbl="ft_inv memb"; env_x=(FT_INV_MW=1) mem=$FT_GATE_MEM_IMW ;;
-		# The settle-premise DETECTOR's own validation.  It belongs to a
-		# config that DEFINES -DURCU_TXN_DEBUG_SETTLE and nowhere else:
-		# without the flag it skips, and a detector whose self-test only
-		# ever skips is indistinguishable from one that is blind.  It
-		# constructs its violation rather than waiting for one, so it is
-		# ~20 ms and carries no spacing dependence.
-		sp)   bin=$SP; tmo=120; lbl="txn settle"; env_x=() mem=$FT_GATE_MEM_SP ;;
-		esac
-		o=$(run_leg "$cdir" "$tmo" "$mem" env LD_LIBRARY_PATH="$LIB" \
-			${env_x[@]+"${env_x[@]}"} "$bin"); rc=$?
-		# The SPACING rides every label below: a red that names only the
-		# suite is unattributable when three spacings run the same leg.
-		lbl="$lbl $sp"
-		ok=$(printf '%s' "$o" | grep -c '^ok ')
-		notok=$(printf '%s' "$o" | grep -c '^not ok ')
-		abrt=$(printf '%s' "$o" | grep -c -i 'assert')
-		printf '  [%-11s] %s ok=%s notok=%s abrt=%s\n' "$name" "$lbl" "$ok" "$notok" "$abrt" >> "$out"
-		# NAME the failures, do not just count them.  An INTERMITTENT red is
-		# unattributable from a count alone: you cannot tell a known flake
-		# from a new regression without re-running and hoping it recurs.
-		# (Cost real time once: a fault-audit red that never reproduced.)
-		if [ "$notok" -gt 0 ]; then
-			printf '%s' "$o" | grep '^not ok ' | sed "s/^/      [$name] $lbl /" >> "$out"
-		fi
-		# A HUNG suite used to score GREEN.  The run is killed, its PARTIAL
-		# ok-count is reported, and with no 'not ok ' line and no abort the
-		# config passed -- so a single-threaded DLM self-deadlock rode in on
-		# a "GATE PASS" while dlm's ft_unit silently fell from 290 tests to
-		# 36.  The count drop was the only signal and nothing checked it.
-		# Two independent checks now, because each catches what the other
-		# misses: a non-zero exit (124 == timeout kill, or a crash after the
-		# last emitted line), and a run that never reached its TAP plan
-		# (self-maintaining -- the plan is the suite's own test count, so
-		# adding tests needs no gate update).
-		# Most-specific diagnosis first: a timeout and a plan shortfall have
-		# very different causes (hang vs retired-but-still-planned test), and
-		# libtap's exit_status() is planned-minus-run, so a bare "exit 3"
-		# would report the shortfall in its least legible form.
-		plan=$(printf '%s' "$o" | sed -n 's/^1\.\.\([0-9]\{1,\}\)$/\1/p' | head -1)
-		ran=$((ok + notok))
-		if [ "$rc" -eq 124 ]; then
-			echo "$name: $lbl INCOMPLETE (TIMEOUT/hang after $ran tests)" >> "$out"
-		elif [ "$rc" -gt 128 ]; then
-			echo "$name: $lbl INCOMPLETE (killed by signal $((rc - 128)) after $ran tests)" >> "$out"
-		elif [ -z "$plan" ]; then
-			echo "$name: $lbl NO TAP PLAN (completeness unverifiable)" >> "$out"
-		elif [ "$ran" -ne "$plan" ]; then
-			echo "$name: $lbl INCOMPLETE (ran $ran of $plan planned)" >> "$out"
-		elif [ "$rc" -ne 0 ]; then
-			echo "$name: $lbl NONZERO EXIT ($rc) with a complete run" >> "$out"
-		fi
-		# Keep this leg's directory iff it went red, and say where the core
-		# is (see the KEEP THE CORE note above).  "Red" is deliberately
-		# WIDER here than the RESULTS grep below: a leg killed by a timeout
-		# or a signal leaves a core too, and that core is the entire point
-		# of having kept the directory.
-		if [ "$notok" -gt 0 ] || [ "$abrt" -gt 0 ] || [ "$rc" -ne 0 ] \
-				|| [ -z "$plan" ] || [ "$ran" -ne "$plan" ]; then
-			c=$(ls "$cdir"/core* 2>/dev/null | head -1)
-			if [ -n "$c" ]; then
-				echo "$name: $lbl CORE kept -- LD_LIBRARY_PATH=$LIB gdb $bin $c" >> "$out"
-			fi
-		else
-			rm -rf "$cdir"
-		fi
-	done
-	done
+	else
+		rm -rf "$cdir"
+	fi
 }
 
 echo "gate dir : $GATE   (-j$J x ${#CONFIGS[@]} configs on $NCPU cores)"
