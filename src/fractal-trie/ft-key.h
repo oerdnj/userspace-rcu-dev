@@ -109,9 +109,9 @@ int ft_word_mismatch(unsigned long va, unsigned long vb,
  * Returns 0 when equal, non-zero when unequal.
  *
  * @signed_cmp: when true, the return value encodes lexicographic
- *   order (<0 means a < b, >0 means a > b).  When false, any
- *   non-zero value may be returned (allows the compiler to
- *   eliminate the bswap).
+ *   order.  <0 means a < b, and >0 means a > b.  When false, any
+ *   non-zero value may be returned.  This lets the compiler
+ *   eliminate the bswap.
  *
  * @mismatch_pos: when non-NULL, receives the index of the first
  *   mismatching byte (undefined on full match).  Gates the
@@ -122,16 +122,15 @@ int ft_word_mismatch(unsigned long va, unsigned long vb,
  * function is force-inlined, both @signed_cmp and @mismatch_pos
  * checks are constant-folded at each call site.
  *
- * Dispatch is ordered by frequency: short keys (< 8 bytes) are the
- * most common case in trie traversal (compressed paths), followed
- * by medium keys, then long keys where SIMD helps.
+ * Dispatch is ordered by frequency.  Short keys (< 8 bytes) are the
+ * most common case in trie traversal (compressed paths).  Medium
+ * keys come next.  Long keys, where SIMD helps, come last.
  */
 
 /*
- * Helper: resolve a mismatch found at byte position @pos by
- * loading a full word from each array at that position and
- * delegating to ft_word_mismatch.  The word load is safe because
- * @remaining_key guarantees enough readable memory.
+ * Helper: resolve a mismatch found at byte position @pos.  Store
+ * @pos in *@mismatch_pos when it is non-NULL.  Return the byte
+ * difference when @signed_cmp is true, else 1.
  */
 static inline_lookup
 int ft_byte_mismatch(const uint8_t *a, const uint8_t *b,
@@ -357,15 +356,15 @@ int ft_cmp_short_unmasked_sse2(const uint8_t *a, const uint8_t *b,
  * AVX-512 short-key compare for 1 <= len <= 32 (BW + VL).
  *
  * Predicated load on BOTH sides + predicated compare.  The k-mask
- * gates which byte lanes each load fetches -- bytes outside the mask
- * are NOT read from memory (architectural guarantee in Intel SDM
- * and AMD APM for AVX-512 masked memory operands).  Page-cross safe
- * on both pointers by construction; no runtime check, no
- * @readable_bytes contract needed beyond @readable_bytes >= @len.
+ * gates which byte lanes each load fetches.  Bytes outside the mask
+ * are NOT read from memory.  The Intel SDM and the AMD APM guarantee
+ * this for AVX-512 masked memory operands.  So both pointers are
+ * page-cross safe by construction, with no runtime check.  The
+ * @readable_bytes contract needs nothing beyond @readable_bytes >= @len.
  *
- * Cheaper than the AVX2 fallback (no page-cross branch, no separate
- * mask-and-result step) and matches what glibc's __memcmp_evex_movbe
- * emits for len <= 32.
+ * This is cheaper than the AVX2 fallback.  It has no page-cross branch
+ * and no separate mask-and-result step.  It matches what glibc's
+ * __memcmp_evex_movbe emits for len <= 32.
  */
 static inline_lookup
 int ft_cmp_short_avx512(const uint8_t *a, const uint8_t *b,
@@ -388,19 +387,19 @@ int ft_cmp_short_avx512(const uint8_t *a, const uint8_t *b,
 /*
  * Page-cross-safe single-vector compare for 16 <= len <= 31.
  *
- * Loads 32 bytes from both pointers, compares all 32, masks the
- * result to the first @len lanes.  Reading 7-15 bytes past the
+ * Load 32 bytes from both pointers and compare all 32.  Then mask
+ * the result to the first @len lanes.  Reading 1-16 bytes past the
  * requested length is safe iff neither pointer is in the last 32
- * bytes of its 4 KB page -- the page-cross check below.  If the
- * check fails, fall back to the overlapping-pair SSE2 path which
- * never reads past byte @len-1.
+ * bytes of its 4 KB page.  The page-cross check below tests that.
+ * If the check fails, fall back to the overlapping-pair SSE2 path.
+ * That path never reads past byte @len-1.
  *
- * The branch is highly predictable: in practice both @a and @b
- * are typically in the first ~4000 bytes of their pages (slot
- * bodies start CL-aligned and never span pages for our slot
- * sizes), so the fast path is taken essentially 100% of the time.
+ * The branch is highly predictable.  In practice both @a and @b
+ * are typically in the first ~4000 bytes of their pages.  Slot
+ * bodies start CL-aligned and never span pages for our slot sizes.
+ * So the fast path is taken essentially 100% of the time.
  *
- * Used only when AVX-512 BW+VL is not available; the AVX-512 path
+ * Used only when AVX-512 BW+VL is not available.  The AVX-512 path
  * above does the same job without the page-cross check.
  */
 static inline_lookup
