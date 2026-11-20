@@ -92,10 +92,10 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 	 * holds the forward edge, the SKIP_X dual for a compressed parent, and
 	 * the tombstone.
 	 *
-	 * The reservation comes first because ft_node_recompact eagerly
-	 * re-parents the rebuilt node's children.  That re-parent is a point of
-	 * no return: a clean _try abort would orphan the children onto an
-	 * unpublished node.  So the commit must be infallible.
+	 * The reservation comes first because ft_node_recompact records into
+	 * it.  The copied slots and the children's re-parent
+	 * (ft_reparent_record) ride this txn, so they flip in the same commit
+	 * as the forward publish.
 	 *
 	 * A non-compressed parent was formerly a lone on-stack forward store.
 	 * It is now a 2-edge flip (forward + tombstone).
@@ -182,10 +182,8 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 	 * the OLD copy, so the free below would reclaim a node that is still
 	 * reader-reachable.
 	 *
-	 * Nor can this site bail instead.  ft_node_recompact has already
-	 * re-parented the children onto the fresh copy.  The reservation
-	 * comment above calls that the point of no return.  Leaving the node
-	 * in place would strand the children on a node no slot points at.
+	 * Nor does this site bail instead.  No bail path is written for an
+	 * aborted commit, because the exclusion makes one unreachable.
 	 *
 	 * So the commit MUST be infallible here, which is exactly what the
 	 * exclusion buys.  ASSERT the claim rather than discard the status.
