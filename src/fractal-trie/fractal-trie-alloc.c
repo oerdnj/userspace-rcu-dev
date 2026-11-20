@@ -5,22 +5,23 @@
 /*
  * RCU Fractal Trie allocator for internal nodes.
  *
- * This allocator maximizes cache and TLB locality for read-side fast
- * paths (lookups and traversals) by separating item data from metadata:
- * they sit on different cache lines and, because each range places the
- * item array and the metadata array in separate pages (see the layout
- * below), in different pages -- so a lookup or traversal that touches
- * only item data keeps the metadata pages out of its DTLB working set.
+ * This allocator maximizes cache and TLB locality for the read-side fast
+ * paths (lookups and traversals).  It separates item data from metadata:
  *
- * A consequence of this data/metadata separation is that resident
- * memory (RSS) overstates the cache-hot working set: a lookup or
- * ordered traversal touches only the densely-packed item region, never
- * the metadata (or bitmap) regions, so the Fractal Trie keeps a denser
- * cache-hot set than other trie implementations even though its RSS is
- * higher.
+ *   - They sit on different cache lines.
+ *   - They sit in different pages.  Each range places the item array and
+ *     the metadata array in separate pages (see the layout below).
  *
- * This is achieved using a strided allocation approach with the
- * following layout:
+ * A lookup or ordered traversal touches only the densely-packed item
+ * region.  It never touches the metadata or bitmap regions.  This has two
+ * consequences:
+ *
+ *   - The metadata pages stay out of the DTLB working set of the reader.
+ *   - Resident memory (RSS) overstates the cache-hot working set.  The
+ *     Fractal Trie keeps a denser cache-hot set than other trie
+ *     implementations, even though its RSS is higher.
+ *
+ * The allocator achieves this with a strided allocation.
  *
  * Layout of allocation arena ranges for read-side items of size
  * item_len (power of 2):
@@ -70,20 +71,23 @@ static void ft_dbg_arena_mutex_lock(pthread_mutex_t *m)
 #include "urcu-utils.h"
 
 /*
- * Superblock size for the bump-allocator backing range_create.  Each
- * arena owns a list of superblocks; ranges are carved out of the head
- * superblock with a bump pointer, and a new superblock is mmap'd when
- * the head fills up.  Sized large enough that VMA fragmentation is
- * negligible and small enough to avoid wasting address space on tiny
+ * Superblock size for the bump-allocator backing range_create.
+ *
+ * Each arena owns a list of superblocks.  Ranges are carved out of the
+ * head superblock with a bump pointer.  A new superblock is mmap'd when
+ * the head fills up.  The size is large enough that VMA fragmentation is
+ * negligible.  It is small enough to avoid wasting address space on tiny
  * tries.
  *
- * The mmap is MAP_NORESERVE (lazily faulted), so a superblock costs its
- * full size in VIRTUAL address space but almost no physical memory.  On
- * 32-bit a process has only ~3 GiB of address space, and a bulk op's node
- * reserve eagerly creates one arena (hence one superblock) per node order
- * and kind -- a dozen 64 MiB superblocks would exhaust it.  So keep the
- * 32-bit superblock small; the slightly-more-frequent mmap is irrelevant
- * next to staying inside the address space.
+ * The mmap is MAP_NORESERVE (lazily faulted).  So a superblock costs its
+ * full size in VIRTUAL address space but almost no physical memory.
+ *
+ * On 32-bit, a process has only ~3 GiB of address space.  A bulk op's
+ * node reserve eagerly creates one arena per node order and kind, hence
+ * one superblock each.  A dozen 64 MiB superblocks would exhaust the
+ * address space.  So keep the 32-bit superblock small.  The mmap calls
+ * are slightly more frequent.  That does not matter next to staying
+ * inside the address space.
  */
 #ifndef FT_SUPERBLOCK_SIZE
 # if (CAA_BITS_PER_LONG < 64)
@@ -119,22 +123,30 @@ struct cds_ft_alloc_arena {
 	size_t item_len_order;
 	size_t max_nr_items_per_range;
 	/*
-	 * Ranges that currently hold reusable freed slots (i.e. whose
-	 * per-range free_list_head != NULL), MRU-ordered: cds_ft_do_free_item
-	 * moves a freed-into range to the head so the next allocation reuses
-	 * the hottest just-freed slot (recovering the locality the former
-	 * single per-arena freelist provided).  Keeping freelists per range
-	 * lets a drained range be reclaimed in O(1) without a shared-list walk.
+	 * Ranges that currently hold reusable freed slots, in MRU order.
+	 * These are the ranges whose per-range free_list_head != NULL.
+	 *
+	 * cds_ft_do_free_item moves a range to the head when a slot is
+	 * freed into it.  So the next allocation reuses the hottest
+	 * just-freed slot.  This recovers the locality that the former
+	 * single per-arena freelist provided.
+	 *
+	 * Freelists are kept per range so that a drained range can be
+	 * reclaimed in O(1), without a walk of a shared list.
 	 */
 	struct cds_list_head partial_ranges;
 	/*
-	 * Reclaimed ranges available for reuse.  When a range fills then
-	 * fully drains, its node-body region is released with MADV_DONTNEED
-	 * (see ft_arena_reclaim_range) and the range is parked here;
-	 * range_create recycles it before allocating fresh, avoiding a new
-	 * mmap and re-applying the NUMA/THP policy.  Both layouts use this:
-	 * a far range could instead be munmap'd to also return its VA, but
-	 * recycling avoids the munmap+mmap+re-policy churn on range turnover.
+	 * Reclaimed ranges available for reuse.
+	 *
+	 * When a range fills then fully drains, its node-body region is
+	 * released with MADV_DONTNEED (see ft_arena_reclaim_range).  The
+	 * range is then parked here.  range_create recycles it before it
+	 * allocates a fresh one.  This avoids a new mmap, and avoids
+	 * re-applying the NUMA/THP policy.
+	 *
+	 * Both layouts use this list.  A far range could instead be
+	 * munmap'd to also return its VA.  Recycling avoids the
+	 * munmap+mmap+re-policy churn on range turnover.
 	 */
 	struct cds_list_head free_ranges;
 	pthread_mutex_t lock;
@@ -148,9 +160,11 @@ static
 void *cds_ft_range_get_nth_item(struct cds_ft_alloc_range *range, size_t n)
 {
 	/*
-	 * Items occupy the page unit just before the range header: page_size in
-	 * the default layout, the leading 2 MiB of the macro under FT_FAR_METADATA
-	 * (range == macro base + 2 MiB).
+	 * Items occupy the page unit just before the range header:
+	 *
+	 *   - default layout: page_size;
+	 *   - FT_FAR_METADATA: the leading 2 MiB of the macro
+	 *     (range == macro base + 2 MiB).
 	 */
 	return (((char *) range) - FT_RANGE_PAGE_UNIT) + (n << range->arena->item_len_order);
 }
@@ -173,15 +187,21 @@ struct cds_ft_metadata *cds_ft_item_to_metadata(void *p)
 	struct cds_ft_alloc_range *range;
 
 	/*
-	 * @p must be a NODE, not a parked transaction proxy.  This is the choke
-	 * point for "treat this word as an arena item", and the very next line
-	 * dereferences the range header derived from it -- so a caller that read
-	 * a transacted slot RAW and handed the parked proxy (a descriptor-record
-	 * POINTER carrying the whole in-band tag) straight here faults on foreign
-	 * memory, with nothing in the backtrace naming the raw read.  An arena
-	 * item is (1 << item_len_order)-aligned and can never carry the whole
-	 * tag, so this only ever fires on that mistake.  Resolve the slot
-	 * (ft_resolve_flip_proxy / urcu_txn_load) before naming a node.
+	 * @p must be a NODE, not a parked transaction proxy.
+	 *
+	 * This is the choke point for "treat this word as an arena item".
+	 * The very next line dereferences the range header derived from @p.
+	 *
+	 * The mistake this assert catches: a caller reads a transacted slot
+	 * RAW and hands the parked proxy straight here.  The proxy is a
+	 * descriptor-record POINTER that carries the whole in-band tag.
+	 * Without the assert, that caller faults on foreign memory, and
+	 * nothing in the backtrace names the raw read.
+	 *
+	 * An arena item is (1 << item_len_order)-aligned and can never carry
+	 * the whole tag.  So the assert only ever fires on that mistake.
+	 * Resolve the slot (ft_resolve_flip_proxy / urcu_txn_load) before
+	 * naming a node.
 	 */
 	assert(((uintptr_t) p & FT_PARENT_TAG_MASK) != FT_PARENT_TAG_MASK);
 	range = cds_ft_item_to_range(p);
@@ -219,19 +239,19 @@ size_t cds_ft_arena_range_alloc_size(size_t item_len_order, bool bitmap)
  * the calling thread's allowed NUMA nodes, applied at superblock
  * creation while no page is faulted yet.
  *
- * Enabled by default: the fractal trie targets workloads with many
- * concurrent readers traversing shared data, where spreading the
- * arena across NUMA nodes wins by a wide margin over concentrating
- * it on a single node via first-touch.  Set CDS_FT_NUMA_INTERLEAVE=0
- * to opt out and fall back to first-touch placement (useful for
- * workloads with thread-local working sets or for benchmarking
- * against the no-policy baseline).
+ * It is enabled by default.  The fractal trie targets workloads where
+ * many concurrent readers traverse shared data.  There, spreading the
+ * arena across NUMA nodes wins by a wide margin over first-touch, which
+ * concentrates it on a single node.
  *
- * Transparent hugepages are a separate, orthogonal concern handled per-arena
- * by ft_apply_thp_policy(): 2 MiB pages are advised ON for the internal node
- * arena (TLB win on the structured descent) and OFF for the external/leaf
- * arena (prefetch-pollution loss on random access).  The 2 MiB-granular
- * interleave below is about NUMA placement only and is unaffected by page size.
+ * Set CDS_FT_NUMA_INTERLEAVE=0 to opt out and fall back to first-touch
+ * placement.  This is useful for workloads with thread-local working
+ * sets, and for benchmarking against the no-policy baseline.
+ *
+ * Transparent hugepages are a separate, orthogonal concern.
+ * ft_apply_thp_policy() handles them per arena, from the cds_ft_optimize
+ * attribute.  The 2 MiB-granular interleave below is about NUMA placement
+ * only.  The page size does not affect it.
  */
 #ifdef __linux__
 /*
@@ -249,10 +269,12 @@ size_t cds_ft_arena_range_alloc_size(size_t item_len_order, bool bitmap)
 #define FT_NODEMASK_BITS_PER_LONG	(sizeof(unsigned long) * 8)
 /*
  * FT_NODEMASK_LONGS divides, so FT_MAX_NUMA_NODES must be a whole number of
- * words -- otherwise the nodemask[] array rounds DOWN and the
- * FT_MAX_NUMA_NODES-bounded scan in ft_apply_interleave reads past it.  (A
- * machine with more NUMA nodes than this ceiling makes get_mempolicy() return
- * EINVAL, which the caller already treats as "skip the interleave".)
+ * words.  Otherwise the nodemask[] array rounds DOWN.  The scan in
+ * ft_apply_interleave is bounded by FT_MAX_NUMA_NODES and would read past
+ * the array.
+ *
+ * A machine with more NUMA nodes than this ceiling makes get_mempolicy()
+ * return EINVAL.  The caller already treats that as "skip the interleave".
  */
 urcu_static_assert(FT_MAX_NUMA_NODES % (sizeof(unsigned long) * 8) == 0,
 		"FT_MAX_NUMA_NODES must be a whole number of words",
@@ -261,11 +283,14 @@ urcu_static_assert(FT_MAX_NUMA_NODES % (sizeof(unsigned long) * 8) == 0,
 
 /*
  * MADV_HUGEPAGE / MADV_NOHUGEPAGE (asm-generic/mman-common.h values 14/15).
- * glibc only exposes them under _GNU_SOURCE, so define them locally -- like
- * the FT_MPOL_* numbers above -- to guarantee ft_apply_thp_policy() can advise
- * THP per-arena regardless of the feature-test macros this translation unit
- * was built with.  Without these the madvise() silently compiles out and the
- * per-arena policy is NOT applied on a kernel with transparent_hugepage=always.
+ *
+ * glibc only exposes them under _GNU_SOURCE.  So define them locally, like
+ * the FT_MPOL_* numbers above.  This guarantees that ft_apply_thp_policy()
+ * can advise THP per arena, whatever feature-test macros this translation
+ * unit was built with.
+ *
+ * Without these the madvise() silently compiles out.  The per-arena policy
+ * is then NOT applied on a kernel with transparent_hugepage=always.
  */
 #ifndef MADV_NOHUGEPAGE
 #define MADV_NOHUGEPAGE		15
@@ -279,17 +304,22 @@ urcu_static_assert(FT_MAX_NUMA_NODES % (sizeof(unsigned long) * 8) == 0,
 
 /*
  * Whether MADV_DONTNEED on private anonymous memory zero-fills on refault.
- * Linux guarantees it (madvise(2): the range reads as zero-fill-on-demand
- * after MADV_DONTNEED), and the allocator relies on it -- a reclaimed range's
- * node-body region is released with MADV_DONTNEED and later handed back out by
- * the bump-allocation paths WITHOUT an explicit memset, trusting the refault
- * to read zero (a fresh node must start zeroed).  Platforms where
- * MADV_DONTNEED does NOT zero on refault (e.g. FreeBSD) keep the previous
- * life's bytes instead, so there the recycled body must be cleared on reuse;
- * ft_clear_recycled_slot does that when this is 0.
  *
- * NOTE: the non-Linux path is provided for correctness, but FT additionally
- * depends on Linux-only NUMA syscalls, so non-Linux support as a whole is
+ * Linux guarantees it.  madvise(2) says that the range reads as
+ * zero-fill-on-demand after MADV_DONTNEED.  The allocator relies on it:
+ *
+ *   - A reclaimed range's node-body region is released with MADV_DONTNEED.
+ *   - The bump-allocation paths later hand it back out WITHOUT an explicit
+ *     memset.  They trust the refault to read zero.  A fresh node must
+ *     start zeroed.
+ *
+ * Some platforms (e.g. FreeBSD) do NOT zero on refault after
+ * MADV_DONTNEED.  They keep the previous life's bytes instead.  There the
+ * recycled body must be cleared on reuse.  ft_clear_recycled_slot does
+ * that when this is 0.
+ *
+ * NOTE: the non-Linux path is provided for correctness.  But FT also
+ * depends on Linux-only NUMA syscalls.  So non-Linux support as a whole is
  * incomplete and UNTESTED.
  */
 #ifdef __linux__
@@ -310,10 +340,11 @@ urcu_static_assert(FT_MAX_NUMA_NODES % (sizeof(unsigned long) * 8) == 0,
 #endif
 
 /*
- * Returns 1 if the env var CDS_FT_NUMA_INTERLEAVE=0 is set -- a debug
- * override telling the library to skip ALL mbind() calls regardless of
- * group policy.  Defers entirely to whatever the kernel / process
- * policy decides.  Returns 0 otherwise.
+ * Return 1 if the env var CDS_FT_NUMA_INTERLEAVE=0 is set, 0 otherwise.
+ *
+ * The variable is a debug override.  It tells the library to skip ALL
+ * mbind() calls regardless of group policy.  Placement is then left
+ * entirely to whatever the kernel / process policy decides.
  */
 static
 int ft_interleave_env_forces_skip(void)
@@ -334,13 +365,18 @@ int ft_interleave_env_forces_skip(void)
 /*
  * Per-arena Transparent Huge Page (THP) policy for FT allocator mappings.
  *
- * Page size does NOT affect cache-line selection on this hardware: the L1 is
- * virtually indexed from the page offset, the L2/L3 (and the L3 slice hash)
- * are physically indexed, and a 2 MiB-vs-4 KiB mapping over the *same physical
- * frames* gives identical cache behaviour (verified by a same-frames
- * split-the-PMD experiment).  So THP is purely a TLB tradeoff, selected per
- * arena by the caller-supplied @huge (from the group / external-arena
- * cds_ft_optimize attribute; default CDS_FT_OPTIMIZE_THROUGHPUT -> huge):
+ * Page size does NOT affect cache-line selection on this hardware:
+ *
+ *   - The L1 is virtually indexed from the page offset.
+ *   - The L2/L3 (and the L3 slice hash) are physically indexed.
+ *   - A 2 MiB and a 4 KiB mapping over the *same physical frames* give
+ *     identical cache behaviour.  A same-frames split-the-PMD experiment
+ *     verified this.
+ *
+ * So THP is purely a TLB tradeoff.  The caller selects it per arena with
+ * @huge.  @huge comes from the cds_ft_optimize attribute of the group or
+ * of the external arena.  The default is CDS_FT_OPTIMIZE_THROUGHPUT, which
+ * means huge.
  *
  *   huge (THROUGHPUT) -> MADV_HUGEPAGE.  2 MiB pages cut DTLB misses ~1000x;
  *     on the internal node arena (structured descent, reused hot top) this is
@@ -351,9 +387,9 @@ int ft_interleave_env_forces_skip(void)
  *   !huge (RSS) -> MADV_NOHUGEPAGE.  4 KiB pages, no hugepage floor: a small /
  *     sparse trie faults only what it touches.  Right for many small tries.
  *
- * Advice only (no eager populate) so worker first-touch still places pages on
- * the local NUMA node; the 2 MiB-granular mbind interleave (ft_apply_interleave)
- * is orthogonal and unaffected.
+ * This is advice only, with no eager populate.  So worker first-touch still
+ * places pages on the local NUMA node.  The 2 MiB-granular mbind interleave
+ * (ft_apply_interleave) is orthogonal and unaffected.
  */
 static
 void ft_apply_thp_policy(void *base, size_t size, int huge)
@@ -387,36 +423,46 @@ int ft_query_process_mempolicy_mode(void)
 }
 
 /*
- * The process-wide position in the per-2 MiB-chunk node rotation.  A
- * per-REGION rotation restarted at the first allowed node every time, so
- * every region's first chunk was hard-bound to that one node -- and a
- * process whose arenas are mostly small (many groups, or node orders that
- * never grow past their first chunk) piled onto it under a strict
- * MPOL_BIND.  Measured 2026-09-26 on a 24-node box: 24 processes creating
- * groups in a loop filled node 0 (30 GB) while ~700 GB stayed free on the
- * other nodes, and the kernel's policy-constrained OOM killer took
- * processes machine-wide (a VM included).  Each region now reserves a
- * contiguous slice of one shared counter, so the chunks keep rotating
- * across regions, groups and threads.
+ * The process-wide position in the per-2 MiB-chunk node rotation.
+ *
+ * The rotation used to be per REGION.  It restarted at the first allowed
+ * node every time, so every region's first chunk was hard-bound to that
+ * one node.  Under a strict MPOL_BIND, a process whose arenas are mostly
+ * small piled onto that node.  Arenas are mostly small with many groups,
+ * or with node orders that never grow past their first chunk.
+ *
+ * Measured 2026-09-26 on a 24-node box, with 24 processes creating groups
+ * in a loop:
+ *
+ *   - Node 0 filled up (30 GB) while ~700 GB stayed free on the other
+ *     nodes.
+ *   - The kernel's policy-constrained OOM killer took processes
+ *     machine-wide (a VM included).
+ *
+ * Each region now reserves a contiguous slice of one shared counter.  So
+ * the chunks keep rotating across regions, groups and threads.
  */
 static unsigned long ft_interleave_next_chunk;
 
 /*
  * Apply the configured NUMA placement policy to the @size bytes at
- * @base.  Three policies, all subject to the CDS_FT_NUMA_INTERLEAVE=0
- * env var (which forces a skip):
+ * @base.  There are three policies.  The CDS_FT_NUMA_INTERLEAVE=0 env
+ * var forces a skip of all three.
  *
  *   - CDS_FT_NUMA_INTERLEAVE: per-2 MiB-chunk mbind(MPOL_BIND) round-
  *     robin across the calling thread's allowed nodes.  Binding whole
- *     2 MiB spans (rather than the kernel's 4 KiB-fine interleave) keeps
- *     contiguous virtual ranges node-local, which the hardware
- *     prefetcher and NUMA locality favour -- this coarse granularity is
- *     the measured win.  (FT pages stay 4 KiB; THP is disabled, see
- *     ft_apply_thp_policy.)  Falls back to whole-region MPOL_INTERLEAVE at
- *     native page granularity when @base isn't 2 MiB-aligned, the region
- *     is smaller than 2 MiB, or only one node is allowed.  The rotation is
- *     PROCESS-WIDE (ft_interleave_next_chunk): each region takes the next
- *     slice of it, so region after region continues across the nodes.
+ *     2 MiB spans keeps contiguous virtual ranges node-local, unlike
+ *     the kernel's 4 KiB-fine interleave.  The hardware prefetcher and
+ *     NUMA locality favour this.  This coarse granularity is the
+ *     measured win.  (The page size is a separate choice, see
+ *     ft_apply_thp_policy.)  The rotation is PROCESS-WIDE
+ *     (ft_interleave_next_chunk): each region takes the next slice of
+ *     it, so region after region continues across the nodes.
+ *     The policy falls back to whole-region MPOL_INTERLEAVE at native
+ *     page granularity in three cases:
+ *       - @base isn't 2 MiB-aligned;
+ *       - the region is smaller than 2 MiB;
+ *       - only one node is allowed.
  *
  *   - CDS_FT_NUMA_LOCAL: single mbind(MPOL_LOCAL) over the whole
  *     region.  Pages allocated within @base land on the local node
@@ -425,11 +471,12 @@ static unsigned long ft_interleave_next_chunk;
  *     all under a numactl wrapper).
  *
  *   - CDS_FT_NUMA_DEFAULT: query the process / libnuma policy via
- *     get_mempolicy().  If the process policy is INTERLEAVE, treat
- *     this group as INTERLEAVE (apply 2 MiB-chunk MPOL_BIND so the
- *     kernel's intent gets THP-friendly placement).  For any other
- *     process policy (DEFAULT/PREFERRED/BIND/LOCAL), skip mbind and
- *     let the kernel honor the process policy directly.
+ *     get_mempolicy().  If the process policy is DEFAULT or INTERLEAVE,
+ *     treat this group as INTERLEAVE (apply 2 MiB-chunk MPOL_BIND).
+ *     For a process INTERLEAVE policy, this gives the kernel's intent a
+ *     THP-friendly placement.  For any other process policy
+ *     (PREFERRED/BIND/LOCAL), skip mbind and let the kernel honor the
+ *     process policy directly.
  */
 static
 void ft_apply_interleave(void *base, size_t size,
@@ -448,13 +495,19 @@ void ft_apply_interleave(void *base, size_t size,
 	if (policy == CDS_FT_NUMA_DEFAULT) {
 		/*
 		 * Default policy: interleave the FT arenas across the allowed
-		 * nodes UNLESS the caller has expressed an explicit per-process
-		 * NUMA preference (then honor it -- never override a stated
-		 * intent).  Rationale: FT is a shared, read-mostly, random-access
-		 * structure; first-touch placement piles it onto the builder's
-		 * node, so a single memory controller bottlenecks every other
-		 * node's readers and auto-NUMA-balancing thrashes the unbound
-		 * pages.  Interleave (an explicit mbind) spreads the bandwidth and
+		 * nodes, UNLESS the caller has expressed an explicit
+		 * per-process NUMA preference.  Then honor it: never override
+		 * a stated intent.
+		 *
+		 * Rationale: FT is a shared, read-mostly, random-access
+		 * structure.  First-touch placement piles it onto the
+		 * builder's node.  Then:
+		 *
+		 *   - a single memory controller bottlenecks every other
+		 *     node's readers;
+		 *   - auto-NUMA-balancing thrashes the unbound pages.
+		 *
+		 * Interleave (an explicit mbind) spreads the bandwidth and
 		 * exempts the pages from balancing.
 		 *
 		 *   MPOL_DEFAULT   (no preference)        -> interleave (good default)
@@ -505,9 +558,11 @@ void ft_apply_interleave(void *base, size_t size,
 			allowed_nodes[nr_allowed++] = (int) i;
 	}
 	/*
-	 * Per-2MB-chunk MPOL_BIND fast path: needs 2 MiB alignment, at
-	 * least one hugepage of room, and multiple allowed nodes for
-	 * round-robin to do anything useful.
+	 * Per-2MB-chunk MPOL_BIND fast path.  It needs:
+	 *
+	 *   - 2 MiB alignment;
+	 *   - at least one hugepage of room;
+	 *   - multiple allowed nodes, for round-robin to do anything useful.
 	 */
 	if (nr_allowed > 1 &&
 	    ((uintptr_t) base & (FT_HUGEPAGE_SIZE - 1)) == 0 &&
@@ -560,14 +615,16 @@ static inline void ft_apply_thp_policy(void *base __attribute__((unused)),
  * NUMA placement: if @numa_policy is INTERLEAVE/DEFAULT (and not
  * overridden by CDS_FT_NUMA_INTERLEAVE=0), apply per-2 MiB-chunk
  * mbind(MPOL_BIND) round-robin across the calling thread's allowed
- * NUMA nodes.  The 2 MiB granularity (rather than the kernel's default
- * 4 KiB-fine interleave) keeps each contiguous 2 MiB virtual span on a
- * single node, which the hardware prefetcher and NUMA locality both
- * favour -- this coarse interleave is the real measured win and is
- * independent of page size.
+ * NUMA nodes.
  *
- * Transparent hugepages are advised ON for this internal node arena
- * (MADV_HUGEPAGE); see ft_apply_thp_policy() for the per-arena rationale.
+ * The 2 MiB granularity keeps each contiguous 2 MiB virtual span on a
+ * single node, unlike the kernel's default 4 KiB-fine interleave.  The
+ * hardware prefetcher and NUMA locality both favour this.  This coarse
+ * interleave is the real measured win.  It is independent of page size.
+ *
+ * Transparent hugepages are advised ON (MADV_HUGEPAGE) or OFF
+ * (MADV_NOHUGEPAGE) according to @huge.  See ft_apply_thp_policy() for
+ * the per-arena rationale.
  */
 static __attribute__((unused))
 struct cds_ft_alloc_superblock *superblock_create(size_t min_size,
@@ -607,10 +664,12 @@ void superblock_destroy(struct cds_ft_alloc_superblock *sb)
 
 /*
  * Recycle a previously reclaimed range (both layouts), or return NULL if none
- * is parked on the arena's free list.  A recycled range's node-body region was
- * MADV_DONTNEED'd and re-faults zero on use, while its header + metadata page
- * stays mapped and retains the range's NUMA / THP policy, so reusing it avoids
- * a fresh mmap + re-policy.  Resets the per-range bookkeeping before returning.
+ * is parked on the arena's free list.
+ *
+ * A recycled range's node-body region was MADV_DONTNEED'd.  It re-faults
+ * zero on use.  Its header + metadata page stays mapped and retains the
+ * range's NUMA / THP policy.  So reusing it avoids a fresh mmap +
+ * re-policy.  Reset the per-range bookkeeping before returning.
  *
  * Caller must hold arena->lock.
  */
@@ -643,12 +702,15 @@ static
 struct cds_ft_alloc_range *range_create_fresh(struct cds_ft_alloc_arena *arena)
 {
 	/*
-	 * Far-metadata range: a 2 MiB-aligned mmap whose leading 2 MiB is one
-	 * dense run of node bodies and whose remainder (starting at base + 2 MiB)
-	 * holds the range header + metadata[] array.  range == base + 2 MiB, so
-	 * item->range is (item & ~MASK) + 2 MiB and the metadata offset is the
-	 * constant base + 2 MiB.  Its own mmap (over-map + trim to 2 MiB), not
-	 * carved from a superblock.
+	 * Far-metadata range: a 2 MiB-aligned mmap of its own (over-map +
+	 * trim to 2 MiB), not carved from a superblock.
+	 *
+	 *   - The leading 2 MiB is one dense run of node bodies.
+	 *   - The remainder (starting at base + 2 MiB) holds the range
+	 *     header + metadata[] array.
+	 *
+	 * So range == base + 2 MiB.  item->range is (item & ~MASK) + 2 MiB.
+	 * The metadata offset is the constant base + 2 MiB.
 	 */
 	size_t alloc_size = cds_ft_arena_range_alloc_size(arena->item_len_order, arena->bitmap);
 	size_t mapped = (alloc_size + cds_ft_get_page_size() - 1) & ~(cds_ft_get_page_size() - 1);
@@ -754,35 +816,39 @@ void range_destroy(struct cds_ft_alloc_range *range)
 }
 
 /*
- * Reclaim a drained range (nr_live == 0, fully bumped) whose links have
- * already been removed from arena->ranges and arena->partial_ranges under
- * arena->lock by the caller.  The range is unreachable, so the page-returning
- * syscall runs here OUTSIDE arena->lock to keep mutator latency bounded.
+ * Reclaim a drained range (nr_live == 0, fully bumped).  The caller has
+ * already removed its links from arena->ranges and arena->partial_ranges
+ * under arena->lock.  The range is unreachable.  So the page-returning
+ * syscall runs here OUTSIDE arena->lock, to keep mutator latency bounded.
  *
- * Far: the range owns its 2 MiB mapping -> munmap returns VA and RAM.
- * Near: the superblock owns the mapping -> MADV_DONTNEED returns the node-body
- *   page's RAM, and the range region is parked on arena->free_ranges for
- *   range_create to recycle (the header+metadata page stays mapped; it carries
- *   the recycle linkage and is reused as-is).
+ * Both layouts (far and near) are handled the same way.  MADV_DONTNEED
+ * returns the RAM of the node-body region.  The range is parked on
+ * arena->free_ranges for range_create to recycle.  The header+metadata
+ * page stays mapped.  The comment in the body gives the reasons.
  */
 static
 void ft_arena_reclaim_range(struct cds_ft_alloc_arena *arena,
 		struct cds_ft_alloc_range *range)
 {
 	/*
-	 * Return the node-body region (the leading FT_RANGE_PAGE_UNIT, just
-	 * before the range header) to the OS, keeping the header + metadata
-	 * mapped: it carries the recycle linkage and preserves the range's
-	 * NUMA / THP policy so reuse is a syscall-free re-fault.  The range is
-	 * parked on free_ranges for range_create to recycle.
+	 * Return the node-body region to the OS.  It is the leading
+	 * FT_RANGE_PAGE_UNIT, just before the range header.  Keep the
+	 * header + metadata mapped.  It carries the recycle linkage and
+	 * preserves the range's NUMA / THP policy, so reuse is a
+	 * syscall-free re-fault.  The range is parked on free_ranges for
+	 * range_create to recycle.
 	 *
-	 * Layout-agnostic by design.  A far range owns its mapping and could
-	 * be munmap'd outright to also return the VA, but recycling avoids the
-	 * munmap + mmap + re-mbind + re-THP churn that range turnover (e.g.
-	 * recompaction) would otherwise pay, and MADV_DONTNEED only takes
-	 * mmap_lock for read whereas munmap takes it for write (stalling other
-	 * threads' faults).  The retained VA is a bounded, reused pool, not a
-	 * leak; capping it and munmap'ing the surplus is a later refinement.
+	 * This is layout-agnostic by design.  A far range owns its mapping
+	 * and could be munmap'd outright to also return the VA.  Recycling
+	 * is preferred for two reasons:
+	 *
+	 *   - It avoids the munmap + mmap + re-mbind + re-THP churn that
+	 *     range turnover (e.g. recompaction) would otherwise pay.
+	 *   - MADV_DONTNEED only takes mmap_lock for read.  munmap takes it
+	 *     for write, which stalls other threads' faults.
+	 *
+	 * The retained VA is a bounded, reused pool, not a leak.  Capping it
+	 * and munmap'ing the surplus is a later refinement.
 	 */
 	(void) madvise((char *) range - FT_RANGE_PAGE_UNIT,
 			FT_RANGE_PAGE_UNIT, MADV_DONTNEED);
@@ -794,14 +860,20 @@ void ft_arena_reclaim_range(struct cds_ft_alloc_arena *arena,
 #ifdef DEBUG_COUNTERS
 /*
  * DEBUG_COUNTERS-only leak introspection (no public header decl; tests
- * weak-reference it).  Reports the internal + compressed node-arena occupancy
- * of @ft's group.  @live_ranges counts ranges still backed by RAM (on
- * arena->ranges); @reclaimed_ranges counts ranges whose pages were released via
- * MADV_DONTNEED and parked on arena->free_ranges; @internal_items and
- * @compressed_items sum per-range nr_live for the internal vs compressed
- * arenas; @range_bytes is the per-range page unit.  Resident node-arena bytes
- * ~= live_ranges * range_bytes.  Caller must ensure no concurrent arena
- * mutation (we walk the lists without the arena lock).
+ * weak-reference it).  Report the internal + compressed node-arena occupancy
+ * of @ft's group:
+ *
+ *   @live_ranges       ranges still backed by RAM (on arena->ranges);
+ *   @reclaimed_ranges  ranges whose pages were released via MADV_DONTNEED
+ *                      and that are parked on arena->free_ranges;
+ *   @internal_items    sum of per-range nr_live for the internal arenas;
+ *   @compressed_items  sum of per-range nr_live for the compressed arenas;
+ *   @range_bytes       the per-range page unit.
+ *
+ * Resident node-arena bytes ~= live_ranges * range_bytes.
+ *
+ * Caller must ensure no concurrent arena mutation: the lists are walked
+ * without the arena lock.
  */
 void cds_ft_debug_arena_resident(const struct cds_ft *ft, size_t *live_ranges,
 		size_t *reclaimed_ranges, size_t *internal_items,
@@ -949,22 +1021,25 @@ void cds_ft_arena_destroy(struct cds_ft_alloc_arena *arena)
 		return;
 	pthread_mutex_destroy(&arena->lock);
 	/*
-	 * No separate partial_ranges drain is needed: partial_ranges is an
-	 * auxiliary index (linked via range->partial_node) over ranges that
-	 * are simultaneously on arena->ranges (linked via range->node), so the
-	 * ranges + free_ranges walks below already free every range.  The
-	 * partial_node links are left dangling on teardown; this is safe ONLY
-	 * because partial_ranges is never traversed once the ranges are freed.
-	 * Any future teardown step that walks partial_ranges must run BEFORE
-	 * these loops.
+	 * No separate partial_ranges drain is needed.  partial_ranges is an
+	 * auxiliary index, linked via range->partial_node.  Every range on
+	 * it is simultaneously on arena->ranges, linked via range->node.
+	 * So the ranges + free_ranges walks below already free every range.
+	 *
+	 * The partial_node links are left dangling on teardown.  This is
+	 * safe ONLY because partial_ranges is never traversed once the
+	 * ranges are freed.  Any future teardown step that walks
+	 * partial_ranges must run BEFORE these loops.
 	 */
 	cds_list_for_each_entry_safe(range, range_tmp, &arena->ranges, node)
 		range_destroy(range);
 	/*
-	 * Reclaimed-but-recycled ranges (parked on free_ranges) also need
-	 * teardown: far ranges still own their mapping and must be munmap'd
-	 * (range_destroy does so); near ranges are freed with their superblock
-	 * below, so range_destroy just unlinks them here.
+	 * Reclaimed ranges parked on free_ranges also need teardown:
+	 *
+	 *   - Far ranges still own their mapping and must be munmap'd.
+	 *     range_destroy does so.
+	 *   - Near ranges are freed with their superblock below.  So
+	 *     range_destroy just unlinks them here.
 	 */
 	cds_list_for_each_entry_safe(range, range_tmp, &arena->free_ranges, node)
 		range_destroy(range);
@@ -1024,9 +1099,9 @@ void ft_recompact_alloc_merge(struct ft_recompact_alloc_ctx *ctx)
 			/*
 			 * Slots freed while the range was private were threaded
 			 * on its own free list WITHOUT the partial_ranges
-			 * listing (see cds_ft_do_free_item): restore the
-			 * "listed iff free_list_head != NULL" invariant so the
-			 * general allocator can reuse them.
+			 * listing (see cds_ft_do_free_item).  Restore the
+			 * "listed iff free_list_head != NULL" invariant, so
+			 * that the general allocator can reuse them.
 			 */
 			if (range->free_list_head)
 				cds_list_add(&range->partial_node,
@@ -1046,21 +1121,29 @@ bool cds_ft_metadata_in_recompact_private(struct cds_ft_metadata *metadata)
 /*
  * Initialize a freshly bump-allocated slot's per-slot kept-mapped state.
  *
- * A fresh mmap range presents zeroed metadata + bitmap, but a recycled far
- * range only had its node-body region returned via MADV_DONTNEED at reclaim;
- * its metadata[] array and the reverse bitmap[] array live in the kept-mapped
- * region (range + FT_FAR_MACRO_SIZE) and retain the previous life's contents
- * (0xfe poison written on free, or stale counts / occupancy bits).  That region
- * is deliberately kept mapped (not MADV_DONTNEED'd) because it holds the range
- * header carrying the recycle linkage and preserves the range's NUMA / THP
- * policy for a syscall-free reuse -- see ft_arena_reclaim_range.  Clearing
- * them here makes a bump slot from a recycled range equivalent to one from a
- * fresh range, the same guarantee the freelist path provides for reused slots.
- * On Linux the node body itself is not touched: it re-faults zero (DONTNEED on
- * far, fresh mmap otherwise).  On platforms where MADV_DONTNEED does not zero
- * on refault it is cleared explicitly below (see FT_MADV_DONTNEED_ZEROES).
- * alloc_index must be assigned before the bitmap address is derived
- * (cds_ft_metadata_to_item reads it).
+ * A fresh mmap range presents zeroed metadata + bitmap.  A recycled range
+ * does not.  At reclaim, only its node-body region was returned via
+ * MADV_DONTNEED.  Its metadata[] array and its reverse bitmap[] array live
+ * in the kept-mapped region, which starts at the range header.  They retain
+ * the previous life's contents: the 0xfe poison written on free, or stale
+ * counts / occupancy bits.
+ *
+ * That region is deliberately kept mapped (not MADV_DONTNEED'd).  It holds
+ * the range header, which carries the recycle linkage.  It also preserves
+ * the range's NUMA / THP policy for a syscall-free reuse.  See
+ * ft_arena_reclaim_range.
+ *
+ * Clearing them here makes a bump slot from a recycled range equivalent to
+ * one from a fresh range.  The freelist path provides the same guarantee
+ * for reused slots.
+ *
+ * On Linux the node body itself is not touched.  It re-faults zero, after
+ * MADV_DONTNEED on a recycled range and from the fresh mmap otherwise.  On
+ * platforms where MADV_DONTNEED does not zero on refault, it is cleared
+ * explicitly below (see FT_MADV_DONTNEED_ZEROES).
+ *
+ * alloc_index must be assigned before the bitmap address is derived:
+ * cds_ft_metadata_to_item reads it.
  */
 static
 void ft_clear_recycled_slot(struct cds_ft_alloc_arena *arena,
@@ -1077,8 +1160,8 @@ void ft_clear_recycled_slot(struct cds_ft_alloc_arena *arena,
 	if (!FT_MADV_DONTNEED_ZEROES) {
 		/*
 		 * Where MADV_DONTNEED does not zero on refault, a recycled
-		 * range's node body still holds the previous life's bytes, so
-		 * clear it like the freelist-reuse path does.  Compiled out on
+		 * range's node body still holds the previous life's bytes.
+		 * Clear it, as the freelist-reuse path does.  Compiled out on
 		 * Linux, where the body re-faults zero.
 		 */
 		void *p = cds_ft_metadata_to_item(&item->metadata);
@@ -1097,11 +1180,12 @@ struct cds_ft_metadata *cds_ft_arena_alloc(struct cds_ft_alloc_arena *arena)
 	pthread_mutex_lock(&arena->lock);
 
 	/*
-	 * Recompaction context active on this thread: bump-allocate into a
-	 * per-order private fresh range (created lazily, kept off the arena's
-	 * general lists until ft_recompact_alloc_end splices it in), so the
-	 * relocated nodes pack densely and unrelated concurrent allocations on
-	 * other threads (ctx == NULL) are unaffected by the path below.
+	 * A recompaction context is active on this thread.  Bump-allocate
+	 * into a per-order private fresh range.  The range is created
+	 * lazily.  It is kept off the arena's general lists until
+	 * ft_recompact_alloc_merge splices it in.  So the relocated nodes
+	 * pack densely.  Unrelated concurrent allocations on other threads
+	 * (ctx == NULL) are unaffected by the path below.
 	 */
 	{
 		struct ft_recompact_alloc_ctx *ctx = ft_recompact_alloc_tls;
@@ -1110,9 +1194,10 @@ struct cds_ft_metadata *cds_ft_arena_alloc(struct cds_ft_alloc_arena *arena)
 			size_t order = arena->item_len_order;
 			/*
 			 * Internal, compressed-node and cell arenas may share
-			 * item-length orders but are distinct arenas, so keep a
-			 * separate private current-range for each (else items of
-			 * different kinds at the same order would share a range).
+			 * item-length orders, but they are distinct arenas.
+			 * So keep a separate private current-range for each.
+			 * Otherwise items of different kinds at the same
+			 * order would share a range.
 			 */
 			struct cds_ft_alloc_range **curp;
 
@@ -1142,7 +1227,7 @@ struct cds_ft_metadata *cds_ft_arena_alloc(struct cds_ft_alloc_arena *arena)
 			range->nr_live++;
 			item = &range->metadata[item_index];
 			/*
-			 * Clear the bump slot: a recycled far range's kept-mapped
+			 * Clear the bump slot: a recycled range's kept-mapped
 			 * metadata/bitmap may carry the previous life's contents.
 			 * See ft_clear_recycled_slot.
 			 */
@@ -1154,10 +1239,11 @@ struct cds_ft_metadata *cds_ft_arena_alloc(struct cds_ft_alloc_arena *arena)
 
 	/*
 	 * Reuse a freed slot from the most-recently-used range that still
-	 * has one.  partial_ranges is kept MRU-ordered by cds_ft_do_free_item,
-	 * so its head holds the hottest just-freed slot -- preserving the
-	 * locality the former single per-arena freelist provided.  A range
-	 * sits on partial_ranges exactly while its free_list_head != NULL.
+	 * has one.  cds_ft_do_free_item keeps partial_ranges MRU-ordered,
+	 * so its head holds the hottest just-freed slot.  This preserves
+	 * the locality that the former single per-arena freelist provided.
+	 * A range sits on partial_ranges exactly while its
+	 * free_list_head != NULL.
 	 */
 	if (!cds_list_empty(&arena->partial_ranges)) {
 		struct cds_ft_metadata_alloc *fl;
@@ -1184,9 +1270,10 @@ struct cds_ft_metadata *cds_ft_arena_alloc(struct cds_ft_alloc_arena *arena)
 		return &fl->metadata;
 	}
 	/*
-	 * No reusable slot: bump the frontier range.  If there are no
-	 * ranges, or the most recent range (first in list) has no room
-	 * left, create a new range and prepend it to the list head.
+	 * No reusable slot: bump the frontier range.  The frontier is the
+	 * most recent range, first in the list.  If there is no range, or
+	 * the frontier has no room left, create a new range and prepend it
+	 * to the list.
 	 */
 	if (cds_list_empty(&arena->ranges))
 		goto create_range;
@@ -1209,7 +1296,7 @@ room_left:
 	item_index = range->next_unused++;
 	range->nr_live++;
 	item = &range->metadata[item_index];
-	/* Clear stale/poisoned metadata + bitmap from a recycled far range;
+	/* Clear stale/poisoned metadata + bitmap from a recycled range;
 	 * see ft_clear_recycled_slot. */
 	ft_clear_recycled_slot(arena, item, item_index);
 	pthread_mutex_unlock(&arena->lock);
@@ -1219,19 +1306,25 @@ room_left:
 #ifdef FEATURE_FT_FAULT_INJECT
 /*
  * Test-only allocation fault injection (single-threaded use; compiled out
- * unless FEATURE_FT_FAULT_INJECT).  -1 disables.  Arm to N: the next N item
- * allocations succeed and the (N+1)-th returns NULL (simulated -ENOMEM),
- * then it auto-disarms.  Used to drive mutators through every OOM error
- * path; both cds_ft_alloc_item and cds_ft_alloc_compressed_item route here.
+ * unless FEATURE_FT_FAULT_INJECT).
+ *
+ * -1 disables.  Arm to N: the next N item allocations succeed and the
+ * (N+1)-th returns NULL (simulated -ENOMEM).  Then it auto-disarms.
+ *
+ * Used to drive mutators through every OOM error path.  Both
+ * cds_ft_alloc_item and cds_ft_alloc_compressed_item route here.
  */
 long cds_ft_fault_alloc_countdown = -1;
 /*
  * Separate fault counter for flip-transaction allocations
- * (ft_flip_txn_create_bounded).  Same arm-to-N semantics, but independent of
- * the arena counter above: flip-txns are raw malloc, not arena items, so a
- * test arms THIS to drive the grow-and-abort / pre-reserve commit paths
- * (ft_ord_cell_flip_try abort, ft_chain_compress_fused / ft_detach_node txn
- * pre-reservation failure) without perturbing the arena-fault tests.
+ * (ft_flip_txn_create_bounded).  It has the same arm-to-N semantics as the
+ * arena counter above, but is independent of it.  Flip-txns are raw malloc,
+ * not arena items.  So a test arms THIS to drive the grow-and-abort /
+ * pre-reserve commit paths without perturbing the arena-fault tests:
+ *
+ *   - the ft_ord_cell_flip_try abort;
+ *   - the ft_chain_compress_fused / ft_detach_node txn pre-reservation
+ *     failure.
  */
 long cds_ft_fault_flip_countdown = -1;
 
@@ -1256,59 +1349,92 @@ long cds_ft_fault_lock_countdown = -1;
  * Counts down over the fold's one commit and forces the (n+1)-th to abort,
  * exactly as a peer that won a raced MW slot would.
  *
- * Why this knob has to exist, stated as a measurement rather than an argument:
- * the shared-destination merge oracle contends the fold's acquires HARD -- over
- * 71218 merges it took the publish-parent fence miss 62342 times, the overlap
- * spine 89 and the commit_edges miss 1079 -- and took THIS exit 0 times.  Every
- * acquire sits ahead of the commit, so a peer that could make the commit lose
- * has already been turned away by one of them.  Real contention therefore does
- * not reach the fold's LONGEST unwind: a fully built cluster, both glues, the
- * src side's retires, and every fence still held.  Only injection does.
+ * Why this knob has to exist is stated as a measurement, not as an argument.
+ * The shared-destination merge oracle contends the fold's acquires HARD.
+ * Over 71218 merges it took:
  *
- * It routes through the engine's own unpublished-discard path (@acquire_miss:
- * age the handle, clear every registered LOCK, report ABORT), so the unwind
- * under test is the real one and not a synthesised status.
+ *   - the publish-parent fence miss 62342 times;
+ *   - the overlap spine 89 times;
+ *   - the commit_edges miss 1079 times;
+ *   - THIS exit 0 times.
+ *
+ * Every acquire sits ahead of the commit.  So a peer that could make the
+ * commit lose has already been turned away by one of them.  Real contention
+ * therefore does not reach the fold's LONGEST unwind.  That unwind has:
+ *
+ *   - a fully built cluster;
+ *   - both glues;
+ *   - the src side's retires;
+ *   - every fence still held.
+ *
+ * Only injection reaches it.
+ *
+ * It routes through the engine's own unpublished-discard path
+ * (@acquire_miss):
+ *
+ *   - age the handle;
+ *   - clear every registered LOCK;
+ *   - report ABORT.
+ *
+ * So the unwind under test is the real one and not a synthesised status.
  */
 long cds_ft_fault_commit_countdown = -1;
 
 /*
- * Test-only COMMIT-abort injection for the REPLACE FAMILY
- * (_cds_ft_insert_replace's chain + one-commit publishes, cds_ft_replace's two
- * HEAD arms).  Counts down over those commits and forces the (n+1)-th to abort,
+ * Test-only COMMIT-abort injection for the REPLACE FAMILY:
+ *
+ *   - _cds_ft_insert_replace's chain + one-commit publishes;
+ *   - cds_ft_replace's two HEAD arms.
+ *
+ * Counts down over those commits and forces the (n+1)-th to abort,
  * exactly as a peer that won a raced MW slot would.
  *
- * Why this knob has to exist, stated as a measurement rather than an argument.
- * All FIVE of those abort arms -- and the two the head path already had -- run
- * ZERO times across the whole fault-audit suite (ft_unit and ft_inv both, every
- * arm instrumented and counted).  Two reasons compound: the replace family is
- * contract-excluded under LOCK_FINE, so no peer ever races it; and its commits
- * carry only §4.B GUARDS, never an acquire, so cds_ft_fault_lock_countdown --
- * which fails an ACQUIRE -- cannot reach them either.  The existing fault sweep
- * drives cds_ft_insert only.  So the arms that decide whether a lost replace is
- * reported as success were, until this knob, unexecutable.
+ * Why this knob has to exist is stated as a measurement, not as an argument.
+ * All FIVE of those abort arms run ZERO times across the whole fault-audit
+ * suite.  So do the two that the head path already had.  The suite is
+ * ft_unit and ft_inv both, with every arm instrumented and counted.  Two
+ * reasons compound:
  *
- * Routes through the engine's own unpublished-discard path (@acquire_miss: age
- * the handle, clear every registered LOCK, report ABORT), so what runs is the
- * real unwind and not a synthesised status.
+ *   - The replace family is contract-excluded under LOCK_FINE.  So no peer
+ *     ever races it.
+ *   - Its commits carry only §4.B GUARDS, never an acquire.  So
+ *     cds_ft_fault_lock_countdown, which fails an ACQUIRE, cannot reach
+ *     them either.
+ *
+ * The existing fault sweep drives cds_ft_insert only.  So the arms that
+ * decide whether a lost replace is reported as success were, until this
+ * knob, unexecutable.
+ *
+ * It routes through the engine's own unpublished-discard path
+ * (@acquire_miss):
+ *
+ *   - age the handle;
+ *   - clear every registered LOCK;
+ *   - report ABORT.
+ *
+ * So what runs is the real unwind and not a synthesised status.
  */
 long cds_ft_fault_replace_countdown = -1;
 
 /*
  * Test-only refused-acquire injection for cds_ft_compact_step's relocations.
  *
- * WHY THIS EXISTS.  ft_compact_relocate_at bails on -ENOMEM and on -EAGAIN and
- * reports both through one bool (*@oom), so a contention refusal is announced
- * as CDS_FT_COMPACT_OOM -- "free memory and resume", the wrong remedy for a
- * peer.  The -EAGAIN half cannot occur while compact requires caller
- * writer-exclusion (measured: 1,798 relocations reaching the bail, -ENOMEM 6,
- * -EAGAIN 0), so the arm the fine-grained conversion must have has no way to
- * run.  This forces it.
+ * WHY THIS EXISTS.  ft_compact_relocate_at bails on -ENOMEM and on -EAGAIN.
+ * It reports both through one bool (*@oom).  So a contention refusal is
+ * announced as CDS_FT_COMPACT_OOM, "free memory and resume".  That is the
+ * wrong remedy for a peer.
+ *
+ * The -EAGAIN half cannot occur while compact requires caller
+ * writer-exclusion.  Measured: 1,798 relocations reached the bail, 6 with
+ * -ENOMEM and 0 with -EAGAIN.  So the arm that the fine-grained conversion
+ * must have has no way to run.  This forces it.
  *
  * ☠ IT FIRES BEFORE ft_node_recompact's LOCK-SET ACQUIRE, not on its commit.
- * The commit is contractually INFALLIBLE -- the eager child re-parent ahead of
- * it is a point of no return -- and ft_compact_relocate_at ASSERTS its success.
- * Arming that commit crashes on the assert; refusing the acquire is the real
- * -EAGAIN class, and it returns with nothing acquired and nothing published.
+ * The commit is contractually INFALLIBLE: the eager child re-parent ahead
+ * of it is a point of no return.  ft_compact_relocate_at ASSERTS its
+ * success, so arming that commit crashes on the assert.  Refusing the
+ * acquire is the real -EAGAIN class.  It returns with nothing acquired and
+ * nothing published.
  */
 long cds_ft_fault_compact_countdown = -1;
 
@@ -1316,26 +1442,31 @@ long cds_ft_fault_compact_countdown = -1;
  * Test-only refused-acquire injection for cds_ft_remove_all.
  *
  * WHY THIS EXISTS.  remove_all's contention arm reports
- * CDS_FT_STATUS_BUSY_ERROR where its allocation arm reports MEMORY_ERROR, and
- * no workload reaches the contention one on its own: the op requires caller
- * writer-exclusion, so no peer can refuse it a lock-set, and measured over both
- * suites its failure tail ran ZERO times in 4,807,509 calls.  The arm the
- * fine-grained conversion needs therefore has no other way to run.
+ * CDS_FT_STATUS_BUSY_ERROR.  Its allocation arm reports MEMORY_ERROR.  No
+ * workload reaches the contention arm on its own.  The op requires caller
+ * writer-exclusion, so no peer can refuse it a lock-set.  Measured over
+ * both suites, its failure tail ran ZERO times in 4,807,509 calls.  So the
+ * arm that the fine-grained conversion needs has no other way to run.
  *
- * Scoped to the dynamic extent of remove_all's own detach
- * (ft_removeall_fault_scope_enter/exit) rather than to a mode, because 99.95%
- * of its commits go through ft_detach_node, which builds its txn internally --
- * measured: detach 697,344 of 697,675, holder-commit 101, NIL-commit 7.
+ * The injection is scoped to the dynamic extent of remove_all's own detach
+ * (ft_removeall_fault_scope_enter/exit), not to a mode.  The reason: 99.95%
+ * of its commits go through ft_detach_node, which builds its txn
+ * internally.  Measured commits:
+ *
+ *   - detach: 697,344 of 697,675;
+ *   - holder-commit: 101;
+ *   - NIL-commit: 7.
  */
 long cds_ft_fault_removeall_countdown = -1;
 #endif
 
 #ifdef FEATURE_FT_PROBE_EMPTY_INSERT
 /*
- * A/B counters for the born-empty insert candidate (ft-insert.h).  Reported at
- * exit so a soak run records BOTH the catch and the bail: a change that makes
- * the defect vanish while its bail never fires has not fixed anything -- the
- * rule four already-refuted removal-side candidates were settled by.
+ * A/B counters for the born-empty insert candidate (ft-insert.h).  They
+ * are reported at exit so that a soak run records BOTH the catch and the
+ * bail.  A change that makes the defect vanish while its bail never fires
+ * has not fixed anything.  Four already-refuted removal-side candidates
+ * were settled by this rule.
  */
 unsigned long cds_ft_probe_empty_publish_split;
 unsigned long cds_ft_probe_empty_publish_attach;
@@ -1354,14 +1485,18 @@ static void cds_ft_probe_empty_report(void)
 
 #ifdef FEATURE_FT_PROBE_GRAFT_SWAP
 /*
- * B4 residual probe (ft-graft.h, cds_ft_graft_swap).  The oracle
- * inv_graft_swap_shared_dst_nolist dies with "depth 1: internal node N parent
- * mismatch: got (nil)" -- i.e. the extract side re-rooted into @swap_ft a node
- * that is STILL wired into dst at the graft point.  Rather than argue about
- * which compare is missing, COUNT the class: after this op's OWN insert commit
- * reported OK, re-descend to @key and ask whether the occupant this attempt
- * planned to displace is still there.  @reoccupy > 0 is the corruption, caught
- * one statement before it is committed.
+ * B4 residual probe (ft-graft.h, cds_ft_graft_swap).
+ *
+ * The oracle inv_graft_swap_shared_dst_nolist dies with this message:
+ * "depth 1: internal node N parent mismatch: got (nil)".
+ * It means that the extract side re-rooted into @swap_ft a node that is
+ * STILL wired into dst at the graft point.
+ *
+ * Rather than argue about which compare is missing, COUNT the class.  After
+ * this op's OWN insert commit reported OK, re-descend to @key.  Ask whether
+ * the occupant that this attempt planned to displace is still there.
+ * @reoccupy > 0 is the corruption, caught one statement before it is
+ * committed.
  */
 unsigned long cds_ft_probe_gs_commit_ok;
 unsigned long cds_ft_probe_gs_reoccupy;
@@ -1374,21 +1509,27 @@ unsigned long cds_ft_probe_gs_fused;
 unsigned long cds_ft_probe_gs_ext_child;
 /*
  * @torn: the descent's TWO loads of the graft-point slot disagreed.
- * ft_descent_step sets d->nf from ft_node_get_nth_reanchor_slot (load #1);
- * ft_graft_swap_descend then does *raw_ret = *d->nfp (load #2).  The
- * expected-old comes from #2, the extracted occupant (d->nf) from #1, so a
- * peer swapping the graft point between them makes the op RATIFY displacing
- * one node while RE-ROOTING another.
+ *
+ *   - Load #1: ft_descent_step sets d->nf from
+ *     ft_node_get_nth_reanchor_slot.
+ *   - Load #2: ft_graft_swap_descend then does *raw_ret = *d->nfp.
+ *
+ * The expected-old comes from #2.  The extracted occupant (d->nf) comes
+ * from #1.  So a peer that swaps the graft point between the two loads
+ * makes the op RATIFY displacing one node while RE-ROOTING another.
+ *
  * @alias: swap_ft's root already IS the dst occupant on entry (the downstream
- * double-ownership state).  @canon_alias: what we are about to publish equals
- * what we quoted as expected-old -- the no-op replace.
+ * double-ownership state).
+ *
+ * @canon_alias: what we are about to publish equals what we quoted as
+ * expected-old.  This is the no-op replace.
  */
 /*
- * @pubabort: the KEY_SHORTER legacy publish's DROPPED commit status
- * (ft_glue_publish's `(void) ft_ord_cell_flip_into`, whose comment claims
- * "ABORT unreachable under its exclusion").  Its apply_deferred has already
- * rewritten LIVE dst parent back-pointers by then, so a dropped abort leaves
- * them naming a node this op never published.
+ * @pubabort: the KEY_SHORTER legacy publish's DROPPED commit status.  The
+ * drop is ft_glue_publish's `(void) ft_ord_cell_flip_into`, whose comment
+ * claims "ABORT unreachable under its exclusion".  By then its
+ * apply_deferred has already rewritten LIVE dst parent back-pointers.  So a
+ * dropped abort leaves them naming a node this op never published.
  */
 unsigned long cds_ft_probe_gs_pubabort;
 unsigned long cds_ft_probe_gs_pubok;
@@ -1425,12 +1566,16 @@ static void cds_ft_probe_gs_report(void)
 
 #ifdef FEATURE_FT_PROBE_PROMOTE
 /*
- * §4.B unguarded external-promote probe.  ft_node_replace_ptr's promote arm
- * stores into the LIVE holder when @pub is NULL, while the §4.B guard for that
- * holder sits inside the `pub && pub->armed` branch -- so the pub-less variant
- * mutates before acquiring.  @pub is NULL exactly when the ordered list is off,
- * so the unguarded variant needs a LIST-OFF trie AND a promote.  Counted at the
- * call site; see FT_PROMOTE_PROBE_INC.
+ * §4.B unguarded external-promote probe.
+ *
+ * ft_node_replace_ptr's promote arm stores into the LIVE holder when @pub
+ * is NULL.  The §4.B guard for that holder sits inside the
+ * `pub && pub->armed` branch.  So the pub-less variant mutates before
+ * acquiring.
+ *
+ * @pub is NULL exactly when the ordered list is off.  So the unguarded
+ * variant needs a LIST-OFF trie AND a promote.  Counted at the call site;
+ * see FT_PROMOTE_PROBE_INC.
  */
 unsigned long cds_ft_probe_promote_deferred;
 unsigned long cds_ft_probe_promote_immediate;
@@ -1448,17 +1593,19 @@ static void cds_ft_probe_promote_report(void)
 
 /*
  * Test-only REKEY-coherence second-walk fault injection
- * (automatic under the move gate).  Counts down over coherence checks -- the
- * point lookup's two descents and the relational two-pass, via
- * ft_rekey_fault_miss() -- and forces the (n+1)-th to report a MISS, exactly as a
- * concurrent in-trie rekey that restructured the reader's path would.
+ * (automatic under the move gate).  Counts down over coherence checks and
+ * forces the (n+1)-th to report a MISS, exactly as a concurrent in-trie
+ * rekey that restructured the reader's path would.  The coherence checks
+ * are the point lookup's two descents and the relational two-pass.  Both
+ * go through ft_rekey_fault_miss().
  *
- * Why this knob has to exist: with no concurrent rekey the two passes always
- * AGREE, so the coherent lookup's mismatch/retry arm is DEAD CODE a green
- * single-threaded soak says nothing about.  This forces one miss on demand so
- * the re-descend loop is actually executed and shown to still return the correct
- * (coherent) result -- rather than assumed.  The forced miss is self-clearing
- * (resets to -1 when it fires), so it cannot livelock the loop.
+ * Why this knob has to exist: with no concurrent rekey the two passes
+ * always AGREE.  So the coherent lookup's mismatch/retry arm is DEAD CODE,
+ * and a green single-threaded soak says nothing about it.  This forces one
+ * miss on demand.  The re-descend loop is then actually executed.  It is
+ * shown to still return the correct (coherent) result, rather than assumed
+ * to.  The forced miss is self-clearing (resets to -1 when it fires), so
+ * it cannot livelock the loop.
  */
 long cds_ft_fault_rekey_countdown = -1;
 #endif
@@ -1466,25 +1613,33 @@ long cds_ft_fault_rekey_countdown = -1;
 /*
  * Per-thread active node-allocation reserve set (MW §11 drop-mechanics).
  *
- * The reserve is a bulk op's OOM-avoidance pool: graft / merge / graft_swap
- * pre-fill it (while they can still fail cleanly), then ACTIVATE it so every
- * cds_ft_alloc_item into the target trie DRAWS from the pool instead of the
- * fallible arena -- the commit cannot fail mid-way.  It is NOT a per-trie
- * field: that would be safe only while an FT-wide writer lock serialized bulk
- * ops on a trie, and the FT-wide-lock drop removes that
- * serialization, so two concurrent grafts into one live dst would both stamp
- * the same field and collide.  A reserve is a stack-local owned by ONE op on
- * ONE thread, so its activation state is naturally THREAD-LOCAL: each writer's
- * bulk op owns its reserve, and a peer on the same dst has its own -- no shared
- * field, no collision.
+ * The reserve is a bulk op's OOM-avoidance pool.  graft / merge /
+ * graft_swap pre-fill it while they can still fail cleanly.  Then they
+ * ACTIVATE it.  From then on, every cds_ft_alloc_item into the target trie
+ * DRAWS from the pool instead of the fallible arena.  So the commit cannot
+ * fail mid-way.
  *
- * A single op can activate ONE reserve on TWO tries (merge same-trie rekey:
- * dst + the detach product @tmp), so this is a small array of {trie, reserve}
- * records, not one slot.  The old per-trie single-activation invariant
- * (assert(!ft->active_reserve) in activate) becomes: a trie is covered by at
- * most one record at a time (asserted).  FT_TLS_RESERVE_MAX bounds concurrent
- * activations on one thread (2 today; assert on overflow so a future nesting
- * shape surfaces loudly instead of silently corrupting).
+ * It is NOT a per-trie field.  That would be safe only while an FT-wide
+ * writer lock serialized bulk ops on a trie.  The FT-wide-lock drop removes
+ * that serialization.  Two concurrent grafts into one live dst would then
+ * both stamp the same field and collide.
+ *
+ * A reserve is a stack-local owned by ONE op on ONE thread.  So its
+ * activation state is naturally THREAD-LOCAL.  Each writer's bulk op owns
+ * its reserve, and a peer on the same dst has its own.  There is no shared
+ * field and no collision.
+ *
+ * A single op can activate ONE reserve on TWO tries.  The case is the
+ * merge same-trie rekey: dst + the detach product @tmp.  So this is a
+ * small array of {trie, reserve} records, not one slot.
+ *
+ * The old per-trie single-activation invariant was
+ * assert(!ft->active_reserve) in activate.  It becomes: a trie is covered
+ * by at most one record at a time (asserted).
+ *
+ * FT_TLS_RESERVE_MAX bounds concurrent activations on one thread (2 today).
+ * An overflow asserts, so that a future nesting shape surfaces loudly
+ * instead of silently corrupting.
  */
 #define FT_TLS_RESERVE_MAX	4
 struct ft_tls_reserve_rec {
@@ -1522,13 +1677,15 @@ struct cds_ft_metadata *cds_ft_alloc_item_from(struct cds_ft *ft,
 	struct cds_ft_alloc_arena *arena;
 
 	/*
-	 * Draw from this thread's active node-allocation reserve for @ft, ABOVE
-	 * the fault hook and the arena: a bulk op that pre-filled a reserve
-	 * cannot fail here mid-commit, and the fault hook only bites during the
-	 * fill (before the reserve is activated).  Cells are never reserved.
-	 * The reserve set is thread-local, so a peer writer on @ft (or another
-	 * trie) has its own -- no synchronization is needed.  The nr guard keeps
-	 * the common no-reserve path to a single TLS load.
+	 * Draw from this thread's active node-allocation reserve for @ft.
+	 * The draw sits ABOVE the fault hook and the arena.  So a bulk op
+	 * that pre-filled a reserve cannot fail here mid-commit.  The fault
+	 * hook only bites during the fill, before the reserve is activated.
+	 * Cells are never reserved.
+	 *
+	 * The reserve set is thread-local.  A peer writer on @ft (or
+	 * another trie) has its own.  No synchronization is needed.  The nr
+	 * guard keeps the common no-reserve path to a single TLS load.
 	 */
 	if (kind != CDS_FT_ALLOC_KIND_CELL && ft_tls_reserve_nr) {
 		struct cds_ft_alloc_reserve *r = ft_tls_reserve_for(ft);
@@ -1544,18 +1701,21 @@ struct cds_ft_metadata *cds_ft_alloc_item_from(struct cds_ft *ft,
 				return r->branch[--r->branch_count];
 #endif
 			/*
-			 * Reserve active but exhausted for this (kind, order):
-			 * the op's manifest under-counted what it allocates.
-			 * Surface it in debug -- the op would otherwise fall
-			 * through to a fallible allocation here, defeating the
-			 * reserve's no-fail guarantee.  The report names the
-			 * missing bucket so a manifest can be extended to a new
-			 * shape.  Production falls through (degrading to
-			 * pre-reserve behaviour).
+			 * The reserve is active but exhausted for this (kind,
+			 * order).  The op's manifest under-counted what it
+			 * allocates.
 			 *
-			 * It names ONE ATTEMPT's manifest, because an aborted
-			 * attempt gives its items back (ft_alloc_reserve_refund):
-			 * a retry loop cannot walk a bucket down round by round.
+			 * Surface it in debug.  Otherwise the op would fall
+			 * through to a fallible allocation here, and the
+			 * reserve's no-fail guarantee would be lost.  The
+			 * report names the missing bucket, so a manifest can
+			 * be extended to a new shape.  Production falls
+			 * through, and degrades to pre-reserve behaviour.
+			 *
+			 * The report names ONE ATTEMPT's manifest.  An
+			 * aborted attempt gives its items back
+			 * (ft_alloc_reserve_refund), so a retry loop cannot
+			 * walk a bucket down round by round.
 			 */
 			fprintf(stderr,
 				"ft alloc reserve underflow: kind=%d order=%zu\n",
@@ -1607,10 +1767,12 @@ struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_ord
 }
 
 /*
- * Compressed-node allocation for skip-compressed groups: routes to a
- * separate arena set so compressed-node pages don't share allocator
- * pages with the internal nodes that ARE on the cand-mode descent
- * hot path.  Cold for lookup in skip-compressed groups; the descent
+ * Allocate a compressed node.
+ *
+ * A skip-compressed group routes it to a separate arena set.  The
+ * compressed-node pages then don't share allocator pages with the
+ * internal nodes, which ARE on the cand-mode descent hot path.
+ * Compressed nodes are cold for lookup in such a group: the descent
  * never reads compressed-node bodies, only the skip_len high bits.
  *
  * Non-speculative groups can still use this entry point but get the
@@ -1634,10 +1796,11 @@ struct cds_ft_metadata *cds_ft_alloc_compressed_item(struct cds_ft *ft,
 }
 
 /*
- * Ordinal-cell allocation: routes to the group's dedicated cell
- * arena so the uniform 32 B cells pack contiguously in their own item region,
- * the dense stride cds_ft_compact relocates them into.  Never mixed with the
- * internal-node or compressed-node arenas.
+ * Allocate an ordinal cell from the group's dedicated cell arena.
+ *
+ * The uniform 32 B cells then pack contiguously in their own item region.
+ * This is the dense stride that cds_ft_compact relocates them into.  Cells
+ * are never mixed with the internal-node or compressed-node arenas.
  */
 __attribute__((visibility("hidden")))
 struct cds_ft_metadata *cds_ft_alloc_cell_item(struct cds_ft *ft)
@@ -1657,23 +1820,28 @@ static
 void cds_ft_do_free_item(struct cds_ft_metadata *metadata)
 {
 	/*
-	 * ☞ THE HOOK BELONGS AT THE CHOKEPOINT, NOT AT THE WRAPPERS.  It sat
-	 * on cds_ft_free_item / _unpublished / _deferred, which between them
-	 * miss TWO routes back to the arena: the arena drain's bulk reclaim and
-	 * -- the common one -- cds_ft_free_item_rcu, the call_rcu callback.  The
-	 * non-owner-clear table is keyed by ADDRESS, so a free it does not see
-	 * leaves a stale "held by tid T" against a chunk the allocator then
-	 * hands out again, and the next legitimate take of the NEW item reads as
-	 * a steal.  Every route ends here; this is the only place that cannot be
+	 * ☞ THE HOOK BELONGS AT THE CHOKEPOINT, NOT AT THE WRAPPERS.
+	 *
+	 * The hook used to sit on cds_ft_free_item / _unpublished /
+	 * _deferred.  Between them, those miss TWO routes back to the arena:
+	 *  - the arena drain's bulk reclaim;
+	 *  - cds_ft_free_item_rcu, the call_rcu callback (the common one).
+	 *
+	 * The non-owner-clear table is keyed by ADDRESS.  A free that the
+	 * table does not see leaves a stale "held by tid T" against the
+	 * chunk.  The allocator then hands the chunk out again.  The next
+	 * legitimate take of the NEW item reads as a steal.
+	 *
+	 * Every route ends here.  This is the only place that cannot be
 	 * missed.
 	 */
 	FT_DT_NOTE_FREED(metadata);
 
 #ifdef FT_ENABLE_TRACING
 	/*
-	 * THE push itself, keyed on the ITEM pointer to match item_alloc /
-	 * item_free.  @via 0 means no site set it, which for this function means
-	 * the call_rcu callback.
+	 * THE push itself.  It is keyed on the ITEM pointer, to match
+	 * item_alloc / item_free.  @via 0 means that no site set it.  For
+	 * this function, that means the call_rcu callback.
 	 */
 	FT_TP(item_reclaim, cds_ft_metadata_to_item(metadata),
 		(unsigned int) (ft_dbg_free_via ? ft_dbg_free_via
@@ -1717,18 +1885,25 @@ void cds_ft_do_free_item(struct cds_ft_metadata *metadata)
 		range->nr_live--;
 		if (caa_unlikely(range->recompact_private)) {
 			/*
-			 * The range belongs to an in-flight compaction's private
-			 * context: range->node sits on the context's own list
-			 * (ctx->all, mutated by the compactor thread under per-
-			 * arena locks of OTHER arenas), so unlinking it here (the
-			 * reclaim arm below) would corrupt that list; and pushing
-			 * the range onto partial_ranges would let unrelated
-			 * allocations land INSIDE the private range and be
-			 * misclassified as already-relocated by
-			 * cds_ft_metadata_in_recompact_private.  Thread the slot
-			 * on the range's own free list only;
-			 * ft_recompact_alloc_merge restores the partial/reclaim
-			 * invariants when the range becomes ordinary.
+			 * The range belongs to the private context of an
+			 * in-flight compaction.  Two things must not happen:
+			 *
+			 *  - Unlinking range->node here, as the reclaim arm
+			 *    below does.  range->node sits on the context's
+			 *    own list (ctx->all).  The compactor thread
+			 *    mutates that list under the per-arena locks of
+			 *    OTHER arenas.  The unlink would corrupt it.
+			 *
+			 *  - Pushing the range onto partial_ranges.
+			 *    Unrelated allocations would then land INSIDE
+			 *    the private range.
+			 *    cds_ft_metadata_in_recompact_private would
+			 *    misclassify them as already-relocated.
+			 *
+			 * So thread the slot on the range's own free list
+			 * only.  ft_recompact_alloc_merge restores the
+			 * partial/reclaim invariants when the range becomes
+			 * ordinary.
 			 */
 			metadata_alloc->free_list_next = range->free_list_head;
 			range->free_list_head = metadata_alloc;
@@ -1773,12 +1948,15 @@ void cds_ft_do_free_item(struct cds_ft_metadata *metadata)
 }
 
 /*
- * Node-allocation reserve (see struct cds_ft_alloc_reserve + the API docstrings
- * in fractal-trie-internal.h).  Fill uses the low-level alloc entries
- * (cds_ft_alloc_item / cds_ft_alloc_compressed_item) so the items are NOT
- * leak-counted here (the count lives in alloc_cds_ft_node); a drawn-and-used
- * item is counted once there, and a drained (unused) item is freed uncounted,
- * keeping the debug node accounting balanced.
+ * Node-allocation reserve.  See struct cds_ft_alloc_reserve and the API
+ * docstrings in fractal-trie-internal.h.
+ *
+ * The fill uses the low-level alloc entries (cds_ft_alloc_item /
+ * cds_ft_alloc_compressed_item).  So the items are NOT leak-counted here:
+ * the count lives in alloc_cds_ft_node.  This keeps the debug node
+ * accounting balanced:
+ *  - a drawn-and-used item is counted once, in alloc_cds_ft_node;
+ *  - a drained (unused) item is freed uncounted.
  */
 int cds_ft_alloc_reserve_add(struct cds_ft *ft, struct cds_ft_alloc_reserve *r,
 		enum cds_ft_alloc_kind kind, size_t item_len_order, bool bitmap,
@@ -1914,11 +2092,13 @@ void cds_ft_free_item_rcu(struct rcu_head *rcu_head)
  *
  * Concurrent-mode tries defer the actual freelist push by call_rcu
  * so concurrent RCU readers cannot dereference a slot the writer
- * has just unlinked.  Exclusive-mode tries forbid concurrent
- * readers (cds_ft_make_exclusive() drains pre-existing readers via
- * synchronize_rcu before flipping the flag), so the slot can be
- * pushed back synchronously and reused immediately by the next
- * allocation, avoiding the call_rcu round-trip.
+ * has just unlinked.
+ *
+ * Exclusive-mode tries forbid concurrent readers.
+ * cds_ft_make_exclusive() drains pre-existing readers via
+ * synchronize_rcu before flipping the flag.  So the slot can be
+ * pushed back synchronously, and the next allocation can reuse it
+ * immediately.  This avoids the call_rcu round-trip.
  *
  * FT_IMMEDIATE_FREE testing mode poisons every slot in either
  * mode (see cds_ft_do_free_item).
@@ -1938,9 +2118,11 @@ void cds_ft_free_item(struct cds_ft *ft, struct cds_ft_metadata *metadata)
 	 * The item data poison would corrupt concurrent exact
 	 * lookups (which only traverse item data and never touch
 	 * metadata).  The metadata poison would additionally
-	 * corrupt concurrent inequality lookups, iteration, and
-	 * skip-compressed traversal, which read metadata fields
-	 * (parent, external_nodes, nr_keys) on the read-side.
+	 * corrupt the concurrent paths that read metadata fields
+	 * (parent, external_nodes, nr_keys) on the read-side:
+	 *  - inequality lookups;
+	 *  - iteration;
+	 *  - skip-compressed traversal.
 	 *
 	 * Use this mode exclusively for validating that mutation
 	 * paths do not access freed memory.
@@ -1971,46 +2153,67 @@ void cds_ft_free_item(struct cds_ft *ft, struct cds_ft_metadata *metadata)
 
 #ifndef FT_IMMEDIATE_FREE
 /*
- * Give an UNPUBLISHED item back to this thread's active reserve for @ft, so an
- * attempt that drew from the reserve and then aborted returns what it drew.
- * Returns false when the item does not belong in a reserve bucket; the caller
- * then frees it to the arena.
+ * Give an UNPUBLISHED item back to this thread's active reserve for @ft.
+ * An attempt that drew from the reserve and then aborted returns what it
+ * drew this way.  Return false when the item does not belong in a reserve
+ * bucket; the caller then frees it to the arena.
  *
  * THE RESERVE'S OTHER HALF.  ft_bulk_node_reserve_fill sizes a reserve to a
- * superset of what ONE attempt at a bulk op's commit allocates, and the draw
- * path above treats an empty bucket as an under-counted manifest.  But the ops
- * that draw from a reserve RETRY: ft_graft_keylen re-descends from retry_attach
- * on every contention bail and re-allocates that attempt's nodes -- the fresh
- * source root, and a whole glue cluster for a diverge shape -- after freeing the
- * previous attempt's to the ARENA.  Each round therefore shrank the reserve by
- * one attempt's worth, so enough rounds exhausted it however generous the fill
- * was: measured as a kind=0 order=5 underflow (the fresh source root) once a
- * contended same-trie rekey reached its ninth round.  A refund makes an aborted
- * attempt reserve-NEUTRAL, which is what bounds a whole retry loop by one
- * attempt's manifest -- a property no constant can provide.
+ * superset of what ONE attempt at a bulk op's commit allocates.  The draw
+ * path above treats an empty bucket as an under-counted manifest.  But the
+ * ops that draw from a reserve RETRY.  On every contention bail,
+ * ft_graft_keylen:
+ *  - re-descends from retry_attach;
+ *  - re-allocates that attempt's nodes: the fresh source root, and a whole
+ *    glue cluster for a diverge shape.
  *
- * SAFE, and cheaper than the free/alloc round trip it replaces: the item was
- * never published, so no reader can reach it and this thread still owns it.  It
- * goes straight back to the bucket it came from with no arena lock, no grace
- * period, and no change to range->nr_live -- the slot stays live because it
- * stays ours, and it is accounted exactly once when it is finally freed (by a
- * later use, or by cds_ft_alloc_reserve_drain).
+ * It does so after freeing the previous attempt's nodes to the ARENA.
  *
- * It is CLEARED the way the arena's freelist-reuse path clears a recycled slot
- * (body, metadata with alloc_index preserved, reverse bitmap), because the draw
- * path hands items out as they are: a reserve filled by cds_ft_alloc_reserve_add
- * holds untouched arena items, and alloc_cds_ft_node's callers rely on the
- * allocator returning zeroed memory.  A used item is not zero, so refunding one
- * without this would hand the next draw a dirty node.
+ * Each round therefore shrank the reserve by one attempt's worth.  Enough
+ * rounds exhausted it, however generous the fill was.  This was measured
+ * as a kind=0 order=5 underflow (the fresh source root), once a contended
+ * same-trie rekey reached its ninth round.
  *
- * The item's ARENA names its bucket exactly -- there is one arena per (kind,
- * order) -- and that lookup is also what rejects everything a reserve never
- * holds: ordinal cells, and any item not from @ft's group's node arenas.  Those
- * two group slots are published with a release store by the lazy arena create
- * above, so they are read as atomics here; a relaxed load is enough because this
- * only compares pointer identity, and every way the comparison can come out
- * wrong (a slot still read as NULL) falls through to the plain arena free, which
- * is what the caller did before this refund existed.
+ * A refund makes an aborted attempt reserve-NEUTRAL.  One attempt's
+ * manifest then bounds a whole retry loop.  No constant can provide that
+ * property.
+ *
+ * The refund is SAFE: the item was never published, so no reader can reach
+ * it and this thread still owns it.
+ *
+ * It is also cheaper than the free/alloc round trip it replaces.  The item
+ * goes straight back to the bucket it came from, with:
+ *  - no arena lock;
+ *  - no grace period;
+ *  - no change to range->nr_live.
+ *
+ * The slot stays live because it stays ours.  It is accounted exactly once,
+ * when it is finally freed (by a later use, or by
+ * cds_ft_alloc_reserve_drain).
+ *
+ * The item is CLEARED the way the arena's freelist-reuse path clears a
+ * recycled slot: body, metadata with alloc_index preserved, reverse bitmap.
+ * The reason is that the draw path hands items out as they are:
+ *  - a reserve filled by cds_ft_alloc_reserve_add holds untouched arena
+ *    items;
+ *  - alloc_cds_ft_node's callers rely on the allocator returning zeroed
+ *    memory.
+ *
+ * A used item is not zero.  Refunding one without the clear would hand the
+ * next draw a dirty node.
+ *
+ * The item's ARENA names its bucket exactly: there is one arena per (kind,
+ * order).  That lookup is also what rejects everything a reserve never
+ * holds:
+ *  - ordinal cells;
+ *  - any item not from @ft's group's node arenas.
+ *
+ * The lazy arena create above publishes those two group slots with a
+ * release store, so they are read as atomics here.  A relaxed load is
+ * enough because this only compares pointer identity.  The comparison can
+ * only come out wrong when a slot is still read as NULL.  That case falls
+ * through to the plain arena free, which is what the caller did before this
+ * refund existed.
  */
 static
 bool ft_alloc_reserve_refund(struct cds_ft *ft, struct cds_ft_metadata *metadata)
@@ -2079,37 +2282,42 @@ void cds_ft_free_item_unpublished(struct cds_ft *ft __attribute__((unused)),
 {
 #ifdef FT_DEBUG_TOMBSTONE_AUDIT
 	/*
-	 * Counted so a green is a claim about the CODE and not about whether
-	 * this path runs at all: an assert nothing reaches is not coverage.
+	 * Count the calls.  A green is then a claim about the CODE, not
+	 * about whether this path runs at all.  An assert that nothing
+	 * reaches is not coverage.
 	 */
 	uatomic_inc(&ft_unpub_free_calls);
 	/*
-	 * THE OTHER HALF of free_cds_ft_node's freeze-on-free guard, which
-	 * asserts that everything reaching the DEFERRED path carries the
-	 * one-way tombstone, and states the converse in prose: "abandoned fresh
-	 * (never-reader-visible) nodes use free_cds_ft_node_unpublished and do
-	 * not reach here."  That converse was never checked.
+	 * THE OTHER HALF of free_cds_ft_node's freeze-on-free guard.  That
+	 * guard asserts that everything reaching the DEFERRED path carries
+	 * the one-way tombstone.  It states the converse in prose only:
+	 * "abandoned fresh (never-reader-visible) nodes use
+	 * free_cds_ft_node_unpublished and do not reach here."  That
+	 * converse was never checked.
 	 *
-	 * The tombstone is set only by a retire, i.e. only on a node that WAS
-	 * published, so a tombstoned item arriving here is one this path's
-	 * contract excludes -- "items that were never published, no reader can
-	 * hold a reference".  Freeing it immediately returns its metadata to the
-	 * range freelist under readers and writers that may still hold it, and
-	 * free_list_next then lands on parent_word, which is what an ancestor
-	 * climb later dereferences.
+	 * The tombstone is set only by a retire, i.e. only on a node that
+	 * WAS published.  So this path's contract excludes a tombstoned
+	 * item: "items that were never published, no reader can hold a
+	 * reference".
 	 *
-	 * Asserted rather than tolerated because the immediate path is chosen by
-	 * the CALLER: nothing else can catch a site that picks it for a node it
-	 * has already published.
+	 * Freeing a tombstoned item immediately goes wrong in three steps:
+	 *  - its metadata returns to the range freelist, under readers and
+	 *    writers that may still hold it;
+	 *  - free_list_next then lands on parent_word;
+	 *  - an ancestor climb later dereferences parent_word.
+	 *
+	 * This is asserted rather than tolerated because the CALLER chooses
+	 * the immediate path.  Nothing else can catch a site that picks it
+	 * for a node it has already published.
 	 */
 	assert(!ft_meta_tombstone(metadata));
 #endif
 #ifndef FT_IMMEDIATE_FREE
 	/*
-	 * An attempt that drew this item from a reserve gets it back, so a retry
-	 * loop cannot drain the reserve it is supposed to be covered by.  Excluded
-	 * under FT_IMMEDIATE_FREE, whose whole point is that a freed slot is
-	 * poisoned and never reused.
+	 * An attempt that drew this item from a reserve gets it back.  A
+	 * retry loop then cannot drain the reserve that is supposed to cover
+	 * it.  Excluded under FT_IMMEDIATE_FREE, whose whole point is that a
+	 * freed slot is poisoned and never reused.
 	 */
 	if (ft_alloc_reserve_refund(ft, metadata))
 		return;
@@ -2125,23 +2333,30 @@ void cds_ft_free_item_unpublished(struct cds_ft *ft __attribute__((unused)),
 
 /*
  * Always-deferred free for the compactor: routes through call_rcu even on
- * an EXCLUSIVE trie.  The compaction step keeps navigating relative to
- * nodes it has just unpublished, and the exclusive-mode synchronous free
- * threads the freelist link through the freed slot immediately -- the
- * compactor must never free synchronously.  (FT_IMMEDIATE_FREE testing
- * mode keeps its poison-now behavior, like cds_ft_free_item.)
+ * an EXCLUSIVE trie.  The compactor must never free synchronously:
+ *  - the compaction step keeps navigating relative to nodes it has just
+ *    unpublished;
+ *  - the exclusive-mode synchronous free threads the freelist link
+ *    through the freed slot immediately.
+ *
+ * (FT_IMMEDIATE_FREE testing mode keeps its poison-now behavior, like
+ * cds_ft_free_item.)
  */
 /*
  * ☠ THE LEAK BALANCE IS THIS FUNCTION'S JOB, NOT ITS CALLERS'.
  *
- * The counted free paths are WRAPPERS -- free_cds_ft_node and
- * free_compressed_node bump the balance around cds_ft_free_item -- but this
- * entry has no wrapper, so for a long time each caller was expected to bump it
- * by hand.  Three of the five did not (the rekey's old S_top, the old root, and
- * one compaction site), which made cds_ft_group_destroy report a leak of
- * EXACTLY ONE NODE PER SERVED REKEY: allocated, genuinely reclaimed, and never
- * counted.  It cost a full flight-recorder hunt to find that the node in the
- * report was not lost at all.
+ * The counted free paths are WRAPPERS: free_cds_ft_node and
+ * free_compressed_node bump the balance around cds_ft_free_item.  This
+ * entry has no wrapper.  So for a long time each caller was expected to
+ * bump the balance by hand.  Three of the five did not:
+ *  - the rekey's old S_top;
+ *  - the old root;
+ *  - one compaction site.
+ *
+ * This made cds_ft_group_destroy report a leak of EXACTLY ONE NODE PER
+ * SERVED REKEY.  The node was allocated, genuinely reclaimed, and never
+ * counted.  It cost a full flight-recorder hunt to find that the node in
+ * the report was not lost at all.
  *
  * A balance nobody owns drifts, so this owns it.  The arena knows which kind of
  * item it hands out, so the kind needs no parameter and no caller can get it
@@ -2155,9 +2370,9 @@ void ft_free_item_account(struct cds_ft_metadata *metadata)
 	struct cds_ft_group *group;
 
 	/*
-	 * The predicate FIRST: this sits on the deferred-free hot path, and the
-	 * range/arena/group walk is three dependent loads that a build without
-	 * counters must not pay for.
+	 * Test the predicate FIRST.  This sits on the deferred-free hot
+	 * path.  The range/arena/group walk is three dependent loads, and a
+	 * build without counters must not pay for them.
 	 */
 	if (!ft_debug_counters())
 		return;
@@ -2221,26 +2436,31 @@ void cds_ft_free_all_arenas(struct cds_ft_group *ft_group)
  *
  * Each range is FT_EXT_ARENA_RANGE_SIZE bytes, aligned to its own
  * size (via over-mmap-and-trim) so range_base = item & ~(SIZE-1).
- * A 1 MiB per-cell metadata bitmap (1 byte / 16-byte cell) at the
- * start of each range encodes "is this cell the start of an
- * allocated/free block, and at what order".  cds_ft_external_arena_free
- * recovers the order from any item pointer with one mask + one load.
+ * Each range starts with a 1 MiB per-cell metadata bitmap (1 byte /
+ * 16-byte cell).  A byte says whether its cell is the start of an
+ * allocated or free block, and at what order.
+ * cds_ft_external_arena_free recovers the order from any item pointer
+ * with one mask + one load.
  *
- * Cross-class buddy splitting: alloc(O) first checks freelist[O];
- * on miss, scans freelist[O+1..MAX] for a larger free block, pops
- * it, and splits it down to order O -- each split pushes one
- * smaller-order half onto the corresponding freelist.
+ * Cross-class buddy splitting, in alloc(O):
+ *  - check freelist[O] first;
+ *  - on miss, scan freelist[O+1..MAX] for a larger free block and
+ *    pop it;
+ *  - split it down to order O.  Each split pushes one smaller-order
+ *    half onto the corresponding freelist.
  *
- * Cross-class buddy merging: free(ptr) reads the block's order
- * from the cell map, then checks its buddy (at offset ^ (1 << O))
- * -- if the buddy is also free at the same order, removes it from
- * its freelist, marks one cell as "interior", merges into an
- * order-(O+1) block, and recurses upward.
+ * Cross-class buddy merging, in free(ptr):
+ *  - read the block's order O from the cell map;
+ *  - check its buddy, at offset ^ (1 << O);
+ *  - if the buddy is also free at the same order, remove it from
+ *    its freelist, mark one cell as "interior" and merge into an
+ *    order-(O+1) block;
+ *  - recurse upward.
  *
  * The trailing FT_EXT_ARENA_GUARD_SIZE bytes of every range are
- * reserved as a never-allocated guard so the library's 32-byte
- * SIMD leaf compare can safely over-read past the last bump-
- * allocated slot in the range.
+ * reserved as a never-allocated guard.  The library's 32-byte SIMD
+ * leaf compare can then safely over-read past the last
+ * bump-allocated slot in the range.
  */
 
 #define FT_EXT_ARENA_MIN_ORDER		4	/* 16 B minimum slot */
@@ -2256,12 +2476,17 @@ void cds_ft_free_all_arenas(struct cds_ft_group *ft_group)
 	(FT_EXT_ARENA_RANGE_SIZE / FT_EXT_ARENA_MIN_SLOT_SIZE)
 /*
  * Cell sentinel for "not a block start" (interior of a larger block, or
- * unallocated region).  Real cell values encode bit 0 = free, bits 1-7 =
- * (order - MIN_ORDER + 1) -- the +1 reserves the all-zero value as the
- * sentinel so a freshly mmap'd range reads CELL_NONE everywhere WITHOUT an
- * eager memset (the 1 MiB cells[] of a 16 MiB range faults lazily, only the
- * cells the allocator touches).  Real values are therefore >= 2; value 1 is
- * an unused hole (uint8_t has ample room).
+ * unallocated region).
+ *
+ * Real cell values encode:
+ *  - bit 0 = free;
+ *  - bits 1-7 = (order - MIN_ORDER + 1).
+ *
+ * The +1 reserves the all-zero value as the sentinel.  A freshly mmap'd
+ * range then reads CELL_NONE everywhere WITHOUT an eager memset.  The
+ * 1 MiB cells[] of a 16 MiB range faults lazily: only the cells the
+ * allocator touches.  Real values are therefore >= 2; value 1 is an unused
+ * hole (uint8_t has ample room).
  */
 #define FT_EXT_ARENA_CELL_NONE		0x00
 
@@ -2396,12 +2621,14 @@ ft_ext_arena_range_create(int huge)
 		(void) munmap((char *) aligned + FT_EXT_ARENA_RANGE_SIZE, post);
 	/*
 	 * External arena isn't tied to a specific group, so it uses
-	 * CDS_FT_NUMA_DEFAULT: defer to the process / libnuma policy.
-	 * When the process policy is INTERLEAVE (typical numactl
-	 * --interleave wrapper), ft_apply_interleave promotes it to
-	 * 2 MiB-chunk MPOL_BIND for NUMA-local contiguous spans.  Otherwise
-	 * (no process policy, or LOCAL/PREFERRED/BIND), the kernel
-	 * honors the process choice at fault time.
+	 * CDS_FT_NUMA_DEFAULT.  ft_apply_interleave then looks at the
+	 * process policy:
+	 *  - MPOL_DEFAULT (no process policy): interleave the range.
+	 *  - MPOL_INTERLEAVE (typical numactl --interleave wrapper):
+	 *    promote it to 2 MiB-chunk MPOL_BIND for NUMA-local
+	 *    contiguous spans.
+	 *  - LOCAL/PREFERRED/BIND: no mbind.  The kernel honors the
+	 *    process choice at fault time.
 	 */
 	ft_apply_interleave(aligned, FT_EXT_ARENA_RANGE_SIZE,
 			CDS_FT_NUMA_DEFAULT);
@@ -2411,11 +2638,13 @@ ft_ext_arena_range_create(int huge)
 	r = (struct cds_ft_external_arena_range *) aligned;
 	CDS_INIT_LIST_HEAD(&r->node);
 	/*
-	 * No cells[] memset: FT_EXT_ARENA_CELL_NONE is 0, which the fresh mmap
-	 * already zero-fills, so every cell (header region, unbumped tail)
-	 * reads "not a block start" and the 1 MiB cells[] array faults lazily
-	 * -- only the cells the allocator touches.  First slot offset rounds
-	 * the struct size up to MIN_SLOT_SIZE so cell-index math is uniform.
+	 * No cells[] memset.  FT_EXT_ARENA_CELL_NONE is 0, and the fresh
+	 * mmap is already zero-filled.  So every cell (header region,
+	 * unbumped tail) reads "not a block start".  The 1 MiB cells[] array
+	 * faults lazily: only the cells the allocator touches.
+	 *
+	 * First slot offset rounds the struct size up to MIN_SLOT_SIZE so
+	 * cell-index math is uniform.
 	 */
 	r->bump = (sizeof(*r) + FT_EXT_ARENA_MIN_SLOT_SIZE - 1)
 			& ~(FT_EXT_ARENA_MIN_SLOT_SIZE - 1);
@@ -2584,26 +2813,34 @@ void cds_ft_external_arena_free(struct cds_ft_external_arena *a, void *ptr)
 	r = ft_ext_arena_range_of(ptr);
 	/*
 	 * Read the block's cell metadata before taking a->lock.  cells[] is
-	 * otherwise mutated only under the lock, but the cell that starts an
-	 * allocated block is immutable until that block is freed: buddy merge
-	 * only combines free blocks (the merge guard below requires the buddy
-	 * be free), and split / alloc only write the cell of the block they
-	 * carve or hand out -- never an allocated block's start cell.  The
-	 * caller owns @ptr's still-allocated block (freeing an unowned or
-	 * already-freed pointer is caller misuse, caught by the assert below),
-	 * so no other thread can be writing this cell concurrently and the
-	 * order decoded here is still valid once the lock is held.
+	 * otherwise mutated only under the lock.
+	 *
+	 * The unlocked read is safe because the cell that starts an
+	 * allocated block is immutable until that block is freed:
+	 *  - buddy merge only combines free blocks (the merge guard below
+	 *    requires the buddy be free);
+	 *  - split / alloc only write the cell of the block they carve or
+	 *    hand out, never an allocated block's start cell.
+	 *
+	 * The caller owns @ptr's still-allocated block.  Freeing an unowned
+	 * or already-freed pointer is caller misuse, caught by the assert
+	 * below.  So no other thread can be writing this cell concurrently,
+	 * and the order decoded here is still valid once the lock is held.
 	 */
 	cell = r->cells[ft_ext_arena_cell_index(ptr)];
 	order = ft_ext_arena_cell_order(cell);
 	/*
 	 * Guard against freeing a pointer this arena never handed out, or a
-	 * double free.  An unallocated cell is FT_EXT_ARENA_CELL_NONE (0),
-	 * which decodes to order 3 -- below FT_EXT_ARENA_MIN_ORDER -- so the
-	 * freelist index (order - FT_EXT_ARENA_MIN_ORDER) would be -1 and the
-	 * push below would scribble freelist[-1]; an already-free cell has the
-	 * is_free bit set.  Catch either as a diagnosable abort instead of
-	 * silently corrupting the heap.
+	 * double free:
+	 *  - An unallocated cell is FT_EXT_ARENA_CELL_NONE (0).  It decodes
+	 *    to order 3, below FT_EXT_ARENA_MIN_ORDER.  The freelist index
+	 *    (order - FT_EXT_ARENA_MIN_ORDER) would be -1, and the push
+	 *    below would scribble freelist[-1].
+	 *  - An already-free cell has the is_free bit set.
+	 *
+	 * The assert catches either as a diagnosable abort instead of
+	 * silently corrupting the heap.  It is an assert only: a build with
+	 * NDEBUG has no such guard.
 	 */
 	assert(order >= FT_EXT_ARENA_MIN_ORDER &&
 			order <= FT_EXT_ARENA_MAX_ORDER &&
