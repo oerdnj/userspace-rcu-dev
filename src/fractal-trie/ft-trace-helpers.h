@@ -8,9 +8,10 @@
  * Userspace RCU library - Fractal Trie: LTTng tracepoint argument helpers
  * (compiled only under FT_ENABLE_TRACING).  Map a tagged cds_ft_inode_flag
  * pointer to the symbolic node-kind / skip-length values the tracepoints in
- * cds_ft_tp.h record.  Exported (non-static): the tracepoint-provider unit
- * cds_ft_tp.c calls them through the declarations in cds_ft_tp.h; there are no
- * in-translation-unit callers.  Compiles to nothing when tracing is off.
+ * cds_ft_tp.h record.  The helpers are exported (non-static).  The
+ * tracepoint-provider unit cds_ft_tp.c calls them through the declarations
+ * in cds_ft_tp.h.  There are no in-translation-unit callers.  Compiles to
+ * nothing when tracing is off.
  *
  * Implementation unit: #included once into the fractal-trie.c translation
  * unit, after ft-helpers.h (whose node accessors it uses).  Not standalone.
@@ -23,10 +24,11 @@
 /*
  * Map a tagged cds_ft_inode_flag pointer to a symbolic node-kind
  * value (enum ft_tp_node_kind, defined in fractal-trie-internal.h
- * and exposed as the LTTng enum ft_tp_node_kind in src/cds_ft_tp.h).
- * Uses a single 16-entry compile-time dispatch table indexed by the
- * type-selecting bits of the pointer, so the runtime helper reduces
- * to a NULL/skip check plus one table load.
+ * and exposed as the LTTng enum ft_tp_node_kind in
+ * src/fractal-trie/cds_ft_tp.h).
+ * Uses a single 16-entry compile-time dispatch table.  The
+ * type-selecting bits of the pointer index it.  So the runtime helper
+ * reduces to a NULL/skip check plus one table load.
  */
 
 /*
@@ -39,15 +41,15 @@
  *
  * Compressed nodes are 16-byte aligned, so bit 3 is guaranteed zero
  * for them.  External nodes need only 8-byte alignment (low 3 bits
- * = 000), so bit 3 may be either value -- both [0b0000] and [0b1000]
+ * = 000), so bit 3 may be either value.  Both [0b0000] and [0b1000]
  * map to EXTERNAL.
  *
- * Skip-compressed pointers are special-cased before the table lookup
- * (the only exception); the table itself is a pure pointer-bits
+ * Skip-compressed pointers are special-cased before the table lookup.
+ * This is the only exception.  The table itself is a pure pointer-bits
  * dispatch.
  *
  * Slot value 0 (FT_TP_NODE_NULL) doubles as a "no entry" sentinel
- * that resolves to FT_TP_NODE_UNKNOWN; NULL pointers are caught by
+ * that resolves to FT_TP_NODE_UNKNOWN.  NULL pointers are caught by
  * the explicit nf != NULL check before any table access.
  */
 #define FT_TP_KIND_TABLE_MASK	0xFU
@@ -118,7 +120,7 @@ uint16_t ft_tp_node_kind(struct cds_ft_inode_flag *nf)
 	 * Skip-compression is orthogonal to the underlying node type: a
 	 * skip pointer still points to a real child (external or
 	 * internal).  Strip the skip-length bits so the dispatch table
-	 * sees the underlying child's tag bits; the companion
+	 * sees the underlying child's tag bits.  The companion
 	 * ft_tp_node_skip_len() field exposes the skip length separately.
 	 */
 	if (ft_node_skip_compressed(nf))
