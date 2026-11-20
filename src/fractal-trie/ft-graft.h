@@ -2387,14 +2387,15 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 	 * The check is gated on the SOURCE alone.  dst may be a LIVE
 	 * concurrent trie: that is the supported case.
 	 *
-	 * A SAME-trie op is excluded (src == dst, reachable via
-	 * cds_ft_merge_at's whole-source rekey).  It takes one lock
-	 * reentrantly, like the crosstrie guard's a != b test.
+	 * Both callers (cds_ft_graft, cds_ft_merge_at) reject src == dst.
+	 * So past this check the source is always an exclusive, distinct
+	 * trie, and this function has no shared-source path.
 	 *
 	 * The check applies under every writer strategy.
 	 */
-	if (src_ft != dst_ft && !src_ft->exclusive)
+	if (!src_ft->exclusive)
 		return CDS_FT_STATUS_BUSY_ERROR;
+	assert(src_ft != dst_ft);
 
 	ft_crosstrie_lock_mode_guard(dst_ft, src_ft);
 	CDS_FT_SCOPED_WRITER(dst_ft);
@@ -2516,9 +2517,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * destination's root with no parent-pointer change
 		 * (both are root positions with parent == NULL).  No
 		 * "jump out" window, so the STRUCTURAL swap needs no
-		 * internal synchronize_rcu.  (The ordered-list run move
-		 * below adds its own post-flip drain when @src_ft is
-		 * concurrent -- see the finalize after the publish.)
+		 * internal synchronize_rcu.
 		 *
 		 * Swap root pointers.  The source's root carries all
 		 * metadata (nr_child, external_nodes) with it.  The
@@ -2556,9 +2555,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * disappear pending) or in NEITHER.
 		 *
 		 * Capture src's live root and endpoints first: the flip
-		 * overwrites them.  After the flip, drain src (if
-		 * concurrent).  Then finalize dst's adopted run to dst's
-		 * sentinel (below).
+		 * overwrites them.
 		 *
 		 * List off: head/tail are unused.  The swap reduces to the
 		 * two lone root edges, MCAS-expressible like the list-on
@@ -2566,16 +2563,13 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * internal synchronize_rcu is required.
 		 */
 		/*
-		 * An EXCLUSIVE src has no straddler.  So its run lands in
+		 * The exclusive src has no straddler.  So its run lands in
 		 * @dst_ft already linked to @dst_ft's sentinel.  The
 		 * whole-trie graft_swap relinks @swap_ft's run the same way.
-		 *
-		 * Only a live src keeps the universal end and the post-drain
-		 * finalize below.  A live src here means src == dst, the one
-		 * case the BUSY check at entry lets through.
+		 * Only the FT_RED_SEAM_NULLTERM red control leaves the
+		 * universal end, for the finalize below.
 		 */
-		struct cds_ft *dst_relink =
-			FT_SEAM_RELINK(src_ft->exclusive ? dst_ft : NULL);
+		struct cds_ft *dst_relink = FT_SEAM_RELINK(dst_ft);
 
 		{
 			struct cds_ft_inode_flag *dst_old = dst_root_fenced;
@@ -2630,23 +2624,18 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		FT_TP(root_publish, (const void *) src_ft,
 			(const void *) src_ft->root);
 		/*
-		 * Ordered-list run finalize.  The dual NULL-terminated src's
-		 * moved run (universal end).  Drain the src readers that
-		 * straddle that run.  Then repoint its outer links at dst's
-		 * sentinel, so dst's list is circular again.  The remove
-		 * folding and the reverse walk need first->prev == sentinel.
-		 *
-		 * An exclusive src has no straddler, so there is no drain.
-		 * The finalize still runs.  dst is live, so the finalize uses
-		 * rcu_assign_pointer.  The race with dst's own readers is
-		 * benign: for them both NULL and dst's sentinel mark the
-		 * end.
+		 * Ordered-list run finalize, red control only.  The dual
+		 * NULL-terminated the moved run (universal end).  Repoint
+		 * its outer links at dst's sentinel, so dst's list is
+		 * circular again.  The remove folding and the reverse walk
+		 * need first->prev == sentinel.  The exclusive src has no
+		 * straddler, so there is no drain.  dst is live, so the
+		 * finalize uses rcu_assign_pointer.  The race with dst's own
+		 * readers is benign: for them both NULL and dst's sentinel
+		 * mark the end.
 		 */
-		if (dst_ft->group->ordered_list_set && !dst_relink) {
-			if (!src_ft->exclusive)
-				ft_writer_lock_gp_wait(src_ft);
+		if (dst_ft->group->ordered_list_set && !dst_relink)
 			ft_ord_finalize_circular(dst_ft);
-		}
 		free_cds_ft_node(dst_ft, old_dst_root);
 		goto done;
 	}
@@ -2725,9 +2714,9 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * SUCCEEDS.  It is set post-commit.  So the existing
 		 * @already_swapped-guarded cleanup handles the abort.
 		 *
-		 * A non-exclusive src still needs the unlink -> drain ->
-		 * attach ordering.  It keeps the separate swap, and
-		 * @already_swapped is set at the swap.
+		 * With the ordered list on, the src-root retire is still a
+		 * separate flip (@src_retire_txn), and @already_swapped is
+		 * set there.
 		 */
 		bool src_swap_fused = false;
 		/*
@@ -2764,8 +2753,8 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * (graft_run.armed).  So this fallback is not taken today.
 		 * It is kept defensively.
 		 *
-		 * It runs in the failure-free section (post src-unlink +
-		 * drain), hence it is un-abortable.  So PRE-RESERVE its
+		 * It runs in the failure-free section (post src-unlink),
+		 * hence it is un-abortable.  So PRE-RESERVE its
 		 * bounded txn here.
 		 *
 		 * It is reserved only when the ordered list is on.  The
@@ -2840,16 +2829,12 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 *    parked on that lane is an ONLINE, non-quiescent reader
 		 *    that holds the GP open.
 		 *
-		 * The only grace period reachable from this body is its own
-		 * src drain.  That drain is gated on !src_ft->exclusive.
-		 * And dst_ft->lock_fine is what binds the escalation lane at
-		 * all.  So the conjunction IS the GP-free contract.
-		 *
-		 * The condition covers every retry the loop takes.  The same
-		 * run counted excl=679819 live=0, against 225 ops that
-		 * entered off-contract.  So the split is not vacuous.
+		 * The source is exclusive, so this body drains nothing: it
+		 * reaches no grace period.  And dst_ft->lock_fine is what
+		 * binds the escalation lane at all.  So it IS the GP-free
+		 * contract.
 		 */
-		const bool ra_txn = dst_ft->lock_fine && src_ft->exclusive;
+		const bool ra_txn = dst_ft->lock_fine;
 		unsigned long ra_depth __attribute__((unused)) = 0;
 
 		ft_txn_op_init(dst_ft, &optxn);
@@ -2916,17 +2901,17 @@ retry_attach:
 		 *
 		 * The txn is created before the build only to keep its
 		 * lifecycle in one place.  The build records nothing into
-		 * it.  Post-drain, the commit replays g->deferred through
+		 * it.  Post-unlink, the commit replays g->deferred through
 		 * it, and the store reserves its slot proxy through it.
 		 */
 		glue.txn = ft_flip_txn_create(dst_ft);
 		if (!glue.txn || !ft_flip_txn_reserve(glue.txn,
 				/* + FLOOR_FREE: fused free-list tombstones (§4.B) */
 				FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE
-				/* +1 fused src-root retire edge (exclusive src, follow-up b) */
-				+ (src_ft->exclusive ? 1 : 0)
-				/* +1 fused nil-key wrapper tombstone (exclusive nil-key src) */
-				+ ((src_ft->exclusive && nil_key_root) ? 1 : 0)
+				/* +1 fused src-root retire edge (follow-up b) */
+				+ 1
+				/* +1 fused nil-key wrapper tombstone */
+				+ (nil_key_root ? 1 : 0)
 				/* + count walk: the +src_count nr_keys ancestor edges (BULK fold) */
 				+ (dst_ft->rank_stats ? (int) key_len + 1 : 0)
 				/* the split-retire terminal's second word, if any */
@@ -3078,17 +3063,10 @@ retry_attach:
 		 * txn (ft_ord_cell_flip_into).
 		 *
 		 * When to reserve:
-		 *  - List off: the retire is a lone-edge root store, so
-		 *    reserve only when the list is on.  The EXCEPTION is a
-		 *    NON-exclusive nil-key root retire.  It fuses the
-		 *    orphaned wrapper's tombstone into the retire (atomic
-		 *    detach, §4.B).  That needs a 2-edge txn even list-off.
-		 *  - List on: the txn grows by +1 for that same fused
-		 *    tombstone.
-		 *  - An EXCLUSIVE nil-key src instead fuses BOTH edges into
-		 *    @glue.txn (the src-swap-fused arm below).  So it needs
-		 *    no separate retire txn.  The wrapper tombstone was
-		 *    reserved above.
+		 *  - List off: the src-root retire and a nil-key wrapper's
+		 *    tombstone both fuse into @glue.txn (the src-swap-fused
+		 *    arm below), reserved above.  So no retire txn.
+		 *  - List on: +1 for a nil-key wrapper's fused tombstone.
 		 *
 		 * One-shot (src-side): the swap below consumes the
 		 * src-retire txn.  So a post-swap retry keeps the src empty
@@ -3124,24 +3102,6 @@ retry_attach:
 					ft_flip_txn_destroy(src_retire_txn);
 				if (run_splice_txn)
 					ft_flip_txn_destroy(run_splice_txn);
-				ft_flip_txn_destroy(glue.txn);
-				free_cds_ft_node_unpublished(src_ft, fresh_node);
-				ft_txn_attempt_end(&optxn, ra_txn);
-				return CDS_FT_STATUS_MEMORY_ERROR;
-			}
-		} else if (!already_swapped && nil_key_root && !src_ft->exclusive) {
-			src_retire_txn = ft_flip_txn_create_bounded(src_ft, 2);
-			if (!src_retire_txn) {
-				if (glue.split_cn_holder) {
-					/* SHARED: the caller's earlier acquire owns the release. */
-					if (!glue.split_cn_shared)
-						ft_meta_lock_release(glue.split_cn_holder);
-					glue.split_cn_holder = NULL;
-					glue.split_cn_shared = false;
-					glue.split_cn_snap = 0;
-					glue.split_cn_node = NULL;
-					glue.split_cn_node_snap = 0;
-				}
 				ft_flip_txn_destroy(glue.txn);
 				free_cds_ft_node_unpublished(src_ft, fresh_node);
 				ft_txn_attempt_end(&optxn, ra_txn);
@@ -3451,23 +3411,10 @@ retry_attach:
 		}
 
 		/*
-		 * "Jump out" prevention.  Take a reader that has
-		 * descended into src_ft's root subtree.  Then the
-		 * subtree's parent pointer is flipped to point into
-		 * dst_ft.  When that reader backtracks via parent
-		 * pointers, it observes dst_ft's ancestor chain.
-		 *
-		 * Correct ordering:
-		 *   1. Unlink the old root from src_ft (publish a fresh
-		 *      empty root) so no new reader can descend into
-		 *      the payload via src_ft.
-		 *   2. synchronize_rcu() drains readers that were
-		 *      inside the payload before the unlink.
-		 *   3. Re-parent and publish under dst_ft.  No reader
-		 *      is present to observe the parent flip.
-		 *
-		 * Exclusive sources carry no RCU readers, so the sync
-		 * is skipped in that case.
+		 * No "jump out" drain.  A reader inside src_ft's payload
+		 * would see dst_ft's ancestors once the payload is
+		 * re-parented.  But the source is exclusive: it has no
+		 * readers to drain.
 		 */
 		/*
 		 * Point of no return -- ONE-SHOT (doc post-store retry).
@@ -3512,17 +3459,15 @@ retry_attach:
 			 * while its ordered list still shows the run, or
 			 * vice versa.
 			 *
-			 * The synchronize_rcu below then drains src readers
-			 * of the old content.  The run is spliced into dst
-			 * after the structural publish (same commit point).
+			 * The run is spliced into dst after the structural
+			 * publish (same commit point).
 			 *
 			 * No rollback: every failure mode (OOM / populated)
 			 * returned above, before this retire.
 			 */
-			if (src_ft->exclusive && !dst_ft->group->ordered_list_set) {
+			if (!dst_ft->group->ordered_list_set) {
 				/*
-				 * FUSED cross-trie move (exclusive src, list
-				 * off): record the src-root retire INTO
+				 * FUSED cross-trie move (list off): record the src-root retire INTO
 				 * @glue.txn instead of a separate flip.  The
 				 * src unlink then flips ATOMICALLY with the
 				 * dst attach below.  There is no orphan
@@ -3548,8 +3493,8 @@ retry_attach:
 				 * §4.B).  So the unlink and the freeze
 				 * commit atomically with the attach.  An
 				 * abort rolls the tombstone back too.  The
-				 * wrapper is reclaimed post-drain, at the
-				 * nil-key free below.
+				 * wrapper is reclaimed at the nil-key free
+				 * below.
 				 *
 				 * Non-nil: @old_src_root IS the payload,
 				 * moved LIVE.  No tombstone.
@@ -3559,7 +3504,7 @@ retry_attach:
 						cds_ft_item_to_metadata(
 							ft_node_ptr(old_src_root)));
 				src_swap_fused = true;
-			} else if (dst_ft->group->ordered_list_set) {
+			} else {
 				graft_run_first = ft_ord_first(src_ft);
 				graft_run_last = ft_ord_last(src_ft);
 				/*
@@ -3578,27 +3523,6 @@ retry_attach:
 					old_src_root, ft_node_flag(fresh_node, 0),
 					graft_run_first, NULL, graft_run_last, NULL,
 					NULL, false);
-			} else if (nil_key_root) {
-				/*
-				 * List off + nil-key: the lone root edge and
-				 * the orphaned wrapper's tombstone commit as
-				 * ONE 2-edge flip, through the pre-reserved
-				 * txn.  Readers resolve the transient root
-				 * proxy exactly as on the list-on path.
-				 */
-				/* Stage 5: the root's own lock, so this record can park SW. */
-				(void) ft_root_lock_take(src_ft, NULL, src_retire_txn);
-				ft_flip_txn_record_root(src_retire_txn,
-					(void **) &src_ft->root,
-					(void *) old_src_root,
-					(void *) ft_node_flag(fresh_node, 0));
-				ft_flip_txn_record_tombstone(src_retire_txn,
-					cds_ft_item_to_metadata(ft_node_ptr(old_src_root)));
-				ft_flip_txn_commit_unfailable(src_ft,
-					src_retire_txn);
-			} else {
-				ft_root_edge_flip(src_ft, &src_ft->root,
-					old_src_root, ft_node_flag(fresh_node, 0));
 			}
 			if (!src_swap_fused) {
 				/*
@@ -3648,9 +3572,6 @@ retry_attach:
 			graft_run.armed = false;
 			run_arg = &graft_run;
 		}
-
-		if (!src_ft->exclusive)
-			ft_writer_lock_gp_wait(src_ft);
 
 		if (prep == FT_GRAFT_PREP_GLUE) {
 			/*
@@ -3851,7 +3772,7 @@ retry_attach:
 		 */
 
 		/*
-		 * Ordered list: src is now structurally empty and drained.
+		 * Ordered list: src is now structurally empty.
 		 * The payload is published under @key in dst.
 		 *
 		 * Every ordered graft shape FUSES the run-splice into its
@@ -3863,7 +3784,7 @@ retry_attach:
 		 * fallback for any not-yet-fused shape (none today).
 		 * Without it, an unfused shape would strand the run out of
 		 * the list.  It commits through the pre-reserved
-		 * @run_splice_txn (un-abortable post-drain).  The fused
+		 * @run_splice_txn (un-abortable post-unlink).  The fused
 		 * common case frees that txn unused.
 		 */
 		if (graft_run_first && !graft_run.armed) {
@@ -3878,8 +3799,7 @@ retry_attach:
 		/*
 		 * NIL-key graft succeeded: the external chain head was placed
 		 * directly, so the orphaned wrapper internal (the old source root)
-		 * is reclaimed.  Deferred, as readers may have been inside it before
-		 * the root swap + drain above.
+		 * is reclaimed.  No reader is inside it: the source is exclusive.
 		 */
 		if (nil_key_root)
 			free_cds_ft_node(src_ft, ft_node_ptr(old_src_root));
