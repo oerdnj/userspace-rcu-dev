@@ -23980,6 +23980,7 @@ void ft_glue_init(struct ft_glue *g)
 	g->op = NULL;			/* the op sets it beside g->txn */
 	g->src_key = NULL;		/* the rekey fold sets it: see @src_key */
 	g->src_len = 0;
+	g->payload_live = false;	/* the rekey fold sets it: see @payload_live */
 	g->deferred = g->deferred_floor;
 	g->nr_deferred = 0;
 	g->cap_deferred = FT_GLUE_FLOOR_DEFERRED;
