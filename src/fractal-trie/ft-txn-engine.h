@@ -9,18 +9,20 @@
  * THE COMMIT ENGINE AS FT SEES IT: the parked-slot format.
  *
  * While a commit is between install and settle, each of its slots holds a
- * PROXY: a tagged pointer to a small engine object that resolves to the
- * slot's old or new value, depending on ONE decision shared by every proxy
- * of that commit.  Readers resolve through that decision, and a reader that
- * needs two slots to agree compares the two proxies' decisions.
+ * PROXY.  A proxy is a tagged pointer to a small engine object.  It
+ * resolves to the slot's old or new value.  ONE decision, shared by every
+ * proxy of that commit, selects which.  Readers resolve through that
+ * decision.  A reader that needs two slots to agree compares the decisions
+ * of the two proxies.
  *
  * FT reads parked slots only through this file, so that an engine swap
- * re-implements it and nothing else.  Here it is the MCAS engine
- * (<urcu/rcu-txn.h>): a proxy is (struct urcu_txn_record * | tag), and its
- * decision is the record's descriptor status word.  In the SW engine
- * (<urcu/rcu-txn-sw.h>) a proxy is a latch's proxy and its decision is the
- * flip group's selector.  Both are 16-byte aligned, which FT's 0xF tag
- * needs (FT_FLIP_PROXY_TAG).
+ * re-implements it and nothing else.  The two engines:
+ *   - Here it is the MCAS engine (<urcu/rcu-txn.h>).  A proxy is
+ *     (struct urcu_txn_record * | tag).  Its decision is the record's
+ *     descriptor status word.
+ *   - In the SW engine (<urcu/rcu-txn-sw.h>) a proxy is a latch's proxy.
+ *     Its decision is the flip group's selector.
+ * Both are 16-byte aligned, which FT's 0xF tag needs (FT_FLIP_PROXY_TAG).
  */
 
 #define FT_TXN_INLINE	static inline __attribute__((always_inline))
@@ -98,11 +100,11 @@ void *ft_txn_read(void **slot, uintptr_t tag)
 }
 
 /*
- * THE TXN'S OWN RECORDS.  FT reads what a txn recorded and never edits it:
- * a struct ft_txn_rec is one recorded edge, read through the accessors
- * below.  Lookups take the HANDLE, not the engine's record array, because
- * a record or a reservation that grows the array moves it: a pointer to
- * the array taken earlier names the old block (6f774617).
+ * THE TXN'S OWN RECORDS.  FT reads what a txn recorded and never edits it.
+ * A struct ft_txn_rec is one recorded edge, read through the accessors
+ * below.  Lookups take the HANDLE, not the engine's record array.  A record
+ * or a reservation that grows the array moves it.  A pointer to the array
+ * taken earlier then names the old block (6f774617).
  */
 struct ft_txn_rec;
 
@@ -201,8 +203,8 @@ void ft_txn_discard(struct urcu_txn *h)
 
 /*
  * LOADS INSIDE A TXN.  ft_txn_load() returns @slot as the txn behind @h will
- * leave it: its own pending value when it recorded @slot, else the slot's
- * committed value.  ft_txn_load_committed() skips the pending value.
+ * leave it.  That is its own pending value when it recorded @slot, else the
+ * slot's committed value.  ft_txn_load_committed() skips the pending value.
  *
  * A slot this txn did not record may hold ANOTHER commit's proxy, between
  * that commit's install and its settle.  The MCAS engine resolves it (and
