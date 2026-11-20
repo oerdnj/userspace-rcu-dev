@@ -13044,17 +13044,17 @@ bool ft_dlm_member_linked(const struct cds_ft *ft,
 	 * measured as a permanent refusal loop: the same node refused over
 	 * and over (ft_insert_dlm_acquire_split, unit test 2).  The fix was
 	 * to resolve the value the way every other reader of a slot does.
-	 * Test skip FIRST: a
-	 * SKIP_X flag carries its child's low tag bits, so ft_node_external()
-	 * would misclassify it.
+	 * Resolve skip FIRST: a SKIP_X flag carries its child's low tag bits,
+	 * so ft_node_external() and ft_node_compressed() would misclassify it.
 	 */
+	if (ft_node_skip_compressed(v))
+		v = ft_resolve_skip_compressed(ft, v);
 	if (ft_node_external(v))
 		return false;		/* an external head carries no metadata */
 	return (ft_node_compressed(v) ?
 			cds_ft_item_to_metadata((struct cds_ft_inode *)
 				ft_compressed_node_ptr(v)) :
-			cds_ft_item_to_metadata(ft_node_ptr(
-				ft_resolve_skip_compressed(ft, v)))) == node;
+			cds_ft_item_to_metadata(ft_node_ptr(v))) == node;
 }
 
 
@@ -13828,8 +13828,12 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		 * ft_insert_dlm_acquire_split: a member whose resolved parent
 		 * slot holds an EXTERNAL head.  A false refusal is permanent:
 		 * the plan re-derives the same member and is refused again.
-		 * test_urcu_ft_unit stalls at test 2 with the gate on, and
-		 * passes 308/308 with it off.  So the oracle confirms the
+		 * test_urcu_ft_unit stalled at test 2 with the gate on, and
+		 * passed 308/308 with it off.  Part of that was a SKIP_X value
+		 * classified before it was resolved.  With that fixed, the run
+		 * passes 109 tests.  It then spins in test 110
+		 * (test_merge_rekey_same_trie, in
+		 * ft_rekey_graft_simple_attempt).  So the oracle confirms the
 		 * DIRECTION, but the PREDICATE is not finished.  It must be
 		 * exact for every node kind (external heads, duplicate chains,
 		 * compressed runs) before it can gate a real acquire.
