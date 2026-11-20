@@ -11,15 +11,15 @@
  * ft-txn-rec-dbg: WHICH RECORD LOST, when a commit aborts.
  *
  * ft-txn-kind-stats.h counts what each txn RECORDS and what its commit
- * RETURNS, per creation site.  Between those two lies the question neither can
- * answer: a content txn carries a structural edge, an ordered-cell edge and a
- * §4.B guard in ONE descriptor, so its ABORT tells you nothing about which of
- * them a peer beat.  The engine knows -- `t->recs[planted]` in
- * urcu_txn_desc_commit -- and did not report it.  It does now, through the
+ * RETURNS, per creation site.  Neither answers the question that lies between
+ * the two.  A content txn carries three things in ONE descriptor: a structural
+ * edge, an ordered-cell edge and a §4.B guard.  So its ABORT tells you nothing
+ * about which of them a peer beat.  The engine knows (`t->recs[planted]` in
+ * urcu_txn_desc_commit), but did not report it.  It does now, through the
  * default-inert URCU_TXN_STAT_ABORT hook.
  *
- * ☠ THE PROXY TAG CANNOT SUBSTITUTE FOR THIS, and the near-miss is worth
- * recording: FT_STATE_PROXY, FT_NR_KEYS_PROXY_TAG and URCU_TXN_TAG are ALL 1.
+ * ☠ THE PROXY TAG CANNOT SUBSTITUTE FOR THIS.  The near-miss is worth
+ * recording.  FT_STATE_PROXY, FT_NR_KEYS_PROXY_TAG and URCU_TXN_TAG are ALL 1.
  * The tag separates a structural edge from everything else and nothing more.
  *
  * WHAT IT IS FOR -- two questions, one instrument:
@@ -28,20 +28,23 @@
  *      which a per-cell lock would be argued?  (The record volume said 9%;
  *      volume is not the abort rate.)
  *   2. ★ A DETECTOR.  A structural MW record whose owner the op HOLDS should
- *      never lose its CAS: the DLM lock over the slot's owner is exactly what
- *      excludes every peer writer of that word.  If one loses, the abort is not
- *      contention to be converted away -- it is a lock that did not exclude
- *      somebody, and the conversion would turn that word into an unarbitrated
- *      SW park.  FT_AB_OWN_HELD on a structural class is that event, and it is
- *      counted rather than asserted first ([[feedback_claim_without_the_arm]]):
- *      -DFT_ABORT_CLAIM turns the count into an abort with the record dumped.
+ *      never lose its CAS.  The DLM lock over the slot's owner is exactly
+ *      what excludes every peer writer of that word.  If one loses, the abort
+ *      is not contention to be converted away.  It is a lock that did not
+ *      exclude somebody.  The conversion would turn that word into an
+ *      unarbitrated SW park.  FT_AB_OWN_HELD on a structural class is that
+ *      event.  It is counted rather than asserted first
+ *      ([[feedback_claim_without_the_arm]]).  -DFT_ABORT_CLAIM turns the
+ *      count into an abort with the record dumped.
  *
- * BUILD.  Needs BOTH -DFT_DEBUG_TXN_KIND (the class the FT stamps) and
- * -DURCU_TXN_REC_DBG (the field on the engine record that carries it).  The
- * second is a compilation-wide define on purpose: the descriptor is allocated
- * by urcu-txn.c's slab and filled here, so a field only one TU can see is a
- * layout split.  With only one of the two, the dump says so rather than
- * printing zeros ([[feedback_verify_the_mechanism_ran_before_believing_a_zero]]).
+ * BUILD.  Needs BOTH defines:
+ * - -DFT_DEBUG_TXN_KIND: the class the FT stamps;
+ * - -DURCU_TXN_REC_DBG: the field on the engine record that carries it.
+ * The second is a compilation-wide define on purpose.  The descriptor is
+ * allocated by urcu-txn.c's slab and filled here.  So a field only one TU
+ * can see is a layout split.  With only one of the two, the dump says so
+ * rather than printing zeros
+ * ([[feedback_verify_the_mechanism_ran_before_believing_a_zero]]).
  */
 
 #if defined(FT_WINNER_DBG) && \
@@ -54,10 +57,10 @@
 #define FT_ABORT_ATTRIB	1
 
 /*
- * The label packed into urcu_txn_record.dbg_embedder.  One CLASS, plus -- for
- * the classes that a lock could cover -- WHO witnessed the hold, because
- * "a structural record lost" and "a structural record the op OWNS lost" are
- * different findings.
+ * The label packed into urcu_txn_record.dbg_embedder.  It holds one CLASS.
+ * For the classes that a lock could cover, it also holds WHO witnessed the
+ * hold.  "A structural record lost" and "a structural record the op OWNS
+ * lost" are different findings.
  */
 enum ft_ab_cls {
 	FT_AB_UNSET = 0,	/* added by a path that stamps nothing */
@@ -68,14 +71,14 @@ enum ft_ab_cls {
 	FT_AB_CELL_HANDLE,	/* an ordered-cell / hlist store recorded straight on the handle */
 	/*
 	 * + enum ft_tk_mwa_class: the always-MW populations.  The count is
-	 * SPELLED OUT because this header precedes ft-txn-kind-stats.h and so
-	 * cannot read FT_TK_MWA_NR; the static assert there is what keeps the
-	 * two in step.  ☠ It had drifted: the DUAL column was split three ways
-	 * (DUAL_ROOT / DUAL_NAMED / DUAL_UNNAMED) and this reservation stayed at
-	 * nine, which made EVERY -DFT_ABORT_ATTRIB build fail that assert -- so
-	 * the abort-attribution config, and -DFT_WINNER_DBG with it, had no
-	 * coverage at all.  A count that must be updated by hand needs the
-	 * assert to be REACHED, and a config nobody builds never reaches it.
+	 * SPELLED OUT.  This header precedes ft-txn-kind-stats.h, so it cannot
+	 * read FT_TK_MWA_NR.  The static assert there keeps the two in step.
+	 * ☠ It had drifted.  The DUAL column was split three ways (DUAL_ROOT /
+	 * DUAL_NAMED / DUAL_UNNAMED), but this reservation stayed at nine.  So
+	 * EVERY -DFT_ABORT_ATTRIB build failed that assert.  The
+	 * abort-attribution config had no coverage at all, and -DFT_WINNER_DBG
+	 * with it.  A count that must be updated by hand needs the assert to be
+	 * REACHED.  A config nobody builds never reaches it.
 	 */
 	FT_AB_MWA_BASE,
 	FT_AB_CLS_NR = FT_AB_MWA_BASE + 13,
@@ -96,8 +99,8 @@ enum ft_ab_own {
 #define FT_AB_OWN_MASK		0x300u
 /*
  * Two DIFFERENT labels folded onto one record by read-your-own-writes chaining.
- * The record is then one word written by two FT concerns and no single class is
- * true of it, so it is counted apart instead of credited to either.
+ * The record is then one word written by two FT concerns.  No single class is
+ * true of it.  So it is counted apart instead of credited to either.
  */
 #define FT_AB_MIXED		0x400u
 
@@ -107,10 +110,11 @@ enum ft_ab_own {
 #define ft_ab_code_own(c)	(((c) & FT_AB_OWN_MASK) >> FT_AB_OWN_SHIFT)
 
 /*
- * The label the NEXT engine record add will carry.  A thread-local hand-off
- * rather than an argument threaded through urcu_txn_store_*: the store API is
- * the engine's, shared with every other embedder, and this must not appear in
- * it.  Set immediately before the store, consumed by the stamp hook inside it.
+ * The label the NEXT engine record add will carry.  It is a thread-local
+ * hand-off rather than an argument threaded through urcu_txn_store_*.  The
+ * store API is the engine's and is shared with every other embedder.  This
+ * label must not appear in it.  Set it immediately before the store.  The
+ * stamp hook inside the store consumes it.
  */
 static __thread unsigned int ft_ab_pending = ft_ab_code(FT_AB_UNSET, FT_AB_OWN_NA);
 /* The label of the record that lost the last aborted commit. */
@@ -118,11 +122,13 @@ static __thread unsigned int ft_ab_lost;
 static __thread int ft_ab_lost_valid;
 /*
  * ...and its SLOT TAG, which the class alone does not give.  A structural MW
- * record writes one of two very different words: a child POINTER slot
- * (FT_FLIP_PROXY_TAG), which only a holder of the owning node's lock may write,
- * or the node's packed STATE word (FT_STATE_PROXY), which by design also has
- * writers that hold nothing -- the re-parent sweep's guard, the §4.B validates.
- * Losing a CAS means opposite things on the two, so the alarm must not pool
+ * record writes one of two very different words:
+ * - a child POINTER slot (FT_FLIP_PROXY_TAG).  Only a holder of the owning
+ *   node's lock may write it.
+ * - the node's packed STATE word (FT_STATE_PROXY).  By design it also has
+ *   writers that hold nothing: the re-parent sweep's guard and the §4.B
+ *   validates.
+ * Losing a CAS means opposite things on the two.  So the alarm must not pool
  * them.
  */
 static __thread uintptr_t ft_ab_lost_tag;
@@ -132,11 +138,13 @@ static __thread int ft_ab_claim_armed;
 #if defined(FT_ABORT_CLAIM) || defined(FT_WINNER_DBG)
 /*
  * SLOT -> the OWNER the record NAMED.  The engine record has no room for a
- * pointer and this is not worth growing it for: a ring walked BACKWARDS finds
- * the most recent naming of a slot, which is the one the losing record made.
- * Sized far above the largest observed graft descriptor.  Two consumers: the
- * claim's dump (the loser's own naming), and the winner ledger (the writer
- * stamps ITS naming as it wins the word, on its own thread, from its own ring).
+ * pointer, and this is not worth growing it for.  A ring walked BACKWARDS
+ * finds the most recent naming of a slot.  That is the one the losing record
+ * made.  Sized far above the largest observed graft descriptor.  It has two
+ * consumers:
+ * - the claim's dump (the loser's own naming);
+ * - the winner ledger.  The writer stamps ITS naming as it wins the word, on
+ *   its own thread, from its own ring.
  */
 #define FT_AB_RING_NR	256
 static __thread struct {
@@ -192,11 +200,12 @@ const void *ft_ab_ra_of(void **slot)
 	do { ft_ab_pending = ft_ab_code((cls), (own)); } while (0)
 
 /*
- * ☠ The chain hook fires on a store that folds onto an EXISTING record, so the
+ * ☠ The chain hook fires on a store that folds onto an EXISTING record.  So the
  * disagreement it must resolve is between two labels on one word.  Resolve it
- * PESSIMISTICALLY in both fields: a differing class becomes MIXED (credited to
- * neither), and the ownership degrades to the weakest witness of the two, so the
- * detector fires only where EVERY store to that word claimed the hold.
+ * PESSIMISTICALLY in both fields:
+ * - a differing class becomes MIXED (credited to neither);
+ * - the ownership degrades to the weakest witness of the two.
+ * So the detector fires only where EVERY store to that word claimed the hold.
  */
 #define URCU_TXN_REC_DBG_STAMP(r)	\
 	do { (r)->dbg_embedder = ft_ab_pending; } while (0)
@@ -214,14 +223,15 @@ const void *ft_ab_ra_of(void **slot)
 	} while (0)
 /*
  * @r is NULL where the abort has no losing record (a poisoned descriptor).
- * Recorded as such rather than dropped: an unattributed abort that vanishes
+ * Such an abort is recorded, not dropped.  An unattributed abort that vanishes
  * would make the attributed ones look complete.
  *
- * ☠ A FUNCTION, not a ternary in the macro: the hook is expanded with a literal
- * NULL at the poisoned exit, and `NULL ? NULL->dbg_embedder : x` is a type error
- * even in the arm that cannot run.  Declared here against an INCOMPLETE type
- * (this header is parsed before the engine's, by design) and defined in
- * ft-txn-kind-stats.h, where the record is complete and the counters exist.
+ * ☠ A FUNCTION, not a ternary in the macro.  The hook is expanded with a
+ * literal NULL at the poisoned exit.  `NULL ? NULL->dbg_embedder : x` is a type
+ * error, even in the arm that cannot run.  The function is declared here
+ * against an INCOMPLETE type: by design, this header is parsed before the
+ * engine's.  It is defined in ft-txn-kind-stats.h, where the record is complete
+ * and the counters exist.
  */
 struct urcu_txn_record;
 struct urcu_txn_desc;
@@ -232,13 +242,13 @@ static void ft_ab_note_lost(const struct urcu_txn_desc *t,
 
 #ifdef FT_DEBUG_SAME_SLOT
 /*
- * THE SAME-SLOT CENSUS (-DFT_DEBUG_SAME_SLOT, on top of the two defines above):
- * every record FT adds onto a slot its descriptor already holds.  The MW
- * front end fuses the pair (read-your-own-writes chain at age 1+, escalation
- * at age 0), so the DEBUG_RCU duplicate scan at commit never sees it; the SW
- * engine (<urcu/rcu-txn-sw.h>) would append it blindly and settle both,
- * last-wins.  This is the list the engine swap must empty or route through
- * urcu_txn_sw_load / urcu_txn_sw_record_chain.  Declared against the
+ * THE SAME-SLOT CENSUS (-DFT_DEBUG_SAME_SLOT, on top of the two defines above).
+ * It lists every record FT adds onto a slot its descriptor already holds.  The
+ * MW front end fuses the pair: a read-your-own-writes chain at age 1+, an
+ * escalation at age 0.  So the DEBUG_RCU duplicate scan at commit never sees
+ * it.  The SW engine (<urcu/rcu-txn-sw.h>) would append it blindly and settle
+ * both, last-wins.  This is the list the engine swap must empty or route
+ * through urcu_txn_sw_load / urcu_txn_sw_record_chain.  Declared against the
  * incomplete record, defined in ft-txn-kind-stats.h.
  */
 static void ft_ss_note(const struct urcu_txn_record *r, void *old_ptr,
@@ -247,13 +257,15 @@ static void ft_ss_note(const struct urcu_txn_record *r, void *old_ptr,
 #define URCU_TXN_REC_DBG_SAME_SLOT(r, o, n, up, k)	\
 	ft_ss_note((r), (o), (n), (up), (k))
 /*
- * A DECLARED FOLD: a producer whose write site is COMPUTED, so a second
- * record on one slot is its design, not an accident -- the rank count walks
- * (several walks add deltas to a shared ancestor's nr_keys) and the glue's
- * deferred re-home (a back edge re-aimed after an earlier step of the same
- * txn aimed it).  Those map to the SW engine's fusing pair
- * (urcu_txn_sw_load + urcu_txn_sw_record_chain); every other same-slot hit
- * must be made distinct.  The census counts the two apart.
+ * A DECLARED FOLD: a producer whose write site is COMPUTED.  A second record
+ * on one slot is then its design, not an accident.  The producers are:
+ * - the rank count walks: several walks add deltas to a shared ancestor's
+ *   nr_keys;
+ * - the glue's deferred re-home: a back edge is re-aimed after an earlier
+ *   step of the same txn aimed it.
+ * Those map to the SW engine's fusing pair (urcu_txn_sw_load +
+ * urcu_txn_sw_record_chain).  Every other same-slot hit must be made
+ * distinct.  The census counts the two apart.
  */
 static __thread int ft_ss_fold_depth;
 # define FT_SS_FOLD_BEGIN()	do { ft_ss_fold_depth++; } while (0)
@@ -263,16 +275,18 @@ static __thread int ft_ss_fold_depth;
 #ifdef FT_WINNER_DBG
 /*
  * THE WINNER LEDGER (-DFT_WINNER_DBG, on top of the two defines above).  The
- * alarm's remaining question is about the WINNER, not the loser: the op holds
- * P's DLM lock, writes a child slot inside P, and a peer still wins that word
- * -- so WHO writes a child slot of P without holding P?  Every engine write of
- * a slot (proxy plant, park, settle, the lone-edge fast paths) lands here via
- * URCU_TXN_REC_WROTE with the record's label, and is filed in a global
- * slot-keyed ledger together with the owner this writer NAMED (its own ring,
- * its own thread) and its tid.  The loser consults the ledger at the alarm.
+ * alarm's remaining question is about the WINNER, not the loser.  The op holds
+ * P's DLM lock and writes a child slot inside P.  A peer still wins that word.
+ * So WHO writes a child slot of P without holding P?  Every engine write of a
+ * slot lands here via URCU_TXN_REC_WROTE, with the record's label.  That
+ * covers the proxy plant, the park, the settle and the lone-edge fast paths.
+ * Each write is filed in a global slot-keyed ledger.  The entry also holds
+ * the writer's tid and the owner this writer NAMED.  That owner comes from
+ * the writer's own ring, on its own thread.
+ * The loser consults the ledger at the alarm.
  *
  * Declared against the incomplete engine type for the same reason as
- * ft_ab_note_lost above; defined in ft-txn-kind-stats.h, where the counters
+ * ft_ab_note_lost above.  Defined in ft-txn-kind-stats.h, where the counters
  * and the ledger live.
  */
 static void ft_win_note(void **slot, void *val, unsigned int code);
@@ -281,18 +295,19 @@ static void ft_win_lost(const struct urcu_txn_record *rec, void *seen);
 #define URCU_TXN_REC_WROTE(r, v)	\
 	ft_win_note((r)->slot, (v), (r)->dbg_embedder)
 /*
- * ★ THE PRIMARY WITNESS.  The value the losing CAS OBSERVED, captured by the
- * engine at the loss itself -- race-free, unlike any later re-read of the
- * slot.  A proxy here IS the winning record; a plain value is matched against
- * the ledger for corroboration only.
+ * ★ THE PRIMARY WITNESS.  The engine captures the value the losing CAS
+ * OBSERVED, at the loss itself.  That is race-free, unlike any later re-read
+ * of the slot.  A proxy here IS the winning record.  A plain value is matched
+ * against the ledger for corroboration only.
  */
 #define URCU_TXN_REC_LOST(r, seen)	ft_win_lost((r), (seen))
 /*
- * A NON-ENGINE writer of a live slot -- the lone-edge release-store lane
- * (ft_ord_cell_flip_one and friends), whose exclusion is the caller's lock,
- * not an expected-old.  Filed in the same ledger under a synthetic class so an
- * alarmed loser can name it; without these notes a raw winner is UNPROVABLE
- * (it surfaces as a ledger mismatch, indistinguishable from ledger lag).
+ * A NON-ENGINE writer of a live slot: the lone-edge release-store lane
+ * (ft_ord_cell_flip_one and friends).  Its exclusion is the caller's lock,
+ * not an expected-old.  It is filed in the same ledger under a synthetic
+ * class, so an alarmed loser can name it.  Without these notes a raw winner
+ * is UNPROVABLE.  It surfaces as a ledger mismatch, indistinguishable from
+ * ledger lag.
  */
 #define FT_WIN_NOTE_RAW(slot_, val_, k_)				\
 	ft_win_note((void **) (slot_), (void *) (val_),			\
@@ -315,23 +330,23 @@ static void ft_win_lost(const struct urcu_txn_record *rec, void *seen);
 
 #if defined(FT_DEBUG_HIDDEN_FILL) && !defined(URCU_TXN_REC_DBG_STAMP)
 /*
- * ITEM 4: WHO CREATED THIS RECORD?  The hidden-fill scan runs at COMMIT, so its
- * backtrace names the committer, never the producer of the one record that
+ * ITEM 4: WHO CREATED THIS RECORD?  The hidden-fill scan runs at COMMIT.  So
+ * its backtrace names the committer, never the producer of the one record that
  * fills a hidden body.  The engine stamps every record as it is created, which
- * is the right moment: park the creating pc in a small table keyed by the
- * record's own address, and let the scan look it up.  Records are reused across
- * transactions, but a stamp is overwritten on every reuse and read within the
- * SAME commit, so the answer belongs to this record.
+ * is the right moment.  Park the creating pc in a small table keyed by the
+ * record's own address, and let the scan look it up.  Records are reused
+ * across transactions.  But a stamp is overwritten on every reuse and read
+ * within the SAME commit.  So the answer belongs to this record.
  */
 struct urcu_txn_record;
 static void ft_hf_pc_note(const struct urcu_txn_record *r, const void *pc);
 /*
- * ☠ THE STAMP IS INSIDE THE ENGINE, so return_address(0) is always
- * urcu_txn_store_mw and every producer looks the same (measured: 673468 fills,
- * ONE "site").  return_address(1) is not the answer either -- the add is
- * inlined into the store, so level 1 walks off the end and SEGVs, with and
- * without -fno-omit-frame-pointer (measured twice).  The note itself unwinds
- * instead, and only for the records that can BE a fill.
+ * ☠ THE STAMP IS INSIDE THE ENGINE.  So return_address(0) is always
+ * urcu_txn_store_mw, and every producer looks the same.  Measured: 673468
+ * fills, ONE "site".  return_address(1) is not the answer either.  The add is
+ * inlined into the store, so level 1 walks off the end and SEGVs.  It does so
+ * with and without -fno-omit-frame-pointer (measured twice).  The note itself
+ * unwinds instead, and only for the records that can BE a fill.
  */
 # define URCU_TXN_REC_DBG_STAMP(r)					\
 	ft_hf_pc_note((r), NULL)
@@ -341,17 +356,17 @@ static void ft_hf_pc_note(const struct urcu_txn_record *r, const void *pc);
  * ☠ THE ENGINE OFFERS ONE STORE HOOK AND TWO INSTRUMENTS WANT IT.
  *
  * Both of the blocks below used to claim URCU_TXN_REC_WROTE behind a
- * `!defined(URCU_TXN_REC_WROTE)` guard, so whichever was parsed first won and
- * the other went SILENTLY blind -- harmless only while both were opt-in and
- * nobody passed them together.  FT_DT_ARMED now follows --enable-rcu-debug, so
- * that collision would be the DEFAULT on every debug build carrying
- * -DFT_DEBUG_SLOT_HIST, and a slot history that quietly records nothing is a
- * wrong zero waiting to be believed.  They CHAIN instead.
+ * `!defined(URCU_TXN_REC_WROTE)` guard.  Whichever was parsed first won, and
+ * the other went SILENTLY blind.  That was harmless only while both were
+ * opt-in and nobody passed them together.  FT_DT_ARMED now follows
+ * --enable-rcu-debug.  So that collision would be the DEFAULT on every debug
+ * build carrying -DFT_DEBUG_SLOT_HIST.  A slot history that quietly records
+ * nothing is a wrong zero waiting to be believed.  They CHAIN instead.
  */
 #if FT_DT_ARMED
 /*
- * The engine writes state words too -- its settles are how a recorded release
- * actually clears FT_STATE_LOCK -- and a detector keyed on the BIT has to see
+ * The engine writes state words too.  Its settles are how a recorded release
+ * actually clears FT_STATE_LOCK.  A detector keyed on the BIT has to see
  * them.  Defined in ft-mutation-helpers.h, where the record type is complete.
  */
 struct urcu_txn_record;
@@ -360,11 +375,12 @@ static void ft_dt_wrote(const struct urcu_txn_record *r, void *v);
 
 #ifdef FT_DEBUG_SLOT_HIST
 /*
- * -DFT_DEBUG_SLOT_HIST: a per-SLOT history of every engine store -- plant,
- * park, settle, abort restore, lone edge -- replayed by a writer that stalls,
- * so a TORN multi-word edit names the commit that wrote (or failed to write)
- * each of its words.  Tag the producer, not the consumer.  Defined in
- * ft-mutation-helpers.h, where the record type is complete.
+ * -DFT_DEBUG_SLOT_HIST: a per-SLOT history of every engine store.  The stores
+ * are plant, park, settle, abort restore and lone edge.  A writer that stalls
+ * replays the history.  So a TORN multi-word edit names the commit that wrote
+ * (or failed to write) each of its words.  Tag the producer, not the
+ * consumer.  Defined in ft-mutation-helpers.h, where the record type is
+ * complete.
  */
 struct urcu_txn_record;
 static void ft_sh_note(const struct urcu_txn_record *r, void *v);
@@ -374,17 +390,17 @@ static void ft_sh_clobber(const struct urcu_txn_record *r, void *prev);
 
 #if FT_DT_ARMED
 /*
- * ☠ A RELEASE-SHAPED RECORD ON A WORD ANOTHER THREAD TOOK.  Checked where the
- * record is CREATED (or chained onto), which runs on the producer's own stack,
- * so the report names the recording site -- the commit-time settle can only
- * name the committer.  Defined in ft-mutation-helpers.h.
+ * ☠ A RELEASE-SHAPED RECORD ON A WORD ANOTHER THREAD TOOK.  It is checked
+ * where the record is CREATED (or chained onto).  That runs on the producer's
+ * own stack, so the report names the recording site.  The commit-time settle
+ * can only name the committer.  Defined in ft-mutation-helpers.h.
  */
 struct urcu_txn_record;
 static void ft_dt_rec_check(const struct urcu_txn_record *r);
 /*
- * THE STALE-PLAN AUDIT: an SW record is CREATED by an op that already holds
- * the lock covering its word, so the word's committed value must equal the
- * record's expected-old -- an SW park and settle store BLIND and will not
+ * THE STALE-PLAN AUDIT.  An SW record is CREATED by an op that already holds
+ * the lock covering its word.  So the word's committed value must equal the
+ * record's expected-old.  An SW park and settle store BLIND, and will not
  * find out otherwise.  CREATION only: a chained record's old_ptr is this
  * txn's own earlier value.  Defined in ft-mutation-helpers.h.
  */
@@ -400,9 +416,9 @@ static void ft_sw_stale_check(const struct urcu_txn_record *r);
 #  define URCU_TXN_REC_DBG_CHAIN(r)	ft_dt_rec_check(r)
 # endif
 /*
- * The detector's engine half runs BEFORE a plain store (the owner it reads is
- * still the one the store displaces) and after a CAS store only; see
- * URCU_TXN_REC_WILL_WRITE.
+ * The detector's engine half runs BEFORE a plain store, and after a CAS store
+ * only.  Before a plain store, the owner it reads is still the one the store
+ * displaces.  See URCU_TXN_REC_WILL_WRITE.
  */
 static void ft_dt_will_write(const struct urcu_txn_record *r, void *v);
 # define URCU_TXN_REC_WILL_WRITE(r, v)	ft_dt_will_write((r), (void *) (v))
