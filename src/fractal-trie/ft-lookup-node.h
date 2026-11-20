@@ -5,17 +5,23 @@
 /*
  * src/fractal-trie/ft-lookup-node.h
  *
- * Userspace RCU library - Fractal Trie: node-structure READ operations and the
- * popcount (1L / 2L) and pigeon bitmap layout they are built on -- the layout
- * primitives (pointer array / bitmap addressing / header sizing), the read
- * scanners (get_nth / get_direction / get_minmax / get_ith_pos) with their
- * per-class implementations, and the non-inlined *_shared scanner copies the
- * write path calls through the fractal-trie.c redirect.  The per-class LOW-level
- * set_nth stay here too, co-located with the bitmap layout they manipulate.
+ * Userspace RCU library - Fractal Trie: node-structure READ operations and
+ * the bitmap layouts they are built on: popcount (1L / 2L) and pigeon.
  *
- * The high-level child-slot mutators (the set_nth / replace_ptr dispatchers and
- * ft_node_recompact) live in ft-mutation-node.h, split out so they can sit after
- * ft-mutation-helpers.h instead of forward-declaring ft_set_parent_raw.
+ * This file holds:
+ *   - the layout primitives (pointer array / bitmap addressing / header
+ *     sizing);
+ *   - the read scanners (get_nth / get_direction / get_minmax /
+ *     get_ith_pos) with their per-class implementations;
+ *   - the non-inlined *_shared scanner copies.  The write path calls them
+ *     through the fractal-trie.c redirect;
+ *   - the per-class LOW-level set_nth.  They stay here, next to the bitmap
+ *     layout they manipulate.
+ *
+ * The high-level child-slot mutators live in ft-mutation-node.h.  They are
+ * the set_nth / replace_ptr dispatchers and ft_node_recompact.  They are
+ * split out so that they can sit after ft-mutation-helpers.h instead of
+ * forward-declaring ft_set_parent_raw.
  *
  * Implementation unit: #included once by fractal-trie.c, in dependency
  * order, into a single translation unit (preserves cross-module inlining).
@@ -200,31 +206,33 @@ void ft_popcount_node_get_ith_pos(const struct cds_ft_type *type,
  *   sub_bm[k] : 16-bit; presence of the low nibble for the k-th
  *               popcount-ordered hi position
  *
- * Pointer slot index for byte n = (hi<<4)|lo equals popcount of all
- * bits set below the (hi, lo) position across the concatenated
- * sub_bm[] in popcount order.  This is the rank of (hi,lo) among
- * populated entries.
+ * The pointer slot index for byte n = (hi<<4)|lo is the rank of (hi,lo)
+ * among populated entries.  It equals the popcount of all bits set
+ * below the (hi, lo) position across the concatenated sub_bm[] in
+ * popcount order.
  *
  * For order-5 nodes (32 B, max_child = 3):
  *   header = 8 B (root_bm + 3 sub_bm)
  *   ptrs   = 24 B (3 child pointers)
  *
- * scan_16_16_max_3 reads the header as one u64 load and decomposes
- * via fixed bit-shifts: low 16 bits = root_bm, upper 48 bits =
- * sub_bm[0..2] in popcount order with sub_bm[0] at bits 16..31.  The
- * rank `popcount(subs & ((1ULL << bit_pos) - 1))` thus requires
+ * scan_16_16_max_3 reads the header as one u64 load and decomposes it
+ * via fixed bit-shifts:
+ *   low 16 bits   = root_bm
+ *   upper 48 bits = sub_bm[0..2] in popcount order, with sub_bm[0] at
+ *                   bits 16..31
+ * The rank `popcount(subs & ((1ULL << bit_pos) - 1))` thus requires
  * sub_bm[0] in the low bits of the loaded u64.  In memory that maps
  * to first-to-last byte order on little-endian and last-to-first on
- * big-endian, so the writer flips the in-memory offsets accordingly
+ * big-endian.  So the writer flips the in-memory offsets accordingly
  * (see ft_popcount_2l_root_bm_addr / ft_popcount_2l_sub_bm_addr).
- * max_child=5 uses per-u16 reads (scan_16_16_max_5) and keeps the
+ * max_child=5 uses per-u16 reads (scan_16_16_max_5).  It keeps the
  * canonical "root_bm at offset 0, sub_bm[k] at 2+2k" layout on both
  * arches.
  *
- * The lookup is branch-free past the two presence tests and uses
- * portable __builtin_popcount{,ll} -- no SIMD intrinsics, so the
- * same code compiles for any architecture with a popcount intrinsic
- * (including software-emulated popcount on older targets).
+ * The lookup is branch-free past the two presence tests.  It uses the
+ * portable __builtin_popcount{,ll} and no SIMD intrinsics.  So the
+ * same code compiles for any architecture with a popcount intrinsic,
+ * including software-emulated popcount on older targets.
  */
 struct ft_popcount_2l_header {
 	uint16_t root_bm;
@@ -283,12 +291,15 @@ struct cds_ft_inode_flag **ft_popcount_2l_pointers(
 
 	/*
 	 * Flat scan_32_8 (12 B hdr + 4 B pad) and scan_64_4 (16 B hdr)
-	 * scanners hardcode the ptr table at node+16.  max_child=12 and 16
-	 * reuse the scan_64_4 layout on 32-bit -- the 16-slot bitmap
-	 * caps the safe distinct-hi count at 16 (cf. scan_32_8's 8-slot
-	 * cap, which is too tight for 12+ children in the worst case).
+	 * scanners hardcode the ptr table at node+16.
+	 *
+	 * max_child=12 and 16 reuse the scan_64_4 layout on 32-bit.  Its
+	 * 16-slot bitmap caps the safe distinct-hi count at 16.  The
+	 * 8-slot cap of scan_32_8 is too tight for 12+ children in the
+	 * worst case.
+	 *
 	 * max_child=16 lives in a 128 B order-7 node with 48 B trailing
-	 * slack; the bitmap cap is binding, not the node size.
+	 * slack.  The bitmap cap is binding, not the node size.
 	 */
 	if (max_lc == 6 || max_lc == 12 || max_lc == 14 || max_lc == 16)
 		byte_offset = 16;
@@ -332,7 +343,7 @@ struct cds_ft_inode_flag *ft_popcount_2l_scan_16_16_max_3(
 	/*
 	 * Absolute bit position of (hi, lo) in the 48-bit subs concat.
 	 * (slot1 << 4) | lo is identical to slot1 * 16 + lo because
-	 * lo < 16, but it folds the multiply+add into a single shift+OR
+	 * lo < 16.  It folds the multiply+add into a single shift+OR
 	 * dependency.
 	 */
 	bit_pos = (slot1 << 4) | lo;
@@ -358,20 +369,20 @@ not_found:
 /*
  * Lookup primitive: 2-level popcount, max_child = 5 (32-bit only).
  *
- * Same generic 2L layout as scan_16_16_max_3, just two more slots:
+ * Same generic 2L layout as scan_16_16_max_3, with two more slots:
  *   [0..1]   root_bm        (u16)
  *   [2..11]  sub_bm[0..4]   (5 x u16)
  *   [12..31] 5 x 4-byte pointers
  *
  * 32-bit-native: 16-bit loads for root_bm and sub_bm[], 32-bit
- * popcount.  No 64-bit ops on the hot path (which would compile to
- * register-pair handling on i386).  The prefix sum runs a short
- * loop of 0..4 iterations over sub_bm[0..slot1-1]; the compiler can
- * predict / unroll given the bounded count.
+ * popcount.  There are no 64-bit ops on the hot path.  On i386 they
+ * would compile to register-pair handling.  The prefix sum runs a
+ * short loop of 0..4 iterations over sub_bm[0..slot1-1].  The count
+ * is bounded, so the compiler can predict / unroll the loop.
  *
  * Trade-off vs scan_16_16_max_3 (max_child=3): one variable-length
- * prefix loop in exchange for max_child 3 -> 5 (recovers the 12 B of
- * trailing waste per 32 B node).
+ * prefix loop in exchange for max_child 3 -> 5.  This recovers the
+ * 12 B of trailing waste per 32 B node.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_popcount_2l_scan_16_16_max_5(
@@ -417,26 +428,28 @@ not_found:
  * Lookup primitive: per-slot flat popcount with 5+3 byte-split,
  * max_child = 6.
  *
- * Layout in the 64-byte order-6 node (FLAT layout, NOT shared with
- * scan_16_16_max_3 which uses the 4+4 sub_bm[] layout):
+ * Layout in the 64-byte order-6 node.  It is a FLAT layout, NOT shared
+ * with scan_16_16_max_3, which uses the 4+4 sub_bm[] layout.
  *   [0..3]   root_bm (32-bit; bit set per populated hi = n >> 3)
  *   [4..11]  packed_bms (8 bytes = 8 x 8-bit sub_bm; only first 6 used)
  *   [12..15] padding
  *   [16..63] 6 x cds_ft_inode_flag *
  *
- * The byte split is 5-bit hi + 3-bit lo (departs from the quadbit-popcount
- * (QP) 4+4 convention to fit all sub_bms in one u64).  packed_bms is a flat
- * 64-bit view: bit at position (slot1*8 + lo) is set iff (hi, lo)
- * is a populated child.  The single packed bitmap collapses prior
- * + chunk-select + sub_bm popcount into one popcount(bms & mask).
+ * The byte split is 5-bit hi + 3-bit lo.  It departs from the
+ * quadbit-popcount (QP) 4+4 convention to fit all sub_bms in one u64.
+ * packed_bms is a flat 64-bit view: bit at position (slot1*8 + lo) is
+ * set iff (hi, lo) is a populated child.  The single packed bitmap
+ * collapses prior + chunk-select + sub_bm popcount into one
+ * popcount(bms & mask).
  *
  * Hot path:
  *   slot1   = popcount(root & ((1<<hi)-1))
  *   p       = (slot1 << 3) | lo
  *   ptr_idx = popcount(bms & ((1<<p)-1))
  *
- * No chunk-select cmov, no per-slot prior cache: a single packed
- * bitmap suffices because max_child=6 fits in 48 bits (well within u64).
+ * There is no chunk-select cmov and no per-slot prior cache.  A single
+ * packed bitmap suffices because max_child=6 fits in 48 bits, well
+ * within a u64.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_popcount_2l_scan_32_8(
@@ -478,8 +491,8 @@ not_found:
  * Lookup primitive: flat packed sub_bms with 6+2 byte-split,
  * max_child = 14.
  *
- * Layout in the 128-byte order-7 node (6+2 FLAT, not shared with
- * scan_16_16_max_3 / scan_32_8):
+ * Layout in the 128-byte order-7 node.  It is 6+2 FLAT, not shared with
+ * scan_16_16_max_3 / scan_32_8.
  *   [0..7]    root_bm (u64; bit set per populated hi = n >> 2)
  *   [8..15]   packed_bms (u64; 14 x 4-bit sub_bms, 56 bits used)
  *   [16..127] 14 x cds_ft_inode_flag *
@@ -490,8 +503,8 @@ not_found:
  * header + 14 * 8 = 128 exactly).
  *
  * Both root and packed_bms load at constant offsets (no data-dep
- * load), and a single popcountll on (packed_bms & mask) yields
- * ptr_idx -- no chunk-select cmov, no per-slot prior cache to refresh.
+ * load).  A single popcountll on (packed_bms & mask) yields ptr_idx.
+ * There is no chunk-select cmov and no per-slot prior cache to refresh.
  *
  * Hot path:
  *   slot1   = popcount(root & ((1<<hi)-1))
@@ -667,29 +680,39 @@ void ft_popcount_2l_node_get_ith_pos(const struct cds_ft_type *type,
 }
 
 /*
- * Bit-scan core for the 2-level layouts.  Their sub-bitmaps are
- * concatenated in popcount order: bit (slot1*G + lo) is set iff lo-value
- * @lo is present under the slot1-th populated hi-group, where G =
- * 1 << @lo_bits and slot1 = popcount(root & ((1<<hi)-1)).  The concat is
- * passed split as @subs_lo (bits 0..63) and @subs_hi (bits 64..127); the
- * three u64-packed layouts (scan_16_16_max_3, scan_32_8, scan_64_4) fit in
- * @subs_lo alone (@subs_hi = 0), while scan_16_16_max_5 (32-bit; 5x16 = 80
- * bits) carries its top group in @subs_hi.
+ * Bit-scan core for the 2-level layouts.
  *
- * Find the nearest set bit toward @dir from byte @n and return its byte
- * value (hi << lo_bits | lo, with hi recovered by selecting the slot1-th
- * set bit of @root), or -1 if there is none in that direction.  The scan
- * itself is the shared cds_find_{next,prev}_bit primitive (the same one
- * popcount_1l / pigeon use) over the concat materialized as an unsigned
- * long array; it naturally spans the >64-bit max_5 concat and bounds the
- * scan at @total = nr_groups*G, so a transient stray bit in an unused slot
- * (>= total) during a concurrent insert shift is ignored.
+ * Their sub-bitmaps are concatenated in popcount order.  Bit
+ * (slot1*G + lo) is set iff lo-value @lo is present under the slot1-th
+ * populated hi-group, where:
+ *   G     = 1 << @lo_bits
+ *   slot1 = popcount(root & ((1<<hi)-1))
  *
- * @n is the EXCLUSIVE byte bound and may be the get_minmax sentinels (-1
- * for FT_RIGHT/leftmost, FT_ENTRY_PER_NODE for FT_LEFT/rightmost), which
- * are NOT valid bytes -- decode hi/lo only for an in-range byte.  The
- * resulting inclusive start bit maps 1:1 onto the primitive's start_bit
- * (which also handles the out-of-range start that the sentinels produce).
+ * The concat is passed split as @subs_lo (bits 0..63) and @subs_hi (bits
+ * 64..127):
+ *   - the three u64-packed layouts (scan_16_16_max_3, scan_32_8,
+ *     scan_64_4) fit in @subs_lo alone (@subs_hi = 0);
+ *   - scan_16_16_max_5 (32-bit; 5x16 = 80 bits) carries its top group in
+ *     @subs_hi.
+ *
+ * Find the nearest set bit toward @dir from byte @n.  Return its byte
+ * value (hi << lo_bits | lo), or -1 if there is none in that direction.
+ * hi is recovered by selecting the slot1-th set bit of @root.
+ *
+ * The scan itself is the shared cds_find_{next,prev}_bit primitive, the
+ * same one popcount_1l / pigeon use.  It runs over the concat materialized
+ * as an unsigned long array, so it naturally spans the >64-bit max_5
+ * concat.  It bounds the scan at @total = nr_groups*G.  So a transient
+ * stray bit in an unused slot (>= total) during a concurrent insert shift
+ * is ignored.
+ *
+ * @n is the EXCLUSIVE byte bound.  It may be one of the get_minmax
+ * sentinels, which are NOT valid bytes:
+ *   - -1 for FT_RIGHT/leftmost;
+ *   - FT_ENTRY_PER_NODE for FT_LEFT/rightmost.
+ * So decode hi/lo only for an in-range byte.  The resulting inclusive
+ * start bit maps 1:1 onto the primitive's start_bit.  The primitive also
+ * handles the out-of-range start that the sentinels produce.
  */
 static inline_lookup
 int ft_popcount_2l_dir_byte(uint64_t root, uint64_t subs_lo, uint64_t subs_hi,
@@ -760,13 +783,15 @@ int ft_popcount_2l_dir_byte(uint64_t root, uint64_t subs_lo, uint64_t subs_hi,
  * smallest v > n) populated entry.
  *
  * Every 2-level layout bit-scans its concatenated sub-bitmap toward @dir
- * with ft_popcount_2l_dir_byte (which delegates the scan to the shared
- * cds_find_{next,prev}_bit, the same primitive popcount_1l / pigeon use):
- * the sub_bms are stored contiguously in popcount order, so one scan
- * crosses hi-groups and a single select on root_bm recovers the hi nibble.
- * The byte is mapped to its pointer by the layout's scan primitive; the
- * bitmap is only a hint, so a soft-deleted entry (bit set, pointer NULL)
- * makes the scan continue past it.
+ * with ft_popcount_2l_dir_byte.  That helper delegates the scan to the
+ * shared cds_find_{next,prev}_bit, the same primitive popcount_1l / pigeon
+ * use.  The sub_bms are stored contiguously in popcount order, so one scan
+ * crosses hi-groups.  A single select on root_bm then recovers the hi
+ * nibble.
+ *
+ * The layout's scan primitive maps the byte to its pointer.  The bitmap is
+ * only a hint: a soft-deleted entry has its bit set and a NULL pointer.
+ * The scan continues past such an entry.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_popcount_2l_node_get_direction(
@@ -831,25 +856,27 @@ struct cds_ft_inode_flag *ft_popcount_2l_node_get_direction(
 				(uint8_t) byte, FT_PF_NONE);
 		if (ptr) {
 			/*
-			 * Spatial prefetch: the child pointers are a dense
-			 * byte-ordered array, so the adjacent sibling in
+			 * Spatial prefetch.  The child pointers are a dense
+			 * byte-ordered array.  So the adjacent sibling in
 			 * iteration order is slot[+1] (FT_RIGHT / next) or
-			 * slot[-1] (FT_LEFT / prev) -- a near-future
+			 * slot[-1] (FT_LEFT / prev).  It is a near-future
 			 * cds_ft_next/prev target.
 			 *
 			 * No bounds check: the one-element over/under-read cannot
 			 * fault, by allocator construction.
-			 *   - slot[+1] past the last pointer of a full node lands,
-			 *     in the worst case (node at the end of the 2 MiB
-			 *     node-body run), in the FT_FAR_METADATA metadata array
-			 *     the allocator places immediately after that run;
-			 *     within a node it is just an unused allocated slot.
+			 *   - slot[+1] past the last pointer of a full node:
+			 *     the worst case is a node at the end of the 2 MiB
+			 *     node-body run.  The load then lands in the
+			 *     FT_FAR_METADATA metadata array, which the
+			 *     allocator places immediately after that run.
+			 *     Within a node it is just an unused allocated
+			 *     slot.
 			 *   - slot[-1] before pointers[0] lands in the node's
 			 *     bitmap header, which precedes the pointer array.
-			 * Either way the load hits allocated memory; the word read
-			 * is unrelated to a real child pointer, but ft_maybe_prefetch
-			 * (__builtin_prefetch) silently drops NULL / non-canonical
-			 * addresses without faulting.
+			 * Either way the load hits allocated memory.  The word
+			 * read is unrelated to a real child pointer.  But
+			 * ft_maybe_prefetch (__builtin_prefetch) silently drops
+			 * NULL / non-canonical addresses without faulting.
 			 */
 			ft_maybe_prefetch_nta(dir == FT_RIGHT ? slot[1] : slot[-1]);
 			*result_key = (uint8_t) byte;
@@ -861,8 +888,8 @@ struct cds_ft_inode_flag *ft_popcount_2l_node_get_direction(
 
 /*
  * Insert (n, child_node_flag) into a freshly-allocated, unpublished
- * popcount_2l node.  Called only from the recompact path: the new node is
- * not yet wired into the trie, so direct in-place mutation (shifts
+ * popcount_2l node.  Called only from the recompact path.  The new node
+ * is not yet wired into the trie, so direct in-place mutation (shifts
  * of sub_bm[] and pointers[]) is race-free.
  *
  * is_init=true zeroes the bitmap header and writes pointers[0] for
@@ -1054,7 +1081,7 @@ int ft_popcount_2l_node_set_nth(const struct cds_ft_type *type,
  * 1-level byte-popcount node header.
  *
  * One bit per possible byte value (0..255).  Used by larger
- * popcount nodes (orders 8/9/10) where the 2-level popcount_2l
+ * popcount nodes (orders 8/9/10).  There the 2-level popcount_2l
  * layout would not fit alongside the pointer array.
  *
  * Layout in the order-8 (256-byte) node:
@@ -1151,9 +1178,9 @@ uint8_t ft_popcount_1l_node_get_nr_child(const struct cds_ft_type *type,
 }
 
 /*
- * Find the i-th set bit in the 256-bit bitmap and return its byte
- * value (0..255) and the corresponding pointer.  Iterates over the
- * four 64-bit words; uses a "skip the bottom popcount bits" pattern
+ * Find the i-th set bit in the 256-bit bitmap.  Return its byte
+ * value (0..255) and the corresponding pointer.  Iterate over the
+ * four 64-bit words.  Use a "skip the bottom popcount bits" pattern
  * (clear the lowest set bit i times) to land on the target.
  */
 static inline_lookup
@@ -1191,12 +1218,14 @@ void ft_popcount_1l_node_get_ith_pos(const struct cds_ft_type *type,
 
 /*
  * Recover the branch byte indexing @slot within internal parent @node (the
- * inverse of byte -> child slot).  Pigeon: the body is a 256-entry array
- * indexed by byte, so the slot offset IS the byte.  Popcount: children are
- * packed by set-bit rank, so the slot's index in the packed pointer array
- * (slot - pointers_base) is its rank, mapped to the byte via get_ith_pos.
- * @node is always an internal (pigeon/popcount) node -- ft_set_parent_slot
- * guards out compressed parents (which have no slot array).
+ * inverse of byte -> child slot).
+ *   - Pigeon: the body is a 256-entry array indexed by byte, so the slot
+ *     offset IS the byte.
+ *   - Popcount: children are packed by set-bit rank.  So the slot's index
+ *     in the packed pointer array (slot - pointers_base) is its rank.
+ *     get_ith_pos maps the rank to the byte.
+ * @node is always an internal (pigeon/popcount) node.  ft_set_parent_slot
+ * guards out compressed parents, which have no slot array.
  */
 static
 uint8_t ft_slot_to_byte(const struct cds_ft_type *type,
@@ -1223,11 +1252,11 @@ uint8_t ft_slot_to_byte(const struct cds_ft_type *type,
  * populated entry.
  *
  * Scan the inline 256-bit occupancy bitmap for the nearest set bit toward
- * @dir with cds_find_prev_bit / cds_find_next_bit (as
- * ft_pigeon_node_get_direction does), then map that byte value to its
+ * @dir with cds_find_prev_bit / cds_find_next_bit, as
+ * ft_pigeon_node_get_direction does.  Then map that byte value to its
  * compact pointer via ft_popcount_1l_scan_28.  The bitmap is only a hint:
- * a soft-deleted entry keeps its bit set but holds a NULL pointer, so on
- * NULL continue the scan past that bit.
+ * a soft-deleted entry keeps its bit set but holds a NULL pointer.  On
+ * NULL, continue the scan past that bit.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_popcount_1l_node_get_direction(
@@ -1270,12 +1299,13 @@ retry:
 			/*
 			 * Spatial prefetch (dense byte-ordered pointers): the
 			 * adjacent sibling is slot[+1] (FT_RIGHT) / slot[-1]
-			 * (FT_LEFT) -- a near-future cds_ft_next/prev target.
-			 * The unchecked slot[+-1] over/under-read is fault-free by
-			 * the same allocator construction documented in
-			 * ft_popcount_2l_node_get_direction (FT_FAR_METADATA after
-			 * the 2 MiB run for +1; bitmap header before pointers
-			 * for -1).
+			 * (FT_LEFT).  It is a near-future cds_ft_next/prev
+			 * target.  The unchecked slot[+-1] over/under-read is
+			 * fault-free.  The reason is the same allocator
+			 * construction as documented in
+			 * ft_popcount_2l_node_get_direction:
+			 *   - +1: FT_FAR_METADATA after the 2 MiB run;
+			 *   - -1: bitmap header before pointers.
 			 */
 			ft_maybe_prefetch_nta(dir == FT_RIGHT ? slot[1] : slot[-1]);
 			*result_key = (uint8_t) i;
@@ -1387,11 +1417,12 @@ retry:
 			goto retry;
 		}
 		/*
-		 * Spatial prefetch: pigeon slots are byte-indexed (sparse), so
-		 * unlike the dense popcount layouts the adjacent present child is
-		 * NOT slot[+-1] -- one more bitmap scan in the iteration direction
-		 * locates it, and we prefetch it as a near-future cds_ft_next/prev
-		 * target.  The extra scan is cheap against a far-metadata/body miss.
+		 * Spatial prefetch.  Pigeon slots are byte-indexed (sparse).
+		 * So unlike the dense popcount layouts, the adjacent present
+		 * child is NOT slot[+-1].  One more bitmap scan in the
+		 * iteration direction locates it.  We prefetch it as a
+		 * near-future cds_ft_next/prev target.  The extra scan is
+		 * cheap against a far-metadata/body miss.
 		 */
 		{
 			int adj = (dir == FT_RIGHT) ?
@@ -1468,8 +1499,8 @@ ft_check_popcount_1l_idx_assumptions(void)
 
 /*
  * ft_node_get_nth_skip: raw child slot access.  Returns the slot
- * value as-is, including skip-compressed pointers.  Used only by
- * candidate lookup which resolves skip pointers itself.
+ * value as-is, including skip-compressed pointers.  It does not resolve
+ * skip pointers: a caller that needs the target resolves them itself.
  *
  * Per-type dispatch on type_index (no ft_types[] field load).  Each
  * arch maps type_index to a scanner specialized for that tier's
@@ -1493,26 +1524,27 @@ ft_check_popcount_1l_idx_assumptions(void)
  *   5:  pigeon                      (1024 B)
  *
  * The popcount scanners are pure integer math (popcount + bitmap
- * indexing); no SSE / SIMD dependency.  The hot caa_likely branch
+ * indexing), with no SSE / SIMD dependency.  The hot caa_likely branch
  * targets the most-frequent type observed across the comprehensive
- * benchmark (popcount_2l max_child=3 on 64-bit: ~46% of dispatches).
+ * benchmark.  That is popcount_2l max_child=3 on 64-bit: ~46% of
+ * dispatches.
  */
 
 /*
  * FT_NODE_SUB_TAG: SUB-by-imm tag-clear.  At each dispatch case below
- * the type_index is a compile-time literal, so the tag value to
- * subtract is a compile-time constant -- the compiler emits a single
- * SUB-by-immediate (or folds into an LEA with displacement) instead
- * of the data-dependent variable-shift AND used by
- * ft_node_ptr_internal.
+ * the type_index is a compile-time literal.  So the tag value to
+ * subtract is a compile-time constant.  The compiler emits a single
+ * SUB-by-immediate, or folds it into an LEA with displacement.
+ * ft_node_ptr_internal uses a data-dependent variable-shift AND
+ * instead.
  *
  * The subtraction is exact because every alignment bit covered by the
- * tag bits is zero in the raw address: type-T internal nodes are
- * 2^(4+T)-byte aligned, while the tag bits live in [0,3]
+ * tag bits is zero in the raw address.  Type-T internal nodes are
+ * 2^(4+T)-byte aligned.  The tag bits live in [0,3]
  * (FT_INTERNAL_MASK | FT_TYPE_MASK = 0xF).
  *
  * On FEATURE_FT_SKIP_COMPRESSED builds the skip-len high bits live
- * at [FT_SKIP_LEN_SHIFT, 63]; mask them off with FT_ADDR_MASK so
+ * at [FT_SKIP_LEN_SHIFT, 63].  Mask them off with FT_ADDR_MASK so
  * the result is a canonical address suitable for memory access.
  * Builds without FEATURE_FT_SKIP_COMPRESSED skip the mask entirely.
  */
@@ -1533,10 +1565,10 @@ ft_check_popcount_1l_idx_assumptions(void)
 /*
  * FT_NODE_SUB_TAG_NOSKIP: SUB-by-imm tag-clear variant *without* the
  * FT_ADDR_MASK (skip_len high-bit clear).  Safe only at descent sites
- * where the caller has already established skip_len = 0 (e.g. via the
- * loop-top ft_node_skip_compressed handler that either skips the entry
- * or resolves the skip through ft_skip_child_ptr).  The pure SUB folds
- * into the immediately-following load's displacement, avoiding the
+ * where the caller has already established skip_len = 0.  One way is the
+ * loop-top ft_node_skip_compressed handler: it either skips the entry or
+ * resolves the skip through ft_skip_child_ptr.  The pure SUB folds
+ * into the immediately-following load's displacement.  This avoids the
  * movabs of the 64-bit FT_ADDR_MASK constant in the hot path.
  */
 #define FT_NODE_SUB_TAG_NOSKIP(nf, type_idx)				\
@@ -1549,25 +1581,27 @@ ft_check_popcount_1l_idx_assumptions(void)
  * The type index a tagged pointer carries when it names no node type:
  * NODE_INDEX_NULL, which no real node is ever allocated with.
  *
- * A parked flip PROXY is exactly that, on purpose -- it is encoded as a
- * synthetic internal node of the maximal type index (ft-helpers.h), so every
- * caller that reaches a descent step still holding an unresolved proxy
- * dispatches to here.
+ * A parked flip PROXY is that, on purpose.  It is encoded as a synthetic
+ * internal node of the maximal type index (ft-helpers.h).  So every caller
+ * that reaches a descent step still holding an unresolved proxy dispatches
+ * to here.
  *
  * This arm used to be __builtin_unreachable(), on the premise that such an
- * index is "never encoded in a tagged pointer".  The proxy encoding makes that
- * premise false, and being wrong about it cost the worst failure shape
- * available: the compiler is entitled to index past the end of the jump table,
- * so an unresolved proxy became a wild jump to a non-executable address --
- * SIGILL, no diagnostic, nothing on the stack but a return address in the
- * caller.  That is how the free-walk defect presented, and why it took a
- * bisect and a hand-rolled probe to place rather than one assert.
+ * index is "never encoded in a tagged pointer".  The proxy encoding makes
+ * that premise false.  Being wrong about it cost the worst failure shape
+ * available.  The compiler is entitled to index past the end of the jump
+ * table.  So an unresolved proxy became a wild jump to a non-executable
+ * address.  It raised SIGILL with no diagnostic.  The stack held nothing
+ * but a return address in the caller.  That is how the free-walk defect
+ * presented.  It is also why it took a bisect and a hand-rolled probe to
+ * place it, rather than one assert.
  *
- * Answer "no child" instead.  Every caller already handles NULL: it is what an
- * external or compressed parent returns from the tag test above, and what the
- * reader descent turns into CDS_FT_STATUS_NOT_FOUND.  So a caller bug degrades
- * to a miss it can cope with rather than to undefined control flow, and the
- * debug build names the culprit first, with the frame still intact.
+ * Answer "no child" instead.  Every caller already handles NULL:
+ * - an external or compressed parent returns NULL from the tag test above;
+ * - the reader descent turns NULL into CDS_FT_STATUS_NOT_FOUND.
+ * So a caller bug degrades to a miss it can cope with, rather than to
+ * undefined control flow.  The debug build names the culprit first, with
+ * the frame still intact.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_node_dispatch_untyped(
@@ -1600,8 +1634,8 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 #if CAA_BITS_PER_LONG >= 64
 	/*
 	 * Pure switch; expect gcc to emit a jump table for 0..6.  Each
-	 * case computes FT_NODE_SUB_TAG with a compile-time-literal type
-	 * so the SUB is by-immediate and has no data dependency on
+	 * case computes FT_NODE_SUB_TAG with a compile-time-literal type.
+	 * So the SUB is by-immediate and has no data dependency on
 	 * @node_flag's type bits.
 	 */
 	switch (type_index) {
@@ -1661,17 +1695,17 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
  * ft_node_get_nth_skip_pretyped: same dispatch as ft_node_get_nth_skip,
  * but the caller has already extracted @type_index from the tag bits
  * and verified the FT_INTERNAL_MASK bit was set.  The parent pointer
- * @node_flag is still tagged -- each switch case applies
- * FT_NODE_SUB_TAG_NOSKIP with a compile-time-literal type, so the
+ * @node_flag is still tagged.  Each switch case applies
+ * FT_NODE_SUB_TAG_NOSKIP with a compile-time-literal type.  So the
  * SUB-by-immediate folds into the immediately-following body load's
- * displacement (gcc emits e.g. `mov -5(%rcx), %rax`), avoiding an
+ * displacement (gcc emits e.g. `mov -5(%rcx), %rax`).  This avoids an
  * explicit AND step on the per-step dependency chain to the body load.
  *
- * Skip-compressed safety: at this call site the loop-top
- * ft_node_skip_compressed handler has already either skipped this
- * entry or resolved the skip via ft_skip_child_ptr (which masks
- * FT_ADDR_MASK internally), so @node_flag's high-bit skip_len field is
- * zero and the FT_NODE_SUB_TAG_NOSKIP form is safe.
+ * Skip-compressed safety.  At this call site the loop-top
+ * ft_node_skip_compressed handler has already run.  It either skipped
+ * this entry or resolved the skip via ft_skip_child_ptr.  That function
+ * masks FT_ADDR_MASK internally.  So @node_flag's high-bit skip_len
+ * field is zero, and the FT_NODE_SUB_TAG_NOSKIP form is safe.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_nth_skip_pretyped(
@@ -1753,9 +1787,9 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip_pretyped(
  *
  * Resolves any skip pointer via the slot value directly (no validation,
  * no concurrency handling).  All RCU reader paths use
- * ft_node_get_nth_reanchor instead, which validates the skip pointer
- * against the live compressed node and re-anchors via the child's
- * parent chain on a mismatch (the single concurrency mechanism -- see
+ * ft_node_get_nth_reanchor instead.  That one validates the skip pointer
+ * against the live compressed node.  On a mismatch it re-anchors via the
+ * child's parent chain (the single concurrency mechanism -- see
  * ft_skip_reanchor).  The historical validate=true spin loop here is
  * therefore gone; the @validate_lookup parameter is dropped.
  */
@@ -1768,14 +1802,15 @@ struct cds_ft_inode_flag *ft_node_get_nth(const struct cds_ft *ft, struct cds_ft
 		ft_node_get_nth_skip(node_flag, node_flag_ptr, n, pf_hint);
 
 	/*
-	 * Resolve a type-7 flip proxy transiently occupying the slot (Phase 4.3:
-	 * a peer's one-commit publish or merge flip in its install-to-settle
-	 * window) BEFORE the skip handler classifies the child -- an unresolved
-	 * proxy's low nibble reads as internal type 7, so the descent would
-	 * dereference the proxy latch as node memory on its next step (a SIGILL /
-	 * SIGSEGV garbage jump in ft_descent_step).  Predicted-not-taken when no
-	 * flip is in flight (single-writer unchanged); the resolved value may
-	 * itself be skip-encoded, hence resolve-then-skip order.  Mirrors
+	 * Resolve a type-7 flip proxy transiently occupying the slot BEFORE
+	 * the skip handler classifies the child.  (Phase 4.3: the proxy is a
+	 * peer's one-commit publish or merge flip in its install-to-settle
+	 * window.)  An unresolved proxy's low nibble reads as internal type
+	 * 7.  So the descent would dereference the proxy latch as node memory
+	 * on its next step (a SIGILL / SIGSEGV garbage jump in
+	 * ft_descent_step).  Predicted-not-taken when no flip is in flight
+	 * (single-writer unchanged).  The resolved value may itself be
+	 * skip-encoded, hence resolve-then-skip order.  Mirrors
 	 * ft_node_get_nth_reanchor's leading resolve.
 	 */
 	child = ft_resolve_flip_proxy(child);
@@ -1784,39 +1819,41 @@ struct cds_ft_inode_flag *ft_node_get_nth(const struct cds_ft *ft, struct cds_ft
 
 /*
  * ft_node_get_nth_reanchor_slot: the shared robust child-resolution step for
- * BOTH the read side and the MW update side.  Fetches @node_flag's child at
- * byte @n and resolves a skip-compressed slot via the live skip-child parent
- * chain (ft_skip_reanchor) -- the single concurrency-handling mechanism --
- * rather than the unvalidated one-hop back-pointer.
+ * BOTH the read side and the MW update side.  Fetch @node_flag's child at
+ * byte @n.  Resolve a skip-compressed slot via the live skip-child parent
+ * chain (ft_skip_reanchor), not via the unvalidated one-hop back-pointer.
+ * That chain is the single concurrency-handling mechanism.
  *
  * Under mutual exclusion the update side could descend with the simpler
  * one-hop resolve (a peer writer could not change the structure under its own
- * descent).  MW removes that exemption: the writer descent now faces the same
- * concurrent split/merge the read side always did, so it navigates through
- * THIS primitive instead of a bespoke writer resolver.  The update side differs
- * from a reader only in capturing the mutable publish slot via @slot_ret.
+ * descent).  MW removes that exemption.  The writer descent now faces the
+ * same concurrent split/merge the read side always did.  So it navigates
+ * through THIS primitive instead of a bespoke writer resolver.  The update
+ * side differs from a reader only in capturing the mutable publish slot via
+ * @slot_ret.
  *
  * @raw_ret:    out (may be NULL) -- the raw word that slot held at THIS load,
  *              unresolved.  Callers comparing against slot contents (an
  *              expected-old) need it; the resolved return value never equals a
  *              skip-encoded word.
- * @slot_ret:   out (may be NULL) -- the RAW slot the child sits in (the skip
- *              slot itself under skip-compression, unresolved: the update
- *              side's publish target, the value ft_split_compressed_insert's
- *              forward CAS matches).  Readers pass NULL.
+ * @slot_ret:   out (may be NULL) -- the RAW slot the child sits in.  Under
+ *              skip-compression it is the skip slot itself, unresolved.  It
+ *              is the update side's publish target, the value
+ *              ft_split_compressed_insert's forward CAS matches.  Readers
+ *              pass NULL.
  * @rewind_ret: out -- byte-depths the resolved node lies ABOVE the dispatched
- *              child (0 in the split / recompaction case; > 0 only when a
- *              concurrent chain-merge moved the encoded position shallower --
- *              a reader backs its descent cursor up by that much, while the
- *              update side's @slot_ret is then at the wrong level so a mutator
- *              re-descends).
+ *              child.  It is 0 in the split / recompaction case.  It is > 0
+ *              only when a concurrent chain-merge moved the encoded position
+ *              shallower.  A reader then backs its descent cursor up by that
+ *              much.  The update side's @slot_ret is then at the wrong level,
+ *              so a mutator re-descends.
  *
- * Returns the resolved child flag -- a LIVE compressed/internal/external node,
- * never skip-encoded, never a torn back-pointer's content -- or NULL for an
- * empty slot.  ft_skip_reanchor never returns NULL on a well-formed trie (the
- * writer wires every fresh cluster's parent before the cluster becomes
- * reachable, so the up-walk never observes a NULL parent); the result is
- * asserted non-NULL.
+ * Return the resolved child flag, or NULL for an empty slot.  The resolved
+ * child is a LIVE compressed/internal/external node.  It is never
+ * skip-encoded, and never a torn back-pointer's content.  ft_skip_reanchor
+ * never returns NULL on a well-formed trie.  The writer wires every fresh
+ * cluster's parent before the cluster becomes reachable.  So the up-walk
+ * never observes a NULL parent.  The result is asserted non-NULL.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_nth_reanchor_slot(struct cds_ft *ft,
@@ -1837,30 +1874,32 @@ struct cds_ft_inode_flag *ft_node_get_nth_reanchor_slot(struct cds_ft *ft,
 		*raw_ret = child;
 
 	/*
-	 * Resolve a type-7 flip proxy transiently occupying the slot (a
+	 * Resolve a type-7 flip proxy transiently occupying the slot BEFORE
+	 * the skip handler classifies the child.  The proxy is a
 	 * cds_ft_merge_at flip, or an ordered-list insert's one-commit
-	 * publish) BEFORE the skip handler classifies the child: an
-	 * unresolved proxy's tag bits read as internal type 7 and would
-	 * dereference the proxy latch as node memory.  Predicted-not-taken
-	 * when no flip is in flight; the resolved value may itself be
-	 * skip-encoded, hence resolve-then-skip order.
+	 * publish.  An unresolved proxy's tag bits read as internal type 7
+	 * and would dereference the proxy latch as node memory.
+	 * Predicted-not-taken when no flip is in flight.  The resolved value
+	 * may itself be skip-encoded, hence resolve-then-skip order.
 	 */
 	child = ft_resolve_flip_proxy(child);
 	return ft_reanchor_flag(ft, child, rewind_ret);
 }
 
 /*
- * Surgical reader descent step: fetch @node_flag's child at byte @n, resolving
+ * Surgical reader descent step: fetch @node_flag's child at byte @n.  Resolve
  * a skip-compressed slot mismatch via the live skip-child parent chain instead
- * of spinning on a (possibly frozen) slot like ft_node_get_nth's validate path.
- * A thin reader wrapper over ft_node_get_nth_reanchor_slot (no publish slot).
- * On a mismatch ft_skip_reanchor locates the live position; *@rewind_ret is how
- * many byte-depths the resolved node lies ABOVE the dispatched child (0 in the
- * common split / recompaction case; > 0 only when a concurrent chain-merge
- * moved the encoded position shallower -- the caller backs its descent cursor
- * up by that much, or re-descends).  ft_skip_reanchor never returns NULL on a
- * well-formed trie; the result is asserted non-NULL.  Returns the resolved
- * child flag (compressed/internal/external), or NULL for an empty slot.
+ * of spinning on a (possibly frozen) slot like ft_node_get_nth's old validate
+ * path.  It is a thin reader wrapper over ft_node_get_nth_reanchor_slot, with
+ * no publish slot.
+ * On a mismatch ft_skip_reanchor locates the live position.  *@rewind_ret is
+ * how many byte-depths the resolved node lies ABOVE the dispatched child.  It
+ * is 0 in the common split / recompaction case.  It is > 0 only when a
+ * concurrent chain-merge moved the encoded position shallower.  The caller
+ * then backs its descent cursor up by that much, or re-descends.
+ * ft_skip_reanchor never returns NULL on a well-formed trie; the result is
+ * asserted non-NULL.  Return the resolved child flag
+ * (compressed/internal/external), or NULL for an empty slot.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_nth_reanchor(struct cds_ft *ft,
@@ -1942,13 +1981,13 @@ bool ft_node_find_child(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 /*
  * @validate_lookup: when true, validate the skip-compressed resolution
  * against the slot's skip_len.  On mismatch the RAW (still skip-compressed)
- * pointer is returned as a re-anchor signal; the reader-level caller resolves
- * it via ft_skip_reanchor (a validated result is never skip-compressed, so the
- * signal is unambiguous).  RCU readers must pass true and MUST handle the
- * skip-compressed return.  Writers must pass false (no validation: a writer
- * reads its own in-flight state and is the race partner, not a victim of it).
- * With static inlining and a constant arg, the unused branch is DCE'd at each
- * call site.
+ * pointer is returned as a re-anchor signal.  The reader-level caller resolves
+ * it via ft_skip_reanchor.  A validated result is never skip-compressed, so
+ * the signal is unambiguous.  RCU readers must pass true and MUST handle the
+ * skip-compressed return.  Writers must pass false and get no validation.  A
+ * writer reads its own in-flight state.  It is the race partner, not a victim
+ * of it.  With static inlining and a constant arg, the unused branch is DCE'd
+ * at each call site.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft *ft, struct cds_ft_inode_flag *node_flag,
@@ -1987,18 +2026,19 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft *ft, struct cds_ft
 		/*
 		 * Resolve a type-7 flip proxy transiently occupying a slot (a
 		 * cds_ft_merge_at flip, or a one-commit insert's parked
-		 * publish), so every ordered traversal reaching a directional
-		 * child through this accessor (iteration via
-		 * ft_node_get_leftright / ft_node_get_minmax and the relational
-		 * lookups) sees the view-appropriate old-or-new child.
-		 * Predicted-not-taken when no flip is in flight; NULL and
+		 * publish).  Every ordered traversal reaching a directional
+		 * child through this accessor then sees the view-appropriate
+		 * old-or-new child.  Those traversals are iteration via
+		 * ft_node_get_leftright / ft_node_get_minmax and the
+		 * relational lookups.
+		 * Predicted-not-taken when no flip is in flight.  NULL and
 		 * skip-encoded children pass through unchanged (a skip child's
 		 * low nibble is its tag, never the 0xF proxy).
 		 *
 		 * A parked one-commit insert proxy resolves to NULL (fresh key,
-		 * empty old slot): that slot is INVISIBLE, not end-of-scan --
-		 * continue the directional scan past it, else a rank walk
-		 * (lookup_nth / nth_last) or going-up sibling scan would
+		 * empty old slot).  That slot is INVISIBLE, not end-of-scan.
+		 * Continue the directional scan past it.  Otherwise a rank
+		 * walk (lookup_nth / nth_last) or going-up sibling scan would
 		 * silently drop every child beyond the parked slot.
 		 */
 		if (caa_unlikely(ft_node_flip_proxy(child))) {
@@ -2027,10 +2067,10 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft *ft, struct cds_ft
 	 * result never is, so the reader-level caller detects it and resolves
 	 * via ft_skip_reanchor (the single skip concurrency mechanism).  We must
 	 * NOT resolve it here by assuming the skip child's back-pointer is a
-	 * compressed node: mid-split (e.g. a suffix_len==0 branch re-parenting
-	 * the old external child before the slot is republished) it can
-	 * transiently be an INTERNAL node, and reading that as a compressed
-	 * len/key_bytes yields a garbage key.
+	 * compressed node.  Mid-split, it can transiently be an INTERNAL
+	 * node.  An example is a suffix_len==0 branch re-parenting the old
+	 * external child before the slot is republished.  Reading an
+	 * INTERNAL node as a compressed len/key_bytes yields a garbage key.
 	 */
 	return child;
 }
@@ -2066,14 +2106,19 @@ struct cds_ft_inode_flag *ft_node_get_minmax(struct cds_ft *ft, struct cds_ft_in
  * force-inlines the node scanners.  Several are also called at many write-side
  * sites, where the same force-inline duplicated each scanner across the mutation
  * code.  Provide a single shared, non-inlined copy of each such scanner for the
- * mutation path to call; read-side callers keep calling the always_inline
+ * mutation path to call.  Read-side callers keep calling the always_inline
  * originals.  The mutation modules are redirected to these *_shared variants via
  * #define in fractal-trie.c.
  *
- * Only these five pay off (about -9% .text together): get_nth, get_nth_skip,
- * get_nth_reanchor, get_direction, get_minmax.  An A/B over every node scanner
- * showed the rest are either too small for sharing to beat inlining, or reached
- * only from the read path.
+ * Only these five pay off, about -9% .text together:
+ * - get_nth;
+ * - get_nth_skip;
+ * - get_nth_reanchor;
+ * - get_direction;
+ * - get_minmax.
+ * An A/B over every node scanner showed why the rest do not.  Some are too
+ * small for sharing to beat inlining.  The others are reached only from the
+ * read path.
  */
 static struct cds_ft_inode_flag *ft_node_get_nth_shared(
 		const struct cds_ft *ft, struct cds_ft_inode_flag *node_flag,
