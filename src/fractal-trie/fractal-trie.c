@@ -523,6 +523,21 @@ void _cds_ft_debug_move_gate_exit(struct cds_ft *ft)
 {
 	ft_move_gate_exit(ft);
 }
+
+/*
+ * TEST/DEBUG (NOT public API).  Raise and lower the gate that detach, graft,
+ * graft_swap and merge_at hold.  A thread that holds it stands in for such
+ * an op, parked between its commits.  Call both from the same thread.
+ */
+void _cds_ft_debug_bulk_gate_enter(struct cds_ft *ft)
+{
+	ft_bulk_gate_enter(ft, FT_BULK_WRITER_ONLY);
+}
+
+void _cds_ft_debug_bulk_gate_exit(struct cds_ft *ft)
+{
+	ft_bulk_gate_exit(ft, FT_BULK_WRITER_ONLY);
+}
 /*
  * TEST/DEBUG (coherent-rekey sub-step 2, NOT public API).
  *

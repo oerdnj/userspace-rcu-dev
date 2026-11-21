@@ -69,7 +69,7 @@
 #endif
 
 /*
- * 359 unconditional + 52 fault-injection-only RUN_TEST registrations, on top of
+ * 360 unconditional + 52 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  *
  * ☠ BUMP BOTH ARMS.  A new unconditional test belongs to the fault-inject
@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (411 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (412 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (359 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (360 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -303,6 +303,8 @@ extern "C" {
 #endif
 extern void _cds_ft_debug_move_gate_enter(struct cds_ft *ft);
 extern void _cds_ft_debug_move_gate_exit(struct cds_ft *ft);
+extern void _cds_ft_debug_bulk_gate_enter(struct cds_ft *ft);
+extern void _cds_ft_debug_bulk_gate_exit(struct cds_ft *ft);
 extern void *_cds_ft_debug_root(struct cds_ft *ft);
 extern int _cds_ft_debug_cow_replace_root(struct cds_ft *ft);
 extern int _cds_ft_debug_flag_is_compressed(void *flag);
@@ -6291,6 +6293,128 @@ static int lookup_nth_varlen_run_end(bool rank)
 static int test_lookup_nth_varlen_run_end(void)
 {
 	return lookup_nth_varlen_run_end(false) | lookup_nth_varlen_run_end(true);
+}
+
+/*
+ * A point remove or replace while a bulk op is in flight, on an iterator
+ * positioned by a walk.
+ *
+ * With the bulk gate up, cds_ft_remove and cds_ft_replace look the node up
+ * again by the iterator's key (ft_iter_redescend_node).  A walk step on a
+ * variable-length list-on trie with no in-leaf key does not spell that key:
+ * it defers it.  The re-descent must still find a node that nothing moved.
+ *
+ * A helper thread holds the gate up, standing in for a detach parked between
+ * its commits.  The main thread replaces the first key, then drains the trie
+ * with lookup_first + remove.  Every call must report OK.
+ */
+struct bulk_gate_holder {
+	struct cds_ft *ft;
+	int up;
+	int release;
+};
+
+static void *bulk_gate_holder_thread(void *arg)
+{
+	struct bulk_gate_holder *h = (struct bulk_gate_holder *) arg;
+
+	rcu_register_thread();
+	_cds_ft_debug_bulk_gate_enter(h->ft);
+	uatomic_set(&h->up, 1);
+	rcu_thread_offline();
+	while (!uatomic_read(&h->release))
+		(void) usleep(1000);
+	rcu_thread_online();
+	_cds_ft_debug_bulk_gate_exit(h->ft);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int test_point_ops_under_bulk_gate_walk(void)
+{
+	static const char *const keys[] = { "ab", "abc", "cd", "x" };
+	const unsigned int N = sizeof(keys) / sizeof(keys[0]);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_fine_lock_ft(&group);
+	struct bulk_gate_holder h = { ft, 0, 0 };
+	struct ft_test_node *repl = node_alloc(100);
+	struct cds_ft_iter *it;
+	struct cds_ft_node *old;
+	enum cds_ft_status s;
+	unsigned int i, removed = 0;
+	pthread_t th;
+	int rc = 0;
+
+	for (i = 0; i < N; i++) {
+		struct ft_test_node *n = node_alloc(i);
+
+		if (cds_ft_insert(ft, (const uint8_t *) keys[i],
+				strlen(keys[i]), &n->node) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	if (cds_ft_iter_create(ft, &it) < 0)
+		abort();
+
+	rcu_thread_offline();
+	if (pthread_create(&th, NULL, bulk_gate_holder_thread, &h))
+		abort();
+	while (!uatomic_read(&h.up))
+		(void) usleep(1000);
+	rcu_thread_online();
+
+	rcu_read_lock();
+	if (cds_ft_lookup_first(ft, it) != CDS_FT_STATUS_OK)
+		abort();
+	old = cds_ft_iter_node(it);
+	s = cds_ft_replace(ft, it, old, &repl->node);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "bulk gate walk: replace of the first key "
+			"reported %s\n", cds_ft_status_to_string(s));
+		rc = -1;
+		node_free(repl);
+	} else {
+		node_free_rcu(to_test_node(old));
+	}
+	rcu_read_unlock();
+
+	/* Run even after a failed replace, so both ops are checked. */
+	for (i = 0; i < 2 * N; i++) {
+		struct cds_ft_node *node;
+
+		rcu_read_lock();
+		if (cds_ft_lookup_first(ft, it) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			break;
+		}
+		node = cds_ft_iter_node(it);
+		s = cds_ft_remove(ft, it, node);
+		if (s == CDS_FT_STATUS_OK) {
+			node_free_rcu(to_test_node(node));
+			removed++;
+		} else {
+			fprintf(stderr, "bulk gate walk: remove %u reported "
+				"%s\n", i, cds_ft_status_to_string(s));
+			rc = -1;
+			rcu_read_unlock();
+			break;
+		}
+		rcu_read_unlock();
+		rcu_quiescent_state();
+	}
+	if (!rc && removed != N) {
+		fprintf(stderr, "bulk gate walk: removed %u of %u\n",
+			removed, N);
+		rc = -1;
+	}
+
+	uatomic_set(&h.release, 1);
+	rcu_thread_offline();
+	pthread_join(th, NULL);
+	rcu_thread_online();
+	cds_ft_iter_destroy(it);
+	if (drain_and_destroy(ft, group))
+		rc = -1;
+	return rc;
 }
 
 /*
@@ -41342,6 +41466,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_lookup_nth_duplicates);
 	RUN_TEST(test_lookup_nth_varlen);
 	RUN_TEST(test_lookup_nth_varlen_run_end);
+	RUN_TEST(test_point_ops_under_bulk_gate_walk);
 
 	/* Iterator skip tests */
 	diag("Iterator skip tests");

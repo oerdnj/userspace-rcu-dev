@@ -15256,6 +15256,14 @@ enum cds_ft_status ft_iter_redescend_node(struct cds_ft *ft,
 {
 	struct cds_ft_node *h;
 
+	/*
+	 * SPELL THE KEY FIRST.  A walk step may have deferred it, and only the
+	 * cached position can spell it.  Dropped first, the lookup searched an
+	 * unset key and missed a node that nothing moved.  Spelling it here is
+	 * sound: this op holds the FT-wide lock, so no bulk commit runs while
+	 * it reads.  If a bulk op moved @node out, the chain check below fails.
+	 */
+	ft_iter_materialize_key(iter);
 	ft_iter_drop_position_keep_key(iter);
 	if ((*ft->lookup_iter_fn)(ft, iter) != CDS_FT_STATUS_OK)
 		return CDS_FT_STATUS_NOT_FOUND;
