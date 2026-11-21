@@ -934,9 +934,90 @@ enum ft_descent_action ft_skip_forward_compressed(
  * nodes between the start and end positions, so concurrent mutations
  * in unrelated key ranges do not affect the result.
  */
-enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
-		struct cds_ft_iter *iter,
-		unsigned long n)
+/*
+ * Put @iter back at the start of a rank skip: the key @key of @len bytes at
+ * the front of its buffer, on @node.  The cache is dropped, so the pass
+ * reads the key from the buffer and not from @node.
+ */
+static inline
+void ft_iter_restart(struct cds_ft_iter *iter, const uint8_t *key, size_t len,
+		struct cds_ft_node *node)
+{
+	memcpy(iter_key(iter), key, len);
+	iter->key_len = len;
+	iter->key_off = 0;
+	iter->node = node;
+	iter->cache_valid = false;
+	iter->path_len = 0;
+}
+
+/* Read a key count for a rank pass, and record its node in @wit. */
+static inline
+unsigned long ft_wit_child_key_count(struct ft_visit_witness *wit,
+		struct cds_ft_inode_flag *child)
+{
+	if (wit)
+		ft_witness_visit(wit, ft_node_ptr(child));
+	return ft_child_key_count(child);
+}
+
+static inline
+unsigned long ft_wit_nr_keys_load(struct ft_visit_witness *wit,
+		const struct cds_ft_metadata *m)
+{
+	if (wit)
+		ft_witness_visit(wit, m);
+	return ft_nr_keys_load(m);
+}
+
+/*
+ * The relative form of ft_rank_two_pass, for skip_forward and skip_reverse.
+ * They start from @iter's key and overwrite @iter with the result.  So
+ * during a move, put the start key at the front of the buffer while the
+ * position still spells it, and restore it before each pass.
+ */
+static
+void ft_rank_skip_two_pass(struct cds_ft *ft, struct cds_ft_iter *iter,
+		unsigned long n,
+		enum cds_ft_status (*pass)(struct cds_ft *,
+			struct cds_ft_iter *, unsigned long,
+			struct ft_visit_witness *))
+{
+	uint8_t start[FT_MAX_KEY_LEN];
+	struct cds_ft_node *start_node, *n1;
+	struct ft_visit_witness w1, w2;
+	enum cds_ft_status s1, s2;
+	size_t len;
+
+	if (caa_likely(!ft_move_active(ft))) {
+		(void) pass(ft, iter, n, NULL);
+		return;
+	}
+	ft_iter_materialize_key(iter);
+	len = iter->key_len;
+	memcpy(start, iter_key(iter), len);
+	start_node = iter->node;
+	for (;;) {
+		ft_iter_restart(iter, start, len, start_node);
+		ft_witness_init(&w1);
+		s1 = pass(ft, iter, n, &w1);
+		n1 = iter->node;
+		ft_iter_restart(iter, start, len, start_node);
+		ft_witness_init(&w2);
+		s2 = pass(ft, iter, n, &w2);
+		if (s1 == s2 && n1 == iter->node && ft_witness_equal(&w1, &w2))
+			return;
+	}
+}
+
+/*
+ * One rank pass of cds_ft_iter_skip_forward.
+ * If @wit is not NULL, record in it every node whose key count it reads.
+ */
+static
+enum cds_ft_status ft_iter_skip_forward_rank_pass(struct cds_ft *ft,
+		struct cds_ft_iter *iter, unsigned long n,
+		struct ft_visit_witness *wit)
 {
 	uint8_t ordinal_key[FT_MAX_KEY_LEN];
 	unsigned long remaining;
@@ -945,38 +1026,6 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 	struct cds_ft_inode_flag *deepest = NULL;
 	struct cds_ft_inode_flag *descend_from = NULL;
 
-	CDS_FT_SCOPED_READER(ft);
-	FT_TP(iter_skip_forward_enter, n);
-
-	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
-
-	if (!iter->node) {
-		FT_TP(iter_skip_forward_exit, (int) CDS_FT_STATUS_NOT_FOUND);
-		return CDS_FT_STATUS_NOT_FOUND;
-	}
-	if (n == 0) {
-		FT_TP(iter_skip_forward_exit, (int) CDS_FT_STATUS_OK);
-		return CDS_FT_STATUS_OK;
-	}
-
-	/*
-	 * Order statistics off: no per-node count to jump whole subtrees by, so
-	 * step forward one key at a time.  cds_ft_next unpositions the iterator
-	 * and returns NOT_FOUND when it runs off the end.  This is exactly the
-	 * out-of-range result the rank-on path produces.
-	 */
-	if (!ft->rank_stats) {
-		bool excl = ft_rank_walk_exclude_enter(ft);
-		enum cds_ft_status st = CDS_FT_STATUS_OK;
-		unsigned long i;
-
-		for (i = 0; i < n && st == CDS_FT_STATUS_OK; i++)
-			st = cds_ft_next(ft, iter);
-		if (excl)
-			ft_writer_lock_scope_exit(ft);
-		FT_TP(iter_skip_forward_exit, (int) st);
-		return st;
-	}
 
 	iter_debug_path_snapshot(iter);
 
@@ -1005,7 +1054,9 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 		struct cds_ft_inode_flag *parent = deepest;
 		struct cds_ft_metadata *pmeta =
 			cds_ft_item_to_metadata(ft_node_ptr(parent));
-		unsigned long right_keys = ft_nr_keys_load(pmeta) - 1; /* exclude self */
+		/* Exclude self. */
+		unsigned long right_keys =
+			ft_wit_nr_keys_load(wit, pmeta) - 1;
 
 		if (remaining <= right_keys) {
 			/*
@@ -1022,7 +1073,8 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 				int j;
 
 				assert(cn->child != NULL);	/* compressed node always has a live child */
-				ck = ft_child_key_count(ft_resolve_flip_proxy(cn->child));
+				ck = ft_wit_child_key_count(wit,
+					ft_resolve_flip_proxy(cn->child));
 				if (remaining < ck) {
 					for (j = 0; j < cn->len; j++) {
 						ordinal_key[depth + j] =
@@ -1066,7 +1118,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 						continue;
 					}
 #endif
-					ck = ft_child_key_count(child);
+					ck = ft_wit_child_key_count(wit, child);
 					if (remaining < ck) {
 						ordinal_key[depth] = child_key;
 						level = depth + 1;
@@ -1154,7 +1206,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 					continue;
 				}
 	#endif
-				ck = ft_child_key_count(child);
+				ck = ft_wit_child_key_count(wit, child);
 				if (remaining <= ck) {
 					remaining--;  /* enter this subtree (1-indexed within) */
 					ordinal_key[level] = child_key;
@@ -1282,7 +1334,7 @@ descend_forward:
 					goto next_forward_level;
 				}
 #endif
-				ck = ft_child_key_count(child);
+				ck = ft_wit_child_key_count(wit, child);
 				if (remaining < ck) {
 					ordinal_key[level] = child_key;
 					level++;
@@ -1322,6 +1374,47 @@ next_forward_level:
 	}
 
 end:
+	return iter->status;
+}
+
+enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		unsigned long n)
+{
+	CDS_FT_SCOPED_READER(ft);
+	FT_TP(iter_skip_forward_enter, n);
+
+	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+
+	if (!iter->node) {
+		FT_TP(iter_skip_forward_exit, (int) CDS_FT_STATUS_NOT_FOUND);
+		return CDS_FT_STATUS_NOT_FOUND;
+	}
+	if (n == 0) {
+		FT_TP(iter_skip_forward_exit, (int) CDS_FT_STATUS_OK);
+		return CDS_FT_STATUS_OK;
+	}
+
+	/*
+	 * Order statistics off: no per-node count to jump whole subtrees by, so
+	 * step forward one key at a time.  cds_ft_next unpositions the iterator
+	 * and returns NOT_FOUND when it runs off the end.  This is exactly the
+	 * out-of-range result the rank-on path produces.
+	 */
+	if (!ft->rank_stats) {
+		bool excl = ft_rank_walk_exclude_enter(ft);
+		enum cds_ft_status st = CDS_FT_STATUS_OK;
+		unsigned long i;
+
+		for (i = 0; i < n && st == CDS_FT_STATUS_OK; i++)
+			st = cds_ft_next(ft, iter);
+		if (excl)
+			ft_writer_lock_scope_exit(ft);
+		FT_TP(iter_skip_forward_exit, (int) st);
+		return st;
+	}
+
+	ft_rank_skip_two_pass(ft, iter, n, ft_iter_skip_forward_rank_pass);
 	iter_auto_invalidate_cache(iter);
 	FT_TP(iter_skip_forward_exit, (int) iter->status);
 	return iter->status;
@@ -1437,9 +1530,14 @@ enum ft_descent_action ft_skip_reverse_walk_up_compressed(
  * When enough are accumulated, descend into the target subtree using
  * the reverse lookup_nth_last algorithm.
  */
-enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
-		struct cds_ft_iter *iter,
-		unsigned long n)
+/*
+ * One rank pass of cds_ft_iter_skip_reverse.
+ * If @wit is not NULL, record in it every node whose key count it reads.
+ */
+static
+enum cds_ft_status ft_iter_skip_reverse_rank_pass(struct cds_ft *ft,
+		struct cds_ft_iter *iter, unsigned long n,
+		struct ft_visit_witness *wit)
 {
 	uint8_t ordinal_key[FT_MAX_KEY_LEN];
 	unsigned long remaining;
@@ -1448,37 +1546,6 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 	struct cds_ft_inode_flag *deepest = NULL;
 	struct cds_ft_inode_flag *descend_from = NULL;
 
-	CDS_FT_SCOPED_READER(ft);
-	FT_TP(iter_skip_reverse_enter, n);
-
-	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
-
-	if (!iter->node) {
-		FT_TP(iter_skip_reverse_exit, (int) CDS_FT_STATUS_NOT_FOUND);
-		return CDS_FT_STATUS_NOT_FOUND;
-	}
-	if (n == 0) {
-		FT_TP(iter_skip_reverse_exit, (int) CDS_FT_STATUS_OK);
-		return CDS_FT_STATUS_OK;
-	}
-
-	/*
-	 * Order statistics off: step backward one key at a time.  cds_ft_prev
-	 * unpositions the iterator and returns NOT_FOUND when it runs off the
-	 * front.  This matches the out-of-range result of the rank-on path.
-	 */
-	if (!ft->rank_stats) {
-		bool excl = ft_rank_walk_exclude_enter(ft);
-		enum cds_ft_status st = CDS_FT_STATUS_OK;
-		unsigned long i;
-
-		for (i = 0; i < n && st == CDS_FT_STATUS_OK; i++)
-			st = cds_ft_prev(ft, iter);
-		if (excl)
-			ft_writer_lock_scope_exit(ft);
-		FT_TP(iter_skip_reverse_exit, (int) st);
-		return st;
-	}
 
 	iter_debug_path_snapshot(iter);
 
@@ -1595,7 +1662,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 					continue;
 				}
 	#endif
-				left_keys += ft_child_key_count(child);
+				left_keys += ft_wit_child_key_count(wit, child);
 				pivot = child_key;
 				child = ft_node_get_direction(ft, ancestor, pivot,
 						&child_key, FT_LEFT, true);
@@ -1651,7 +1718,8 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 							continue;
 						}
 	#endif
-						ck = ft_child_key_count(child);
+						ck = ft_wit_child_key_count(wit,
+							child);
 						if (remaining <= ck) {
 							remaining--;
 							ordinal_key[level] = child_key;
@@ -1769,7 +1837,7 @@ descend_reverse:
 					goto next_reverse_level;
 				}
 #endif
-				ck = ft_child_key_count(child);
+				ck = ft_wit_child_key_count(wit, child);
 				if (remaining < ck) {
 					ordinal_key[level] = child_key;
 					level++;
@@ -1831,6 +1899,46 @@ next_reverse_level:
 	}
 
 end:
+	return iter->status;
+}
+
+enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		unsigned long n)
+{
+	CDS_FT_SCOPED_READER(ft);
+	FT_TP(iter_skip_reverse_enter, n);
+
+	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+
+	if (!iter->node) {
+		FT_TP(iter_skip_reverse_exit, (int) CDS_FT_STATUS_NOT_FOUND);
+		return CDS_FT_STATUS_NOT_FOUND;
+	}
+	if (n == 0) {
+		FT_TP(iter_skip_reverse_exit, (int) CDS_FT_STATUS_OK);
+		return CDS_FT_STATUS_OK;
+	}
+
+	/*
+	 * Order statistics off: step backward one key at a time.  cds_ft_prev
+	 * unpositions the iterator and returns NOT_FOUND when it runs off the
+	 * front.  This matches the out-of-range result of the rank-on path.
+	 */
+	if (!ft->rank_stats) {
+		bool excl = ft_rank_walk_exclude_enter(ft);
+		enum cds_ft_status st = CDS_FT_STATUS_OK;
+		unsigned long i;
+
+		for (i = 0; i < n && st == CDS_FT_STATUS_OK; i++)
+			st = cds_ft_prev(ft, iter);
+		if (excl)
+			ft_writer_lock_scope_exit(ft);
+		FT_TP(iter_skip_reverse_exit, (int) st);
+		return st;
+	}
+
+	ft_rank_skip_two_pass(ft, iter, n, ft_iter_skip_reverse_rank_pass);
 	iter_auto_invalidate_cache(iter);
 	FT_TP(iter_skip_reverse_exit, (int) iter->status);
 	return iter->status;

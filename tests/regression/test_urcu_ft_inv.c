@@ -22703,7 +22703,8 @@ static int inv_rekey_shorter_reanchor(void)
 /*   one and back.  No other key lies between the two prefixes, so no */
 /*   move changes any key's rank.  So lookup_nth(n) has exactly one   */
 /*   right answer at every moment.  Past the last rank it must report */
-/*   NOT_FOUND.  lookup_nth_last mirrors it.                          */
+/*   NOT_FOUND.  lookup_nth_last mirrors it.  So do skip_forward from */
+/*   the lowest key and skip_reverse from the highest.                */
 /*                                                                    */
 /*   Three shapes place the two prefixes:                             */
 /*     - both under the root;                                         */
@@ -22786,6 +22787,61 @@ static void *rkn_reader(void *arg)
 				rcu_read_lock();
 				s = last ? cds_ft_lookup_nth_last(ra->ft, iter, n) :
 					cds_ft_lookup_nth(ra->ft, iter, n);
+				if (n == nk) {
+					if (s != CDS_FT_STATUS_NOT_FOUND) {
+						fprintf(stderr, "inv_rekey_rank_nth "
+							"[%s]: %s(%lu) past the "
+							"end reported %s\n",
+							rkn_sh->name, what, n,
+							cds_ft_status_to_string(s));
+						atomic_fetch_add(&violation_count, 1);
+					}
+				} else if (s != CDS_FT_STATUS_OK ||
+					   cds_ft_iter_get_key(iter, k, sizeof(k),
+						&kl) != CDS_FT_STATUS_OK ||
+					   !rkn_key_at_rank(r, k, kl)) {
+					fprintf(stderr, "inv_rekey_rank_nth [%s]: "
+						"%s(%lu) reported %s, key %.*s\n",
+						rkn_sh->name, what, n,
+						cds_ft_status_to_string(s),
+						s == CDS_FT_STATUS_OK ? (int) kl : 0,
+						(const char *) k);
+					atomic_fetch_add(&violation_count, 1);
+				}
+				rcu_read_unlock();
+				rcu_quiescent_state();
+				ra->ops++;
+			}
+		}
+		/*
+		 * Relative rank: from the lowest key, skip_forward(m) lands on
+		 * rank m.  From the highest, skip_reverse(m) lands on rank
+		 * nk - 1 - m.  Past the end, both report NOT_FOUND.
+		 */
+		for (last = 0; last < 2; last++) {
+			const char *end = last ? rkn_sh->hi[rkn_sh->nhi - 1] :
+				rkn_sh->lo[0];
+			const char *what = last ? "skip_reverse" : "skip_forward";
+
+			for (n = 1; n <= nk; n++) {
+				unsigned long r = last ? nk - 1 - n : n;
+				enum cds_ft_status s;
+				uint8_t k[32];
+				size_t kl = 0;
+
+				rcu_read_lock();
+				cds_ft_iter_set_key(iter, (const uint8_t *) end,
+					strlen(end));
+				if (cds_ft_lookup(ra->ft, iter) != CDS_FT_STATUS_OK) {
+					fprintf(stderr, "inv_rekey_rank_nth [%s]: "
+						"lookup of %s failed\n",
+						rkn_sh->name, end);
+					atomic_fetch_add(&violation_count, 1);
+					rcu_read_unlock();
+					break;
+				}
+				s = last ? cds_ft_iter_skip_reverse(ra->ft, iter, n) :
+					cds_ft_iter_skip_forward(ra->ft, iter, n);
 				if (n == nk) {
 					if (s != CDS_FT_STATUS_NOT_FOUND) {
 						fprintf(stderr, "inv_rekey_rank_nth "
