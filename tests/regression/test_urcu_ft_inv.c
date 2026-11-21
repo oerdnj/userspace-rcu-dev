@@ -22712,8 +22712,8 @@ static int inv_rekey_shorter_reanchor(void)
 /*   The descent reads one slot's count, then the next slot's.  In    */
 /*   the last shape those two slots are in different nodes.           */
 /*                                                                    */
-/*   Rank stats only.  Without them lookup_nth is a walk, and a key   */
-/*   that moves during the walk may be counted twice or not at all.   */
+/*   Each shape runs with rank stats on (one descent by key counts)   */
+/*   and off (a walk from the first or last key).                     */
 /* ================================================================== */
 
 struct rkn_shape {
@@ -22849,7 +22849,7 @@ static void *rkn_writer(void *arg)
 	return NULL;
 }
 
-static int rkn_run(const struct rkn_shape *sh)
+static int rkn_run(const struct rkn_shape *sh, bool rank)
 {
 	struct cds_ft_group_attr *gattr;
 	struct cds_ft_group *group;
@@ -22870,7 +22870,7 @@ static int rkn_run(const struct rkn_shape *sh)
 	if (cds_ft_group_attr_set_max_key_len(gattr, 32) < 0 ||
 	    cds_ft_group_attr_set_ordered_list(gattr, true) < 0 ||
 	    cds_ft_group_attr_set_rekey(gattr, true) < 0 ||
-	    cds_ft_group_attr_set_rank_stats(gattr, true) < 0)
+	    (rank && cds_ft_group_attr_set_rank_stats(gattr, true) < 0))
 		abort();
 	if (cds_ft_group_create(gattr, &group) < 0)
 		abort();
@@ -22939,8 +22939,9 @@ static int rkn_run(const struct rkn_shape *sh)
 		ret = -1;
 	}
 	rcu_read_unlock();
-	fprintf(stderr, "# inv_rekey_rank_nth[%s]: moves=%lu queries=%lu "
-		"violations=%lu -> %s\n", sh->name, rkn_moves, ops,
+	fprintf(stderr, "# inv_rekey_rank_nth[%s, %s]: moves=%lu queries=%lu "
+		"violations=%lu -> %s\n", sh->name, rank ? "rank" : "walk",
+		rkn_moves, ops,
 		atomic_load(&violation_count),
 		(ret || atomic_load(&violation_count)) ? "RED" : "ok");
 	if (atomic_load(&violation_count) > 0 || !rkn_moves)
@@ -22958,8 +22959,10 @@ static int inv_rekey_rank_nth(void)
 	unsigned int i;
 	int ret = 0;
 
-	for (i = 0; i < sizeof(rkn_shapes) / sizeof(rkn_shapes[0]); i++)
-		ret |= rkn_run(&rkn_shapes[i]);
+	for (i = 0; i < sizeof(rkn_shapes) / sizeof(rkn_shapes[0]); i++) {
+		ret |= rkn_run(&rkn_shapes[i], true);
+		ret |= rkn_run(&rkn_shapes[i], false);
+	}
 	return ret;
 }
 

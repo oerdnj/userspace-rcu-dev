@@ -241,6 +241,48 @@ enum ft_descent_action ft_lookup_nth_compressed(
  *    If n < count, descend. Else n -= count and continue.
  */
 /*
+ * EXCLUDE BULK OPS FOR A RANK WALK.  With rank stats off, a rank op is a walk:
+ * lookup_first or lookup_last, then n steps.  A bulk op that moves keys
+ * during it can make it count a key twice or not at all.  A lookup retries
+ * until two passes agree.  A whole walk cannot: a stream of moves could keep
+ * it from ever finishing.
+ *
+ * So exclude bulk ops for the length of the walk, as a point writer does
+ * (ft_writer_lock_scope_enter).  With a bulk gate up, take the FT-wide lock:
+ * a bulk op commits only while it holds that lock.  A bulk op whose gate
+ * rises after this sample waits, in the gate's grace period, for the
+ * caller's read section, which spans the walk.  On a COARSE trie only a
+ * rekey owns that grace period.  A detach or graft may still start, but it
+ * adds or removes keys, it does not move one.
+ *
+ * Nest if this thread already holds the lock.  Return true if the caller
+ * must call ft_writer_lock_scope_exit() after the walk.
+ */
+static inline
+bool ft_rank_walk_exclude_enter(struct cds_ft *ft)
+{
+	if (ft->exclusive || ft->external_sync)
+		return false;
+	if (ft_wlock_held == ft) {
+		ft_wlock_depth++;
+		return true;
+	}
+	if (caa_likely(!ft_bulk_active(ft)))
+		return false;
+	if (caa_unlikely(ft_wlock_held != NULL)) {
+		fprintf(stderr, "cds_ft: a rank walk on cds_ft=%p while holding "
+			"the FT-wide writer lock of cds_ft=%p\n", (void *) ft,
+			(void *) ft_wlock_held);
+		fflush(stderr);
+		abort();
+	}
+	ft_writer_lock_take(ft);
+	ft_wlock_held = ft;
+	ft_wlock_depth = 1;
+	return true;
+}
+
+/*
  * REKEY-COHERENT RANK DESCENT: the point lookup's two passes
  * (ft_lookup_two_descents).
  *
@@ -481,10 +523,13 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 	 * unpositioned.  This matches the rank-on path.
 	 */
 	if (!ft->rank_stats) {
+		bool excl = ft_rank_walk_exclude_enter(ft);
 		enum cds_ft_status st = cds_ft_lookup_first(ft, iter);
 
 		if (st == CDS_FT_STATUS_OK)
 			st = cds_ft_iter_skip_forward(ft, iter, n);
+		if (excl)
+			ft_writer_lock_scope_exit(ft);
 		FT_TP(lookup_nth_exit, (int) st);
 		return st;
 	}
@@ -721,10 +766,13 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 	 * leaves the iterator unpositioned.  This matches the rank-on path.
 	 */
 	if (!ft->rank_stats) {
+		bool excl = ft_rank_walk_exclude_enter(ft);
 		enum cds_ft_status st = cds_ft_lookup_last(ft, iter);
 
 		if (st == CDS_FT_STATUS_OK)
 			st = cds_ft_iter_skip_reverse(ft, iter, n);
+		if (excl)
+			ft_writer_lock_scope_exit(ft);
 		FT_TP(lookup_nth_last_exit, (int) st);
 		return st;
 	}
@@ -918,18 +966,16 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 	 * out-of-range result the rank-on path produces.
 	 */
 	if (!ft->rank_stats) {
+		bool excl = ft_rank_walk_exclude_enter(ft);
+		enum cds_ft_status st = CDS_FT_STATUS_OK;
 		unsigned long i;
 
-		for (i = 0; i < n; i++) {
-			enum cds_ft_status st = cds_ft_next(ft, iter);
-
-			if (st != CDS_FT_STATUS_OK) {
-				FT_TP(iter_skip_forward_exit, (int) st);
-				return st;
-			}
-		}
-		FT_TP(iter_skip_forward_exit, (int) CDS_FT_STATUS_OK);
-		return CDS_FT_STATUS_OK;
+		for (i = 0; i < n && st == CDS_FT_STATUS_OK; i++)
+			st = cds_ft_next(ft, iter);
+		if (excl)
+			ft_writer_lock_scope_exit(ft);
+		FT_TP(iter_skip_forward_exit, (int) st);
+		return st;
 	}
 
 	iter_debug_path_snapshot(iter);
@@ -1422,18 +1468,16 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 	 * front.  This matches the out-of-range result of the rank-on path.
 	 */
 	if (!ft->rank_stats) {
+		bool excl = ft_rank_walk_exclude_enter(ft);
+		enum cds_ft_status st = CDS_FT_STATUS_OK;
 		unsigned long i;
 
-		for (i = 0; i < n; i++) {
-			enum cds_ft_status st = cds_ft_prev(ft, iter);
-
-			if (st != CDS_FT_STATUS_OK) {
-				FT_TP(iter_skip_reverse_exit, (int) st);
-				return st;
-			}
-		}
-		FT_TP(iter_skip_reverse_exit, (int) CDS_FT_STATUS_OK);
-		return CDS_FT_STATUS_OK;
+		for (i = 0; i < n && st == CDS_FT_STATUS_OK; i++)
+			st = cds_ft_prev(ft, iter);
+		if (excl)
+			ft_writer_lock_scope_exit(ft);
+		FT_TP(iter_skip_reverse_exit, (int) st);
+		return st;
 	}
 
 	iter_debug_path_snapshot(iter);
