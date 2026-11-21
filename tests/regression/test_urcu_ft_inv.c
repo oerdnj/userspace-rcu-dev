@@ -92,7 +92,7 @@
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
 /* +1 inv_graft_swap_whole_seam_points */
-#define NR_TESTS	(145 + NR_TESTS_REKEY_DLM)	/* +1: inv_owned_long_runs; +1: inv_owned_prefix_dense_remove_all; +1: inv_ir_prefix_roundtrip; +1: inv_owned_prefix_dense_replace; +1: inv_owned_prefix_dense; +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension; +1: inv_prefix_shape_zoo */
+#define NR_TESTS	(146 + NR_TESTS_REKEY_DLM)	/* +1: inv_owned_long_runs; +1: inv_owned_prefix_dense_remove_all; +1: inv_ir_prefix_roundtrip; +1: inv_owned_prefix_dense_replace; +1: inv_owned_prefix_dense; +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension; +1: inv_prefix_shape_zoo */
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -22714,7 +22714,8 @@ static int inv_rekey_shorter_reanchor(void)
 /*   the last shape those two slots are in different nodes.           */
 /*                                                                    */
 /*   Each shape runs with rank stats on (one descent by key counts)   */
-/*   and off (a walk from the first or last key).                     */
+/*   and off (a walk from the first or last key).  The walk runs on   */
+/*   both FINE and COARSE tries.  Rank stats force COARSE.            */
 /* ================================================================== */
 
 struct rkn_shape {
@@ -22722,15 +22723,31 @@ struct rkn_shape {
 	const char *lpfx, *spfx;	/* the subtree's two homes */
 	const char *lo[2], *hi[2];	/* the keys below and above it */
 	unsigned int nlo, nhi;
+	/*
+	 * Set for a graft_swap shape: the writer swaps the subtree at @lpfx
+	 * (== @spfx) with one holding the same number of keys, under these
+	 * suffixes instead of rks_suffixes.
+	 */
+	const char *const *alt;
 };
 
 static const struct rkn_shape rkn_shapes[] = {
-	{ "root", "Kabcdefghijk", "Q", { "A1" }, { "Z1" }, 1, 1 },
-	{ "one parent", "PKabcdefghijk", "PQ", { "PA1" }, { "PZ1" }, 1, 1 },
+	{ "root", "Kabcdefghijk", "Q", { "A1" }, { "Z1" }, 1, 1, NULL },
+	{ "one parent", "PKabcdefghijk", "PQ", { "PA1" }, { "PZ1" }, 1, 1,
+		NULL },
 	{ "two parents", "BKabcdefghijk", "CQ", { "A1", "BA1" },
-		{ "CZ1", "Z1" }, 2, 2 },
+		{ "CZ1", "Z1" }, 2, 2, NULL },
 };
 
+static const char *const rkn_alt_suffixes[] = { "a", "b1", "b2", "cdefgh" };
+
+static const struct rkn_shape rkn_swap_shapes[] = {
+	{ "root", "M", "M", { "A1" }, { "Z1" }, 1, 1, rkn_alt_suffixes },
+	{ "one parent", "PM", "PM", { "PA1" }, { "PZ1" }, 1, 1,
+		rkn_alt_suffixes },
+};
+
+static const char *rkn_name;
 static const struct rkn_shape *rkn_sh;
 static unsigned long rkn_moves;
 
@@ -22757,7 +22774,8 @@ static bool rkn_key_at_rank(unsigned long r, const uint8_t *k, size_t kl)
 	if (r >= RKS_NSUF)
 		return rkn_is(k, kl, rkn_sh->hi[r - RKS_NSUF], NULL);
 	s = rks_suffixes[r];
-	return rkn_is(k, kl, rkn_sh->lpfx, s) || rkn_is(k, kl, rkn_sh->spfx, s);
+	return rkn_is(k, kl, rkn_sh->lpfx, s) ||
+		rkn_is(k, kl, rkn_sh->spfx, rkn_sh->alt ? rkn_sh->alt[r] : s);
 }
 
 static void *rkn_reader(void *arg)
@@ -22789,10 +22807,10 @@ static void *rkn_reader(void *arg)
 					cds_ft_lookup_nth(ra->ft, iter, n);
 				if (n == nk) {
 					if (s != CDS_FT_STATUS_NOT_FOUND) {
-						fprintf(stderr, "inv_rekey_rank_nth "
+						fprintf(stderr, "%s "
 							"[%s]: %s(%lu) past the "
 							"end reported %s\n",
-							rkn_sh->name, what, n,
+							rkn_name, rkn_sh->name, what, n,
 							cds_ft_status_to_string(s));
 						atomic_fetch_add(&violation_count, 1);
 					}
@@ -22800,9 +22818,9 @@ static void *rkn_reader(void *arg)
 					   cds_ft_iter_get_key(iter, k, sizeof(k),
 						&kl) != CDS_FT_STATUS_OK ||
 					   !rkn_key_at_rank(r, k, kl)) {
-					fprintf(stderr, "inv_rekey_rank_nth [%s]: "
+					fprintf(stderr, "%s [%s]: "
 						"%s(%lu) reported %s, key %.*s\n",
-						rkn_sh->name, what, n,
+						rkn_name, rkn_sh->name, what, n,
 						cds_ft_status_to_string(s),
 						s == CDS_FT_STATUS_OK ? (int) kl : 0,
 						(const char *) k);
@@ -22833,9 +22851,9 @@ static void *rkn_reader(void *arg)
 				cds_ft_iter_set_key(iter, (const uint8_t *) end,
 					strlen(end));
 				if (cds_ft_lookup(ra->ft, iter) != CDS_FT_STATUS_OK) {
-					fprintf(stderr, "inv_rekey_rank_nth [%s]: "
+					fprintf(stderr, "%s [%s]: "
 						"lookup of %s failed\n",
-						rkn_sh->name, end);
+						rkn_name, rkn_sh->name, end);
 					atomic_fetch_add(&violation_count, 1);
 					rcu_read_unlock();
 					break;
@@ -22844,10 +22862,10 @@ static void *rkn_reader(void *arg)
 					cds_ft_iter_skip_forward(ra->ft, iter, n);
 				if (n == nk) {
 					if (s != CDS_FT_STATUS_NOT_FOUND) {
-						fprintf(stderr, "inv_rekey_rank_nth "
+						fprintf(stderr, "%s "
 							"[%s]: %s(%lu) past the "
 							"end reported %s\n",
-							rkn_sh->name, what, n,
+							rkn_name, rkn_sh->name, what, n,
 							cds_ft_status_to_string(s));
 						atomic_fetch_add(&violation_count, 1);
 					}
@@ -22855,9 +22873,9 @@ static void *rkn_reader(void *arg)
 					   cds_ft_iter_get_key(iter, k, sizeof(k),
 						&kl) != CDS_FT_STATUS_OK ||
 					   !rkn_key_at_rank(r, k, kl)) {
-					fprintf(stderr, "inv_rekey_rank_nth [%s]: "
+					fprintf(stderr, "%s [%s]: "
 						"%s(%lu) reported %s, key %.*s\n",
-						rkn_sh->name, what, n,
+						rkn_name, rkn_sh->name, what, n,
 						cds_ft_status_to_string(s),
 						s == CDS_FT_STATUS_OK ? (int) kl : 0,
 						(const char *) k);
@@ -22886,15 +22904,15 @@ static void *rkn_writer(void *arg)
 		rcu_quiescent_state();
 	while (!test_stop) {
 		if (cds_ft_rekey_graft(ft, sh, sl, l, ll) != CDS_FT_STATUS_OK) {
-			fprintf(stderr, "inv_rekey_rank_nth [%s]: long->short "
-				"failed\n", rkn_sh->name);
+			fprintf(stderr, "%s [%s]: long->short "
+				"failed\n", rkn_name, rkn_sh->name);
 			atomic_fetch_add(&violation_count, 1);
 			break;
 		}
 		rcu_quiescent_state();
 		if (cds_ft_rekey_graft(ft, l, ll, sh, sl) != CDS_FT_STATUS_OK) {
-			fprintf(stderr, "inv_rekey_rank_nth [%s]: short->long "
-				"failed\n", rkn_sh->name);
+			fprintf(stderr, "%s [%s]: short->long "
+				"failed\n", rkn_name, rkn_sh->name);
 			atomic_fetch_add(&violation_count, 1);
 			break;
 		}
@@ -22905,11 +22923,60 @@ static void *rkn_writer(void *arg)
 	return NULL;
 }
 
-static int rkn_run(const struct rkn_shape *sh, bool rank)
+/*
+ * Swap the subtree at @rkn_sh->lpfx with @swap, again and again.  @swap
+ * starts with the keys under rkn_alt_suffixes.  After each swap it holds
+ * the previous content.  make_exclusive waits a grace period, so no reader
+ * is still in that content when it goes back in.
+ */
+static void *rkn_swap_writer(void *arg)
+{
+	struct cds_ft **fts = (struct cds_ft **) arg;
+	const uint8_t *p = (const uint8_t *) rkn_sh->lpfx;
+	size_t pl = strlen(rkn_sh->lpfx);
+
+	rcu_register_thread();
+	while (!test_go)
+		rcu_quiescent_state();
+	while (!test_stop) {
+		enum cds_ft_status st;
+
+		cds_ft_make_exclusive(fts[1]);
+		st = cds_ft_graft_swap(fts[0], p, pl, fts[1]);
+		if (st != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "%s [%s]: graft_swap: %s\n", rkn_name,
+				rkn_sh->name, cds_ft_status_to_string(st));
+			atomic_fetch_add(&violation_count, 1);
+			break;
+		}
+		rcu_quiescent_state();
+		rkn_moves++;
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void rkn_insert(struct cds_ft *ft, const char *a, const char *b,
+		uint64_t tag)
+{
+	uint8_t k[32];
+	size_t kl = strlen(a);
+
+	memcpy(k, a, kl);
+	if (b) {
+		memcpy(k + kl, b, strlen(b));
+		kl += strlen(b);
+	}
+	if (cds_ft_insert(ft, k, kl, &node_alloc(tag)->node) != CDS_FT_STATUS_OK)
+		abort();
+}
+
+static int rkn_run(const struct rkn_shape *sh, bool rank,
+		enum cds_ft_writer_strategy ws)
 {
 	struct cds_ft_group_attr *gattr;
 	struct cds_ft_group *group;
-	struct cds_ft *ft;
+	struct cds_ft *ft, *fts[2] = { NULL, NULL };
 	struct rks_reader_arg rargs[2 * NR_READERS_DEFAULT];
 	pthread_t readers[2 * NR_READERS_DEFAULT], writer;
 	struct timespec t0;
@@ -22925,7 +22992,9 @@ static int rkn_run(const struct rkn_shape *sh, bool rank)
 		return -1;
 	if (cds_ft_group_attr_set_max_key_len(gattr, 32) < 0 ||
 	    cds_ft_group_attr_set_ordered_list(gattr, true) < 0 ||
-	    cds_ft_group_attr_set_rekey(gattr, true) < 0 ||
+	    cds_ft_group_attr_set_writer_strategy(gattr, ws) !=
+			CDS_FT_STATUS_OK ||
+	    (!sh->alt && cds_ft_group_attr_set_rekey(gattr, true) < 0) ||
 	    (rank && cds_ft_group_attr_set_rank_stats(gattr, true) < 0))
 		abort();
 	if (cds_ft_group_create(gattr, &group) < 0)
@@ -22934,30 +23003,19 @@ static int rkn_run(const struct rkn_shape *sh, bool rank)
 	if (cds_ft_create(group, NULL, &ft) < 0)
 		abort();
 
+	fts[0] = ft;
+	if (sh->alt && cds_ft_create(group, NULL, &fts[1]) < 0)
+		abort();
 	rcu_read_lock();
-	for (i = 0; i < RKS_NSUF + sh->nlo + sh->nhi; i++) {
-		uint8_t k[32];
-		size_t kl;
-		const char *a, *b = NULL;
-
-		if (i < RKS_NSUF) {
-			a = sh->lpfx;
-			b = rks_suffixes[i];
-		} else if (i < RKS_NSUF + sh->nlo) {
-			a = sh->lo[i - RKS_NSUF];
-		} else {
-			a = sh->hi[i - RKS_NSUF - sh->nlo];
-		}
-		kl = strlen(a);
-		memcpy(k, a, kl);
-		if (b) {
-			memcpy(k + kl, b, strlen(b));
-			kl += strlen(b);
-		}
-		if (cds_ft_insert(ft, k, kl, &node_alloc(i)->node) !=
-				CDS_FT_STATUS_OK)
-			abort();
+	for (i = 0; i < RKS_NSUF; i++) {
+		rkn_insert(ft, sh->lpfx, rks_suffixes[i], i);
+		if (sh->alt)
+			rkn_insert(fts[1], sh->alt[i], NULL, 100 + i);
 	}
+	for (i = 0; i < sh->nlo; i++)
+		rkn_insert(ft, sh->lo[i], NULL, 200 + i);
+	for (i = 0; i < sh->nhi; i++)
+		rkn_insert(ft, sh->hi[i], NULL, 300 + i);
 	rcu_read_unlock();
 
 	rkn_moves = 0;
@@ -22970,7 +23028,10 @@ static int rkn_run(const struct rkn_shape *sh, bool rank)
 		rargs[i].ops = 0;
 		pthread_create(&readers[i], NULL, rkn_reader, &rargs[i]);
 	}
-	pthread_create(&writer, NULL, rkn_writer, ft);
+	if (sh->alt)
+		pthread_create(&writer, NULL, rkn_swap_writer, fts);
+	else
+		pthread_create(&writer, NULL, rkn_writer, ft);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	test_go = 1;
 
@@ -22990,13 +23051,15 @@ static int rkn_run(const struct rkn_shape *sh, bool rank)
 	rcu_read_lock();
 	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
 	    cds_ft_count_keys(ft) != rkn_nkeys()) {
-		fprintf(stderr, "inv_rekey_rank_nth [%s]: final trie wrong "
-			"(count %lu)\n", sh->name, cds_ft_count_keys(ft));
+		fprintf(stderr, "%s [%s]: final trie wrong "
+			"(count %lu)\n", rkn_name, sh->name, cds_ft_count_keys(ft));
 		ret = -1;
 	}
 	rcu_read_unlock();
-	fprintf(stderr, "# inv_rekey_rank_nth[%s, %s]: moves=%lu queries=%lu "
-		"violations=%lu -> %s\n", sh->name, rank ? "rank" : "walk",
+	fprintf(stderr, "# %s[%s, %s, %s]: moves=%lu queries=%lu "
+		"violations=%lu -> %s\n", rkn_name, sh->name,
+		rank ? "rank" : "walk",
+		ws == CDS_FT_WRITER_LOCK_COARSE ? "coarse" : "fine",
 		rkn_moves, ops,
 		atomic_load(&violation_count),
 		(ret || atomic_load(&violation_count)) ? "RED" : "ok");
@@ -23004,22 +23067,54 @@ static int rkn_run(const struct rkn_shape *sh, bool rank)
 		ret = -1;
 
 	drain_trie_local(ft);
+	if (fts[1])
+		drain_trie_local(fts[1]);
 	rcu_barrier();
+	if (fts[1])
+		cds_ft_destroy(fts[1]);
 	cds_ft_destroy(ft);
 	cds_ft_group_destroy(group);
 	return ret;
 }
 
-static int inv_rekey_rank_nth(void)
+/* Run each shape with rank stats, then walk on a FINE and a COARSE trie. */
+static int rkn_run_all(const char *name, const struct rkn_shape *shapes,
+		unsigned int nr)
 {
 	unsigned int i;
 	int ret = 0;
 
-	for (i = 0; i < sizeof(rkn_shapes) / sizeof(rkn_shapes[0]); i++) {
-		ret |= rkn_run(&rkn_shapes[i], true);
-		ret |= rkn_run(&rkn_shapes[i], false);
+	rkn_name = name;
+	for (i = 0; i < nr; i++) {
+		ret |= rkn_run(&shapes[i], true, CDS_FT_WRITER_LOCK_COARSE);
+		ret |= rkn_run(&shapes[i], false, CDS_FT_WRITER_LOCK_FINE);
+		ret |= rkn_run(&shapes[i], false, CDS_FT_WRITER_LOCK_COARSE);
 	}
 	return ret;
+}
+
+static int inv_rekey_rank_nth(void)
+{
+	return rkn_run_all("inv_rekey_rank_nth", rkn_shapes,
+		sizeof(rkn_shapes) / sizeof(rkn_shapes[0]));
+}
+
+/* ================================================================== */
+/*                                                                    */
+/*   INVARIANT 11f: a rank lookup_nth gives the right key while a     */
+/*   graft_swap replaces a subtree                                    */
+/*                                                                    */
+/*   The writer swaps the four keys under a prefix with four other    */
+/*   keys under the same prefix, and back.  No key's rank changes,    */
+/*   so the readers of INVARIANT 11e check the same ranks.  A walk    */
+/*   that is inside the old subtree at the swap stays in it.  So a    */
+/*   walk with rank stats off needs no exclusion against graft_swap.  */
+/* ================================================================== */
+
+static int inv_graft_swap_rank_nth(void)
+{
+	return rkn_run_all("inv_graft_swap_rank_nth", rkn_swap_shapes,
+		sizeof(rkn_swap_shapes) / sizeof(rkn_swap_shapes[0]));
 }
 
 /* ================================================================== */
@@ -29597,6 +29692,8 @@ int main(int argc, char **argv)
 
 	diag("11e. lookup_nth gives the right key while a rekey moves a subtree");
 	RUN_TEST(inv_rekey_rank_nth);
+	diag("11f. lookup_nth is right while a graft_swap replaces a subtree");
+	RUN_TEST(inv_graft_swap_rank_nth);
 
 	diag("12. Merge into a compressed destination never escapes");
 	RUN_TEST(inv_merge_compressed_dst_no_escape);
