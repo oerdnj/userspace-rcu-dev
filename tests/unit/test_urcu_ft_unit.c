@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (413 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (414 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (360 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (361 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -14043,6 +14043,169 @@ static int test_rekey_bare_head_upwalk_key(void)
 				cases[i][2]))
 			return -1;
 	return 0;
+}
+
+/*
+ * A rekey moves the key at its source prefix: "q" here, the prefix key of
+ * "q1" and "q2".  The moved node is copied, but the key's leaf is the
+ * application's.  Its ordered cell keeps the key's last byte, which the
+ * up-walk reads once the key sits in a body slot.  Remove "@dst 1" and
+ * "@dst 2": the holder collapses and moves the key into its parent's slot.
+ * The walk must still spell @dst.
+ *
+ * Without the fix, the walk spells the source byte: "z" -> "q", "ax" ->
+ * "aq".  cds_ft_verify passes.  Only with the ordered list on: with it off,
+ * the walk spells the key from the trie.  A merge also runs onto an occupied
+ * destination: "@dst 5" sorts after the moved keys, and "@dst 15" between
+ * them, so the merge interleaves the lists.
+ */
+static int rekey_prefix_key_byte(const char *dst, bool merge,
+		const char *occupied, int list)
+{
+	const char *const sfx[] = { "1", "2", occupied };
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter = NULL;
+	enum cds_ft_status s;
+	char k[16], want[16];
+	unsigned int i;
+	int nr = 0, ret = -1;
+
+	if (merge && !cds_ft_merge_enabled())
+		return 0;
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0 ||
+	    cds_ft_group_attr_set_ordered_list(attr, list) < 0 ||
+	    cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *) "q", 1, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "q1", 2, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "q2", 2, &node_alloc(3)->node);
+	cds_ft_insert(ft, (const uint8_t *) "am", 2, &node_alloc(4)->node);
+	cds_ft_insert(ft, (const uint8_t *) "an", 2, &node_alloc(5)->node);
+	/* @occupied makes the destination occupied: a merge then unions. */
+	if (occupied) {
+		snprintf(k, sizeof(k), "%s%s", dst, occupied);
+		cds_ft_insert(ft, (const uint8_t *) k, strlen(k),
+			&node_alloc(6)->node);
+	}
+
+	s = merge ? ft_rekey(ft, dst, "q") :
+		cds_ft_rekey_graft(ft, (const uint8_t *) dst, strlen(dst),
+			(const uint8_t *) "q", 1);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "prefix_key_byte(%s, %s%s, list %d): rekey %s\n",
+			dst, merge ? "merge" : "graft",
+			occupied ? " occupied" : "", list,
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (cds_ft_iter_create(ft, &iter) != CDS_FT_STATUS_OK)
+		goto out;
+	for (i = 0; i < 2u + !!occupied; i++) {
+		struct cds_ft_node *victim;
+
+		snprintf(k, sizeof(k), "%s%s", dst, sfx[i]);
+		cds_ft_iter_set_key(iter, (const uint8_t *) k, strlen(k));
+		if (cds_ft_lookup(ft, iter) != CDS_FT_STATUS_OK ||
+		    !(victim = cds_ft_iter_node(iter)) ||
+		    cds_ft_remove(ft, iter, victim) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "prefix_key_byte(%s): could not remove "
+				"\"%s\"\n", dst, k);
+			goto out;
+		}
+		node_free_rcu(to_test_node(victim));
+	}
+	/* Every key the walk spells must be in the trie, @dst among them. */
+	snprintf(want, sizeof(want), "%s", dst);
+	if (cds_ft_lookup_first(ft, iter) == CDS_FT_STATUS_OK) {
+		do {
+			size_t kl = 0;
+
+			if (cds_ft_iter_get_key(iter, (uint8_t *) k,
+					sizeof(k) - 1, &kl) != CDS_FT_STATUS_OK)
+				goto out;
+			k[kl] = '\0';
+			if (!ft_test_has_key(ft, k)) {
+				fprintf(stderr, "prefix_key_byte(%s, %s%s, "
+					"list %d): the walk spells \"%s\", not "
+					"in the trie\n", dst,
+					merge ? "merge" : "graft",
+					occupied ? " occupied" : "", list, k);
+				goto out;
+			}
+			if (!strcmp(k, want))
+				want[0] = '\0';
+			nr++;
+		} while (cds_ft_next(ft, iter) == CDS_FT_STATUS_OK);
+	}
+	if (nr != 3 || want[0] || cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "prefix_key_byte(%s, %s, list %d): walked %d "
+			"(want 3)%s\n", dst, merge ? "merge" : "graft", list, nr,
+			want[0] ? ", the moved key missing" : "");
+		goto out;
+	}
+	ret = 0;
+out:
+	/*
+	 * Remove the three keys by exact lookup first.  drain_trie walks, and
+	 * would look up a misspelled key forever.
+	 */
+	if (iter) {
+		const char *const left[] = { dst, "am", "an" };
+
+		for (i = 0; i < 3; i++) {
+			struct cds_ft_node *victim;
+
+			cds_ft_iter_set_key(iter, (const uint8_t *) left[i],
+				strlen(left[i]));
+			if (cds_ft_lookup(ft, iter) == CDS_FT_STATUS_OK &&
+			    (victim = cds_ft_iter_node(iter)) &&
+			    cds_ft_remove(ft, iter, victim) == CDS_FT_STATUS_OK)
+				node_free_rcu(to_test_node(victim));
+		}
+		cds_ft_iter_destroy(iter);
+	}
+	rcu_read_unlock();
+	if (drain_trie(ft) < 0)
+		ret = -1;
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_rekey_prefix_key_byte(void)
+{
+	/* A root slot, a slot of an existing node, a deep new chain. */
+	static const char *const dsts[] = { "z", "ax", "zzz" };
+	unsigned int i;
+	int merge, list, ret = 0;
+
+	for (i = 0; i < CAA_ARRAY_SIZE(dsts); i++)
+		for (merge = 0; merge < 2; merge++)
+			for (list = 1; list >= 0; list--) {
+				if (rekey_prefix_key_byte(dsts[i], merge, NULL,
+						list))
+					ret = -1;
+				if (merge && rekey_prefix_key_byte(dsts[i],
+						true, "5", list))
+					ret = -1;
+				if (merge && rekey_prefix_key_byte(dsts[i],
+						true, "15", list))
+					ret = -1;
+			}
+	return ret;
 }
 
 /*
@@ -41752,6 +41915,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_merge_dst_run_start);
 	RUN_TEST(test_rekey_merge_dst_bare_head);
 	RUN_TEST(test_rekey_bare_head_upwalk_key);
+	RUN_TEST(test_rekey_prefix_key_byte);
 	RUN_TEST(test_rekey_bare_head_collide_walk);
 	RUN_TEST(test_rekey_fold_collapse_two_child);
 	RUN_TEST(test_rekey_count_root_relocation);
