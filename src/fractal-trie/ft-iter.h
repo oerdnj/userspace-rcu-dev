@@ -834,6 +834,20 @@ enum cds_ft_status cds_ft_iter_get_key(struct cds_ft_iter *iter,
 	return CDS_FT_STATUS_OK;
 }
 
+/*
+ * Can a key be read from the leaf alone?  The leaf must hold the key bytes
+ * (speculative_key_offset).  It must also give the length: the group's fixed
+ * length, or an in-leaf length (key_len_offset).  A variable-length group may
+ * declare the key bytes without the length.
+ */
+static inline
+bool ft_leaf_key_readable(const struct cds_ft *ft)
+{
+	return ft->speculative_key_offset_active &&
+		(ft->group->key_len != CDS_FT_LEN_VARIABLE ||
+		 ft->group->key_len_offset_set);
+}
+
 enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
 		const struct cds_ft_node *node, uint8_t *result_key,
 		size_t result_key_max_len, size_t *result_key_len)
@@ -845,7 +859,7 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
 
 	if (!node)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	if (ft->speculative_key_offset_active) {
+	if (ft_leaf_key_readable(ft)) {
 		/*
 		 * In-leaf key: the head stores its ordinal key bytes (and, for a
 		 * variable-length group, its length) directly.  Read them in place.
@@ -876,7 +890,10 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
 			klen = ft_rebuild_key_upwalk(ft, cell, scratch, max_len);
 			ordinals = scratch + (max_len - klen);
 		} else {
-			/* List off: no cell, no in-leaf key -> not materializable. */
+			/*
+			 * List off: no cell, and no in-leaf key with its
+			 * length -> not materializable.
+			 */
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
 	}
@@ -1208,7 +1225,7 @@ enum cds_ft_status cds_ft_cell_get_key(const struct cds_ft *ft,
 
 	if (!cell)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	if (ft->speculative_key_offset_active) {
+	if (ft_leaf_key_readable(ft)) {
 		const struct cds_ft_node *node = rcu_dereference(cell->node);
 
 		ordinals = (const uint8_t *) node + group->speculative_key_offset;

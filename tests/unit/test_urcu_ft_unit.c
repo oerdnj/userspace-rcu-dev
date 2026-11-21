@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (415 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (416 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (362 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (363 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -5605,6 +5605,128 @@ out:
 	if (drain_and_destroy(ft, group))
 		return -1;
 	return ret;
+}
+
+/*
+ * cds_ft_node_get_key and cds_ft_cell_get_key on a variable-length group that
+ * declares the in-leaf key bytes but no in-leaf length.  The leaf alone does
+ * not give the key, so the list-on trie rebuilds it from the trie structure
+ * and the list-off trie answers NOT_FOUND.  Neither may read a length from
+ * the leaf.
+ */
+struct gk_leaf {
+	struct cds_ft_node node;
+	uint8_t key[16];
+};
+
+static int gk_nolen_run(bool list)
+{
+	static const char *const keys[] = { "abc", "hello", "z" };
+	struct gk_leaf *leaf[3] = { NULL };
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	unsigned int i;
+	int ret = -1;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE) < 0 ||
+	    cds_ft_group_attr_set_max_key_len(attr, 16) < 0 ||
+	    cds_ft_group_attr_set_ordered_list(attr, list) < 0 ||
+	    cds_ft_group_attr_set_speculative_key_offset(attr,
+			offsetof(struct gk_leaf, key) -
+			offsetof(struct gk_leaf, node)) != CDS_FT_STATUS_OK ||
+	    cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	list = cds_ft_group_ordered_list(group);	/* off in a no-cell build */
+	rcu_read_lock();
+	for (i = 0; i < 3; i++) {
+		leaf[i] = (struct gk_leaf *) calloc(1, sizeof(*leaf[i]));
+		if (!leaf[i])
+			goto unlock;
+		cds_ft_node_init(&leaf[i]->node);
+		memcpy(leaf[i]->key, keys[i], strlen(keys[i]));
+		if (cds_ft_insert(ft, (const uint8_t *) keys[i],
+				strlen(keys[i]), &leaf[i]->node) != CDS_FT_STATUS_OK) {
+			free(leaf[i]);
+			leaf[i] = NULL;
+			goto unlock;
+		}
+	}
+	for (i = 0; i < 3; i++) {
+		uint8_t k[64];
+		size_t kl = 0;
+		enum cds_ft_status s = cds_ft_node_get_key(ft, &leaf[i]->node,
+				k, sizeof(k), &kl);
+
+		if (!list ? s != CDS_FT_STATUS_NOT_FOUND :
+		    (s != CDS_FT_STATUS_OK || kl != strlen(keys[i]) ||
+		     memcmp(k, keys[i], kl))) {
+			fprintf(stderr, "node_get_key no-len (list %s) '%s': "
+				"%s len %zu\n", list ? "on" : "off", keys[i],
+				cds_ft_status_to_string(s), kl);
+			goto unlock;
+		}
+	}
+	if (list) {
+		const struct cds_ft_cell *buf[4];
+		const struct cds_ft_cell *cur;
+		size_t n = 0;
+
+		if (cds_ft_cell_next_batch(ft, NULL, buf, 4, &n, &cur) !=
+				CDS_FT_STATUS_OK || n != 3)
+			goto unlock;
+		for (i = 0; i < n; i++) {
+			uint8_t k[64];
+			size_t kl = 0;
+			enum cds_ft_status s = cds_ft_cell_get_key(ft, buf[i],
+					k, sizeof(k), &kl);
+
+			if (s != CDS_FT_STATUS_OK || kl != strlen(keys[i]) ||
+			    memcmp(k, keys[i], kl)) {
+				fprintf(stderr, "cell_get_key no-len '%s': "
+					"%s len %zu\n", keys[i],
+					cds_ft_status_to_string(s), kl);
+				goto unlock;
+			}
+		}
+	}
+	ret = 0;
+unlock:
+	for (i = 0; i < 3; i++) {
+		struct cds_ft_iter *iter;
+
+		if (!leaf[i] || cds_ft_iter_create(ft, &iter) < 0)
+			continue;
+		cds_ft_iter_set_key(iter, (const uint8_t *) keys[i],
+				strlen(keys[i]));
+		if (cds_ft_lookup(ft, iter) != CDS_FT_STATUS_OK ||
+		    cds_ft_remove(ft, iter, &leaf[i]->node) != CDS_FT_STATUS_OK)
+			ret = -1;
+		cds_ft_iter_destroy(iter);
+	}
+	rcu_read_unlock();
+	synchronize_rcu();
+	for (i = 0; i < 3; i++)
+		free(leaf[i]);
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_node_get_key_no_leaf_len(void)
+{
+	if (gk_nolen_run(true) || gk_nolen_run(false))
+		return -1;
+	return 0;
 }
 
 /*
@@ -41867,6 +41989,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_batched_break);
 	RUN_TEST(test_first_last_keylen_on_miss);
 	RUN_TEST(test_node_get_key_no_list);
+	RUN_TEST(test_node_get_key_no_leaf_len);
 	RUN_TEST(test_list_off_ops);
 	RUN_TEST(test_lookup_nth_basic);
 	RUN_TEST(test_lookup_nth_last);

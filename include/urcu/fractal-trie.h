@@ -3819,8 +3819,9 @@ struct cds_ft_node *cds_ft_iter_node(const struct cds_ft_iter *iter);
  *
  * Reconstructs @node's key without an iterator object -- the same key
  * cds_ft_iter_get_key() would return.  The key comes from an in-leaf key when
- * the group declares a speculative key offset, otherwise from the trie
- * structure (ordered-list groups only).
+ * the group declares a speculative key offset, and for a variable-length
+ * group also a key length offset.  Otherwise it comes from the trie structure
+ * (ordered-list groups only).
  *
  * RCU CONTRACT: @node is valid only while the RCU read-side lock that
  * produced it is held CONTINUOUSLY.  The same holds for the trie structure
@@ -3834,8 +3835,9 @@ struct cds_ft_node *cds_ft_iter_node(const struct cds_ft_iter *iter);
  * Returns CDS_FT_STATUS_OK on success.
  * Returns CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @node is NULL.
  * Returns CDS_FT_STATUS_OVERFLOW_ERROR if the buffer is too small.
- * Returns CDS_FT_STATUS_NOT_FOUND if the group has neither an in-leaf key nor
- * an ordered list, so a key cannot be materialized from a node alone.
+ * Returns CDS_FT_STATUS_NOT_FOUND if the group has neither an in-leaf key
+ * (with its length) nor an ordered list, so a key cannot be materialized from
+ * a node alone.
  */
 enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
 		const struct cds_ft_node *node, uint8_t *result_key,
