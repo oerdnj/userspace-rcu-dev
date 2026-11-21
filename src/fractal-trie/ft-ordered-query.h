@@ -288,6 +288,23 @@ bool ft_rank_walk_exclude_enter(struct cds_ft *ft)
 }
 
 /*
+ * Fail a rank or skip pass on a stale skip slot (ft_skip_reanchor_impl).
+ * That happens only during a move, so the pass has a witness.  Tear it, and
+ * the two-pass retries.
+ */
+#define FT_RANK_PASS_TORN()						\
+	do {								\
+		assert(wit);						\
+		if (wit)						\
+			ft_witness_tear(wit);				\
+		iter->node = NULL;					\
+		iter->cache_valid = false;				\
+		iter->path_len = 0;					\
+		iter->status = CDS_FT_STATUS_NOT_FOUND;			\
+		goto end;						\
+	} while (0)
+
+/*
  * REKEY-COHERENT RANK DESCENT: the point lookup's two passes
  * (ft_lookup_two_descents).
  *
@@ -448,7 +465,8 @@ enum cds_ft_status ft_lookup_nth_rank_pass(struct cds_ft *ft,
 				 *     compressed.  Descend INTO it.
 				 */
 				anchor = ft_skip_reanchor(ft, child, &rewind, &merged);
-				assert(anchor != NULL);
+				if (caa_unlikely(!anchor))
+					FT_RANK_PASS_TORN();	/* a stale slot */
 				if (caa_likely(rewind == 0)) {
 					node_flag = anchor;
 					child = merged;
@@ -670,7 +688,8 @@ enum cds_ft_status ft_lookup_nth_last_rank_pass(struct cds_ft *ft,
 				 * before publishing.
 				 */
 				anchor = ft_skip_reanchor(ft, child, &rewind, &merged);
-				assert(anchor != NULL);
+				if (caa_unlikely(!anchor))
+					FT_RANK_PASS_TORN();	/* a stale slot */
 				if (caa_likely(rewind == 0)) {
 					node_flag = anchor;
 					child = merged;
@@ -1116,7 +1135,8 @@ enum cds_ft_status ft_iter_skip_forward_rank_pass(struct cds_ft *ft,
 						struct cds_ft_inode_flag *anchor =
 							ft_skip_reanchor(ft, child, &rewind, &at_pos);
 
-						assert(anchor != NULL);
+						if (caa_unlikely(!anchor))
+							FT_RANK_PASS_TORN();	/* a stale slot */
 						assert(rewind == 0);
 						parent = anchor;
 						child = at_pos;
@@ -1202,7 +1222,8 @@ enum cds_ft_status ft_iter_skip_forward_rank_pass(struct cds_ft *ft,
 					struct cds_ft_inode_flag *anchor =
 						ft_skip_reanchor(ft, child, &rewind, &at_pos);
 
-					assert(anchor != NULL);
+					if (caa_unlikely(!anchor))
+						FT_RANK_PASS_TORN();	/* a stale slot */
 					assert(rewind == 0);
 					ancestor = anchor;
 					up_node = anchor;	/* live holder at @level (internal, span 1) */
@@ -1328,7 +1349,8 @@ descend_forward:
 					struct cds_ft_inode_flag *anchor =
 						ft_skip_reanchor(ft, child, &rewind, &merged);
 
-					assert(anchor != NULL);
+					if (caa_unlikely(!anchor))
+						FT_RANK_PASS_TORN();	/* a stale slot */
 					if (caa_likely(rewind == 0)) {
 						node_flag = anchor;
 						child = merged;
@@ -1658,7 +1680,8 @@ enum cds_ft_status ft_iter_skip_reverse_rank_pass(struct cds_ft *ft,
 					struct cds_ft_inode_flag *anchor =
 						ft_skip_reanchor(ft, child, &rewind, &at_pos);
 
-					assert(anchor != NULL);
+					if (caa_unlikely(!anchor))
+						FT_RANK_PASS_TORN();	/* a stale slot */
 					assert(rewind == 0);
 					ancestor = anchor;
 					up_node = anchor;
@@ -1714,7 +1737,8 @@ enum cds_ft_status ft_iter_skip_reverse_rank_pass(struct cds_ft *ft,
 							struct cds_ft_inode_flag *anchor =
 								ft_skip_reanchor(ft, child, &rewind, &at_pos);
 
-							assert(anchor != NULL);
+							if (caa_unlikely(!anchor))
+								FT_RANK_PASS_TORN();	/* a stale slot */
 							assert(rewind == 0);
 							ancestor = anchor;
 							up_node = anchor;
@@ -1831,7 +1855,8 @@ descend_reverse:
 					struct cds_ft_inode_flag *anchor =
 						ft_skip_reanchor(ft, child, &rewind, &merged);
 
-					assert(anchor != NULL);
+					if (caa_unlikely(!anchor))
+						FT_RANK_PASS_TORN();	/* a stale slot */
 					if (caa_likely(rewind == 0)) {
 						node_flag = anchor;
 						child = merged;

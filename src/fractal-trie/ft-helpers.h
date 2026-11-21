@@ -2673,14 +2673,11 @@ unsigned int ft_upwalk_edge_bytes(struct cds_ft_inode_flag *cur,
  * Returns the live node holding the slot equivalent to the failing one.  The
  * caller re-anchors its descent there and re-reads / re-descends.
  *
- * Never returns NULL on a well-formed trie.  The writer wires every fresh
- * cluster's parent before the cluster becomes reachable.  This includes the
- * cluster top's parent, wired into the live parent.  So the up-walk never
- * observes a NULL parent.  All call sites assert anchor != NULL and treat any
- * NULL return as a bug.  The walk has two defensive `return NULL` paths:
- * assert(0) + return NULL under NDEBUG, and pathological guard exhaustion.
- * They exist only so a debug build aborts at the violation site instead of
- * dereferencing NULL.
+ * Return NULL when the slot is stale: a rekey moved @G to a shorter key
+ * after the caller loaded the slot, so its chain no longer covers the
+ * encoded length.  Only a reader in a move can see it.  The caller then
+ * fails its pass, and its two-pass retries.  Guard exhaustion (a cycle)
+ * also returns NULL.
  *
  * Read-side only (rcu_dereference on every back-pointer).  The caller must be
  * in an RCU read-side critical section.
@@ -2734,46 +2731,24 @@ struct cds_ft_inode_flag *ft_skip_reanchor_impl(struct cds_ft *ft,
 		FT_TP(reanchor_walk, (const void *) cur, (const void *) parent, acc);
 		if (caa_unlikely(!parent)) {
 			/*
-			 * A NULL parent on the up-walk is a bug.  The walk
-			 * runs through LIVE nodes.  Their parents are wired
-			 * before the node becomes reader-reachable:
+			 * THE SLOT IS STALE.  The walk ran out of parents before
+			 * it covered the encoded length.  The only node with no
+			 * parent is the root, and no skip pointer sits at the
+			 * root.  So the chain from @G is now shorter than when
+			 * the caller loaded the slot: a rekey moved @G to a
+			 * shorter key since then.  This happens to a moved BARE
+			 * KEY.  Its leaf is app-owned, so the rekey re-parents
+			 * it in place instead of copying it (ft_rekey_cow_stop
+			 * copies every other moved top, and the old copy keeps
+			 * its chain).
 			 *
-			 *   - a build-invisible commit connects the whole
-			 *     fresh cluster's parents (including the top's)
-			 *     before any live gateway exposes it
-			 *     (ft_graft_glue_apply_deferred);
-			 *   - a detach nulls parent only after a grace
-			 *     period, which an in-flight reader cannot
-			 *     observe.
-			 *
-			 * The only legitimate NULL parent is the root's.  The
-			 * accumulation reaches @want at or below the root,
-			 * because there are no root-level skip pointers.  So
-			 * the walk never steps onto the root.
-			 *
-			 * ☐ ...as long as the skip child stays at its DEPTH.
-			 * Two producers of a shallower child:
-			 *
-			 *   - a rekey to a SHORTER key moves an internal
-			 *     child up;
-			 *   - the member hop above substitutes a chain HEAD
-			 *     that sits on the destination path.  That head
-			 *     is shallower than the encoded position when
-			 *     the destination key is shorter.
-			 *
-			 * Either way the new chain is shorter than the
-			 * encoded length, and this walk would step onto the
-			 * root.  This is reasoned, not measured: the
-			 * fixed-key oracles keep every head at one depth.
-			 * Handing the root back here was refuted.  With
-			 * @rewind 0, three callers would accept it without a
-			 * witness: the write-path ft_reanchor_flag, the
-			 * detach source resolve and the count walk.  The
-			 * variable-length oracle is owed, and with it the
-			 * answer for those callers.
+			 * Only a reader can see this.  A writer is excluded from
+			 * a rekey's commit by the FT-wide lock and the move
+			 * gate's grace period.  A reader can see it only during
+			 * a move, so it is on a two-pass path.  Return NULL: the
+			 * caller fails its pass, and the two-pass retries.
 			 */
-			assert(0);
-			return NULL;		/* defensive under NDEBUG */
+			return NULL;
 		}
 		pitem = ft_node_compressed(parent) ?
 			(void *) ft_compressed_node_ptr(parent) :
@@ -2806,9 +2781,10 @@ struct cds_ft_inode_flag *ft_skip_reanchor_impl(struct cds_ft *ft,
 			 * The holder is NULL only if @parent is the root.
 			 * The encoded position is then the root itself: a
 			 * root-level skip pointer, which mutators never
-			 * produce.
+			 * produce.  A stale slot ends here too, when the
+			 * shorter chain covers the length exactly at the
+			 * root: report it like the walk that ran out.
 			 */
-			assert(holder != NULL);
 			return holder;
 		}
 		cur = parent;
@@ -3744,10 +3720,13 @@ struct cds_ft_inode_flag *ft_resolve_skip_compressed(const struct cds_ft *ft,
  * Set @*rewind_ret > 0 iff a concurrent chain-merge moved the encoded
  * position shallower than the dispatched child.  A caller that captured the
  * raw slot then finds it at the wrong level, and re-descends.  Return a
- * non-skip @child unchanged, with rewind 0.  ft_skip_reanchor never returns
- * NULL on a well-formed trie; the result is asserted non-NULL.
- * RCU-read-side safe.
+ * non-skip @child unchanged, with rewind 0.  On a stale slot (see
+ * ft_skip_reanchor_impl), return NULL with @*rewind_ret set to
+ * FT_REANCHOR_TORN.  RCU-read-side safe.
  */
+/* The rewind ft_reanchor_flag reports for a stale slot. */
+#define FT_REANCHOR_TORN	UINT_MAX
+
 static inline
 struct cds_ft_inode_flag *ft_reanchor_flag(struct cds_ft *ft,
 		struct cds_ft_inode_flag *child, unsigned int *rewind_ret)
@@ -3760,7 +3739,14 @@ struct cds_ft_inode_flag *ft_reanchor_flag(struct cds_ft *ft,
 		/* Write path: its hops are not the oracle's positive control. */
 		anchor = ft_skip_reanchor_impl(ft, child, rewind_ret, &at_pos,
 				false);
-		assert(anchor != NULL);
+		if (caa_unlikely(!anchor)) {
+			/*
+			 * A stale slot.  Every caller treats a non-zero
+			 * rewind as "re-descend" or as a conflict to retry.
+			 */
+			*rewind_ret = FT_REANCHOR_TORN;
+			return NULL;
+		}
 		return at_pos;
 	}
 #else

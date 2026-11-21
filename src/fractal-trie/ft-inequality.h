@@ -1361,7 +1361,8 @@ going_up:
 				struct cds_ft_inode_flag *anchor =
 					ft_skip_reanchor(ft, node_flag, &rewind, &at_pos);
 
-				assert(anchor != NULL);
+				if (caa_unlikely(!anchor))
+					FT_INEQ_CLIMB_TORN();	/* a stale slot */
 				if (caa_likely(rewind == 0)) {
 					/*
 					 * Surgical: @at_pos is the live
@@ -1850,7 +1851,8 @@ descend_children:
 				struct cds_ft_inode_flag *anchor =
 					ft_skip_reanchor(ft, node_flag, &rewind, &at_pos);
 
-				assert(anchor != NULL);
+				if (caa_unlikely(!anchor))
+					FT_INEQ_CLIMB_TORN();	/* a stale slot */
 				if (caa_likely(rewind == 0)) {
 					node_flag = at_pos;
 				} else {

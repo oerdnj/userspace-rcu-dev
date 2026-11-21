@@ -408,7 +408,18 @@ descend_loop:
 					struct cds_ft_inode_flag *anchor =
 						ft_skip_reanchor(ft, node_flag, &rewind, &at_pos);
 
-					assert(anchor != NULL);
+					if (caa_unlikely(!anchor)) {
+						/*
+						 * A stale slot (ft_skip_reanchor_impl):
+						 * fail this descent so that the
+						 * coherent lookup retries.
+						 */
+						assert(wit);
+						if (wit)
+							ft_witness_tear(wit);
+						status = CDS_FT_STATUS_NOT_FOUND;
+						goto end;
+					}
 					if (rewind == 0) {
 						/*
 						 * Split (or same-length
