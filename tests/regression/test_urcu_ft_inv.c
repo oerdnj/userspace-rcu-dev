@@ -22712,6 +22712,9 @@ static int inv_rekey_shorter_reanchor(void)
 /*     - under two different interior nodes.                          */
 /*   The descent reads one slot's count, then the next slot's.  In    */
 /*   the last shape those two slots are in different nodes.           */
+/*   Readers also check lookup_first and lookup_last.  Two more       */
+/*   shapes move the lowest key or the highest one, so that those     */
+/*   checks see a move.                                               */
 /*                                                                    */
 /*   Each shape runs with rank stats on (one descent by key counts)   */
 /*   and off (a walk from the first or last key).  The walk runs on   */
@@ -22737,6 +22740,9 @@ static const struct rkn_shape rkn_shapes[] = {
 		NULL },
 	{ "two parents", "BKabcdefghijk", "CQ", { "A1", "BA1" },
 		{ "CZ1", "Z1" }, 2, 2, NULL },
+	/* The writer moves the lowest key, then the highest one. */
+	{ "first moves", "Kabcdefghijk", "Q", { NULL }, { "Z1" }, 0, 1, NULL },
+	{ "last moves", "Kabcdefghijk", "Q", { "A1" }, { NULL }, 1, 0, NULL },
 };
 
 static const char *const rkn_alt_suffixes[] = { "a", "b1", "b2", "cdefgh" };
@@ -22831,15 +22837,46 @@ static void *rkn_reader(void *arg)
 				ra->ops++;
 			}
 		}
+		/* The endpoints: lookup_first is rank 0, lookup_last rank nk - 1. */
+		for (last = 0; last < 2; last++) {
+			const char *what = last ? "lookup_last" : "lookup_first";
+			unsigned long r = last ? nk - 1 : 0;
+			enum cds_ft_status s;
+			uint8_t k[32];
+			size_t kl = 0;
+
+			rcu_read_lock();
+			s = last ? cds_ft_lookup_last(ra->ft, iter) :
+				cds_ft_lookup_first(ra->ft, iter);
+			if (s != CDS_FT_STATUS_OK ||
+			    cds_ft_iter_get_key(iter, k, sizeof(k), &kl) !=
+					CDS_FT_STATUS_OK ||
+			    !rkn_key_at_rank(r, k, kl)) {
+				fprintf(stderr, "%s [%s]: %s reported %s, key %.*s\n",
+					rkn_name, rkn_sh->name, what,
+					cds_ft_status_to_string(s),
+					s == CDS_FT_STATUS_OK ? (int) kl : 0,
+					(const char *) k);
+				atomic_fetch_add(&violation_count, 1);
+			}
+			rcu_read_unlock();
+			rcu_quiescent_state();
+			ra->ops++;
+		}
 		/*
 		 * Relative rank: from the lowest key, skip_forward(m) lands on
 		 * rank m.  From the highest, skip_reverse(m) lands on rank
-		 * nk - 1 - m.  Past the end, both report NOT_FOUND.
+		 * nk - 1 - m.  Past the end, both report NOT_FOUND.  Skip this
+		 * when the lowest or highest key is one the writer moves.
 		 */
 		for (last = 0; last < 2; last++) {
-			const char *end = last ? rkn_sh->hi[rkn_sh->nhi - 1] :
-				rkn_sh->lo[0];
+			const char *end = last ?
+				(rkn_sh->nhi ? rkn_sh->hi[rkn_sh->nhi - 1] : NULL) :
+				(rkn_sh->nlo ? rkn_sh->lo[0] : NULL);
 			const char *what = last ? "skip_reverse" : "skip_forward";
+
+			if (!end)
+				continue;
 
 			for (n = 1; n <= nk; n++) {
 				unsigned long r = last ? nk - 1 - n : n;
