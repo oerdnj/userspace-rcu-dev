@@ -3228,6 +3228,63 @@ int ft_rekey_merge_cow_after_detach(struct cds_ft *ft,
 
 #endif /* FEATURE_FT_MERGE */
 
+/*
+ * Record the bare head's switch to its fresh cell: head->prev, from @old_cell
+ * to @new_cell.  Readers load head->prev through
+ * ft_dereference_prev_resolved, so the parked proxy is safe.
+ */
+static
+void ft_rekey_fresh_cell_swap(struct ft_flip_txn *txn,
+		struct ft_ord_cell *old_cell, struct ft_ord_cell *new_cell)
+{
+	struct cds_ft_node *head = txn->fresh_head;
+
+	ft_flip_txn_record_head_back_edge(txn, (void **) &head->prev,
+		ft_ord_cell_flag(old_cell), ft_ord_cell_flag(new_cell)
+		FT_BE_SITE(FT_BE_REKEY_CELL, NULL));
+}
+
+/*
+ * Link the fresh cell @new_cell between the destination neighbours @pred and
+ * @succ, for a bare head whose old cell @old_cell the detach unlinks at the
+ * source.  @new_cell is invisible, so its own links are plain stores.  Record
+ * the two neighbour edges, and the deletion mark on @old_cell (whose
+ * successor is @old_succ), as ft_ord_cell_swap_edges does.  Return the new
+ * edge count.
+ */
+static
+unsigned int ft_rekey_fresh_cell_splice_edges(struct cds_ft *ft,
+		struct ft_ord_cell *old_cell, struct ft_ord_cell *old_succ,
+		struct ft_ord_cell *new_cell, struct ft_ord_cell *pred,
+		struct ft_ord_cell *succ, struct ft_ord_cell_edge *edges,
+		unsigned int n)
+{
+	pred = ft_ord_or_sentinel(ft, pred);
+	succ = ft_ord_or_sentinel(ft, succ);
+	new_cell->lnode.prev = ft_ord_cell_lnode(pred);
+	new_cell->lnode.next = ft_ord_cell_lnode(succ);
+	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
+	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
+	edges[n].owner_cell = pred;
+	edges[n].old_target = succ;
+	edges[n].new_target = new_cell;
+	n++;
+	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
+	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
+	edges[n].owner_cell = succ;
+	edges[n].old_target = pred;
+	edges[n].new_target = new_cell;
+	n++;
+	edges[n].tag = URCU_TXN_TAG;	/* the deletion mark */
+	edges[n].slot = (struct ft_ord_cell **) &old_cell->lnode.next;
+	edges[n].owner_cell = old_cell;
+	edges[n].old_target = old_succ;
+	edges[n].new_target = (struct ft_ord_cell *)
+		urcu_txn_list_set_mark(ft_ord_cell_lnode(old_succ));
+	n++;
+	return n;
+}
+
 static
 int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_len,
@@ -3484,6 +3541,15 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 */
 	struct cds_ft_inode_flag *fold_rest_new = NULL;
 	bool fold_rest_published = false;
+	/*
+	 * A FRESH CELL for a moved bare head (see step 2).  @fresh_old is
+	 * the head's live cell, which this move retires.  @fresh_swapped
+	 * says the commit carries the swap.  Without it the commit must not
+	 * land: the head's back edge went to @fresh_cell only.
+	 * @fresh_published guards the free at @sweep.
+	 */
+	struct ft_ord_cell *fresh_cell = NULL, *fresh_old = NULL;
+	bool fresh_swapped = false, fresh_published = false;
 	/*
 	 * The plan-locks of the chain. They stay out of the txn registry for
 	 * the reason ft_detach_node states for its own: the chain reaches
@@ -4592,6 +4658,45 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * The mixed commit installs the MW (detach) edges first, then parks
 	 * the SW (graft + cow_stop) edges before the flip.
 	 */
+
+	/*
+	 * ☞ A FRESH CELL FOR A BARE HEAD.  The head is app-owned, so it gets
+	 * no copy, and the move used to write its cell in place: the parent
+	 * and the edge byte.  A reader spells a key from those two fields
+	 * with two loads (ft_rebuild_key_upwalk).  It could pair the new
+	 * parent with the old byte, and spell a key that was never in the
+	 * trie.
+	 *
+	 * The cell is library-owned, so it can be copied.  Give the head a
+	 * fresh cell, written while invisible.  The commit swaps it into the
+	 * list and into head->prev.  The old cell keeps its fields, and is
+	 * retired after a grace period.  ft_reparent_record sends the head's
+	 * back edge to the fresh cell (@txn->fresh_head).
+	 *
+	 * The graft arm only.  A merge can demote the head onto a chain, and
+	 * that path already records head->prev.
+	 */
+	if (!merge_dst && s_top_external && ft->ordered_list) {
+		struct cds_ft_node *head = (struct cds_ft_node *) s_top;
+		void *prev = ft_dereference_prev_resolved(head);
+		void *fresh;
+
+		if (!prev || !((uintptr_t) prev & FT_ORD_CELL_TAG)) {
+			ft_flip_txn_destroy(txn);
+			ret = -EAGAIN;
+			goto sweep;
+		}
+		fresh_old = ft_ord_cell_ptr(prev);
+		fresh = ft_ord_cell_alloc(ft, head, NULL);
+		if (!fresh) {
+			ft_flip_txn_destroy(txn);
+			ret = -ENOMEM;
+			goto sweep;
+		}
+		fresh_cell = ft_ord_cell_ptr(fresh);
+		txn->fresh_head = head;
+		txn->fresh_cell = fresh_cell;
+	}
 
 	/* 2. Graft-fold: record-only attach of S_top' at @dst_key. */
 	ft_glue_init(&glue);
@@ -8341,6 +8446,30 @@ detach_bail:
 		rlc = ft_ord_cell_ptr(rcu_dereference(run_rlast->prev));
 		src_pred = ft_ord_cell_resolve_ord(&rfc->lnode.prev);
 		src_succ = ft_ord_cell_resolve_ord(&rlc->lnode.next);
+		if (run_keeps_pos && fresh_cell) {
+			/*
+			 * The fresh cell takes the old one's place in the list.
+			 * The swap records both neighbour edges and the
+			 * deletion mark on the old cell, as a compaction does
+			 * (ft_compact_relocate_cell).  Its edges also do the
+			 * validates' job below: a peer splice into the
+			 * boundary aborts the commit.
+			 */
+			struct ft_cell_plan plan = {
+				.cell = rfc,
+				.cell_lock_held = false,
+				.pred = src_pred,
+				.succ = src_succ,
+			};
+
+			if (ft_cell_lockset_take(ft, NULL, txn, &plan))
+				goto cells_bail;
+			cn = ft_ord_cell_swap_edges(ft, rfc, fresh_cell, cedges, 0);
+			ft_ord_cell_record_into_ft(ft, txn, cedges, cn);
+			ft_rekey_fresh_cell_swap(txn, fresh_old, fresh_cell);
+			fresh_swapped = true;
+			goto cells_done;
+		}
 		if (run_keeps_pos) {
 			/*
 			 * The run keeps its ordered position (the dst abuts
@@ -8556,9 +8685,23 @@ detach_bail:
 			if (ft_cell_lockset_take(ft, NULL, txn, &plan))
 				goto cells_bail;
 		}
-		cn = ft_ord_cell_run_resplice_edges(ft, rfc, rlc, run_dpred,
-				run_dsucc, cedges, cn);
-		ft_ord_cell_record_into_ft(ft, txn, cedges, cn);
+		if (fresh_cell) {
+			/*
+			 * The detach above unlinks the old cell at the source.
+			 * Link the fresh one at the destination instead of
+			 * moving the old one, and mark the old one deleted.
+			 */
+			cn = ft_rekey_fresh_cell_splice_edges(ft, rfc, src_succ,
+					fresh_cell, run_dpred, run_dsucc, cedges,
+					cn);
+			ft_ord_cell_record_into_ft(ft, txn, cedges, cn);
+			ft_rekey_fresh_cell_swap(txn, fresh_old, fresh_cell);
+			fresh_swapped = true;
+		} else {
+			cn = ft_ord_cell_run_resplice_edges(ft, rfc, rlc,
+					run_dpred, run_dsucc, cedges, cn);
+			ft_ord_cell_record_into_ft(ft, txn, cedges, cn);
+		}
 cells_done:
 		;
 	}
@@ -8701,11 +8844,9 @@ cells_done:
 	 * write on it a plain store into something invisible.  It also
 	 * removes any need to put this byte in the txn.  The BARE EXTERNAL
 	 * HEAD is the one top that gets no copy, because it is app-owned.
-	 * So here alone the store is reader-visible ahead of the publish.
-	 * @payload_live already routes the head's PARENT word through the
-	 * txn for that reason.  There is no such route for a byte.  The cure
-	 * is not a transacted byte.  It is the same rule one level down: the
-	 * head's ORDERED CELL is library-allocated and CAN be copied.
+	 * On the graft arm it gets a fresh cell instead (step 2), and the
+	 * byte goes there.  ☐ On the merge arm the store still lands on the
+	 * head's live cell, ahead of the publish.
 	 * ☞ ft_head_stamp_incoming_byte's header.
 	 *
 	 * ☠ MEASURED, all four builds.  The SLOT-only stamp is what left it:
@@ -8762,7 +8903,10 @@ cells_done:
 			if (glue.splices[si].src_head ==
 					(struct cds_ft_node *) s_top)
 				demoted = true;
-		if (!demoted && head_prev &&
+		if (fresh_cell)		/* invisible: the live cell stays */
+			cds_ft_item_to_metadata(fresh_cell)->incoming_byte =
+				dst_ord[dst_len - 1];
+		else if (!demoted && head_prev &&
 				((uintptr_t) head_prev & FT_ORD_CELL_TAG))
 			cds_ft_item_to_metadata(ft_ord_cell_ptr(head_prev))
 				->incoming_byte = dst_ord[dst_len - 1];
@@ -8828,6 +8972,16 @@ cells_done:
 	 * deterministic livelock into a silent hang.
 	 */
 	assert(txn->structural_sw);
+	if (fresh_cell && !fresh_swapped) {
+		/*
+		 * The head's back edge went to the fresh cell, but no swap was
+		 * recorded.  Committing would move the head while its live cell
+		 * keeps the old parent.  Abort instead, by the engine's own
+		 * discard-unpublished route.
+		 */
+		txn->acquire_miss = true;
+		FT_MISS_NOTE(txn, __func__, __LINE__);
+	}
 	st = ft_flip_txn_commit(ft, txn);
 	if (st == URCU_TXN_STATUS_OK) {
 		/*
@@ -9015,6 +9169,11 @@ cells_done:
 		if ((!merge_dst || src_cut) && !s_top_external &&
 				!(src_cut && glue.old_dir_dropped))
 			cds_ft_free_item_deferred(ft, s_top_meta);
+		if (fresh_cell) {
+			assert(fresh_cell->parent);
+			fresh_published = true;
+			ft_ord_cell_free(ft, fresh_old);	/* after a GP */
+		}
 		ret = 0;
 	} else {
 		/*
@@ -9139,6 +9298,8 @@ bail_build:
 		free_cds_ft_node_unpublished(ft, ft_node_ptr(gst_st.dest));
 
 sweep:
+	if (fresh_cell && !fresh_published)
+		ft_ord_cell_free_unpublished(ft, fresh_cell);
 	/*
 	 * REPLACE's fresh copy, on every path the commit did NOT take.  It is
 	 * placed here because all five bails reach this label and none of

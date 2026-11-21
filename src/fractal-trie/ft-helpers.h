@@ -4648,25 +4648,22 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
  * gets a copy.
  *
  * ☠ THE ONE TOP THAT GETS NO COPY IS THE BARE EXTERNAL HEAD.  It is
- * APP-OWNED, so @s_top_prime == @s_top.  The writes land on a LIVE object
- * that stays reachable at the SOURCE for the whole build window.
- * @payload_live exists for exactly that: it routes the head's PARENT word
- * through the txn instead of plain-storing it (ft-graft.h).  The byte has no
- * such route.  So for a bare head, and ONLY for it, this store is
- * reader-visible ahead of the publish.  An abort does not undo it.
+ * APP-OWNED, so @s_top_prime == @s_top.  It stays reachable at the SOURCE
+ * for the whole build window.  A store into its live cell would be
+ * reader-visible ahead of the publish: a reader could pair the new parent
+ * with the old byte, and an abort would not undo it.
  *
- * ☞ AND THE CURE IS THE SAME RULE ONE LEVEL DOWN, not a transacted byte.  The
- * byte does not live in the application's cds_ft_node.  It lives in the
- * head's ORDERED CELL, which is LIBRARY-allocated (ft_ord_cell_alloc) and
- * therefore CAN be copied.  Giving the moved head a FRESH CELL restores the
- * fresh-address property for the one word that lacks it.  The fresh cell is:
- *   - stamped while invisible;
- *   - published by the same commit that re-parents the head;
- *   - a replacement for the old cell, which is retired after a grace period.
- * It rides the ordered-list splice the rekey already performs for that cell.
- * Transacting @incoming_byte would not work anyway.  It shares a 32-bit word
- * with @alloc_index, with no room for a parked descriptor pointer, and the
+ * ☞ SO THE REKEY GIVES IT A FRESH CELL.  The byte lives in the head's
+ * ORDERED CELL, which is library-allocated and can be copied.  The rekey's
+ * graft arm allocates a fresh cell and stamps it while invisible.  One commit
+ * swaps it into the list and into head->prev, and the old cell is retired
+ * after a grace period (ft-rekey.h, step 2).  ft_reparent_record sends the
+ * head's back edge to the fresh cell, so this function never sees that head.
+ * Transacting @incoming_byte would not work.  It shares a 32-bit word with
+ * @alloc_index, with no room for a parked descriptor pointer, and the
  * up-walk reads it raw.
+ *
+ * ☐ The merge arm still stamps a non-demoted bare head's live cell in place.
  */
 static inline
 void ft_head_stamp_incoming_byte(const struct cds_ft *ft,

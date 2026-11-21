@@ -3225,6 +3225,14 @@ struct ft_flip_txn {
 	 */
 	bool pending_pub_folded;
 	/*
+	 * A FRESH CELL for a moved bare head (the rekey).  When set, every
+	 * back edge this txn would record on @fresh_head's live cell is
+	 * plain-stored into @fresh_cell instead.  @fresh_cell is invisible
+	 * until the commit swaps it in.  See ft_rekey_fresh_cell_alloc.
+	 */
+	struct cds_ft_node *fresh_head;
+	struct ft_ord_cell *fresh_cell;
+	/*
 	 * ...and WHICH node it folded into.  The publish is live in that copy.
 	 * So a delta the op still owes the published-into node must land
 	 * there, and not on @publish_parent, which this commit retires.  The
@@ -4288,6 +4296,8 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	t->pending_dual_val = NULL;
 	t->pending_pub_val = NULL;
 	t->pending_pub_folded = false;
+	t->fresh_head = NULL;
+	t->fresh_cell = NULL;
 	t->pending_pub_node = NULL;
 	t->pending_del_slot = NULL;
 	t->pending_del_expected = NULL;
@@ -4577,6 +4587,8 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->pending_dual_val = NULL;
 	t->pending_pub_val = NULL;
 	t->pending_pub_folded = false;
+	t->fresh_head = NULL;
+	t->fresh_cell = NULL;
 	t->pending_pub_node = NULL;
 	t->pending_del_slot = NULL;
 	t->pending_del_expected = NULL;
@@ -4696,6 +4708,8 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	t->pending_dual_val = NULL;
 	t->pending_pub_val = NULL;
 	t->pending_pub_folded = false;
+	t->fresh_head = NULL;
+	t->fresh_cell = NULL;
 	t->pending_pub_node = NULL;
 	t->pending_del_slot = NULL;
 	t->pending_del_expected = NULL;
@@ -11426,6 +11440,7 @@ enum ft_be_site {
 	FT_BE_PARK_PAST,		/* ft_insert_compressed_past_child */
 	FT_BE_PARK_KSHORT,		/* ft_insert_compressed_key_shorter */
 	FT_BE_COMPACT_CELL,		/* ft_compact_relocate_cell */
+	FT_BE_REKEY_CELL,		/* ft_rekey_fresh_cell_swap */
 	FT_BE_SITE_NR,
 };
 # define FT_BE_SITE_PARAM	, enum ft_be_site dbg_be_site,		\
@@ -11447,7 +11462,7 @@ const char *const ft_be_site_name[FT_BE_SITE_NR] = {
 	"park_live_parent", "recompact", "detach_cn_parent", "detach_unchain",
 	"child_back_edge", "parent_word", "reparent_meta",
 	"park:split", "park:attach", "park:past_child", "park:key_shorter",
-	"compact_cell",
+	"compact_cell", "rekey_cell",
 };
 /*
  * ★ THE LEDGER COLUMNS.  The ledger is the second witness.  It answers a
@@ -11874,7 +11889,8 @@ void ft_flip_txn_record_head_back_edge_owned(struct ft_flip_txn *t, void **slot,
 		 * head->prev, whose value is the CELL, not a parent word.
 		 */
 		lc__ = dbg_be_ctx;
-		if (dbg_be_site == FT_BE_COMPACT_CELL && ow__ &&
+		if ((dbg_be_site == FT_BE_COMPACT_CELL ||
+				dbg_be_site == FT_BE_REKEY_CELL) && ow__ &&
 				!ft_node_flip_proxy(ow__))
 			ow__ = ft_ord_cell_ptr(ow__)->parent;
 # endif
@@ -25304,6 +25320,18 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 		 * Leaving it unmaintained here is what let a moved bare head
 		 * keep the SOURCE key's last byte.
 		 */
+		if (txn && txn->fresh_head == en) {
+			/*
+			 * The head moves to a FRESH CELL.  Its back edge goes
+			 * there, as a plain store: no reader can reach the
+			 * fresh cell before the commit.  The live cell keeps
+			 * its old parent and byte.  The rekey stamps the
+			 * fresh cell's byte from the destination key.
+			 */
+			txn->fresh_cell->parent =
+				ft_head_parent_word_slot(parent_nf, slot);
+			return;
+		}
 		ft_head_stamp_incoming_byte(ft, en, parent_nf, slot);
 		{
 			/*
