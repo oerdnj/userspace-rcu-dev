@@ -1440,6 +1440,13 @@ long cds_ft_fault_replace_countdown = -1;
 long cds_ft_fault_compact_countdown = -1;
 
 /*
+ * Test-only seam hook, called by ft_writer_lock_gp_wait between releasing the
+ * FT-wide lock and waiting for the grace period.  A test uses it to park a
+ * bulk op at its seam, where point writers may run.
+ */
+void (*cds_ft_fault_seam_hook)(struct cds_ft *ft);
+
+/*
  * Test-only refused-acquire injection for cds_ft_remove_all.
  *
  * WHY THIS EXISTS.  remove_all's contention arm reports

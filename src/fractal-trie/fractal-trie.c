@@ -526,12 +526,14 @@ void _cds_ft_debug_move_gate_exit(struct cds_ft *ft)
 
 /*
  * TEST/DEBUG (NOT public API).  Raise and lower the gate that detach, graft,
- * graft_swap and merge_at hold.  A thread that holds it stands in for such
- * an op, parked between its commits.  Call both from the same thread.
+ * graft_swap and merge_at raise.  Only the gate: not the bulk lock that
+ * serializes their bodies.  A thread that holds it stands in for such an op
+ * waiting for its turn, so another bulk op can still run.  Call both from
+ * the same thread.
  */
 void _cds_ft_debug_bulk_gate_enter(struct cds_ft *ft)
 {
-	ft_bulk_gate_enter(ft, FT_BULK_WRITER_ONLY);
+	ft_bulk_gate_enter_gp(ft, FT_BULK_WRITER_ONLY);
 }
 
 void _cds_ft_debug_bulk_gate_exit(struct cds_ft *ft)

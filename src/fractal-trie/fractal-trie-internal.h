@@ -4482,6 +4482,11 @@ void ft_ll_mark_freed(const struct cds_ft_metadata *m);
 # define FT_LL_MARK_FREED(m_)	do { } while (0)
 #endif
 
+#ifdef FEATURE_FT_FAULT_INJECT
+/* Test-only seam hook: see ft_writer_lock_gp_wait.  NULL when unused. */
+extern void (*cds_ft_fault_seam_hook)(struct cds_ft *ft);
+#endif
+
 #ifdef FT_DEBUG_SEAM
 /*
  * ☞ -DFT_DEBUG_SEAM: THE SEAM RULE, CHECKED WHERE IT IS RELIED ON.
@@ -4582,6 +4587,14 @@ void ft_writer_lock_gp_wait(struct cds_ft *ft)
 #endif
 		(void) cds_fair_mutex_unlock(&held->writer_lock, &ft_wlock_waiter);
 	}
+#ifdef FEATURE_FT_FAULT_INJECT
+	/*
+	 * Test-only: let a test park this op at its seam, with the FT-wide
+	 * lock released and the grace period not yet started.
+	 */
+	if (cds_ft_fault_seam_hook)
+		cds_ft_fault_seam_hook(ft);
+#endif
 	/*
 	 * NEVER a grace period while holding a txn escalation fallback.  A peer
 	 * parked on that lock is an ONLINE, non-quiescent QSBR reader.  So it

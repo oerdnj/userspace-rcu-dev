@@ -69,7 +69,7 @@
 #endif
 
 /*
- * 360 unconditional + 52 fault-injection-only RUN_TEST registrations, on top of
+ * 360 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  *
  * ☠ BUMP BOTH ARMS.  A new unconditional test belongs to the fault-inject
@@ -79,7 +79,7 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (412 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (413 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
 #define NR_TESTS (360 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
@@ -34143,6 +34143,174 @@ static int test_remove_all_contended_bail_walk(void)
 	cds_ft_group_destroy(group);
 	return rc;
 }
+
+/*
+ * A point remove of a node that a bulk op moved out, run at that op's seam.
+ *
+ * A detach or graft_swap publishes, then releases the FT-wide lock for a
+ * grace period (its seam).  A point writer may run there.  This one holds
+ * a node X it found by a walk before the publish, so its iterator key is
+ * deferred.  ft_iter_redescend_node then spells the key from X, walking up
+ * through X's parents, which still lead into the trie.  The remove must
+ * report NOT_FOUND, because X is not in the trie any more, and must not
+ * fault.
+ *
+ * Three threads make the order deterministic:
+ *   - a gate holder raises the bulk gate first, so the walk runs with the
+ *     gate up and the op below takes no gate grace period;
+ *   - the main thread walks to X and keeps its read section open;
+ *   - the op thread runs the bulk op, which parks at its seam (fault hook)
+ *     until the main thread has removed and closed its section.
+ */
+extern void (*cds_ft_fault_seam_hook)(struct cds_ft *ft);
+
+static struct cds_ft *seam_park_ft;
+static int seam_park_armed, seam_park_parked, seam_park_release;
+
+static void seam_park_hook(struct cds_ft *ft)
+{
+	if (ft != seam_park_ft || !uatomic_read(&seam_park_armed))
+		return;
+	uatomic_set(&seam_park_armed, 0);
+	uatomic_set(&seam_park_parked, 1);
+	rcu_thread_offline();
+	while (!uatomic_read(&seam_park_release))
+		(void) usleep(1000);
+	rcu_thread_online();
+}
+
+struct seam_op {
+	struct cds_ft *dst, *swap, *detached;
+	bool detach;
+	enum cds_ft_status s;
+};
+
+static void *seam_op_thread(void *arg)
+{
+	struct seam_op *op = (struct seam_op *) arg;
+
+	rcu_register_thread();
+	if (op->detach)
+		op->s = cds_ft_detach(op->dst, (const uint8_t *) "p", 1,
+				&op->detached);
+	else
+		op->s = cds_ft_graft_swap(op->dst, (const uint8_t *) "p", 1,
+				op->swap);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int remove_moved_at_seam(bool detach)
+{
+	static const char *const keys[] = { "pa", "pb", "x" };
+	const char *name = detach ? "detach" : "graft_swap";
+	struct cds_ft_group *group;
+	struct cds_ft *dst = create_varlen_fine_lock_ft(&group);
+	struct bulk_gate_holder h = { dst, 0, 0 };
+	struct seam_op op = { dst, NULL, NULL, detach, CDS_FT_STATUS_OK };
+	struct cds_ft_iter *it;
+	struct cds_ft_node *x;
+	enum cds_ft_status s;
+	pthread_t th_gate, th_op;
+	unsigned int i, waited;
+	int rc = 0;
+
+	for (i = 0; i < 3; i++) {
+		struct ft_test_node *n = node_alloc(i);
+
+		if (cds_ft_insert(dst, (const uint8_t *) keys[i],
+				strlen(keys[i]), &n->node) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	if (!detach) {
+		struct ft_test_node *n = node_alloc(10);
+
+		/* Lands at "pa" in dst: the lookup then finds another node. */
+		if (cds_ft_create(group, NULL, &op.swap) < 0 ||
+				cds_ft_insert(op.swap, (const uint8_t *) "a", 1,
+					&n->node) != CDS_FT_STATUS_OK)
+			abort();
+		cds_ft_make_exclusive(op.swap);
+	}
+	if (cds_ft_iter_create(dst, &it) < 0)
+		abort();
+
+	rcu_thread_offline();
+	if (pthread_create(&th_gate, NULL, bulk_gate_holder_thread, &h))
+		abort();
+	while (!uatomic_read(&h.up))
+		(void) usleep(1000);
+	rcu_thread_online();
+
+	seam_park_ft = dst;
+	uatomic_set(&seam_park_parked, 0);
+	uatomic_set(&seam_park_release, 0);
+	uatomic_set(&seam_park_armed, 1);
+	cds_ft_fault_seam_hook = seam_park_hook;
+
+	rcu_read_lock();
+	if (cds_ft_lookup_first(dst, it) != CDS_FT_STATUS_OK)
+		abort();
+	x = cds_ft_iter_node(it);
+	if (pthread_create(&th_op, NULL, seam_op_thread, &op))
+		abort();
+	for (waited = 0; !uatomic_read(&seam_park_parked) && waited < 10000;
+			waited++)
+		(void) usleep(1000);
+	if (!uatomic_read(&seam_park_parked)) {
+		fprintf(stderr, "remove at %s seam: the op never reached its "
+			"seam\n", name);
+		rc = -1;
+	} else {
+		s = cds_ft_remove(dst, it, x);
+		if (s != CDS_FT_STATUS_NOT_FOUND) {
+			fprintf(stderr, "remove at %s seam: removing the moved "
+				"node reported %s, expected NOT_FOUND\n", name,
+				cds_ft_status_to_string(s));
+			rc = -1;
+		}
+	}
+	rcu_read_unlock();
+
+	uatomic_set(&seam_park_armed, 0);
+	uatomic_set(&seam_park_release, 1);
+	rcu_thread_offline();
+	pthread_join(th_op, NULL);
+	rcu_thread_online();
+	cds_ft_fault_seam_hook = NULL;
+	uatomic_set(&h.release, 1);
+	rcu_thread_offline();
+	pthread_join(th_gate, NULL);
+	rcu_thread_online();
+	cds_ft_iter_destroy(it);
+
+	if (op.s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "remove at %s seam: the op reported %s\n", name,
+			cds_ft_status_to_string(op.s));
+		rc = -1;
+	}
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "remove at %s seam: verify failed\n", name);
+		rc = -1;
+	}
+	{
+		struct cds_ft *moved = detach ? op.detached : op.swap;
+
+		if (moved) {
+			drain_trie(moved);
+			rcu_barrier();
+			cds_ft_destroy(moved);
+		}
+	}
+	if (drain_and_destroy(dst, group))
+		rc = -1;
+	return rc;
+}
+
+static int test_remove_moved_at_bulk_seam(void)
+{
+	return remove_moved_at_seam(false) | remove_moved_at_seam(true);
+}
 #endif	/* FEATURE_FT_FAULT_INJECT */
 
 #ifdef FEATURE_FT_FAULT_INJECT
@@ -41901,6 +42069,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_compact_contended_bail);
 	RUN_TEST(test_remove_all_contended_bail);
 	RUN_TEST(test_remove_all_contended_bail_walk);
+	RUN_TEST(test_remove_moved_at_bulk_seam);
 	RUN_TEST(test_replace_family_commit_fault);
 	RUN_TEST(test_fine_lock_acquire_fault);
 	RUN_TEST(test_fine_lock_chain_acquire_fault);
