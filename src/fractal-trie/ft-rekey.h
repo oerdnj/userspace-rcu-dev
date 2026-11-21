@@ -3752,14 +3752,13 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * and its one child. The one re-parent it records also re-points the
 	 * skip back-channel. So nothing about the encoding needs recomputing.
 	 *
-	 * The SKIP-ENCODED slot form is refused. That refusal guards a shape
-	 * a rekey cannot reach. It does not narrow this cut.  The encoding
-	 * is a group property. cds_ft_group_attr_set_lookup_optimization
-	 * clears CDS_FT_FLAG_SKIP_COMPRESSED for EAGER. A rekey requires
-	 * EAGER, because it re-parents a leaf and cannot rewrite an app-owned
-	 * stored key. So every compressed run a rekey meets was published
-	 * plain.  Keep the check. It is cheap. It stops the accessor mismatch
-	 * below from becoming a wild read if that coupling ever changes.
+	 * The SKIP-ENCODED slot form is refused.  A rekey trie CAN hold skip
+	 * slots: the encoding is a group property, on by default
+	 * (SPECULATIVE), while a rekey only needs an EAGER trie, one with no
+	 * in-leaf key.  But the src descent resolves skip words, so a
+	 * skip-encoded S_top should not reach this line.  Keep the check.
+	 * It is cheap, and it stops the accessor mismatch below from
+	 * becoming a wild read.
 	 */
 	/*
 	 * AN EXTERNAL S_top IS ADMITTED. This is the bare head: the whole

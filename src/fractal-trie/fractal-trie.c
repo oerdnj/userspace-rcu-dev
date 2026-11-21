@@ -73,8 +73,9 @@
  * cds_ft_next / cds_ft_prev and the batched cell walk step that list.
  *
  * Disabling it (cds_ft_group_attr_set_ordered_list false) drops the
- * per-key cell.  Memory use is lower and mutations are faster, at the
- * cost of ordered iteration.
+ * per-key cell.  Memory use is lower and mutations are faster.  Ordered
+ * iteration then walks the trie structure, and the batched cell walk is
+ * refused (cds_ft_group_attr_set_ordered_list lists what changes).
  *
  * Read descent
  * ------------

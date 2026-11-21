@@ -3066,10 +3066,18 @@ enum cds_ft_status cds_ft_group_attr_set_key_len_offset(
  * - an identity-mapped group, where the key is recovered from the trie
  *   structure.
  *
- * DISABLED is for a write-heavy group that never iterates in key order.
- * The group then uses less memory per key and mutates faster.  It gives up
- * ordered iteration (cds_ft_next / cds_ft_prev / cds_ft_for_each*) and the
- * node-pointer key/step helpers.
+ * DISABLED is for a write-heavy group that rarely iterates in key order.
+ * The group then uses less memory per key and mutates faster.  Ordered
+ * iteration (cds_ft_next / cds_ft_prev / cds_ft_for_each_rcu), the
+ * first/last, relational and rank lookups, and rekey still work.  They walk
+ * the trie structure instead of the list, so a step costs more.  Two things
+ * are refused:
+ *   - cds_ft_cell_next_batch and cds_ft_cell_prev_batch return
+ *     CDS_FT_STATUS_NOT_SUPPORTED, so cds_ft_for_each_batched_rcu and its
+ *     reverse iterate nothing;
+ *   - cds_ft_node_get_key returns CDS_FT_STATUS_NOT_FOUND unless the group
+ *     stores the key in the leaf
+ *     (cds_ft_group_attr_set_speculative_key_offset).
  *
  * On by default, so passing true is normally redundant (it re-affirms the
  * default).  Returns CDS_FT_STATUS_OK on success,

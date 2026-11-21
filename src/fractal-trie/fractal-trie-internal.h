@@ -2709,8 +2709,9 @@ struct cds_ft {
 	 * trie's reads from wait-free into lock-free (bounded by writer move
 	 * progress).
 	 *
-	 * It requires the up-walk, so it is ANDed with ->ordered_list at
-	 * create.  It is immutable after ft_install_lookup_ops, because the
+	 * It is set at create from the rekey opt-in and an EAGER trie (no
+	 * in-leaf key), with the ordered list on or off.  It is immutable
+	 * after ft_install_lookup_ops, because the
 	 * coherent lookup specializations are keyed off it.  So a concurrent
 	 * reader's branch (really the fn-ptr choice) is race-free.
 	 */
