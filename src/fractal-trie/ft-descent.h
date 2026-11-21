@@ -110,6 +110,13 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 		*found_ret = ft_dereference_external(cn_meta->external_nodes);
 		*status_ret = *found_ret ? CDS_FT_STATUS_OK :
 				CDS_FT_STATUS_NOT_FOUND;
+		/*
+		 * The key ends inside the path.  For a longest match, every
+		 * byte of it matched above, so the match is the whole key:
+		 * keep the position set there.
+		 */
+		if (track_longest && !candidate && remaining_key > 0)
+			return FT_DESCENT_END;
 		if (track && (*found_ret || track_longest)) {
 			*match_key_pos_p = key;
 			*match_node_p = *found_ret;

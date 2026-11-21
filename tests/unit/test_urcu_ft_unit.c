@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (414 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (415 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (361 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (362 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -8836,6 +8836,82 @@ static int test_lookup_longest_match(void)
 unlock_fail:
 	rcu_read_unlock();
 fail:
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+/*
+ * lookup_longest_match on a key that ends inside a compressed path: every
+ * byte of the key matches, so the match is the whole key.  The answer must
+ * not depend on whether the build compresses paths.
+ */
+static int test_lookup_longest_match_in_compressed(void)
+{
+	static const struct {
+		const char *key;
+		size_t len;
+		enum cds_ft_status status;
+	} q[] = {
+		{ "Kabcde", 6, CDS_FT_STATUS_INTERNAL_MATCH },	/* ends inside */
+		{ "Kab", 3, CDS_FT_STATUS_INTERNAL_MATCH },	/* ends inside */
+		{ "Kabcdx", 5, CDS_FT_STATUS_INTERNAL_MATCH },	/* diverges inside */
+		{ "Kabcdefghij", 11, CDS_FT_STATUS_INTERNAL_MATCH },
+		{ "Kabcdefghij1", 12, CDS_FT_STATUS_OK },
+		{ "K", 1, CDS_FT_STATUS_OK },
+	};
+	static const char *const keys[] = { "K", "Kabcdefghij1", "Kabcdefghij2" };
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
+	struct cds_ft_iter *iter = NULL;
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	size_t match_len;
+	unsigned int i;
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		goto fail;
+	rcu_read_lock();
+	for (i = 0; i < 3; i++) {
+		if (cds_ft_insert(ft, (const uint8_t *) keys[i],
+				strlen(keys[i]), &node_alloc(i)->node) < 0)
+			goto unlock_fail;
+	}
+	for (i = 0; i < sizeof(q) / sizeof(q[0]); i++) {
+		uint8_t k[32];
+		size_t kl = 0;
+
+		s = cds_ft_lookup_longest_match_key(ft,
+			(const uint8_t *) q[i].key, strlen(q[i].key),
+			&match_len, &found);
+		if (s != q[i].status || match_len != q[i].len ||
+		    (s == CDS_FT_STATUS_OK) != (found != NULL)) {
+			fprintf(stderr, "longest_match_key '%s': %s len %zu, "
+				"expected %s len %zu\n", q[i].key,
+				cds_ft_status_to_string(s), match_len,
+				cds_ft_status_to_string(q[i].status), q[i].len);
+			goto unlock_fail;
+		}
+		cds_ft_iter_set_key(iter, (const uint8_t *) q[i].key,
+				strlen(q[i].key));
+		s = cds_ft_lookup_longest_match(ft, iter);
+		cds_ft_iter_get_key(iter, k, sizeof(k), &kl);
+		if (s != q[i].status || kl != q[i].len) {
+			fprintf(stderr, "longest_match '%s': %s len %zu, "
+				"expected %s len %zu\n", q[i].key,
+				cds_ft_status_to_string(s), kl,
+				cds_ft_status_to_string(q[i].status), q[i].len);
+			goto unlock_fail;
+		}
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+
+unlock_fail:
+	rcu_read_unlock();
+fail:
+	if (iter)
+		cds_ft_iter_destroy(iter);
 	drain_and_destroy(ft, group);
 	return -1;
 }
@@ -41832,6 +41908,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_lookup_empty_trie);
 	RUN_TEST(test_lookup_partial);
 	RUN_TEST(test_lookup_longest_match);
+	RUN_TEST(test_lookup_longest_match_in_compressed);
 	RUN_TEST(test_lookup_relational);
 	RUN_TEST(test_lookup_first_last);
 
