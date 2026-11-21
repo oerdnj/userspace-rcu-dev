@@ -2369,6 +2369,13 @@ struct cds_ft_inode_flag *ft_get_parent_rcu(struct cds_ft *ft,
 {
 	struct cds_ft_inode_flag *parent;
 
+	/*
+	 * The parent word may hold a flip proxy during a commit.  Resolve it
+	 * to the parent this reader's view sees.  ft_ext_head_word resolves
+	 * before the prefix strip.  The other two resolve before
+	 * ft_parent_node: a resolved word can be a trie stamp, which must
+	 * become NULL (see ft_parent_node_resolved).
+	 */
 	if (ft_node_external(node))
 		parent = ft_parent_prefix_strip(ft_ext_head_word(ft,
 			(struct cds_ft_node *) node, NULL, false));
@@ -2380,17 +2387,12 @@ struct cds_ft_inode_flag *ft_get_parent_rcu(struct cds_ft *ft,
 		 * here.  The caller first resolves any skip form to its raw
 		 * compressed flag.
 		 */
-		parent = ft_parent_node(rcu_dereference(cds_ft_item_to_metadata(
-			(struct cds_ft_inode *) ft_compressed_node_ptr(node))->parent_word));
+		parent = ft_parent_node_resolved(rcu_dereference(
+			cds_ft_item_to_metadata((struct cds_ft_inode *)
+				ft_compressed_node_ptr(node))->parent_word));
 	else
-		parent = ft_parent_node(rcu_dereference(cds_ft_item_to_metadata(
-			ft_node_ptr(node))->parent_word));
-	/*
-	 * The parent slot may transiently hold a flip-proxy during a
-	 * cds_ft_merge_at commit; resolve it to the view-appropriate
-	 * (old or merged) parent before returning.
-	 */
-	parent = ft_resolve_flip_proxy(parent);
+		parent = ft_parent_node_resolved(rcu_dereference(
+			cds_ft_item_to_metadata(ft_node_ptr(node))->parent_word));
 #ifdef FT_ENABLE_TRACING
 	/*
 	 * FIRE AT DETECTION, not from a signal handler.  The prior rig recorded
