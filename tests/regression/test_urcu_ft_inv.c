@@ -22353,6 +22353,12 @@ static int inv_rekey_no_escape(void)
 /*   slot before the move walks up from a child that now sits under   */
 /*   "Q": the chain is shorter than the encoded length.  Every other  */
 /*   rekey oracle moves between keys of EQUAL length.                 */
+/*                                                                    */
+/*   The writer moves either the whole subtree or the bare prefix key */
+/*   alone.  A bare key's leaf is the application's, so the rekey     */
+/*   cannot copy it.  A third shape puts "M1" between the two homes,  */
+/*   so that each move changes the key's place in the ordered list.   */
+/*   Each shape runs with the ordered list on and off.                */
 /* ================================================================== */
 
 #define RKS_LONG	"Kabcdefghijk"
@@ -22360,6 +22366,21 @@ static int inv_rekey_no_escape(void)
 
 static const char *const rks_suffixes[] = { "mnopq1", "mnopq2", "r", "st" };
 #define RKS_NSUF	(sizeof(rks_suffixes) / sizeof(rks_suffixes[0]))
+
+/*
+ * The keys the writer moves: the prefix followed by each of these suffixes.
+ * The bare set moves the prefix key alone.
+ */
+static const char *const rks_bare[] = { "" };
+static const char *const *rks_sfx = rks_suffixes;
+static unsigned int rks_nsuf = RKS_NSUF;
+/*
+ * Hold "M1", between the two homes, instead of "Z1".  Each move then changes
+ * the moved keys' place in the ordered list, instead of keeping it.  With no
+ * "Z1", the moved key is still the last key at its short home, so
+ * lookup_last lands on it there.
+ */
+static bool rks_across;
 
 struct rks_reader_arg {
 	struct cds_ft *ft;
@@ -22374,18 +22395,20 @@ static bool rks_key_allowed(const uint8_t *k, size_t kl)
 {
 	unsigned int i;
 
-	if (kl == 2 && !memcmp(k, "Z1", 2))
+	if (!rks_across && kl == 2 && !memcmp(k, "Z1", 2))
 		return true;
-	for (i = 0; i < RKS_NSUF; i++) {
-		size_t sl = strlen(rks_suffixes[i]);
+	if (rks_across && kl == 2 && !memcmp(k, "M1", 2))
+		return true;
+	for (i = 0; i < rks_nsuf; i++) {
+		size_t sl = strlen(rks_sfx[i]);
 
 		if (kl == sizeof(RKS_LONG) - 1 + sl &&
 		    !memcmp(k, RKS_LONG, sizeof(RKS_LONG) - 1) &&
-		    !memcmp(k + sizeof(RKS_LONG) - 1, rks_suffixes[i], sl))
+		    !memcmp(k + sizeof(RKS_LONG) - 1, rks_sfx[i], sl))
 			return true;
 		if (kl == sizeof(RKS_SHORT) - 1 + sl &&
 		    !memcmp(k, RKS_SHORT, sizeof(RKS_SHORT) - 1) &&
-		    !memcmp(k + sizeof(RKS_SHORT) - 1, rks_suffixes[i], sl))
+		    !memcmp(k + sizeof(RKS_SHORT) - 1, rks_sfx[i], sl))
 			return true;
 	}
 	return false;
@@ -22394,12 +22417,14 @@ static bool rks_key_allowed(const uint8_t *k, size_t kl)
 static void rks_check_iter(struct cds_ft_iter *iter, const char *what)
 {
 	uint8_t k[32];
-	size_t kl;
+	size_t kl = 0;
+	enum cds_ft_status s = cds_ft_iter_get_key(iter, k, sizeof(k), &kl);
 
-	if (cds_ft_iter_get_key(iter, k, sizeof(k), &kl) != CDS_FT_STATUS_OK ||
-	    !rks_key_allowed(k, kl)) {
+	if (s != CDS_FT_STATUS_OK || !rks_key_allowed(k, kl)) {
 		fprintf(stderr, "inv_rekey_shorter_reanchor: %s returned an "
-			"out-of-namespace key (len %zu)\n", what, kl);
+			"out-of-namespace key (get_key %s, key %.*s)\n", what,
+			cds_ft_status_to_string(s),
+			s == CDS_FT_STATUS_OK ? (int) kl : 0, (const char *) k);
 		atomic_fetch_add(&violation_count, 1);
 	}
 }
@@ -22425,11 +22450,13 @@ static void rks_check_order(struct cds_ft_iter *iter, const char *what,
 	uint8_t r[32];
 	size_t rl = 0;
 	int c;
+	enum cds_ft_status s = cds_ft_iter_get_key(iter, r, sizeof(r), &rl);
 
-	if (cds_ft_iter_get_key(iter, r, sizeof(r), &rl) != CDS_FT_STATUS_OK ||
-	    !rks_key_allowed(r, rl)) {
+	if (s != CDS_FT_STATUS_OK || !rks_key_allowed(r, rl)) {
 		fprintf(stderr, "inv_rekey_shorter_reanchor: %s returned an "
-			"out-of-namespace key (len %zu)\n", what, rl);
+			"out-of-namespace key (get_key %s, key %.*s)\n", what,
+			cds_ft_status_to_string(s),
+			s == CDS_FT_STATUS_OK ? (int) rl : 0, (const char *) r);
 		atomic_fetch_add(&violation_count, 1);
 		return;
 	}
@@ -22457,14 +22484,14 @@ static void *rks_reader(void *arg)
 	while (!test_stop) {
 		uint8_t k[32];
 		size_t kl;
-		unsigned int i = round % RKS_NSUF;
-		bool longk = (round / RKS_NSUF) & 1;
+		unsigned int i = round % rks_nsuf;
+		bool longk = (round / rks_nsuf) & 1;
 		const char *pfx = longk ? RKS_LONG : RKS_SHORT;
 
 		kl = strlen(pfx);
 		memcpy(k, pfx, kl);
-		memcpy(k + kl, rks_suffixes[i], strlen(rks_suffixes[i]));
-		kl += strlen(rks_suffixes[i]);
+		memcpy(k + kl, rks_sfx[i], strlen(rks_sfx[i]));
+		kl += strlen(rks_sfx[i]);
 
 		/* Point lookup: the exact descent. */
 		rcu_read_lock();
@@ -22594,7 +22621,7 @@ static void *rks_writer(void *arg)
 	return NULL;
 }
 
-static int rks_run(bool rank)
+static int rks_run(bool rank, bool bare, bool across, bool list)
 {
 	struct cds_ft_group_attr *gattr;
 	struct cds_ft_group *group;
@@ -22608,10 +22635,14 @@ static int rks_run(bool rank)
 	int ret = 0;
 
 	ms = env ? strtoul(env, NULL, 10) : DEFAULT_DURATION_MS;
+	rks_sfx = bare ? rks_bare : rks_suffixes;
+	rks_nsuf = bare ? 1 : RKS_NSUF;
+	rks_across = across;
+	atomic_store(&violation_count, 0);	/* count per run */
 	if (cds_ft_group_attr_create(&gattr) < 0)
 		return -1;
 	if (cds_ft_group_attr_set_max_key_len(gattr, 32) < 0 ||
-	    cds_ft_group_attr_set_ordered_list(gattr, true) < 0 ||
+	    cds_ft_group_attr_set_ordered_list(gattr, list) < 0 ||
 	    cds_ft_group_attr_set_rekey(gattr, true) < 0 ||
 	    (rank && cds_ft_group_attr_set_rank_stats(gattr, true) < 0))
 		abort();
@@ -22622,18 +22653,18 @@ static int rks_run(bool rank)
 		abort();
 
 	rcu_read_lock();
-	for (i = 0; i < RKS_NSUF; i++) {
+	for (i = 0; i < rks_nsuf; i++) {
 		uint8_t k[32];
 		size_t kl = sizeof(RKS_LONG) - 1;
 		struct ft_test_node *n = node_alloc(i);
 
 		memcpy(k, RKS_LONG, kl);
-		memcpy(k + kl, rks_suffixes[i], strlen(rks_suffixes[i]));
-		kl += strlen(rks_suffixes[i]);
+		memcpy(k + kl, rks_sfx[i], strlen(rks_sfx[i]));
+		kl += strlen(rks_sfx[i]);
 		if (cds_ft_insert(ft, k, kl, &n->node) != CDS_FT_STATUS_OK)
 			abort();
 	}
-	if (cds_ft_insert(ft, (const uint8_t *) "Z1", 2,
+	if (cds_ft_insert(ft, (const uint8_t *) (across ? "M1" : "Z1"), 2,
 			&node_alloc(99)->node) != CDS_FT_STATUS_OK)
 		abort();
 	rcu_read_unlock();
@@ -22667,14 +22698,17 @@ static int rks_run(bool rank)
 
 	rcu_read_lock();
 	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
-	    cds_ft_count_keys(ft) != RKS_NSUF + 1) {
+	    cds_ft_count_keys(ft) != rks_nsuf + 1) {
 		fprintf(stderr, "inv_rekey_shorter_reanchor: final trie wrong "
 			"(count %lu)\n", cds_ft_count_keys(ft));
 		ret = -1;
 	}
 	rcu_read_unlock();
-	fprintf(stderr, "# inv_rekey_shorter_reanchor[%s]: moves=%lu reader "
-		"rounds=%lu violations=%lu -> %s\n", rank ? "rank" : "plain",
+	fprintf(stderr, "# inv_rekey_shorter_reanchor[%s, %s, list %s]: "
+		"moves=%lu reader rounds=%lu violations=%lu -> %s\n",
+		bare ? (across ? "bare key across M1" : "bare key") :
+			"subtree",
+		rank ? "rank" : "plain", list ? "on" : "off",
 		rks_moves, ops, atomic_load(&violation_count),
 		(ret || atomic_load(&violation_count)) ? "RED" : "ok");
 	if (atomic_load(&violation_count) > 0 || !rks_moves)
@@ -22689,9 +22723,17 @@ static int rks_run(bool rank)
 
 static int inv_rekey_shorter_reanchor(void)
 {
-	int ret = rks_run(false);
+	int ret = 0, list;
 
-	return rks_run(true) | ret;
+	for (list = 1; list >= 0; list--) {
+		ret |= rks_run(false, false, false, list);
+		ret |= rks_run(true, false, false, list);
+		ret |= rks_run(false, true, false, list);
+		ret |= rks_run(true, true, false, list);
+		ret |= rks_run(false, true, true, list);
+		ret |= rks_run(true, true, true, list);
+	}
+	return ret;
 }
 
 /* ================================================================== */
