@@ -254,7 +254,15 @@ void ft_trace_capture(void)
  */
 #define FT_TP_ITER_KEY(name, iter)					\
 	FT_TP(name, (const void *) (iter)->ft, (const void *) (iter),	\
-		iter_key(iter), (iter)->key_len)
+		iter_key(iter), FT_TP_ITER_KEY_LEN(iter))
+/*
+ * The length of @iter's key, for an event that carries the key.  An ordered
+ * walk leaves the key unbuilt: key_len is then FT_ITER_KEY_LEN_LAZY (SIZE_MAX).
+ * Give 0 instead.  A sequence of SIZE_MAX bytes corrupts the trace buffer.
+ * Do not build the key here: an event must not change the iterator.
+ */
+#define FT_TP_ITER_KEY_LEN(iter)					\
+	((iter)->key_len == FT_ITER_KEY_LEN_LAZY ? 0 : (iter)->key_len)
 /*
  * enum ft_tp_node_kind (node-kind identifiers) lives in
  * fractal-trie-internal.h so the C side and the LTTng enum in

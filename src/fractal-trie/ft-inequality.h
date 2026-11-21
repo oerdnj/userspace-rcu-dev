@@ -2036,7 +2036,7 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 #endif
 		FT_TP(ineq_result, (int) mode, NULL, 0,
 			iter->node ? iter_key(iter) : NULL,
-			iter->node ? iter->key_len : 0,
+			iter->node ? FT_TP_ITER_KEY_LEN(iter) : 0,
 			(int) iter->status);
 		iter_auto_invalidate_cache(iter);
 		return iter->status;
