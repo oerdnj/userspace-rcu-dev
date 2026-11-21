@@ -3244,45 +3244,88 @@ void ft_rekey_fresh_cell_swap(struct ft_flip_txn *txn,
 		FT_BE_SITE(FT_BE_REKEY_CELL, NULL));
 }
 
+/* Edges ft_rekey_fresh_cell_substitute can add. */
+#define FT_REKEY_FRESH_EXTRA_EDGES	3
+
 /*
- * Link the fresh cell @new_cell between the destination neighbours @pred and
- * @succ, for a bare head whose old cell @old_cell the detach unlinks at the
- * source.  @new_cell is invisible, so its own links are plain stores.  Record
- * the two neighbour edges, and the deletion mark on @old_cell (whose
- * successor is @old_succ), as ft_ord_cell_swap_edges does.  Return the new
- * edge count.
+ * Put the fresh cell @new_cell in place of @old_cell in the cell edge set
+ * @edges.  The set holds the @n edges the move records without a fresh cell,
+ * and has room for FT_REKEY_FRESH_EXTRA_EDGES more.  @new_cell is invisible,
+ * so:
+ *  - an edge on @old_cell's own links becomes a plain store into @new_cell;
+ *  - an edge whose new target is @old_cell names @new_cell instead;
+ *  - a neighbour whose link the set leaves on @old_cell gets an edge to
+ *    @new_cell.
+ * Then mark @old_cell deleted, as ft_ord_cell_swap_edges does.  Return the
+ * new edge count.  An edge whose expected-old no longer holds aborts the
+ * commit, as any other edge does.
  */
 static
-unsigned int ft_rekey_fresh_cell_splice_edges(struct cds_ft *ft,
-		struct ft_ord_cell *old_cell, struct ft_ord_cell *old_succ,
-		struct ft_ord_cell *new_cell, struct ft_ord_cell *pred,
-		struct ft_ord_cell *succ, struct ft_ord_cell_edge *edges,
-		unsigned int n)
+unsigned int ft_rekey_fresh_cell_substitute(struct cds_ft *ft,
+		struct ft_ord_cell *old_cell, struct ft_ord_cell *new_cell,
+		struct ft_ord_cell_edge *edges, unsigned int n)
 {
-	pred = ft_ord_or_sentinel(ft, pred);
-	succ = ft_ord_or_sentinel(ft, succ);
-	new_cell->lnode.prev = ft_ord_cell_lnode(pred);
-	new_cell->lnode.next = ft_ord_cell_lnode(succ);
-	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
-	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
-	edges[n].owner_cell = pred;
-	edges[n].old_target = succ;
-	edges[n].new_target = new_cell;
-	n++;
-	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
-	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
-	edges[n].owner_cell = succ;
-	edges[n].old_target = pred;
-	edges[n].new_target = new_cell;
-	n++;
-	edges[n].tag = URCU_TXN_TAG;	/* the deletion mark */
-	edges[n].slot = (struct ft_ord_cell **) &old_cell->lnode.next;
-	edges[n].owner_cell = old_cell;
-	edges[n].old_target = old_succ;
-	edges[n].new_target = (struct ft_ord_cell *)
-		urcu_txn_list_set_mark(ft_ord_cell_lnode(old_succ));
-	n++;
-	return n;
+	struct ft_ord_cell *old_next =
+		ft_ord_cell_resolve_ord(&old_cell->lnode.next);
+	struct ft_ord_cell *prev =
+		ft_ord_cell_resolve_ord(&old_cell->lnode.prev);
+	struct ft_ord_cell *next = old_next;
+	bool prev_linked = false, next_linked = false;
+	unsigned int i, out = 0;
+
+	for (i = 0; i < n; i++) {
+		struct ft_ord_cell_edge e = edges[i];
+
+		if (ft_edge_tag(&e) == URCU_TXN_TAG) {
+			if (e.slot == (struct ft_ord_cell **)
+					&old_cell->lnode.prev) {
+				prev = e.new_target;
+				continue;
+			}
+			if (e.slot == (struct ft_ord_cell **)
+					&old_cell->lnode.next) {
+				next = e.new_target;
+				continue;
+			}
+			if (e.new_target == old_cell)
+				e.new_target = new_cell;
+		}
+		edges[out++] = e;
+	}
+	prev = ft_ord_or_sentinel(ft, prev);
+	next = ft_ord_or_sentinel(ft, next);
+	for (i = 0; i < out; i++) {
+		if (edges[i].slot == (struct ft_ord_cell **) &prev->lnode.next)
+			prev_linked = true;
+		if (edges[i].slot == (struct ft_ord_cell **) &next->lnode.prev)
+			next_linked = true;
+	}
+	new_cell->lnode.prev = ft_ord_cell_lnode(prev);
+	new_cell->lnode.next = ft_ord_cell_lnode(next);
+	if (!prev_linked) {
+		edges[out].tag = URCU_TXN_TAG;	/* ordered-cell edge */
+		edges[out].slot = (struct ft_ord_cell **) &prev->lnode.next;
+		edges[out].owner_cell = prev;
+		edges[out].old_target = old_cell;
+		edges[out].new_target = new_cell;
+		out++;
+	}
+	if (!next_linked) {
+		edges[out].tag = URCU_TXN_TAG;	/* ordered-cell edge */
+		edges[out].slot = (struct ft_ord_cell **) &next->lnode.prev;
+		edges[out].owner_cell = next;
+		edges[out].old_target = old_cell;
+		edges[out].new_target = new_cell;
+		out++;
+	}
+	edges[out].tag = URCU_TXN_TAG;	/* the deletion mark */
+	edges[out].slot = (struct ft_ord_cell **) &old_cell->lnode.next;
+	edges[out].owner_cell = old_cell;
+	edges[out].old_target = old_next;
+	edges[out].new_target = (struct ft_ord_cell *)
+		urcu_txn_list_set_mark(ft_ord_cell_lnode(old_next));
+	out++;
+	return out;
 }
 
 static
@@ -3418,7 +3461,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * for why that is sound and what the empty-dst graft arm still owes.
 	 */
 	bool s_top_external = false;
-	bool s_top_demoted = false;	/* the merge chains the bare head */
+	bool s_top_demoted = false;	/* the merge chains @fresh_key */
+	struct cds_ft_node *fresh_key = NULL;	/* the key at @src_key */
 	/*
 	 * The src key ends inside a run, @src_cut bytes into it.  Then S_top
 	 * is not a node: it is the tail of the run. ft_rekey_cow_stop
@@ -4576,6 +4620,55 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 */
 	ft_flip_txn_claim_per_op_armable(ft, txn);
 #endif
+	/*
+	 * ☞ A FRESH CELL FOR THE KEY AT @src_key.  Only that key's last byte
+	 * changes.  It is either the bare head itself or the prefix head of
+	 * S_top.  Its leaf is app-owned, so it gets no copy, and the move
+	 * used to write its cell in place: the parent and the edge byte.  A reader spells a key from those two fields
+	 * with two loads (ft_rebuild_key_upwalk).  It could pair the new
+	 * parent with the old byte, and spell a key that was never in the
+	 * trie.
+	 *
+	 * The cell is library-owned, so it can be copied.  Give the head a
+	 * fresh cell, written while invisible.  The commit swaps it into the
+	 * list and into head->prev.  The old cell keeps its fields, and is
+	 * retired after a grace period.  ft_reparent_record sends the head's
+	 * back edge to the fresh cell (@txn->fresh_head).
+	 *
+	 * A merge can demote the head onto the destination key's chain.  The
+	 * demoted head owns no cell, so step 3b drops the fresh one again.
+	 *
+	 * This runs before cow_stop: cow_stop re-parents S_top's prefix head,
+	 * and ft_reparent_record must already see @txn->fresh_head.
+	 */
+	if (s_top_external)
+		fresh_key = (struct cds_ft_node *) s_top;
+	else if (!src_cut && !s_top_compressed &&
+			s_top_meta->external_nodes)
+		fresh_key = (struct cds_ft_node *) ft_dereference_external(
+			s_top_meta->external_nodes);
+	if (fresh_key && ft->ordered_list) {
+		struct cds_ft_node *head = fresh_key;
+		void *prev = ft_dereference_prev_resolved(head);
+		void *fresh;
+
+		if (!prev || !((uintptr_t) prev & FT_ORD_CELL_TAG)) {
+			ft_flip_txn_destroy(txn);
+			ret = -EAGAIN;
+			goto sweep;
+		}
+		fresh_old = ft_ord_cell_ptr(prev);
+		fresh = ft_ord_cell_alloc(ft, head, NULL);
+		if (!fresh) {
+			ft_flip_txn_destroy(txn);
+			ret = -ENOMEM;
+			goto sweep;
+		}
+		fresh_cell = ft_ord_cell_ptr(fresh);
+		txn->fresh_head = head;
+		txn->fresh_cell = fresh_cell;
+	}
+
 	if (!merge_dst && s_top_external) {
 		/*
 		 * THE BARE HEAD: there is nothing to COW.  ft_rekey_cow_stop's
@@ -4658,45 +4751,6 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * The mixed commit installs the MW (detach) edges first, then parks
 	 * the SW (graft + cow_stop) edges before the flip.
 	 */
-
-	/*
-	 * ☞ A FRESH CELL FOR A BARE HEAD.  The head is app-owned, so it gets
-	 * no copy, and the move used to write its cell in place: the parent
-	 * and the edge byte.  A reader spells a key from those two fields
-	 * with two loads (ft_rebuild_key_upwalk).  It could pair the new
-	 * parent with the old byte, and spell a key that was never in the
-	 * trie.
-	 *
-	 * The cell is library-owned, so it can be copied.  Give the head a
-	 * fresh cell, written while invisible.  The commit swaps it into the
-	 * list and into head->prev.  The old cell keeps its fields, and is
-	 * retired after a grace period.  ft_reparent_record sends the head's
-	 * back edge to the fresh cell (@txn->fresh_head).
-	 *
-	 * A merge can demote the head onto the destination key's chain.  The
-	 * demoted head owns no cell, so step 3b drops the fresh one again.
-	 */
-	if (s_top_external && ft->ordered_list) {
-		struct cds_ft_node *head = (struct cds_ft_node *) s_top;
-		void *prev = ft_dereference_prev_resolved(head);
-		void *fresh;
-
-		if (!prev || !((uintptr_t) prev & FT_ORD_CELL_TAG)) {
-			ft_flip_txn_destroy(txn);
-			ret = -EAGAIN;
-			goto sweep;
-		}
-		fresh_old = ft_ord_cell_ptr(prev);
-		fresh = ft_ord_cell_alloc(ft, head, NULL);
-		if (!fresh) {
-			ft_flip_txn_destroy(txn);
-			ret = -ENOMEM;
-			goto sweep;
-		}
-		fresh_cell = ft_ord_cell_ptr(fresh);
-		txn->fresh_head = head;
-		txn->fresh_cell = fresh_cell;
-	}
 
 	/* 2. Graft-fold: record-only attach of S_top' at @dst_key. */
 	ft_glue_init(&glue);
@@ -6709,7 +6763,9 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			 */
 			2 +
 			(ft->ordered_list ? FT_ORD_CELL_RUN_DETACH_MAX_EDGES +
-				FT_ORD_CELL_RUN_RESPLICE_MAX_EDGES : 0) +
+				FT_ORD_CELL_RUN_RESPLICE_MAX_EDGES +
+				/* a fresh cell: its extra edge, head->prev */
+				FT_REKEY_FRESH_EXTRA_EDGES + 1 : 0) +
 			/*
 			 * Merged cluster.  The terms are:
 			 *   - up to THREE records per deferred re-parent
@@ -8382,7 +8438,7 @@ detach_bail:
 	 * needs no fresh cell.  No reader has seen the fresh cell: free it.
 	 */
 	for (int si = 0; si < glue.nr_splices; si++)
-		if (glue.splices[si].src_head == (struct cds_ft_node *) s_top)
+		if (glue.splices[si].src_head == fresh_key)
 			s_top_demoted = true;
 	if (fresh_cell && s_top_demoted) {
 		assert(!fresh_cell->parent);
@@ -8436,7 +8492,8 @@ detach_bail:
 			goto cells_done;
 		/* Zero-initialised: see the note on ms_edges in ft-merge.h. */
 		struct ft_ord_cell_edge cedges[FT_ORD_CELL_RUN_DETACH_MAX_EDGES +
-			FT_ORD_CELL_RUN_RESPLICE_MAX_EDGES] = { 0 };
+			FT_ORD_CELL_RUN_RESPLICE_MAX_EDGES +
+			FT_REKEY_FRESH_EXTRA_EDGES] = { 0 };
 		struct ft_ord_cell *rfc, *rlc, *src_pred, *src_succ;
 		unsigned int cn;
 
@@ -8464,30 +8521,6 @@ detach_bail:
 		rlc = ft_ord_cell_ptr(rcu_dereference(run_rlast->prev));
 		src_pred = ft_ord_cell_resolve_ord(&rfc->lnode.prev);
 		src_succ = ft_ord_cell_resolve_ord(&rlc->lnode.next);
-		if (run_keeps_pos && fresh_cell) {
-			/*
-			 * The fresh cell takes the old one's place in the list.
-			 * The swap records both neighbour edges and the
-			 * deletion mark on the old cell, as a compaction does
-			 * (ft_compact_relocate_cell).  Its edges also do the
-			 * validates' job below: a peer splice into the
-			 * boundary aborts the commit.
-			 */
-			struct ft_cell_plan plan = {
-				.cell = rfc,
-				.cell_lock_held = false,
-				.pred = src_pred,
-				.succ = src_succ,
-			};
-
-			if (ft_cell_lockset_take(ft, NULL, txn, &plan))
-				goto cells_bail;
-			cn = ft_ord_cell_swap_edges(ft, rfc, fresh_cell, cedges, 0);
-			ft_ord_cell_record_into_ft(ft, txn, cedges, cn);
-			ft_rekey_fresh_cell_swap(txn, fresh_old, fresh_cell);
-			fresh_swapped = true;
-			goto cells_done;
-		}
 		if (run_keeps_pos) {
 			/*
 			 * The run keeps its ordered position (the dst abuts
@@ -8524,19 +8557,26 @@ detach_bail:
 			 * -DFT_DEBUG_REKEY_KEEP_POS_VALIDATE records them
 			 * anyway.
 			 */
+			cn = 0;
 #ifndef FT_DEBUG_REKEY_KEEP_POS_VALIDATE
-			if (ft_flip_txn_excludes_all(txn, ft))
-				goto cells_done;
+			if (!ft_flip_txn_excludes_all(txn, ft))
 #endif
-			cedges[0].tag = URCU_TXN_TAG;
-			cedges[0].slot = (struct ft_ord_cell **) &rfc->lnode.prev;
-			cedges[0].old_target = src_pred;
-			cedges[0].new_target = src_pred;
-			cedges[1].tag = URCU_TXN_TAG;
-			cedges[1].slot = (struct ft_ord_cell **) &rlc->lnode.next;
-			cedges[1].old_target = src_succ;
-			cedges[1].new_target = src_succ;
-			ft_ord_cell_record_into_ft(ft, txn, cedges, 2);
+			{
+				cedges[0].tag = URCU_TXN_TAG;
+				cedges[0].slot = (struct ft_ord_cell **)
+					&rfc->lnode.prev;
+				cedges[0].old_target = src_pred;
+				cedges[0].new_target = src_pred;
+				cedges[1].tag = URCU_TXN_TAG;
+				cedges[1].slot = (struct ft_ord_cell **)
+					&rlc->lnode.next;
+				cedges[1].old_target = src_succ;
+				cedges[1].new_target = src_succ;
+				cn = 2;
+			}
+			if (fresh_cell)
+				goto fresh_edges;
+			ft_ord_cell_record_into_ft(ft, txn, cedges, cn);
 			goto cells_done;
 		}
 #ifdef FEATURE_FT_MERGE
@@ -8553,16 +8593,26 @@ detach_bail:
 			unsigned int in = 0;
 			int iret;
 
-			/*
-			 * A bare head is a run of one key, @dst_key itself.
-			 * It interleaves only with an equal key, which demotes
-			 * it.  So no fresh cell gets here.
-			 */
-			assert(!fresh_cell);
 			iret = ft_rekey_ord_interleave(ft, probe_D, dst_len,
 					src_len, run_rfirst, run_rlast,
 					merged_keys, &iedges, &in,
 					&collided_cells, &nr_collided);
+			if (!iret && fresh_cell) {
+				struct ft_ord_cell_edge *grown = realloc(iedges,
+					(in + FT_REKEY_FRESH_EXTRA_EDGES) *
+						sizeof(*iedges));
+
+				if (!grown) {
+					free(iedges);
+					iedges = NULL;
+					iret = -ENOMEM;
+				} else {
+					iedges = grown;
+					assert(rfc == fresh_old);
+					in = ft_rekey_fresh_cell_substitute(ft,
+						rfc, fresh_cell, iedges, in);
+				}
+			}
 
 			if (!iret && !ft_flip_txn_reserve_extra(txn, in)) {
 				free(iedges);
@@ -8640,6 +8690,11 @@ detach_bail:
 #endif
 			ft_ord_cell_record_into_ft(ft, txn, iedges, in);
 			free(iedges);
+			if (fresh_cell) {
+				ft_rekey_fresh_cell_swap(txn, fresh_old,
+					fresh_cell);
+				fresh_swapped = true;
+			}
 			goto cells_done;
 		}
 #endif /* FEATURE_FT_MERGE: an occupied dst is a merge */
@@ -8682,6 +8737,11 @@ detach_bail:
 		/* src unsplice FIRST: reads the run's pristine outer links -> src neighbours. */
 		cn = ft_ord_cell_run_detach_edges(ft, run_rfirst, run_rlast,
 				&rfc, &rlc, cedges, 0);
+		if (fresh_cell) {
+			cn = ft_ord_cell_run_resplice_edges(ft, rfc, rlc,
+					run_dpred, run_dsucc, cedges, cn);
+			goto fresh_edges;
+		}
 		/*
 		 * dst splice into the gap located up front on the pristine
 		 * list.  It records the run's outer links rather than storing
@@ -8711,23 +8771,25 @@ detach_bail:
 			if (ft_cell_lockset_take(ft, NULL, txn, &plan))
 				goto cells_bail;
 		}
-		if (fresh_cell) {
-			/*
-			 * The detach above unlinks the old cell at the source.
-			 * Link the fresh one at the destination instead of
-			 * moving the old one, and mark the old one deleted.
-			 */
-			cn = ft_rekey_fresh_cell_splice_edges(ft, rfc, src_succ,
-					fresh_cell, run_dpred, run_dsucc, cedges,
-					cn);
-			ft_ord_cell_record_into_ft(ft, txn, cedges, cn);
-			ft_rekey_fresh_cell_swap(txn, fresh_old, fresh_cell);
-			fresh_swapped = true;
-		} else {
-			cn = ft_ord_cell_run_resplice_edges(ft, rfc, rlc,
-					run_dpred, run_dsucc, cedges, cn);
-			ft_ord_cell_record_into_ft(ft, txn, cedges, cn);
-		}
+		cn = ft_ord_cell_run_resplice_edges(ft, rfc, rlc, run_dpred,
+				run_dsucc, cedges, cn);
+		ft_ord_cell_record_into_ft(ft, txn, cedges, cn);
+		goto cells_done;
+fresh_edges:
+		/*
+		 * The key at @src_key moves to its fresh cell.  Take the edges
+		 * this branch built and put the fresh cell in place of the old
+		 * one.  That can write cells the branch's plan does not name,
+		 * so lock what the edges name, in one take.
+		 */
+		assert(rfc == fresh_old);
+		cn = ft_rekey_fresh_cell_substitute(ft, rfc, fresh_cell, cedges,
+				cn);
+		if (ft_cell_lockset_take_edges(ft, NULL, txn, cedges, cn))
+			goto cells_bail;
+		ft_ord_cell_record_into_ft(ft, txn, cedges, cn);
+		ft_rekey_fresh_cell_swap(txn, fresh_old, fresh_cell);
+		fresh_swapped = true;
 cells_done:
 		;
 	}
@@ -8868,9 +8930,10 @@ cells_done:
 	 * ☞ AND IT IS A PLAIN STORE ON PURPOSE.  A rekey gives its moved top
 	 * a FRESH ADDRESS (ft_rekey_cow_stop).  That makes every back-edge
 	 * write on it a plain store into something invisible.  It also
-	 * removes any need to put this byte in the txn.  The BARE EXTERNAL
-	 * HEAD is the one top that gets no copy, because it is app-owned.
-	 * It gets a fresh cell instead (step 2), and the byte goes there.
+	 * removes any need to put this byte in the txn.  But the key at
+	 * @src_key is app-owned and gets no copy.  It is the BARE EXTERNAL
+	 * HEAD, or the prefix head the copy takes over.  It gets a fresh cell
+	 * instead (step 2), and the byte goes there.
 	 * ☞ ft_head_stamp_incoming_byte's header.
 	 *
 	 * ☠ MEASURED, all four builds.  The SLOT-only stamp is what left it:
@@ -8889,8 +8952,8 @@ cells_done:
 	 * fractal-trie-internal.h).  A head this merge demotes stops being
 	 * one: its prev will name its chain predecessor, and the walk spells
 	 * the chain from the chain head's cell.  So such a head gets no byte.
-	 * Step 3b dropped its fresh cell.  Every other bare head on a list-on
-	 * trie has a fresh cell here.
+	 * Step 3b dropped its fresh cell.  On a list-on trie, every other key
+	 * at @src_key has a fresh cell here.
 	 */
 	if (fresh_cell)		/* invisible: the live cell stays */
 		cds_ft_item_to_metadata(fresh_cell)->incoming_byte =

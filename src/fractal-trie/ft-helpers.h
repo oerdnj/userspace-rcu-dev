@@ -4647,11 +4647,14 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
  * commit would solve a problem the COW has already solved for every top that
  * gets a copy.
  *
- * ☠ THE ONE TOP THAT GETS NO COPY IS THE BARE EXTERNAL HEAD.  It is
- * APP-OWNED, so @s_top_prime == @s_top.  It stays reachable at the SOURCE
- * for the whole build window.  A store into its live cell would be
- * reader-visible ahead of the publish: a reader could pair the new parent
- * with the old byte, and an abort would not undo it.
+ * ☠ THE KEY AT THE SOURCE PREFIX GETS NO COPY.  Its leaf is APP-OWNED.  It
+ * is either the BARE EXTERNAL HEAD (@s_top_prime == @s_top) or the prefix
+ * head of the copied top.  The copy takes over that prefix head, but not its
+ * leaf or its cell.  It stays reachable at the SOURCE for the whole build
+ * window.  A store into its live cell would be reader-visible ahead of the
+ * publish: a reader could pair the new parent with the old byte, and an
+ * abort would not undo it.  Skipping the store left the source byte at the
+ * new key, for the walk to spell after a later collapse.
  *
  * ☞ SO THE REKEY GIVES IT A FRESH CELL.  The byte lives in the head's
  * ORDERED CELL, which is library-allocated and can be copied.  The rekey
