@@ -241,19 +241,24 @@ enum ft_descent_action ft_lookup_nth_compressed(
  *    If n < count, descend. Else n -= count and continue.
  */
 /*
- * EXCLUDE BULK OPS FOR A RANK WALK.  With rank stats off, a rank op is a walk:
- * lookup_first or lookup_last, then n steps.  A bulk op that moves keys
- * during it can make it count a key twice or not at all.  A lookup retries
+ * EXCLUDE REKEYS FOR A RANK WALK.  With rank stats off, a rank op is a walk:
+ * lookup_first or lookup_last, then n steps.  A rekey that commits during it
+ * can make it count the moved keys twice or not at all.  A lookup retries
  * until two passes agree.  A whole walk cannot: a stream of moves could keep
  * it from ever finishing.
  *
- * So exclude bulk ops for the length of the walk, as a point writer does
- * (ft_writer_lock_scope_enter).  With a bulk gate up, take the FT-wide lock:
- * a bulk op commits only while it holds that lock.  A bulk op whose gate
- * rises after this sample waits, in the gate's grace period, for the
- * caller's read section, which spans the walk.  On a COARSE trie only a
- * rekey owns that grace period.  A detach or graft may still start, but it
- * adds or removes keys, it does not move one.
+ * So exclude rekeys for the length of the walk.  While a move is in flight
+ * (ft_move_active), take the FT-wide lock: a rekey commits only while it
+ * holds that lock.  A rekey whose gate rises after this sample waits, in the
+ * gate's grace period, for the caller's read section, which spans the walk.
+ *
+ * The other bulk ops need no exclusion.  A detach, graft or cross-trie merge
+ * adds or removes keys, so the ranks change anyway.  A graft_swap replaces a
+ * subtree in one store, and a walk inside the old subtree stays in it.
+ *
+ * On an EXTERNAL_SYNC trie the library cannot take the application's lock.
+ * There the application keeps rekeys out of a rank walk
+ * (cds_ft_group_attr_set_rekey).
  *
  * Nest if this thread already holds the lock.  Return true if the caller
  * must call ft_writer_lock_scope_exit() after the walk.
@@ -267,7 +272,7 @@ bool ft_rank_walk_exclude_enter(struct cds_ft *ft)
 		ft_wlock_depth++;
 		return true;
 	}
-	if (caa_likely(!ft_bulk_active(ft)))
+	if (caa_likely(!ft_move_active(ft)))
 		return false;
 	if (caa_unlikely(ft_wlock_held != NULL)) {
 		fprintf(stderr, "cds_ft: a rank walk on cds_ft=%p while holding "

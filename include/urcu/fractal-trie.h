@@ -3103,6 +3103,16 @@ enum cds_ft_status cds_ft_group_attr_set_ordered_list(
  *    exact lookup on such a trie runs the second walk, always.  That is the
  *    price of in-trie moves under an exclusion the library does not own.
  *
+ *  - Also under CDS_FT_WRITER_EXTERNAL_SYNC, the application must keep
+ *    rekeys out of a rank walk.  Without rank stats, cds_ft_lookup_nth /
+ *    _last and cds_ft_iter_skip_forward / _reverse step through the keys
+ *    one at a time.  A move that commits during the walk makes it count
+ *    the moved keys twice or not at all.  Under the other writer
+ *    strategies, the library takes its writer lock for the walk while a
+ *    move is in flight.  Here it has no lock to take.  With rank stats, a
+ *    rank query takes two passes like an exact lookup, so it needs no such
+ *    care.
+ *
  * A move also requires an EAGER trie: it re-parents leaves without rewriting an
  * application-stored speculative key.  On a group that opted in, a
  * speculative trie refuses the move with CDS_FT_STATUS_INVALID_ARGUMENT_ERROR.
@@ -3146,6 +3156,8 @@ enum cds_ft_status cds_ft_group_attr_set_rekey(
  *     (sub)tree in O(size);
  *   - cds_ft_lookup_nth / _last and cds_ft_iter_skip_forward / _reverse
  *     iterate n steps via cds_ft_next / cds_ft_prev.
+ * Under CDS_FT_WRITER_EXTERNAL_SYNC, such a walk must not run during a
+ * rekey (see cds_ft_group_attr_set_rekey).
  * With the ordered list off as well, each iteration step is itself an
  * O(depth) structural traversal.  So select / skip become O(n.depth): the
  * two flags interact for that cost class.
