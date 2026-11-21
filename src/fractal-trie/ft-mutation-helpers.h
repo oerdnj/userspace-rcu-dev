@@ -21208,9 +21208,13 @@ void ft_record_child_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
  * @txn NULL keeps the transitional self-allocating flip (bare-store fallback)
  * for callers not yet migrated.
  *
- * RETURNS the commit status.  ABORT (>0) means a peer writer won and NOTHING
- * was installed (all fused edges discarded).  A retry-enabled caller unwinds
- * and re-descends.  The @txn-NULL lone-store path cannot abort (returns OK).
+ * RETURNS the commit status.  Anything but OK means NOTHING was installed (all
+ * fused edges discarded) and the commit consumed @txn: ABORT (>0) when a peer
+ * writer won, MEMORY_ERROR (<0) when an acquire could not allocate.  The caller
+ * unwinds and re-descends in both cases.  It cannot report -ENOMEM: to the
+ * callers above it, -ENOMEM means a txn that is still live.  A retry under
+ * the same memory pressure fails in its build phase instead, and reports it
+ * there.  The @txn-NULL lone-store path cannot fail (returns OK).
  */
 #define FT_REMOVE_COMMIT_REC_MAX_EDGES	12	/* <=3 structural (+back-edge) + <=5 cell/run (unsplice = 2 back-edges + deletion mark) + 1 DEL-recompact tombstone + 1 promote head re-parent + 1 detached-prefix mark on the dead cell + 1 the SKIP_X dual GP's release-or-guard (ft_lock_skip_dual_gp, §9.3's third member) */
 static
@@ -21330,8 +21334,8 @@ enum urcu_txn_status ft_remove_commit_rec(struct cds_ft *ft,
 		enum urcu_txn_status st = ft_ord_cell_flip_into(ft, txn,
 				edges, n);
 
-		if (st > 0)
-			return st;	/* peer won: nothing installed, no run arm */
+		if (st != URCU_TXN_STATUS_OK)
+			return st;	/* nothing installed, no run arm */
 	} else {
 		/*
 		 * NULL @txn: a non-fused recompaction / external-promote whose

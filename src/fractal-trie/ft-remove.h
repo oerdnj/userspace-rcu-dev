@@ -535,7 +535,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
 				elevated_old_child, &rec, dual_gp_held);
 			if (ft_remove_commit_rec(ft, &rec, fuse_cell, run,
-					txn, false) > 0)
+					txn, false) != URCU_TXN_STATUS_OK)
 				/* Peer won: nothing installed (txn consumed). */
 				return -EAGAIN;
 			pub->armed = true;
@@ -637,7 +637,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
 				elevated_old_child, &rec, dual_gp_held);
 			if (ft_remove_commit_rec(ft, &rec, NULL, NULL, txn,
-					record_only) > 0)
+					record_only) != URCU_TXN_STATUS_OK)
 				/* Peer won: nothing installed (txn consumed). */
 				return -EAGAIN;
 		}
@@ -949,7 +949,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				ft_flip_txn_record_count_parent(ft, txn,
 					pub_parent, count_delta);
 			if (ft_remove_commit_rec(ft, &rec, NULL, NULL, txn,
-					record_only) > 0) {
+					record_only) != URCU_TXN_STATUS_OK) {
 				/*
 				 * Peer won: the fresh internal was never
 				 * published.  The retired compressed node
@@ -2998,7 +2998,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			(const void *) CMM_LOAD_SHARED(iter_meta->external_nodes),
 			-1);
 		if (ft_remove_commit_rec(ft, &rec, dead_cell, run, txn,
-				record_only) > 0) {
+				record_only) != URCU_TXN_STATUS_OK) {
 			/*
 			 * Peer won: NOTHING installed.  The collapsed chain
 			 * (boundary + parent_cn/child_cn) is still live and
@@ -7135,7 +7135,7 @@ int ft_detach_node(struct cds_ft *ft,
 			 */
 			if (ft_remove_commit_rec(ft, &rec, fuse_cell, run,
 					commit_txn_used ? NULL : commit_txn,
-					record_only) > 0) {
+					record_only) != URCU_TXN_STATUS_OK) {
 				/* Peer won: nothing installed (txn consumed). */
 				commit_txn_used = (commit_txn != NULL);
 				ret = -EAGAIN;
@@ -7346,7 +7346,7 @@ int ft_detach_node(struct cds_ft *ft,
 			}
 			if (ft_remove_commit_rec(ft, &rec, NULL, NULL,
 					commit_txn_used ? NULL : commit_txn,
-					record_only) > 0) {
+					record_only) != URCU_TXN_STATUS_OK) {
 				/* Peer won: nothing installed (txn consumed). */
 				commit_txn_used = (commit_txn != NULL);
 				ret = -EAGAIN;
