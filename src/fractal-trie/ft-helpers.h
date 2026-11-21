@@ -4654,16 +4654,15 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
  * with the old byte, and an abort would not undo it.
  *
  * ☞ SO THE REKEY GIVES IT A FRESH CELL.  The byte lives in the head's
- * ORDERED CELL, which is library-allocated and can be copied.  The rekey's
- * graft arm allocates a fresh cell and stamps it while invisible.  One commit
+ * ORDERED CELL, which is library-allocated and can be copied.  The rekey
+ * allocates a fresh cell and stamps it while invisible.  One commit
  * swaps it into the list and into head->prev, and the old cell is retired
  * after a grace period (ft-rekey.h, step 2).  ft_reparent_record sends the
  * head's back edge to the fresh cell, so this function never sees that head.
  * Transacting @incoming_byte would not work.  It shares a 32-bit word with
  * @alloc_index, with no room for a parked descriptor pointer, and the
- * up-walk reads it raw.
- *
- * ☐ The merge arm still stamps a non-demoted bare head's live cell in place.
+ * up-walk reads it raw.  A cds_ft_rekey_merge that demotes the head onto a
+ * chain drops the fresh cell: a demoted head owns no cell.
  */
 static inline
 void ft_head_stamp_incoming_byte(const struct cds_ft *ft,

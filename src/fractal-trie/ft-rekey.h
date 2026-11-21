@@ -3418,6 +3418,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * for why that is sound and what the empty-dst graft arm still owes.
 	 */
 	bool s_top_external = false;
+	bool s_top_demoted = false;	/* the merge chains the bare head */
 	/*
 	 * The src key ends inside a run, @src_cut bytes into it.  Then S_top
 	 * is not a node: it is the tail of the run. ft_rekey_cow_stop
@@ -4672,10 +4673,10 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * retired after a grace period.  ft_reparent_record sends the head's
 	 * back edge to the fresh cell (@txn->fresh_head).
 	 *
-	 * The graft arm only.  A merge can demote the head onto a chain, and
-	 * that path already records head->prev.
+	 * A merge can demote the head onto the destination key's chain.  The
+	 * demoted head owns no cell, so step 3b drops the fresh one again.
 	 */
-	if (!merge_dst && s_top_external && ft->ordered_list) {
+	if (s_top_external && ft->ordered_list) {
 		struct cds_ft_node *head = (struct cds_ft_node *) s_top;
 		void *prev = ft_dereference_prev_resolved(head);
 		void *fresh;
@@ -8375,6 +8376,24 @@ detach_bail:
 			glue.deferred_count_base, glue.deferred_count_delta);
 
 	/*
+	 * A merge whose key collides demotes the head onto the destination
+	 * key's chain.  The graft-fold lists it in @glue.splices.  The splice
+	 * records the head's new prev, its chain predecessor.  So the head
+	 * needs no fresh cell.  No reader has seen the fresh cell: free it.
+	 */
+	for (int si = 0; si < glue.nr_splices; si++)
+		if (glue.splices[si].src_head == (struct cds_ft_node *) s_top)
+			s_top_demoted = true;
+	if (fresh_cell && s_top_demoted) {
+		assert(!fresh_cell->parent);
+		txn->fresh_head = NULL;
+		txn->fresh_cell = NULL;
+		ft_ord_cell_free_unpublished(ft, fresh_cell);
+		fresh_cell = NULL;
+		fresh_old = NULL;
+	}
+
+	/*
 	 * 3b. Cell-fold (list on): record the six ordered-cell run boundary
 	 * edges into the SHARED txn.  The run then unsplices from src and
 	 * re-splices at dst ATOMICALLY with the structural move.
@@ -8532,7 +8551,15 @@ detach_bail:
 			 */
 			struct ft_ord_cell_edge *iedges = NULL;
 			unsigned int in = 0;
-			int iret = ft_rekey_ord_interleave(ft, probe_D, dst_len,
+			int iret;
+
+			/*
+			 * A bare head is a run of one key, @dst_key itself.
+			 * It interleaves only with an equal key, which demotes
+			 * it.  So no fresh cell gets here.
+			 */
+			assert(!fresh_cell);
+			iret = ft_rekey_ord_interleave(ft, probe_D, dst_len,
 					src_len, run_rfirst, run_rlast,
 					merged_keys, &iedges, &in,
 					&collided_cells, &nr_collided);
@@ -8843,9 +8870,7 @@ cells_done:
 	 * write on it a plain store into something invisible.  It also
 	 * removes any need to put this byte in the txn.  The BARE EXTERNAL
 	 * HEAD is the one top that gets no copy, because it is app-owned.
-	 * On the graft arm it gets a fresh cell instead (step 2), and the
-	 * byte goes there.  ☐ On the merge arm the store still lands on the
-	 * head's live cell, ahead of the publish.
+	 * It gets a fresh cell instead (step 2), and the byte goes there.
 	 * ☞ ft_head_stamp_incoming_byte's header.
 	 *
 	 * ☠ MEASURED, all four builds.  The SLOT-only stamp is what left it:
@@ -8859,57 +8884,17 @@ cells_done:
 	 * after the next ordinary mutation.  So "does this landing read it"
 	 * is never the right question.
 	 */
-	if (s_top_external && ft->ordered_list) {
-		void *head_prev = ft_dereference_prev_resolved(
-			(struct cds_ft_node *) s_top);
-
-		/*
-		 * ☠ ONLY A DUPLICATE-CHAIN HEAD OWNS A CELL.  The order links
-		 * live in a cell "hung off each duplicate-chain head's
-		 * cds_ft_node.prev" (fractal-trie-internal.h,
-		 * @ordered_list_set).  A head that COLLIDED with a key already
-		 * at the destination is spliced onto that key's chain and
-		 * DEMOTED.  Its prev then names its chain predecessor, not a
-		 * cell.  It needs no byte either: the walk materialises the
-		 * whole chain from the CHAIN HEAD's cell.
-		 *
-		 * FT_ORD_CELL_TAG decides it and is unambiguous by
-		 * construction.  The cell arena is
-		 * 1<<FT_ORD_CELL_ALLOC_ORDER-aligned, so a cell keeps bits 0-2
-		 * clear.  A leaf pointer has bit 0 clear.
-		 *
-		 * MEASURED without this:
-		 *     {"ab" a bare head, "b" already a key}
-		 *     rekey_merge(dst "b", src "ab")
-		 * SEGVs in cds_ft_item_to_metadata.  prev was the predecessor
-		 * LEAF (tag 0), read as a cell.  A 3000-shape corpus walk
-		 * oracle found it, not the unit tests.
-		 */
-		/*
-		 * ☠ AND NOT FOR A HEAD THIS COMMIT DEMOTES.  The tag test used
-		 * to decide that by itself.  The splice STORED the demotion
-		 * (prev = its chain predecessor, a leaf) at prepare time.  Now
-		 * the demotion is a RECORD, so prev still resolves to the cell
-		 * here and the tag test passes.  Stamping that cell would put
-		 * the DST key's byte on a head that stays a head at its SOURCE
-		 * key if this commit aborts.  The walk then emits a key not in
-		 * the trie.  The splice list is the record of who is demoted.
-		 */
-		bool demoted = false;
-		int si;
-
-		for (si = 0; si < glue.nr_splices; si++)
-			if (glue.splices[si].src_head ==
-					(struct cds_ft_node *) s_top)
-				demoted = true;
-		if (fresh_cell)		/* invisible: the live cell stays */
-			cds_ft_item_to_metadata(fresh_cell)->incoming_byte =
-				dst_ord[dst_len - 1];
-		else if (!demoted && head_prev &&
-				((uintptr_t) head_prev & FT_ORD_CELL_TAG))
-			cds_ft_item_to_metadata(ft_ord_cell_ptr(head_prev))
-				->incoming_byte = dst_ord[dst_len - 1];
-	}
+	/*
+	 * Only a duplicate-chain head owns a cell (@ordered_list_set in
+	 * fractal-trie-internal.h).  A head this merge demotes stops being
+	 * one: its prev will name its chain predecessor, and the walk spells
+	 * the chain from the chain head's cell.  So such a head gets no byte.
+	 * Step 3b dropped its fresh cell.  Every other bare head on a list-on
+	 * trie has a fresh cell here.
+	 */
+	if (fresh_cell)		/* invisible: the live cell stays */
+		cds_ft_item_to_metadata(fresh_cell)->incoming_byte =
+			dst_ord[dst_len - 1];
 	/* 4. ONE commit of the whole stitch (consumes txn). */
 #ifdef FEATURE_FT_FAULT_INJECT
 	/*
