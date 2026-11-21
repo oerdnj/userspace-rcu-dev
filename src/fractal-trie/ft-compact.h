@@ -174,28 +174,27 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 	 * *holder and the old copy is frozen dead.
 	 */
 	/*
-	 * Compaction is not yet MW-hardened.  An ABORT is unreachable under
-	 * its exclusion.  The status is CHECKED all the same: there is no
-	 * recovery from an abort here, and the silent form is a use-after-free.
+	 * This commit cannot fail.  The caller excludes every peer writer, so
+	 * nothing can abort it.  Every acquire ran before it, and a failed one
+	 * bailed above.  No bail is written for a failed commit.
 	 *
-	 * On an abort the forward publish never landed.  *@holder still names
-	 * the OLD copy, so the free below would reclaim a node that is still
-	 * reader-reachable.
-	 *
-	 * Nor does this site bail instead.  No bail path is written for an
-	 * aborted commit, because the exclusion makes one unreachable.
-	 *
-	 * So the commit MUST be infallible here, which is exactly what the
-	 * exclusion buys.  ASSERT the claim rather than discard the status.
-	 * The day compaction goes MW, this fails loudly instead of freeing a
-	 * live node.
+	 * If it fails anyway, the forward publish never landed.  *@holder
+	 * still names the OLD copy, and the free below would reclaim a live
+	 * node.  So report it and abort, in every build, as
+	 * ft_flip_txn_commit_unfailable does.  Write a bail here when
+	 * compaction moves to fine-grained locking.
 	 */
 	{
 		enum urcu_txn_status st = ft_remove_commit_rec(ft, &rec, NULL,
 				NULL, txn, false);
 
-		assert(st == URCU_TXN_STATUS_OK);
-		(void) st;	/* NDEBUG: behaviour-identical to the old discard */
+		if (caa_unlikely(st != URCU_TXN_STATUS_OK)) {
+			fprintf(stderr, "FT UNFAILABLE COMMIT FAILED: status %d "
+				"in a compaction relocation -- its writer "
+				"exclusion premise is false\n", (int) st);
+			fflush(stderr);
+			abort();
+		}
 	}
 	/*
 	 * The old node was just unpublished; concurrent readers may still
