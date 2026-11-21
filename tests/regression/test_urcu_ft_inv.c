@@ -22372,6 +22372,11 @@ static const char *const rks_suffixes[] = { "mnopq1", "mnopq2", "r", "st" };
  * The bare set moves the prefix key alone.
  */
 static const char *const rks_bare[] = { "" };
+/*
+ * The merge cycle's keys: the bare key at its long home, and "Q1" and "Q2"
+ * under the short home.
+ */
+static const char *const rks_msfx[] = { "", "1", "2" };
 static const char *const *rks_sfx = rks_suffixes;
 static unsigned int rks_nsuf = RKS_NSUF;
 /*
@@ -22381,6 +22386,14 @@ static unsigned int rks_nsuf = RKS_NSUF;
  * lookup_last lands on it there.
  */
 static bool rks_across;
+/*
+ * Move the bare key with a merge into "Q", the holder of "Q1" and "Q2".  See
+ * rks_merge_cycle.  RKS_SIB, a sibling of the bare key, stays put.  It gives
+ * the bare key a parent other than the root.  So a key spelled from the old
+ * parent and the new byte is out of namespace.
+ */
+static bool rks_merge;
+#define RKS_SIB		"Kabcdefghijz"	/* RKS_LONG, last byte changed */
 
 struct rks_reader_arg {
 	struct cds_ft *ft;
@@ -22398,6 +22411,9 @@ static bool rks_key_allowed(const uint8_t *k, size_t kl)
 	if (!rks_across && kl == 2 && !memcmp(k, "Z1", 2))
 		return true;
 	if (rks_across && kl == 2 && !memcmp(k, "M1", 2))
+		return true;
+	if (rks_merge && kl == sizeof(RKS_SIB) - 1 &&
+	    !memcmp(k, RKS_SIB, kl))
 		return true;
 	for (i = 0; i < rks_nsuf; i++) {
 		size_t sl = strlen(rks_sfx[i]);
@@ -22585,6 +22601,67 @@ static void *rks_reader(void *arg)
 	return NULL;
 }
 
+/* Move @src to @dst, by a merge if @merge.  Count a failure. */
+static bool rks_move(struct cds_ft *ft, bool merge, const char *dst,
+		const char *src)
+{
+	enum cds_ft_status s;
+
+	s = (merge ? cds_ft_rekey_merge : cds_ft_rekey_graft)(ft,
+			(const uint8_t *) dst, strlen(dst),
+			(const uint8_t *) src, strlen(src));
+	if (s == CDS_FT_STATUS_OK)
+		return true;
+	fprintf(stderr, "inv_rekey_shorter_reanchor: %s %s <- %s: %s\n",
+		merge ? "merge" : "graft", dst, src,
+		cds_ft_status_to_string(s));
+	atomic_fetch_add(&violation_count, 1);
+	return false;
+}
+
+/*
+ * The merge cycle.  The merge lands the bare key on the occupied "Q", as the
+ * prefix key of "Q1" and "Q2".  Then remove "Q" and insert the bare key back
+ * at its long home.
+ */
+static bool rks_merge_cycle(struct cds_ft *ft)
+{
+	struct cds_ft_iter *iter;
+	struct cds_ft_node *found;
+	enum cds_ft_status s = CDS_FT_STATUS_NOT_FOUND;
+
+	if (!rks_move(ft, true, RKS_SHORT, RKS_LONG))
+		return false;
+	rcu_quiescent_state();
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	cds_ft_iter_set_key(iter, (const uint8_t *) RKS_SHORT,
+			sizeof(RKS_SHORT) - 1);
+	cds_ft_lookup(ft, iter);
+	found = cds_ft_iter_node(iter);
+	if (found)
+		s = cds_ft_remove(ft, iter, found);
+	if (s == CDS_FT_STATUS_OK)
+		node_free_rcu(to_test_node(found));
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	if (s == CDS_FT_STATUS_OK) {
+		rcu_read_lock();
+		s = cds_ft_insert(ft, (const uint8_t *) RKS_LONG,
+				sizeof(RKS_LONG) - 1, &node_alloc(0)->node);
+		rcu_read_unlock();
+	}
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "inv_rekey_shorter_reanchor: remove or insert: "
+			"%s\n", cds_ft_status_to_string(s));
+		atomic_fetch_add(&violation_count, 1);
+		return false;
+	}
+	rcu_quiescent_state();
+	return true;
+}
+
 static void *rks_writer(void *arg)
 {
 	struct cds_ft *ft = (struct cds_ft *) arg;
@@ -22595,6 +22672,12 @@ static void *rks_writer(void *arg)
 	while (!test_stop) {
 		enum cds_ft_status s;
 
+		if (rks_merge) {
+			if (!rks_merge_cycle(ft))
+				break;
+			rks_moves++;
+			continue;
+		}
 		s = cds_ft_rekey_graft(ft, (const uint8_t *) RKS_SHORT,
 				sizeof(RKS_SHORT) - 1, (const uint8_t *) RKS_LONG,
 				sizeof(RKS_LONG) - 1);
@@ -22621,7 +22704,7 @@ static void *rks_writer(void *arg)
 	return NULL;
 }
 
-static int rks_run(bool rank, bool bare, bool across, bool list)
+static int rks_run(bool rank, bool bare, bool across, bool list, bool merge)
 {
 	struct cds_ft_group_attr *gattr;
 	struct cds_ft_group *group;
@@ -22635,9 +22718,10 @@ static int rks_run(bool rank, bool bare, bool across, bool list)
 	int ret = 0;
 
 	ms = env ? strtoul(env, NULL, 10) : DEFAULT_DURATION_MS;
-	rks_sfx = bare ? rks_bare : rks_suffixes;
-	rks_nsuf = bare ? 1 : RKS_NSUF;
+	rks_sfx = merge ? rks_msfx : bare ? rks_bare : rks_suffixes;
+	rks_nsuf = merge ? 3 : bare ? 1 : RKS_NSUF;
 	rks_across = across;
+	rks_merge = merge;
 	atomic_store(&violation_count, 0);	/* count per run */
 	if (cds_ft_group_attr_create(&gattr) < 0)
 		return -1;
@@ -22655,10 +22739,11 @@ static int rks_run(bool rank, bool bare, bool across, bool list)
 	rcu_read_lock();
 	for (i = 0; i < rks_nsuf; i++) {
 		uint8_t k[32];
-		size_t kl = sizeof(RKS_LONG) - 1;
+		const char *pfx = merge && i ? RKS_SHORT : RKS_LONG;
+		size_t kl = strlen(pfx);
 		struct ft_test_node *n = node_alloc(i);
 
-		memcpy(k, RKS_LONG, kl);
+		memcpy(k, pfx, kl);
 		memcpy(k + kl, rks_sfx[i], strlen(rks_sfx[i]));
 		kl += strlen(rks_sfx[i]);
 		if (cds_ft_insert(ft, k, kl, &n->node) != CDS_FT_STATUS_OK)
@@ -22666,6 +22751,10 @@ static int rks_run(bool rank, bool bare, bool across, bool list)
 	}
 	if (cds_ft_insert(ft, (const uint8_t *) (across ? "M1" : "Z1"), 2,
 			&node_alloc(99)->node) != CDS_FT_STATUS_OK)
+		abort();
+	if (rks_merge && cds_ft_insert(ft, (const uint8_t *) RKS_SIB,
+			sizeof(RKS_SIB) - 1, &node_alloc(98)->node) !=
+			CDS_FT_STATUS_OK)
 		abort();
 	rcu_read_unlock();
 
@@ -22698,14 +22787,15 @@ static int rks_run(bool rank, bool bare, bool across, bool list)
 
 	rcu_read_lock();
 	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
-	    cds_ft_count_keys(ft) != rks_nsuf + 1) {
+	    cds_ft_count_keys(ft) != rks_nsuf + 1 + rks_merge) {
 		fprintf(stderr, "inv_rekey_shorter_reanchor: final trie wrong "
 			"(count %lu)\n", cds_ft_count_keys(ft));
 		ret = -1;
 	}
 	rcu_read_unlock();
-	fprintf(stderr, "# inv_rekey_shorter_reanchor[%s, %s, list %s]: "
+	fprintf(stderr, "# inv_rekey_shorter_reanchor[%s%s, %s, list %s]: "
 		"moves=%lu reader rounds=%lu violations=%lu -> %s\n",
+		merge ? "merge, " : "",
 		bare ? (across ? "bare key across M1" : "bare key") :
 			"subtree",
 		rank ? "rank" : "plain", list ? "on" : "off",
@@ -22726,12 +22816,16 @@ static int inv_rekey_shorter_reanchor(void)
 	int ret = 0, list;
 
 	for (list = 1; list >= 0; list--) {
-		ret |= rks_run(false, false, false, list);
-		ret |= rks_run(true, false, false, list);
-		ret |= rks_run(false, true, false, list);
-		ret |= rks_run(true, true, false, list);
-		ret |= rks_run(false, true, true, list);
-		ret |= rks_run(true, true, true, list);
+		ret |= rks_run(false, false, false, list, false);
+		ret |= rks_run(true, false, false, list, false);
+		ret |= rks_run(false, true, false, list, false);
+		ret |= rks_run(true, true, false, list, false);
+		ret |= rks_run(false, true, true, list, false);
+		ret |= rks_run(true, true, true, list, false);
+		if (cds_ft_merge_enabled()) {
+			ret |= rks_run(false, true, false, list, true);
+			ret |= rks_run(false, true, true, list, true);
+		}
 	}
 	return ret;
 }
