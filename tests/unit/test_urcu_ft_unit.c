@@ -69,7 +69,7 @@
 #endif
 
 /*
- * 355 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 359 unconditional + 52 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  *
  * ☠ BUMP BOTH ARMS.  A new unconditional test belongs to the fault-inject
@@ -79,7 +79,7 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (410 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (411 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
 #define NR_TESTS (359 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
@@ -33936,6 +33936,89 @@ static int test_remove_all_contended_bail(void)
 	cds_ft_group_destroy(group);
 	return rc;
 }
+
+/*
+ * The same one-shot refusal, on an iterator positioned by a WALK.
+ *
+ * On a variable-length list-on trie with no in-leaf key, a walk position
+ * spells its key with the parent up-walk.  That key sits at the TAIL of
+ * the iterator's buffer.  The retry after a refusal re-descends from the
+ * key, and the descent reads it from the FRONT.  test_remove_all_contended_bail
+ * cannot see this: set_key puts the key at the front.
+ *
+ * Drain the trie through lookup_first + remove_all, refusing every other
+ * remove.  Every call must report OK and hand back a chain.
+ */
+static int test_remove_all_contended_bail_walk(void)
+{
+	const unsigned int N = 64;
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_fine_lock_ft(&group);
+	struct cds_ft_iter *it;
+	unsigned long fired = 0, removed = 0;
+	unsigned int i;
+	int rc = 0;
+
+	for (i = 0; i < N; i++) {
+		struct ft_test_node *n = node_alloc((uint64_t) i);
+		uint8_t k[3] = { 'k', (uint8_t) (i / 8), (uint8_t) (i % 8) };
+
+		/* Keys of length 2 and 3, so some are prefixes of others. */
+		if (cds_ft_insert(ft, k, (i % 8) ? 3 : 2, &n->node) !=
+				CDS_FT_STATUS_OK)
+			abort();
+	}
+	if (cds_ft_iter_create(ft, &it) < 0)
+		abort();
+	rcu_read_lock();
+	for (i = 0; i < 2 * N && cds_ft_lookup_first(ft, it) ==
+			CDS_FT_STATUS_OK; i++) {
+		struct cds_ft_node *res = NULL, *h, *tmp;
+		enum cds_ft_status s;
+		bool armed = !(i % 2);
+
+		cds_ft_fault_removeall_countdown = armed ? 0 : -1;
+		s = cds_ft_remove_all(ft, it, &res);
+		if (armed && cds_ft_fault_removeall_countdown == -1)
+			fired++;
+		cds_ft_fault_removeall_countdown = -1;
+		if (s != CDS_FT_STATUS_OK || !res) {
+			fprintf(stderr, "remove_all contended walk: call %u "
+				"(%s) reported %s, chain %p\n", i,
+				armed ? "refused" : "unrefused",
+				cds_ft_status_to_string(s), (void *) res);
+			rc = -1;
+			break;
+		}
+		h = res;
+		cds_ft_for_each_duplicate_safe_rcu(h, tmp) {
+			node_free_rcu(to_test_node(h));
+			removed++;
+		}
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(it);
+
+	diag("remove_all contended walk: %lu refusals forced, %lu keys removed",
+		fired, removed);
+	if (!rc && fired == 0) {
+		fprintf(stderr, "remove_all contended walk: the knob never "
+			"refused an acquire -- the contention arm did not run\n");
+		rc = -1;
+	}
+	if (!rc && removed != N) {
+		fprintf(stderr, "remove_all contended walk: removed %lu of %u\n",
+			removed, N);
+		rc = -1;
+	}
+
+	cds_ft_fault_removeall_countdown = -1;
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return rc;
+}
 #endif	/* FEATURE_FT_FAULT_INJECT */
 
 #ifdef FEATURE_FT_FAULT_INJECT
@@ -41692,6 +41775,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_replace_head_oom);
 	RUN_TEST(test_compact_contended_bail);
 	RUN_TEST(test_remove_all_contended_bail);
+	RUN_TEST(test_remove_all_contended_bail_walk);
 	RUN_TEST(test_replace_family_commit_fault);
 	RUN_TEST(test_fine_lock_acquire_fault);
 	RUN_TEST(test_fine_lock_chain_acquire_fault);

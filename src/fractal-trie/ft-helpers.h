@@ -731,11 +731,22 @@ void ft_iter_drop_position_keep_key(struct cds_ft_iter *iter)
 	 *    ft_unit test 187 hit a SEGV on release, and
 	 *    `Assertion !(nf) || !ft_node_external(nf)` on --enable-rcu-debug.
 	 *
-	 * The second arm needs no materialize anyway: it derives the key from
-	 * the trie rather than from the dropped position.
+	 * The second arm needs no up-walk here.  Its key was already read
+	 * (that is how the caller knows it), so it already sits in the buffer.
+	 * But it sits at the TAIL, at @key_off.  The re-descent reads its
+	 * search key from the FRONT, so move it there.  Left at the tail, the
+	 * retry searched other bytes.  It reported NOT_FOUND for a present key
+	 * after a contended remove_all on a variable-length list-on trie.
 	 */
-	if (ft_iter_key_referenced(iter))
+	if (ft_iter_key_referenced(iter)) {
 		ft_iter_materialize_key(iter);
+	} else if (iter->key_off &&
+			iter->key_len <= iter->ft->group->max_key_len -
+				iter->key_off) {
+		memmove(iter_key(iter), iter_key(iter) + iter->key_off,
+			iter->key_len);
+		iter->key_off = 0;
+	}
 	iter->cache_valid = false;
 	iter_debug_path_clear(iter);
 	iter->path_len = 0;
