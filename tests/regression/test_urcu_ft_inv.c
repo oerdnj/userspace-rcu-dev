@@ -92,7 +92,7 @@
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
 /* +1 inv_graft_swap_whole_seam_points */
-#define NR_TESTS	(148 + NR_TESTS_REKEY_DLM)	/* +1: inv_compact_vs_rekey; +1: inv_detach_orphan_shape; +1: inv_owned_long_runs; +1: inv_owned_prefix_dense_remove_all; +1: inv_ir_prefix_roundtrip; +1: inv_owned_prefix_dense_replace; +1: inv_owned_prefix_dense; +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension; +1: inv_prefix_shape_zoo */
+#define NR_TESTS	(149 + NR_TESTS_REKEY_DLM)	/* +1: inv_compact_vs_graft; +1: inv_compact_vs_rekey; +1: inv_detach_orphan_shape; +1: inv_owned_long_runs; +1: inv_owned_prefix_dense_remove_all; +1: inv_ir_prefix_roundtrip; +1: inv_owned_prefix_dense_replace; +1: inv_owned_prefix_dense; +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension; +1: inv_prefix_shape_zoo */
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -16034,6 +16034,7 @@ retry:
 #define CR_RSS_GROWTH_MB	1024
 struct cr_mover_arg {
 	struct cds_ft *ft;
+	bool graft;	/* move with detach + graft, not cds_ft_rekey_graft */
 	unsigned int m;
 	int at_b;
 	unsigned long ops, busy;
@@ -16086,7 +16087,26 @@ static void *cr_mover(void *arg)
 		enum cds_ft_status st;
 
 		/* No read section: the move waits for a grace period. */
-		st = cds_ft_rekey_graft(a->ft, dst, 3, src, 3);
+		if (a->graft) {
+			struct cds_ft *tmp = NULL;
+
+			st = cds_ft_detach(a->ft, src, 3, &tmp);
+			if (st == CDS_FT_STATUS_OK && tmp) {
+				/* The subtree is out: put it back, whatever it takes. */
+				do {
+					st = cds_ft_graft(a->ft, dst, 3, tmp);
+					if (st == CDS_FT_STATUS_BUSY_ERROR ||
+							st == CDS_FT_STATUS_MEMORY_ERROR)
+						rcu_quiescent_state();
+				} while (st == CDS_FT_STATUS_BUSY_ERROR ||
+					st == CDS_FT_STATUS_MEMORY_ERROR);
+				cds_ft_destroy(tmp);	/* the graft consumed it */
+			} else if (st == CDS_FT_STATUS_OK) {
+				st = CDS_FT_STATUS_NOT_FOUND;	/* nothing detached */
+			}
+		} else {
+			st = cds_ft_rekey_graft(a->ft, dst, 3, src, 3);
+		}
 		if (st == CDS_FT_STATUS_OK) {
 			a->at_b = !a->at_b;
 			a->ops++;
@@ -16094,8 +16114,9 @@ static void *cr_mover(void *arg)
 				st == CDS_FT_STATUS_MEMORY_ERROR) {
 			a->busy++;
 		} else {
-			fprintf(stderr, "inv_compact_vs_rekey: mover %u: %s\n",
-				a->m, cds_ft_status_to_string(st));
+			fprintf(stderr, "inv_compact_vs_%s: mover %u: %s\n",
+				a->graft ? "graft" : "rekey", a->m,
+				cds_ft_status_to_string(st));
 			a->failed = 1;
 			break;
 		}
@@ -16122,12 +16143,11 @@ static int cr_insert(struct cds_ft *ft, const uint8_t *k, size_t len,
 	return 0;
 }
 
-static int inv_compact_vs_rekey_one(bool list_on)
+static int inv_compact_vs_bulk_one(bool list_on, bool graft)
 {
 	enum cds_ft_writer_strategy ws = CDS_FT_WRITER_LOCK_FINE;
 	struct cds_ft_group *group;
-	struct cds_ft *ft = list_on ? create_varlen_ord_ft_ws(&group, &ws)
-		: create_varlen_fine_lock_ft(&group);
+	struct cds_ft *ft;
 	pthread_t th[CR_MOVERS];
 	struct cr_mover_arg a[CR_MOVERS];
 	const char *env = getenv("FT_INV_COMPACT_REKEY_MS");
@@ -16138,8 +16158,21 @@ static int inv_compact_vs_rekey_one(bool list_on)
 	struct cds_ft_iter *iter;
 	struct timespec t0;
 	unsigned int i, m, l;
+	const char *name = graft ? "inv_compact_vs_graft" :
+		"inv_compact_vs_rekey";
 	int ret = 0;
 
+	/*
+	 * A rekey needs an EAGER trie, which has no skip pointers.  A
+	 * SPECULATIVE trie keeps them, so compaction relocates skip targets
+	 * there.
+	 */
+	if (graft)
+		ft = list_on ? create_varlen_ord_ft_ws_spec(&group, &ws)
+			: create_varlen_nolist_ft_ws_spec(&group, &ws);
+	else
+		ft = list_on ? create_varlen_ord_ft_ws(&group, &ws)
+			: create_varlen_fine_lock_ft(&group);
 	if (cds_ft_iter_create(ft, &iter) < 0)
 		abort();
 	for (m = 0; m < CR_MOVERS; m++)
@@ -16185,6 +16218,7 @@ static int inv_compact_vs_rekey_one(bool list_on)
 	for (m = 0; m < CR_MOVERS; m++) {
 		memset(&a[m], 0, sizeof(a[m]));
 		a[m].ft = ft;
+		a[m].graft = graft;
 		a[m].m = m;
 		pthread_create(&th[m], NULL, cr_mover, &a[m]);
 	}
@@ -16217,9 +16251,8 @@ static int inv_compact_vs_rekey_one(bool list_on)
 		if (rss > rss_max)
 			rss_max = rss;
 		if (rss > rss0 + CR_RSS_GROWTH_MB) {
-			fprintf(stderr, "inv_compact_vs_rekey: RSS grew from "
-				"%lu MB to %lu MB in %lu passes\n", rss0, rss,
-				passes);
+			fprintf(stderr, "%s: RSS grew from %lu MB to %lu MB "
+				"in %lu passes\n", name, rss0, rss, passes);
 			ret = -1;
 			break;
 		}
@@ -16237,7 +16270,7 @@ static int inv_compact_vs_rekey_one(bool list_on)
 	rcu_thread_online();
 
 	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
-		fprintf(stderr, "inv_compact_vs_rekey: verify failed (list %s)\n",
+		fprintf(stderr, "%s: verify failed (list %s)\n", name,
 			list_on ? "on" : "off");
 		ret = -1;
 	}
@@ -16256,17 +16289,17 @@ static int inv_compact_vs_rekey_one(bool list_on)
 			}
 		}
 	rcu_read_unlock();
-	fprintf(stderr, "# inv_compact_vs_rekey list %s: %lu passes, %lu steps "
+	fprintf(stderr, "# %s list %s: %lu passes, %lu steps "
 		"(%lu stopped early), %lu moves, %lu busy, %lu keys of %lu, "
 		"%lu moved keys missing, RSS %lu -> max %lu MB\n",
-		list_on ? "on" : "off", passes, steps, stopped, ops, busy,
+		name, list_on ? "on" : "off", passes, steps, stopped, ops, busy,
 		nr_keys, want_keys, missing, rss0, rss_max);
 	if (nr_keys != want_keys || missing) {
-		fprintf(stderr, "inv_compact_vs_rekey: keys lost or misplaced\n");
+		fprintf(stderr, "%s: keys lost or misplaced\n", name);
 		ret = -1;
 	}
 	if (ops == 0 || passes == 0) {
-		fprintf(stderr, "inv_compact_vs_rekey: no moves or no passes\n");
+		fprintf(stderr, "%s: no moves or no passes\n", name);
 		ret = -1;
 	}
 	cds_ft_iter_destroy(iter);
@@ -16280,9 +16313,26 @@ static int inv_compact_vs_rekey(void)
 {
 	int ret = 0;
 
-	if (inv_compact_vs_rekey_one(true))
+	if (inv_compact_vs_bulk_one(true, false))
 		ret = -1;
-	if (inv_compact_vs_rekey_one(false))
+	if (inv_compact_vs_bulk_one(false, false))
+		ret = -1;
+	return ret;
+}
+
+/*
+ * The same race with cds_ft_detach + cds_ft_graft as the bulk op, on a
+ * SPECULATIVE trie.  Its compressed runs hang under skip pointers, so
+ * compaction relocates skip targets: ft_compact_relocate_compressed with no
+ * grandparent slot.  Only the run's own locks cover that relocation.
+ */
+static int inv_compact_vs_graft(void)
+{
+	int ret = 0;
+
+	if (inv_compact_vs_bulk_one(true, true))
+		ret = -1;
+	if (inv_compact_vs_bulk_one(false, true))
 		ret = -1;
 	return ret;
 }
@@ -30417,6 +30467,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_concurrent_insert_unique_prefix);
 	RUN_TEST(inv_detach_orphan_shape);
 	RUN_TEST(inv_compact_vs_rekey);
+	RUN_TEST(inv_compact_vs_graft);
 	RUN_TEST(inv_prefix_dup_promote_vs_extension);
 	RUN_TEST(inv_prefix_shape_zoo);
 	RUN_TEST(inv_owned_prefix_dense);
