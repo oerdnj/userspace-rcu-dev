@@ -460,8 +460,8 @@ enum cds_ft_status cds_ft_lookup_partial(struct cds_ft *ft,
 /*
  * Helper: derive the public-API return value for longest_match
  * from the descent result.  Sets *match_len / *result_node and
- * returns CDS_FT_STATUS_OK / NOT_FOUND / INTERNAL_MATCH or a
- * negative status when the descent itself failed.
+ * returns CDS_FT_STATUS_OK / INTERNAL_MATCH, NOT_FOUND for an empty
+ * trie, or a negative status when the descent itself failed.
  */
 static inline
 enum cds_ft_status ft_lookup_longest_match_key_finish(

@@ -22,11 +22,9 @@ enum ft_prefix_tracking {
 };
 
 /*
- * Sentinel value: prefix tracking never recorded a match.
- * FT_PREFIX_TRACK_LONGEST uses it to tell two cases apart:
- * - "empty trie";
- * - "matched at root with no external nodes".
- * Both have match_node == NULL.  Only the second sets match_len = 0.
+ * Match length reported when nothing matched.  FT_PREFIX_TRACK_LONGEST
+ * reports it for an empty trie only: otherwise the root matches the empty
+ * prefix, at length 0.
  */
 #define FT_MATCH_LEN_NONE	SIZE_MAX
 
@@ -223,14 +221,13 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 	bool track = (tracking != FT_PREFIX_TRACK_NONE);
 	bool track_longest = (tracking == FT_PREFIX_TRACK_LONGEST);
 	/*
-	 * Pointer-form prefix-tracking state.  @match_key_pos == NULL is
-	 * the "no match yet" sentinel.  It is track_longest's initial
-	 * state.  In the size_t form it was FT_MATCH_LEN_NONE.  Non-NULL
-	 * points into the @orig_key buffer at the matched position.  The
-	 * size_t match_len reported to the caller is the difference,
-	 * computed at end:.
+	 * Prefix-tracking state.  @match_key_pos points into @orig_key at
+	 * the matched position.  It starts at the root, which matches the
+	 * empty prefix.  The match_len reported to the caller is the
+	 * difference, computed at end:.  NULL means no match: longest-match
+	 * tracking sets it for an empty trie.
 	 */
-	const uint8_t *match_key_pos = track_longest ? NULL : orig_key;
+	const uint8_t *match_key_pos = orig_key;
 	struct cds_ft_node *match_node = NULL;
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
@@ -281,6 +278,9 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		if (track) {
 			match_key_pos = orig_key;
 			match_node = found;
+			if (track_longest && !found &&
+			    !ft_meta_nr_child_load(metadata))
+				match_key_pos = NULL;	/* empty trie */
 		}
 		goto end;
 	}
@@ -300,6 +300,9 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 			match_key_pos = orig_key;
 			match_node = external_nodes;
 		}
+		if (track_longest && !external_nodes &&
+		    !ft_meta_nr_child_load(metadata))
+			match_key_pos = NULL;	/* empty trie */
 	}
 
 	/*

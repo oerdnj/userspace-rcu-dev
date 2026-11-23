@@ -962,19 +962,21 @@ enum cds_ft_status cds_ft_lookup_partial_key(struct cds_ft *ft,
  *             This is the deepest position in the trie that matches
  *             a prefix of @key, including internal nodes with no
  *             external nodes attached. The matching sub-key is the
- *             first @match_len bytes of @key.
+ *             first @match_len bytes of @key. The root matches the
+ *             empty prefix, so @match_len is 0 when no byte of @key
+ *             matches. It is also 0 for an empty trie.
  * @result_node: Node output. Set to the first node of a duplicate chain
  *               if the longest match has an external node (status is
  *               CDS_FT_STATUS_OK). Set to NULL if the longest match
  *               ends at an internal node (status is
- *               CDS_FT_STATUS_INTERNAL_MATCH), if no match is found,
+ *               CDS_FT_STATUS_INTERNAL_MATCH), if the trie is empty,
  *               or on error.
  *
  * Returns CDS_FT_STATUS_OK if the longest match has an external node.
+ * At length 0, this is a stored zero-length key.
  * Returns CDS_FT_STATUS_INTERNAL_MATCH if the longest match ends at
  * an internal node with no external nodes attached.
- * Returns CDS_FT_STATUS_NOT_FOUND if no prefix of @key matches any
- * node in the trie.
+ * Returns CDS_FT_STATUS_NOT_FOUND if the trie is empty.
  * Returns a negative cds_ft_status on error.
  *
  * An RCU read-side lock must be held while calling this function and
@@ -1061,13 +1063,16 @@ enum cds_ft_status cds_ft_lookup_partial(struct cds_ft *ft,
  *          of a duplicate chain (status is CDS_FT_STATUS_OK);
  *        - the longest match ends at an internal node: NULL
  *          (status is CDS_FT_STATUS_INTERNAL_MATCH).
+ *        The root matches the empty prefix, so the key length is 0
+ *        when no byte of the key matches.
  *        The cached position is populated.
  *
  * Returns CDS_FT_STATUS_OK if the longest match has an external node.
+ * At length 0, this is a stored zero-length key.
  * Returns CDS_FT_STATUS_INTERNAL_MATCH if the longest match ends at
  * an internal node with no external nodes attached.
- * Returns CDS_FT_STATUS_NOT_FOUND if no prefix of the iterator's key
- * matches any node in the trie.
+ * Returns CDS_FT_STATUS_NOT_FOUND if the trie is empty. The result
+ * node is then NULL.
  * Returns a negative cds_ft_status on error.
  * The status is also stored in the iterator (cds_ft_iter_status()).
  */

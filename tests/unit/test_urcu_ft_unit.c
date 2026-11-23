@@ -69,7 +69,7 @@
 #endif
 
 /*
- * 360 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
+ * 364 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  *
  * ☠ BUMP BOTH ARMS.  A new unconditional test belongs to the fault-inject
@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (416 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (417 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (363 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (364 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -9036,6 +9036,105 @@ fail:
 		cds_ft_iter_destroy(iter);
 	drain_and_destroy(ft, group);
 	return -1;
+}
+
+/*
+ * Check one longest match at the root, in both forms: length 0, and @nil
+ * as the node (NULL unless a zero-length key is stored).  An @empty trie
+ * gives NOT_FOUND.
+ */
+static int lm_root_check(struct cds_ft *ft, struct cds_ft_iter *iter,
+		const char *what, const char *key, struct cds_ft_node *nil,
+		bool empty)
+{
+	enum cds_ft_status want = empty ? CDS_FT_STATUS_NOT_FOUND :
+		nil ? CDS_FT_STATUS_OK : CDS_FT_STATUS_INTERNAL_MATCH;
+	size_t len = strlen(key), match_len = 1, kl = 1;
+	struct cds_ft_node *found = NULL;
+	enum cds_ft_status s;
+	uint8_t k[32];
+
+	s = cds_ft_lookup_longest_match_key(ft, (const uint8_t *) key, len,
+			&match_len, &found);
+	if (s != want || match_len != 0 || found != nil) {
+		fprintf(stderr, "longest_match_key %s '%s': %s len %zu node %p, "
+			"expected %s len 0 node %p\n", what, key,
+			cds_ft_status_to_string(s), match_len, (void *) found,
+			cds_ft_status_to_string(want), (void *) nil);
+		return -1;
+	}
+	cds_ft_iter_set_key(iter, (const uint8_t *) key, len);
+	s = cds_ft_lookup_longest_match(ft, iter);
+	cds_ft_iter_get_key(iter, k, sizeof(k), &kl);
+	if (s != want || (!empty && kl != 0) ||
+	    cds_ft_iter_node(iter) != nil) {
+		fprintf(stderr, "longest_match %s '%s': %s len %zu, "
+			"expected %s len 0\n", what, key,
+			cds_ft_status_to_string(s), kl,
+			cds_ft_status_to_string(want));
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * One pass of test_lookup_longest_match_root.  With @with_key, check an
+ * empty trie, then one key, then the same with an empty key.  Without it,
+ * store only the empty key: the root then has no child, yet the trie is
+ * not empty.
+ */
+static int lm_root_run(bool with_key)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
+	struct cds_ft_iter *iter = NULL;
+	struct ft_test_node *nil;
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		goto fail;
+	rcu_read_lock();
+	if (lm_root_check(ft, iter, "empty", "Z", NULL, true) < 0 ||
+	    lm_root_check(ft, iter, "empty", "", NULL, true) < 0)
+		goto unlock_fail;
+	if (with_key) {
+		if (cds_ft_insert(ft, (const uint8_t *) "Kabcdefghijk", 12,
+				&node_alloc(1)->node) < 0)
+			goto unlock_fail;
+		if (lm_root_check(ft, iter, "one key", "Z", NULL, false) < 0 ||
+		    lm_root_check(ft, iter, "one key", "", NULL, false) < 0)
+			goto unlock_fail;
+	}
+	nil = node_alloc(0);
+	if (cds_ft_insert(ft, NULL, 0, &nil->node) < 0) {
+		node_free(nil);
+		goto unlock_fail;
+	}
+	if (lm_root_check(ft, iter, "empty key", "Z", &nil->node, false) < 0 ||
+	    lm_root_check(ft, iter, "empty key", "", &nil->node, false) < 0)
+		goto unlock_fail;
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+
+unlock_fail:
+	rcu_read_unlock();
+fail:
+	if (iter)
+		cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+/*
+ * lookup_longest_match where no byte of the key matches: the match is the
+ * root, at length 0.  The status says whether a zero-length key is stored.
+ * An empty trie has no match: NOT_FOUND.
+ */
+static int test_lookup_longest_match_root(void)
+{
+	if (lm_root_run(true) < 0)
+		return -1;
+	return lm_root_run(false);
 }
 
 /*
@@ -42032,6 +42131,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_lookup_partial);
 	RUN_TEST(test_lookup_longest_match);
 	RUN_TEST(test_lookup_longest_match_in_compressed);
+	RUN_TEST(test_lookup_longest_match_root);
 	RUN_TEST(test_lookup_relational);
 	RUN_TEST(test_lookup_first_last);
 
