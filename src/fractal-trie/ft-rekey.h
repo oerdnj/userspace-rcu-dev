@@ -562,7 +562,7 @@ int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 					/* Needs an earlier MW @pr: see FT_GUARD_STOP. */
 					FT_GUARD_STOP("rekey re-home parent word",
 						&cm->parent_word);
-					ft_flip_txn_record_tag_mw(txn,
+					ft_flip_txn_record_tag_excluded(txn,
 						(void **) &cm->parent_word, old_pw,
 						new_pw, FT_FLIP_PROXY_TAG
 						FT_TK_MWA(FT_TK_MWA_PARENT_WORD));
@@ -591,7 +591,7 @@ int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 
 					FT_GUARD_STOP("rekey re-home guard",
 						&cm->state);
-					ft_flip_txn_record_state_mw(txn, cm,
+					ft_flip_txn_record_state_excluded(txn, cm,
 						(void *) live, (void *) live);
 				}
 				return 0;
@@ -4749,8 +4749,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * false for exactly these edges. ft_ord_cell_record_into dispatches
 	 * on ft_edge_tag(). ft_edge_tag maps tag 0 -> FT_FLIP_PROXY_TAG.
 	 * That takes the ft_flip_txn_record_tag branch, which honours
-	 * structural_sw, not ft_flip_txn_record_tag_mw.  Only a non-zero
-	 * (ordered-cell) tag is forced MW.  What actually makes the
+	 * structural_sw, not ft_flip_txn_record_tag_excluded.  Only a non-zero
+	 * (ordered-cell) tag goes to the latter.  What actually makes the
 	 * src-junction edges safe here is the exclusive-source gate, not the
 	 * record path. So do not weaken that gate on the strength of the old
 	 * sentence.

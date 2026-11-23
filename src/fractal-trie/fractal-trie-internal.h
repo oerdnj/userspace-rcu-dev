@@ -1359,7 +1359,7 @@ struct ft_pub_rec {
  * INVARIANT this relies on (exhaustively audited 2026-07-23): NO op calls
  * these standalone primitives on a node it ITSELF holds LOCK on.  A LOCK-held
  * node's count / offset change always rides the flip-txn as a RECORDED edge
- * (ft_flip_txn_record_tag_mw / ft_flip_txn_record_release_lock /
+ * (ft_flip_txn_record_tag_excluded / ft_flip_txn_record_release_lock /
  * ft_flip_txn_record_count_parent), never these primitives.  So the spin is
  * on a PEER's lock only and cannot self-deadlock.  A future guard->lock
  * conversion must not route a locked node's nr_child through these

@@ -2613,7 +2613,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		 *
 		 * ft_ord_cell_record_into_ft dispatches BY TAG instead: a
 		 * structural edge keeps the owner-checked path, and a CELL /
-		 * hlist edge goes to record_tag_mw as FT_TK_MWA_CELL -- the
+		 * hlist edge goes to record_tag_excluded as FT_TK_MWA_CELL -- the
 		 * ordered list's [DESIGN] MW class, which it was all along.
 		 * So the edges stop being counted as an exclusion gap because
 		 * they stop being ON the conversion surface, which is the

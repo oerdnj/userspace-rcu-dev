@@ -3331,16 +3331,13 @@ struct ft_flip_txn {
 	 * plain locked park that CANNOT fail.  The op holds the DLM node lock
 	 * over each of those slots, so no peer mutates them.
 	 *
-	 * The genuinely-unlocked edges opt back out to MW via
-	 * ft_flip_txn_record_tag_mw:
+	 * The edges that no node lock covers go through
+	 * ft_flip_txn_record_tag_excluded instead:
 	 *  - the ordered-cell interleave;
 	 *  - the duplicate-chain splices;
 	 *  - the rank-count propagation up unlocked ancestors.
-	 *
-	 * The mixed commit then installs the MW edges FIRST.  They can
-	 * conflict, which gives a clean abort with ZERO structural parks.  It
-	 * parks the SW structure last, just before the flip.  Default false
-	 * keeps every non-opted-in op all-MW == byte-identical.
+	 * It parks them SW where the trie excludes writers, and aborts
+	 * otherwise (FT_STRUCT_SW_STRICT).
 	 */
 	bool structural_sw;
 	/*
@@ -10480,7 +10477,7 @@ void ft_flip_txn_record_unheld_edge(struct ft_flip_txn *t,
 /*
  * A record that is neither owned nor excluded aborts in every build.  The flip
  * txn records SW only.  No record of the suites reaches the MW branch of
- * __ft_flip_txn_record_tag_ctx or of __ft_flip_txn_record_tag_mw, and the
+ * __ft_flip_txn_record_tag_ctx or of __ft_flip_txn_record_tag_excluded, and the
  * DEBUG_RCU trap there only covers debug builds.  An ablation build that
  * restores MW on purpose defines FT_ALLOW_MW_RECORDS or
  * NO_FT_STRUCT_SW_STRICT.  The red controls send every record to the MW
@@ -10965,13 +10962,12 @@ void ft_flip_txn_record_tag(struct ft_flip_txn *t,
 }
 
 /*
- * Record an edge that is ALWAYS MW-kind, regardless of the txn's structural_sw
- * mode: the genuinely-unlocked slots -- the ordered-cell interleave edges, the
- * duplicate-chain splices, the rank-count propagation up unlocked ancestors.
- * Under the mixed commit these install FIRST and may conflict (a clean abort);
- * the SW structure parks only after they all succeed.  Identical to
- * ft_flip_txn_record_tag whenever structural_sw is false, so switching a
- * non-lock_fine site to it is byte-neutral.
+ * Record an edge on a slot that no node lock covers: the ordered-cell
+ * interleave edges, the duplicate-chain splices, the rank-count propagation up
+ * unlocked ancestors.  Park it SW when the trie excludes writers (coarse,
+ * exclusive, or under the FT-wide lock).  A root, a same-value validate and a
+ * record on a fine, shared trie abort under FT_STRUCT_SW_STRICT.  Without it
+ * they record MW, as this lane used to do for every record.
  */
 /*
  * ☞ HOW MUCH OF THE ALWAYS-MW SURFACE IS ALREADY ARMED SW BY DOOR 1?
@@ -11110,7 +11106,7 @@ static inline
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 __attribute__((noinline))
 #endif
-void __ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
+void __ft_flip_txn_record_tag_excluded(struct ft_flip_txn *t, void **slot,
 		void *old_ptr, void *new_ptr, uintptr_t tag,
 		bool pinned FT_TK_MWA_PARAM)
 {
@@ -11234,24 +11230,25 @@ void __ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
 }
 
 static inline
-void ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
+void ft_flip_txn_record_tag_excluded(struct ft_flip_txn *t, void **slot,
 		void *old_ptr, void *new_ptr, uintptr_t tag FT_TK_MWA_PARAM)
 {
-	__ft_flip_txn_record_tag_mw(t, slot, old_ptr, new_ptr, tag,
+	__ft_flip_txn_record_tag_excluded(t, slot, old_ptr, new_ptr, tag,
 		false FT_TK_MWA(dbg_mwa));
 }
 
 /*
- * THE PINNED TWIN: MW whatever the trie is.  It has one caller,
- * ft_flip_txn_record_root.  A root's rule "is a property of the SLOT, not of
- * the txn's named trie".  That is what lets a cross-trie dual record two roots
- * MW while its own trie's content parks SW.  See that function.
+ * THE PINNED TWIN: it never parks, whatever the trie is.  It has one caller,
+ * ft_flip_txn_record_root, and only for a root record that the root checks
+ * would refuse.  A root's rule "is a property of the SLOT, not of the txn's
+ * named trie".  So the record aborts under FT_STRUCT_SW_STRICT and records MW
+ * without it.  See that function.
  */
 static inline
-void ft_flip_txn_record_tag_mw_pinned(struct ft_flip_txn *t, void **slot,
+void ft_flip_txn_record_tag_pinned(struct ft_flip_txn *t, void **slot,
 		void *old_ptr, void *new_ptr, uintptr_t tag FT_TK_MWA_PARAM)
 {
-	__ft_flip_txn_record_tag_mw(t, slot, old_ptr, new_ptr, tag,
+	__ft_flip_txn_record_tag_excluded(t, slot, old_ptr, new_ptr, tag,
 		true FT_TK_MWA(dbg_mwa));
 }
 
@@ -11339,7 +11336,8 @@ enum { FT_RTAKE_CALL, FT_RTAKE_HELD, FT_RTAKE_TOOK, FT_RTAKE_MISS,
  *   - That trie is COARSE or EXCLUSIVE: park SW.
  *   - Otherwise the trie is FINE and shared, and @t does not hold its
  *     @root_lock.  Abort under FT_ROOT_OWNED_STRICT, the default.  Without
- *     it, record MW through ft_flip_txn_record_tag_mw_pinned.
+ *     it, record through ft_flip_txn_record_tag_pinned.  That aborts too,
+ *     unless NO_FT_STRUCT_SW_STRICT is also set.
  * A validate (old == new) aborts first, under FT_ROOT_OWNED_STRICT.  No
  * producer records one: a probe counted none in ft_unit and ft_inv.
  * -DFT_DEBUG_ROOT_VALIDATE_PLANT fails that check on the first root record:
@@ -11501,7 +11499,7 @@ void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
 		}
 	}
 pinned:
-	ft_flip_txn_record_tag_mw_pinned(t, slot, old_ptr, new_ptr,
+	ft_flip_txn_record_tag_pinned(t, slot, old_ptr, new_ptr,
 		FT_FLIP_PROXY_TAG FT_TK_MWA(FT_TK_MWA_ROOT));
 }
 
@@ -12046,7 +12044,7 @@ static void ft_be_site_report(void)
 
 /*
  * An EXTERNAL HEAD's BACK CHANNEL re-pointed at a new parent: cell->parent with
- * the ordered list on, en->prev with it off.  ALWAYS MW, for the reason
+ * the ordered list on, en->prev with it off.  Never a per-op park, for the reason
  * ft_flip_txn_record_parent_word decides per record on @child_held -- a
  * structural edge may park SW only where the op holds the DLM lock over the
  * slot, and here it never can, because neither an external node nor its cell
@@ -12057,8 +12055,8 @@ static void ft_be_site_report(void)
  * Parking it would claim an exclusion the op does not have -- two ops re-homing
  * one head both park, neither fails, and the last install wins.  MW makes the
  * second writer's expected-old mismatch and abort, which the retry lane exists
- * to absorb.  Byte-identical on an unarmed txn (there record_tag IS
- * record_tag_mw); what it changes is that an ARMED op cannot park this word.
+ * to absorb.  So it goes through ft_flip_txn_record_tag_excluded: it parks only
+ * where the trie excludes writers, and aborts otherwise.
  *
  * ☞ This settles the KIND, and only the kind.  WHO owns the back edge --
  * FT_OWNER_NONE_EXTERNAL_HEAD's design question, the model's §8.2 assigning
@@ -12124,7 +12122,7 @@ void ft_flip_txn_record_head_back_edge_owned(struct ft_flip_txn *t, void **slot,
 			old_ptr, new_ptr, FT_FLIP_PROXY_TAG);
 		return;
 	}
-	ft_flip_txn_record_tag_mw(t, slot, old_ptr, new_ptr,
+	ft_flip_txn_record_tag_excluded(t, slot, old_ptr, new_ptr,
 		FT_FLIP_PROXY_TAG FT_TK_MWA(FT_TK_MWA_HEAD_BACK));
 }
 
@@ -12568,7 +12566,7 @@ void ft_flip_txn_record_pub_rec(struct ft_flip_txn *t,
  */
 #define ft_flip_txn_record_state_ctx(t, ctx, meta, o, n)			\
 	ft_flip_txn_record_state_kind_ctx((t), (ctx), (meta), (o), (n), 1)
-#define ft_flip_txn_record_state_mw(t, meta, o, n)			\
+#define ft_flip_txn_record_state_excluded(t, meta, o, n)			\
 	ft_flip_txn_record_state_kind((t), (meta), (o), (n), 0)
 
 static inline
@@ -12620,7 +12618,7 @@ void ft_flip_txn_record_state_kind_ctx(struct ft_flip_txn *t,
 			(void **) &meta->state,
 			old_ptr, new_ptr, FT_STATE_PROXY);
 	else
-		ft_flip_txn_record_tag_mw(t, (void **) &meta->state,
+		ft_flip_txn_record_tag_excluded(t, (void **) &meta->state,
 			old_ptr, new_ptr, FT_STATE_PROXY
 			FT_TK_MWA(FT_TK_MWA_STATE));
 	/*
@@ -16437,7 +16435,7 @@ void ft_flip_txn_record_nr_child_inc(struct ft_flip_txn *t,
 #ifndef FT_DEBUG_COUNT_SW_ON_ANCHOR
 	/* SW only on a word this commit holds itself: see ft_flip_txn_owns_state_word. */
 	if (!ft_flip_txn_owns_state_word(t, meta)) {
-		ft_flip_txn_record_state_mw(t, meta,
+		ft_flip_txn_record_state_excluded(t, meta,
 			(void *) live, (void *) (live + FT_STATE_NR_CHILD_ONE));
 		return;
 	}
@@ -19720,7 +19718,7 @@ void ft_flip_txn_guard_installed_child(struct cds_ft *ft, struct ft_flip_txn *t,
 		(void **) &meta->state, FT_STATE_PROXY);
 	live_state = old_state & ~(FT_STATE_TOMBSTONE | FT_STATE_LOCK);
 	/*
-	 * Spelled as the record_tag_mw that the record_state_mw macro
+	 * Spelled as the record_tag_excluded that the record_state_excluded macro
 	 * expands to.  The only reason is to let this guard name its own
 	 * always-MW class.  This guard and the recompaction sweep's child
 	 * validate have the same shape: {live -> live} on a word the op does
@@ -19728,7 +19726,7 @@ void ft_flip_txn_guard_installed_child(struct cds_ft *ft, struct ft_flip_txn *t,
 	 * stop one number from covering both.
 	 */
 	FT_GUARD_STOP("installed-child guard", &meta->state);
-	ft_flip_txn_record_tag_mw(t, (void **) &meta->state,
+	ft_flip_txn_record_tag_excluded(t, (void **) &meta->state,
 		(void *) live_state, (void *) live_state, FT_STATE_PROXY
 		FT_TK_MWA(FT_TK_MWA_GUARD));
 }
@@ -19787,7 +19785,7 @@ void ft_ord_cell_record_into_ft(struct cds_ft *ft, struct ft_flip_txn *t,
 					(void *) edges[i].old_target,
 					(void *) edges[i].new_target, tag);
 			else
-				ft_flip_txn_record_tag_mw(t,
+				ft_flip_txn_record_tag_excluded(t,
 					(void **) edges[i].slot,
 					(void *) edges[i].old_target,
 					(void *) edges[i].new_target, tag
@@ -19806,15 +19804,12 @@ void ft_ord_cell_record_into_ft(struct cds_ft *ft, struct ft_flip_txn *t,
  * Per-edge SW/MW by tag: a STRUCTURAL trie edge (tag unset -> ft_edge_tag ==
  * FT_FLIP_PROXY_TAG) goes through ft_flip_txn_record_tag, so it parks SW when @t
  * opted into structural_sw; a CELL / hlist edge (URCU_TXN_TAG) goes through
- * record_tag_mw (ALWAYS MW -- the ordered list stays lock-free, a cell conflict
- * aborts the mixed commit clean).  The src-unlink these edges express is the
+ * record_tag_excluded (no node lock covers a cell, so it parks only where the trie
+ * excludes writers).  The src-unlink these edges express is the
  * default-build detach, which RECOMPACTS the src junction: the recompaction holds
  * the rebuilt node's node lock AND (via the fold's parent_held coordination)
  * the shared spine parent it republishes into, so the structural forward-publish /
- * re-parent edges are legitimately SW.  (Byte-identical to ft_ord_cell_flip_into's
- * record loop when structural_sw is false -- record_tag == record_tag_mw -- so the
- * FEATURE_FT_INSERT_IN_PLACE single-writer in-place delete, which is unlocked but
- * has no concurrent peer, is equally fine either way.)  @t must be pre-reserved
+ * re-parent edges are legitimately SW.  @t must be pre-reserved
  * for >= @n edges (record cannot fail).  No commit here => the run-arm
  * (ft_ord_cell_run_install) a self-committing flip does inline must be deferred by
  * the caller to its post-commit finalize.
@@ -20998,7 +20993,7 @@ freeze_done:
 				 * tag is spelled explicitly here, so that
 				 * the untagged-edge default cannot reach it.
 				 */
-				ft_flip_txn_record_tag_mw(txn,
+				ft_flip_txn_record_tag_excluded(txn,
 					(void **) &state_meta->state,
 					(void *) live,
 					(void *) (live - FT_STATE_NR_CHILD_ONE),
@@ -22705,15 +22700,13 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 
 		/*
 		 * The count propagates up UNLOCKED ancestors, so a peer writer
-		 * may race a count on the same word.  Keep these MW, so that
-		 * the CAS detects it and a mixed commit aborts cleanly
-		 * (re-descend).  Never use an SW park, which would clobber
-		 * the peer's delta.  Byte-identical to record_tag while no
-		 * caller has opted structural_sw in.
+		 * may race a count on the same word.  An SW park there would
+		 * clobber the peer's delta.
 		 *
 		 * ☞ "NEVER AN SW PARK" IS A STATEMENT ABOUT A TRIE WITH PEERS.
-		 * ft_flip_txn_record_tag_mw now parks on a COARSE or EXCLUSIVE
-		 * trie (door 1).  There the sentence above has no subject.
+		 * ft_flip_txn_record_tag_excluded parks on a COARSE or EXCLUSIVE
+		 * trie (door 1), and aborts on a fine, shared one.  Where it
+		 * parks, the sentence above has no subject.
 		 * No peer writer exists whose delta could be clobbered: every
 		 * writer is behind the FT-wide mutex or the caller's
 		 * single-writer contract.
@@ -22734,7 +22727,7 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 		 * FT_SS_FOLD_BEGIN).
 		 */
 		FT_SS_FOLD_BEGIN();
-		ft_flip_txn_record_tag_mw(t, (void **) &m->nr_keys,
+		ft_flip_txn_record_tag_excluded(t, (void **) &m->nr_keys,
 			(void *) old_raw, (void *) new_raw,
 			FT_NR_KEYS_PROXY_TAG
 			FT_TK_MWA(FT_TK_MWA_RANK));
@@ -25079,9 +25072,6 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 *    BELOW the child (lost count), or a fresh lock acquire (stolen
 	 *    lock).  Neither C's lock nor P's excludes either one.
 	 *
-	 * Byte-neutral for every non-fold caller: with structural_sw false,
-	 * record_tag IS record_tag_mw.
-	 *
 	 * The alternative is to MARK the sweep's children instead of
 	 * validating.  It was implemented in full and does NOT live.  A
 	 * contended child fails the acquire, and escalation cannot rescue
@@ -25172,7 +25162,7 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 			lv_self, lv_held);
 #endif
 		FT_GUARD_STOP("re-parent guard", &meta->state);
-		ft_flip_txn_record_state_mw(txn, meta,
+		ft_flip_txn_record_state_excluded(txn, meta,
 			(void *) live_state, (void *) live_state);
 	}
 	/*

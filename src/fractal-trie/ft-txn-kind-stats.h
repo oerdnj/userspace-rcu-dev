@@ -43,9 +43,10 @@
  *               the slot is not the &ft->root exemption).  Already converted.
  *   MW_STRUCT   a structural edge recorded MW because the txn is not armed.
  *               THE CONVERSION SURFACE.
- *   MW_ALWAYS   ft_flip_txn_record_tag_mw: the genuinely-unlocked slots --
- *               ordered-cell interleave, duplicate-chain splices, rank-count
- *               propagation.  Stays MW by design.
+ *   MW_ALWAYS   ft_flip_txn_record_tag_excluded: the slots no node lock
+ *               covers -- ordered-cell interleave, duplicate-chain splices,
+ *               rank-count propagation.  It parks SW where the trie excludes
+ *               writers and aborts otherwise.  The class keeps its old name.
  *   MW_LOCK     the DLM lock take.  MUST stay MW; ft_dlm_lock asserts it.
  *   VALIDATE    a read-set guard (back-edge / anchor state).  Not a store; it
  *               can abort a commit, which is why it is worth seeing beside the
@@ -253,7 +254,7 @@ unsigned long ft_tk_ret_held_us, ft_tk_ret_held_other,
  *
  * ONE CLASS PER RECORD BRANCH, declared by the branch itself.  There is no
  * default.  In the instrumented build, the class is a required argument of
- * ft_flip_txn_record_tag_mw.  So a new always-MW branch cannot be added
+ * ft_flip_txn_record_tag_excluded.  So a new caller of it cannot be added
  * without saying which population it joins.  @owner_held uses the same
  * compiler-enforced discipline.  The classes are:
  *
@@ -2205,7 +2206,7 @@ static void ft_tk_miss_pc_report(void)
  * always-constant argument is free at runtime.  But it still moves the
  * compiler's inlining decisions.  This instrument must not perturb the paths
  * it measures.  It is written as a TRAILING pair so that a call site reads:
- * ft_flip_txn_record_tag_mw(t, slot, o, n, tag FT_TK_MWA(FT_TK_MWA_ROOT)).
+ * ft_flip_txn_record_tag_excluded(t, slot, o, n, tag FT_TK_MWA(FT_TK_MWA_ROOT)).
  */
 #define FT_TK_MWA_PARAM			, enum ft_tk_mwa_class dbg_mwa
 #define FT_TK_MWA(c)			, (c)
