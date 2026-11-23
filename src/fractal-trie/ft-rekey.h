@@ -562,10 +562,6 @@ int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 					/* Needs an earlier MW @pr: see FT_GUARD_STOP. */
 					FT_GUARD_STOP("rekey re-home parent word",
 						&cm->parent_word);
-					ft_flip_txn_record_tag_excluded(txn,
-						(void **) &cm->parent_word, old_pw,
-						new_pw, FT_FLIP_PROXY_TAG
-						FT_TK_MWA(FT_TK_MWA_PARENT_WORD));
 				}
 				/*
 				 * The state word has three cases:
@@ -584,15 +580,8 @@ int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 						!ft_txn_recorded(txn->mtxn,
 							(void **) &cm->state) &&
 						!ft_flip_txn_releases_after(txn, cm)) {
-					uintptr_t live = (uintptr_t) ft_txn_load(
-						txn->mtxn, (void **) &cm->state,
-						FT_STATE_PROXY) &
-						~(FT_STATE_TOMBSTONE | FT_STATE_LOCK);
-
 					FT_GUARD_STOP("rekey re-home guard",
 						&cm->state);
-					ft_flip_txn_record_state_excluded(txn, cm,
-						(void *) live, (void *) live);
 				}
 				return 0;
 			}
@@ -8560,13 +8549,9 @@ detach_bail:
 			 * (a park cannot fail).  MEASURED before
 			 * (FT_DEBUG_MW_KEPT, ft_inv MW per run): these two
 			 * were the whole bulk-window residue, CELL ~24k.
-			 * -DFT_DEBUG_REKEY_KEEP_POS_VALIDATE records them
-			 * anyway.
 			 */
 			cn = 0;
-#ifndef FT_DEBUG_REKEY_KEEP_POS_VALIDATE
 			if (!ft_flip_txn_excludes_all(txn, ft))
-#endif
 			{
 				cedges[0].tag = URCU_TXN_TAG;
 				cedges[0].slot = (struct ft_ord_cell **)
@@ -8675,14 +8660,13 @@ detach_bail:
 				free(iedges);
 				goto cells_bail;
 			}
-#ifndef FT_DEBUG_REKEY_KEEP_POS_VALIDATE
 			/*
 			 * The interleave's VALIDATE edges (old == new) guard
 			 * against a peer splicing in between.  Under
 			 * trie-wide exclusion there is no such peer, and a
 			 * validate stays a CAS even there.  This is the
-			 * keep-position arm's reason and the same knob.  Its
-			 * writes are kept, in order.
+			 * keep-position arm's reason.  Its writes are kept,
+			 * in order.
 			 */
 			if (ft_flip_txn_excludes_all(txn, ft)) {
 				unsigned int ii, io = 0;
@@ -8693,7 +8677,6 @@ detach_bail:
 						iedges[io++] = iedges[ii];
 				in = io;
 			}
-#endif
 			ft_ord_cell_record_into_ft(ft, txn, iedges, in);
 			free(iedges);
 			if (fresh_cell) {

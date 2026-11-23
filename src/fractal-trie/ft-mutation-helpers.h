@@ -3337,7 +3337,7 @@ struct ft_flip_txn {
 	 *  - the duplicate-chain splices;
 	 *  - the rank-count propagation up unlocked ancestors.
 	 * It parks them SW where the trie excludes writers, and aborts
-	 * otherwise (FT_STRUCT_SW_STRICT).
+	 * otherwise.
 	 */
 	bool structural_sw;
 	/*
@@ -4181,7 +4181,7 @@ bool ft_txn_content_sw_ok(const struct cds_ft *ft)
  *
  * MEASURED before (FT_DEBUG_MW_KEPT, ft_inv MW per run): 364k records
  * committed as CAS inside bulk windows (MW_STRUCT 279k, CELL 85k).  Each
- * arbitrated against nobody.  -DFT_DEBUG_WLOCK_MW restores them.
+ * arbitrated against nobody.
  * ft_flip_txn_excludes_all() already answers yes there.
  *
  * ☠ IT ARMS @trie_wide_sw ONLY, NEVER @structural_sw.  The structural arm
@@ -4194,12 +4194,7 @@ bool ft_txn_content_sw_ok(const struct cds_ft *ft)
 static inline
 bool ft_txn_bulk_window(const struct cds_ft *ft)
 {
-#ifndef FT_DEBUG_WLOCK_MW
 	return ft && ft->lock_fine && !ft->exclusive && ft_wlock_held == ft;
-#else
-	(void) ft;
-	return false;
-#endif
 }
 
 /*
@@ -9510,42 +9505,6 @@ static bool ft_flip_txn_late_last(void *arg, void **slot)
 #endif
 
 /*
- * ☠ NO MW RECORD, ENFORCED.  The flip txn is being made engine-agnostic for
- * the SW engine (<urcu/rcu-txn-sw.h>).  That engine has no CAS and cannot take
- * an MW record at all, not even one bound for a discarded txn.  After the
- * conversions every FT record is SW.  FT_DEBUG_MW_KEPT measured zero decided
- * MW on ft_inv FT_INV_MW=1 and on ft_unit.  So a record decided MW is now a
- * regression.  In a DEBUG_RCU build it aborts.  The abort message names the
- * class, the slot, the values and the producer.  -DFT_ALLOW_MW_RECORDS lifts
- * the trap.  It is for a build that enables one of the ablation knobs
- * restoring an MW record on purpose.
- */
-#if (defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG)) && \
-	!defined(FT_ALLOW_MW_RECORDS)
-static __attribute__((noinline, noreturn))
-void ft_mw_record_trap(const char *what, void **slot, void *old_ptr,
-		void *new_ptr, const void *producer)
-{
-	Dl_info di;
-
-	fprintf(stderr, "FT MW RECORD: %s slot %p {%p -> %p} producer %s+%#lx "
-		"-- the flip txn records SW only now; -DFT_ALLOW_MW_RECORDS "
-		"lifts this for an ablation build\n", what, (void *) slot,
-		old_ptr, new_ptr,
-		dladdr(producer, &di) && di.dli_fname ? di.dli_fname : "?",
-		dladdr(producer, &di) ? (unsigned long) ((const char *)
-			producer - (const char *) di.dli_fbase) : 0UL);
-	fflush(stderr);
-	abort();
-}
-# define FT_MW_RECORD_TRAP(what, slot, o, n)				\
-	ft_mw_record_trap((what), (void **) (slot), (void *) (o),	\
-		(void *) (n), __builtin_return_address(0))
-#else
-# define FT_MW_RECORD_TRAP(what, slot, o, n)	do { } while (0)
-#endif
-
-/*
  * A §4.B guard is an MW {live -> live} validate of a word the op does not
  * hold.  Ownership is taken, never observed: in the lock-before-write model
  * the op holds the word, or its trie excludes every writer.  Each guard below
@@ -9554,15 +9513,10 @@ void ft_mw_record_trap(const char *what, void **slot, void *old_ptr,
  * re-home guard cannot get there at all: it needs an earlier MW record.
  *
  * So reaching the record is a missing take, not a case to validate.  Stop
- * there, in every build.  -DNO_FT_GUARD_OWNED_STRICT records the MW guard as
- * before.  -DFT_DEBUG_GUARD_UNOWNED_PLANT stops at the first call of the
- * parent, installed-child and re-parent guards: that is the red control.
+ * there, in every build.  -DFT_DEBUG_GUARD_UNOWNED_PLANT stops at the first
+ * call of the parent, installed-child and re-parent guards: that is the red
+ * control.
  */
-#if !defined(NO_FT_GUARD_OWNED_STRICT)
-# define FT_GUARD_OWNED_STRICT	1
-#else
-# define FT_GUARD_OWNED_STRICT	0
-#endif
 #ifdef FT_DEBUG_GUARD_UNOWNED_PLANT
 # define FT_GUARD_UNOWNED_PLANT	1
 #else
@@ -9580,14 +9534,10 @@ void ft_guard_unheld_abort(const char *what, const void *slot,
 	abort();
 }
 #define FT_GUARD_STOP(what, slot)					\
-	do {								\
-		if (FT_GUARD_OWNED_STRICT)				\
-			ft_guard_unheld_abort((what), (slot),		\
-				__builtin_return_address(0));		\
-	} while (0)
+	ft_guard_unheld_abort((what), (slot), __builtin_return_address(0))
 #define FT_GUARD_PLANT(what, slot)					\
 	do {								\
-		if (FT_GUARD_OWNED_STRICT && FT_GUARD_UNOWNED_PLANT)	\
+		if (FT_GUARD_UNOWNED_PLANT)				\
 			ft_guard_unheld_abort((what), (slot),		\
 				__builtin_return_address(0));		\
 	} while (0)
@@ -10475,20 +10425,12 @@ void ft_flip_txn_record_unheld_edge(struct ft_flip_txn *t,
 # define FT_BODY_UNOWNED_PLANT	0
 #endif
 /*
- * A record that is neither owned nor excluded aborts in every build.  The flip
- * txn records SW only.  No record of the suites reaches the MW branch of
- * __ft_flip_txn_record_tag_ctx or of __ft_flip_txn_record_tag_excluded, and the
- * DEBUG_RCU trap there only covers debug builds.  An ablation build that
- * restores MW on purpose defines FT_ALLOW_MW_RECORDS or
- * NO_FT_STRUCT_SW_STRICT.  The red controls send every record to the MW
- * branch: FT_DEBUG_STRUCT_MW_PLANT in the first recorder,
- * FT_DEBUG_LANE_MW_PLANT in the second.
+ * The flip txn records SW only.  A record that is neither owned nor excluded
+ * aborts, in __ft_flip_txn_record_tag_ctx and in
+ * __ft_flip_txn_record_tag_excluded.  No record of the suites gets there.  The
+ * red controls send every record to that abort: FT_DEBUG_STRUCT_MW_PLANT in
+ * the first recorder, FT_DEBUG_LANE_MW_PLANT in the second.
  */
-#if !defined(NO_FT_STRUCT_SW_STRICT) && !defined(FT_ALLOW_MW_RECORDS)
-# define FT_STRUCT_SW_STRICT	1
-#else
-# define FT_STRUCT_SW_STRICT	0
-#endif
 #ifdef FT_DEBUG_STRUCT_MW_PLANT
 # define FT_STRUCT_MW_PLANT	1
 #else
@@ -10896,57 +10838,8 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 		FT_LL_REC(t, slot, old_ptr, new_ptr, true);
 		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	} else {
-		if (FT_STRUCT_SW_STRICT)
-			ft_flip_txn_struct_mw_abort("STRUCT", t, owner, slot,
-				old_ptr, new_ptr, __builtin_return_address(0));
-		/*
-		 * The DLM lock TAKE reaches this same branch.  It is the one MW
-		 * record that must never become SW.  So it is counted apart
-		 * from the conservative ones (ft-txn-kind-stats.h).
-		 */
-		FT_TK_COUNT_REC(t, FT_TK_TXN_IS_TAKE(t) ?
-				FT_TK_MW_LOCK : FT_TK_MW_STRUCT);
-		/*
-		 * ☞ AND IF THE TXN WAS ARMED, SAY SO HERE.  This is the only
-		 * point that knows the record stayed MW_STRUCT.  The OWN split
-		 * above skips an armed txn.  So these used to be counted in
-		 * MW_STRUCT and in none of the OWN columns.  That is why their
-		 * stated invariant fell ~350k short every leg.  Counted here,
-		 * it closes by construction:
-		 *   - unarmed MW_STRUCT goes to the OWN three-way (plus
-		 *     RETIRE);
-		 *   - armed MW_STRUCT goes to one of these two;
-		 *   - nothing else reaches FT_TK_MW_STRUCT.
-		 */
-		if (t->structural_sw && !FT_TK_TXN_IS_TAKE(t))
-			FT_TK_COUNT_REC(t, t->sw_per_op ?
-				FT_TK_OWN_ARMED_PEROP : FT_TK_OWN_ARMED_WIDE);
-#ifdef FT_DEBUG_TXN_KIND
-		if (t->dbg_armed_at_own != t->structural_sw)
-			uatomic_inc(&ft_tk_drift_armed);
-		if (t->dbg_take_at_own != FT_TK_TXN_IS_TAKE(t))
-			uatomic_inc(&ft_tk_drift_take);
-#endif
-		/*
-		 * ★ THE WITNESS TRAVELS WITH THE RECORD, because that is the
-		 * whole detector.  Take a structural edge whose owner the op
-		 * HOLDS.  If it loses its CAS, a lock did not exclude
-		 * somebody.  That is not contention to convert away.  A TAKE
-		 * carries no witness: the word it CASes is the one it is
-		 * trying to acquire.
-		 */
-		FT_AB_NOTE_OWNER(slot, owner);
-		if (FT_TK_TXN_IS_TAKE(t))
-			FT_AB_ARM(FT_AB_MW_LOCK, FT_AB_OWN_NA);
-		else
-			FT_AB_ARM(FT_AB_MW_STRUCT,
-				ft_flip_txn_owns(t, owner) ? FT_AB_OWN_HELD :
-				(ft_hold_trace_holds(owner) ? FT_AB_OWN_LEDGER :
-					FT_AB_OWN_MISS));
-		FT_LL_REC(t, slot, old_ptr, new_ptr, false);
-		FT_MK_SAMPLE(FT_AB_MW_STRUCT);
-		FT_MW_RECORD_TRAP("structural", slot, old_ptr, new_ptr);
-		ret = urcu_txn_store_mw(t->mtxn, slot, old_ptr, new_ptr, tag);
+		ft_flip_txn_struct_mw_abort("STRUCT", t, owner, slot,
+			old_ptr, new_ptr, __builtin_return_address(0));
 	}
 	assert(!ret);
 	(void) ret;	/* reserved up front -> never fails */
@@ -10966,8 +10859,7 @@ void ft_flip_txn_record_tag(struct ft_flip_txn *t,
  * interleave edges, the duplicate-chain splices, the rank-count propagation up
  * unlocked ancestors.  Park it SW when the trie excludes writers (coarse,
  * exclusive, or under the FT-wide lock).  A root, a same-value validate and a
- * record on a fine, shared trie abort under FT_STRUCT_SW_STRICT.  Without it
- * they record MW, as this lane used to do for every record.
+ * record on a fine, shared trie abort.
  */
 /*
  * ☞ HOW MUCH OF THE ALWAYS-MW SURFACE IS ALREADY ARMED SW BY DOOR 1?
@@ -11107,8 +10999,7 @@ static inline
 __attribute__((noinline))
 #endif
 void __ft_flip_txn_record_tag_excluded(struct ft_flip_txn *t, void **slot,
-		void *old_ptr, void *new_ptr, uintptr_t tag,
-		bool pinned FT_TK_MWA_PARAM)
+		void *old_ptr, void *new_ptr, uintptr_t tag FT_TK_MWA_PARAM)
 {
 	int ret;
 
@@ -11131,12 +11022,9 @@ void __ft_flip_txn_record_tag_excluded(struct ft_flip_txn *t, void **slot,
 	 * The SW engine takes no MW record at all, not even one bound for a
 	 * discard.  So the funnel drops it.  SW records are untouched, so an
 	 * op that reads its own pending values reads the same.
-	 * -DFT_DEBUG_MW_IN_DOOMED_TXN records them anyway.
 	 */
-#ifndef FT_DEBUG_MW_IN_DOOMED_TXN
 	if (caa_unlikely(t->acquire_miss))
 		return;
-#endif
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	ft_sa_rec_count(FT_TK_TXN_SITE(t), __builtin_return_address(0),
 		FT_SA_CALLER_PC(),
@@ -11200,9 +11088,9 @@ void __ft_flip_txn_record_tag_excluded(struct ft_flip_txn *t, void **slot,
 	 * through the structural_sw-dispatching helper would be a guard in name
 	 * only".  This recorder BECAME that helper.  So the test is
 	 * STRUCTURAL, not a list of lanes to remember: same value in and out
-	 * means MW.
+	 * never parks.
 	 */
-	if (!FT_LANE_MW_PLANT && !pinned && old_ptr != new_ptr &&
+	if (!FT_LANE_MW_PLANT && old_ptr != new_ptr &&
 			t->trie_wide_sw &&
 			!(t->ft && slot == (void **) &t->ft->root)) {
 		FT_MWA_DOOR1_CONV();
@@ -11210,20 +11098,12 @@ void __ft_flip_txn_record_tag_excluded(struct ft_flip_txn *t, void **slot,
 		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	} else {
 		/*
-		 * Every caller now reaches this lane only on a trie that
-		 * excludes writers.  A root, a same-value validate or a fine,
-		 * shared trie would need MW here, so it aborts.
+		 * Every caller reaches this lane only on a trie that excludes
+		 * writers.  A root, a same-value validate or a fine, shared
+		 * trie has no SW record here, so it aborts.
 		 */
-		if (FT_STRUCT_SW_STRICT)
-			ft_flip_txn_struct_mw_abort("LANE", t, NULL, slot,
-				old_ptr, new_ptr, __builtin_return_address(0));
-		if (!pinned && old_ptr != new_ptr && t->trie_wide_sw)
-			FT_MWA_DOOR1_ROOT_SLOT();
-		FT_MWA_DOOR1_KEPT(t, old_ptr == new_ptr);
-		FT_LL_REC(t, slot, old_ptr, new_ptr, false);
-		FT_MK_SAMPLE(FT_AB_MWA_BASE + dbg_mwa);
-		FT_MW_RECORD_TRAP("always-MW lane", slot, old_ptr, new_ptr);
-		ret = urcu_txn_store_mw(t->mtxn, slot, old_ptr, new_ptr, tag);
+		ft_flip_txn_struct_mw_abort("LANE", t, NULL, slot, old_ptr,
+			new_ptr, __builtin_return_address(0));
 	}
 	assert(!ret);
 	(void) ret;	/* reserved up front -> never fails */
@@ -11233,31 +11113,16 @@ static inline
 void ft_flip_txn_record_tag_excluded(struct ft_flip_txn *t, void **slot,
 		void *old_ptr, void *new_ptr, uintptr_t tag FT_TK_MWA_PARAM)
 {
-	__ft_flip_txn_record_tag_excluded(t, slot, old_ptr, new_ptr, tag,
-		false FT_TK_MWA(dbg_mwa));
-}
-
-/*
- * THE PINNED TWIN: it never parks, whatever the trie is.  It has one caller,
- * ft_flip_txn_record_root, and only for a root record that the root checks
- * would refuse.  A root's rule "is a property of the SLOT, not of the txn's
- * named trie".  So the record aborts under FT_STRUCT_SW_STRICT and records MW
- * without it.  See that function.
- */
-static inline
-void ft_flip_txn_record_tag_pinned(struct ft_flip_txn *t, void **slot,
-		void *old_ptr, void *new_ptr, uintptr_t tag FT_TK_MWA_PARAM)
-{
-	__ft_flip_txn_record_tag_excluded(t, slot, old_ptr, new_ptr, tag,
-		true FT_TK_MWA(dbg_mwa));
+	__ft_flip_txn_record_tag_excluded(t, slot, old_ptr, new_ptr, tag
+		FT_TK_MWA(dbg_mwa));
 }
 
 /*
  * The cell and root parks are MANDATORY: a cell edge or &ft->root whose word's
  * lock the op holds is recorded SW, always.  The flip's own check stays on with
  * them: a partial conversion is the defect, so an unheld cell or root record
- * aborts.  -DNO_FT_CELL_OWNED_STRICT / -DNO_FT_ROOT_OWNED_STRICT are the RED
- * CONTROLS -- drop one take, confirm the guard fires, put it back.
+ * aborts.  -DNO_FT_CELL_OWNED_STRICT is the RED CONTROL -- drop one take,
+ * confirm the guard fires, put it back.
  */
 #if !defined(NO_FT_CELL_OWNED_STRICT)
 # define FT_CELL_OWNED_STRICT	1
@@ -11270,16 +11135,11 @@ void ft_flip_txn_record_tag_pinned(struct ft_flip_txn *t, void **slot,
  * where @root_lock is held.  So an unheld root record left MW is one word under
  * two writer disciplines.  Stage 5 shipped without the guard and was exactly
  * that under the flip.  It parked 82 records SW and CASed 4,273.  Nothing said
- * so.  -DNO_FT_ROOT_OWNED_STRICT is its red control.
+ * so.
  */
 /* What one root take costs a reserved txn: its release terminal. */
 #define FT_ROOT_LOCK_MAX_RECORDS	1
 
-#if !defined(NO_FT_ROOT_OWNED_STRICT)
-# define FT_ROOT_OWNED_STRICT	1
-#else
-# define FT_ROOT_OWNED_STRICT	0
-#endif
 #ifdef FT_DEBUG_ROOT_VALIDATE_PLANT
 # define FT_ROOT_VALIDATE_PLANT	1
 #else
@@ -11335,11 +11195,9 @@ enum { FT_RTAKE_CALL, FT_RTAKE_HELD, FT_RTAKE_TOOK, FT_RTAKE_MISS,
  *     with @root_lock as the owner.
  *   - That trie is COARSE or EXCLUSIVE: park SW.
  *   - Otherwise the trie is FINE and shared, and @t does not hold its
- *     @root_lock.  Abort under FT_ROOT_OWNED_STRICT, the default.  Without
- *     it, record through ft_flip_txn_record_tag_pinned.  That aborts too,
- *     unless NO_FT_STRUCT_SW_STRICT is also set.
- * A validate (old == new) aborts first, under FT_ROOT_OWNED_STRICT.  No
- * producer records one: a probe counted none in ft_unit and ft_inv.
+ *     @root_lock: abort.
+ * A validate (old == new) aborts first.  No producer records one: a probe
+ * counted none in ft_unit and ft_inv.
  * -DFT_DEBUG_ROOT_VALIDATE_PLANT fails that check on the first root record:
  * that is its red control.
  *
@@ -11382,8 +11240,7 @@ enum { FT_RTAKE_CALL, FT_RTAKE_HELD, FT_RTAKE_TOOK, FT_RTAKE_MISS,
  * Since Stage 5, the kind is a property of the SLOT, not of the txn's named
  * trie.  A CROSS-TRIE dual is one txn with two roots (the empty-dst
  * ft_graft).  Each root is asked about its own trie and its own @root_lock, so
- * a root never stays MW because of the other trie.  The pinned form is reached
- * only without FT_ROOT_OWNED_STRICT, and is counted MW_ALWAYS (FT_TK_MWA_ROOT).
+ * a root never stays MW because of the other trie.
  */
 static inline
 void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
@@ -11401,7 +11258,7 @@ void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
 	 * word is asked: does this txn hold the word's lock?
 	 *   - Held: record through the owner-bearing form, which parks SW
 	 *     under the flip.
-	 *   - Not held: the old pinned MW, which is what shipped.
+	 *   - Not held: park SW where the trie excludes writers, else abort.
 	 *
 	 * ☠ The root is NOT a cell, so it is not ft_cell_word_lock's business.
 	 * A cell's lock is derived from the cell.  The root's is a single word
@@ -11427,8 +11284,7 @@ void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
 		 * validate, and an SW park of one would store a possibly
 		 * stale value blind.  So stop rather than record it MW.
 		 */
-		if (FT_ROOT_OWNED_STRICT &&
-				(old_ptr == new_ptr || FT_ROOT_VALIDATE_PLANT)) {
+		if (old_ptr == new_ptr || FT_ROOT_VALIDATE_PLANT) {
 			fprintf(stderr, "FT ROOT VALIDATE: slot %p value %p "
 				"producer %p -- a root record with old == new\n",
 				(void *) slot, old_ptr,
@@ -11444,7 +11300,6 @@ void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
 		}
 		if (!owner_ft->lock_fine || owner_ft->exclusive) {
 			FT_COW_ROOT_EXEMPT();	/* one lock for the whole trie */
-#ifndef FT_DEBUG_ROOT_EXEMPT_MW
 			/*
 			 * ☞ AND SO IT PARKS.  This root's TRIE excludes every
 			 * writer (the FT-wide mutex, or the caller's single-
@@ -11453,22 +11308,16 @@ void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
 			 * the SLOT belongs to.  That is what the pin exists
 			 * for: door 1 answers for @t->ft only, and a cross-trie
 			 * dual writes a second root.  A validate aborted above.
-			 * Without FT_ROOT_OWNED_STRICT it stays MW: a park cannot
-			 * fail.
 			 */
-			if (old_ptr != new_ptr) {
-				int ret;
+			int ret;
 
-				FT_AB_ARM(FT_AB_SW, FT_AB_OWN_NA);
-				FT_LL_REC(t, slot, old_ptr, new_ptr, true);
-				ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr,
-					new_ptr, FT_FLIP_PROXY_TAG);
-				assert(!ret);
-				(void) ret;
-				return;
-			}
-#endif
-			goto pinned;
+			FT_AB_ARM(FT_AB_SW, FT_AB_OWN_NA);
+			FT_LL_REC(t, slot, old_ptr, new_ptr, true);
+			ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr,
+				new_ptr, FT_FLIP_PROXY_TAG);
+			assert(!ret);
+			(void) ret;
+			return;
 		}
 		FT_COW_ROOT_NOTHELD();
 		/*
@@ -11488,19 +11337,14 @@ void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
 		 * wholesale.  The DST of those ops is shared, is NOT exempt,
 		 * and must hold its root's lock.
 		 */
-		if (FT_ROOT_OWNED_STRICT) {
-			fprintf(stderr, "FT ROOT UNHELD: slot %p lock %p "
-				"producer %p -- a root recorded without its lock "
-				"while the root park is on\n",
-				(void *) slot, (void *) &owner_ft->root_lock,
-				__builtin_return_address(0));
-			fflush(stderr);
-			abort();
-		}
+		fprintf(stderr, "FT ROOT UNHELD: slot %p lock %p "
+			"producer %p -- a root recorded without its lock "
+			"while the root park is on\n",
+			(void *) slot, (void *) &owner_ft->root_lock,
+			__builtin_return_address(0));
+		fflush(stderr);
+		abort();
 	}
-pinned:
-	ft_flip_txn_record_tag_pinned(t, slot, old_ptr, new_ptr,
-		FT_FLIP_PROXY_TAG FT_TK_MWA(FT_TK_MWA_ROOT));
 }
 
 
@@ -17779,7 +17623,7 @@ static __attribute__((destructor)) void ft_guard_audit_report(void)
 		uatomic_read(&ft_guard_ctx_covered),
 		uatomic_read(&ft_guard_truly_unheld),
 		uatomic_read(&ft_guard_no_ctx));
-	fprintf(stderr, "FT GUARD AUDIT: INSTALLED (reached urcu_txn_validate) "
+	fprintf(stderr, "FT GUARD AUDIT: INSTALLED (reached the guard stop) "
 		"%lu, of them on a FINE non-exclusive trie %lu (callers below)\n",
 		uatomic_read(&ft_guard_installed),
 		uatomic_read(&ft_guard_installed_fine));
@@ -17812,7 +17656,6 @@ void ft_flip_txn_guard_parent_ctx(const struct cds_ft *ft, struct ft_flip_txn *t
 	 * auto-guarded by the root-slot CAS.  Either way there is no live
 	 * parent to guard here.
 	 */
-	uintptr_t v, live;
 
 	if (!t || !parent_nf)
 		return;
@@ -17924,43 +17767,6 @@ void ft_flip_txn_guard_parent_ctx(const struct cds_ft *ft, struct ft_flip_txn *t
 				return;
 		}
 	}
-	/*
-	 * §4.B VALIDATE as ONE record: read the holder's state (unrecorded)
-	 * and expect its LIVE value at commit.  This is {live -> live}, a pure
-	 * validate that writes nothing new.
-	 *
-	 *  - live holder: identical to the former {v -> v} stability guard.  A
-	 *    retire DURING the commit window changes the word (the tombstone
-	 *    is one-way) and fails the compare.
-	 *  - holder retired BEFORE this guard: the live expectation cannot
-	 *    match, so the commit is a guaranteed ABORT.  A retry-enabled op
-	 *    then re-derives against the current tree.  A stability-only
-	 *    {DEAD -> DEAD} record would PASS this already-DEAD case.  That
-	 *    would commit this publish into a retired copy: a lost update.
-	 *
-	 * Composes ORDER-FREE with an op that fuses a REAL state edge
-	 * (nr_child--) on the same word in the same attempt:
-	 *  - a guard never advances the record's new_ptr (urcu_txn_validate,
-	 *    upgrade-free);
-	 *  - the engine keeps a record's original expected old on upgrade;
-	 *  - a mismatching expected old between the two poisons the
-	 *    descriptor (commit aborts).
-	 * So a live holder's guard and decrement fuse into one record either
-	 * way, and a dead one still fails.  Dead-at-guard is unreachable under
-	 * a single writer.
-	 */
-	v = (uintptr_t) ft_txn_load(t->mtxn,
-			(void **) &ft_flag_to_metadata(ft, parent_nf)->state,
-			FT_STATE_PROXY);
-	/*
-	 * The clean-LIVE expectation masks BOTH one-way death (tombstone) and
-	 * the reversible per-node lock (FT_STATE_LOCK):
-	 *  - a holder under a peer's body copy at validate time mismatches:
-	 *    ABORT, then retry;
-	 *  - a copier that ABORTED and cleared the fence before our validate
-	 *    matches: proceed (the copy was abandoned, the holder unchanged).
-	 */
-	live = v & ~(FT_STATE_TOMBSTONE | FT_STATE_LOCK);
 #ifdef FT_DEBUG_GUARD_AUDIT
 	uatomic_inc(&ft_guard_installed);
 	if (ft->lock_fine && !ft->exclusive) {
@@ -17971,13 +17777,6 @@ void ft_flip_txn_guard_parent_ctx(const struct cds_ft *ft, struct ft_flip_txn *t
 #endif
 	FT_GUARD_STOP("parent guard",
 		&ft_flag_to_metadata(ft, parent_nf)->state);
-	FT_AB_ARM(FT_AB_VALIDATE, FT_AB_OWN_NA);
-	FT_MK_SAMPLE(FT_AB_VALIDATE);
-	FT_MW_RECORD_TRAP("parent-guard validate",
-		&ft_flag_to_metadata(ft, parent_nf)->state, live, live);
-	urcu_txn_validate(t->mtxn,
-			(void **) &ft_flag_to_metadata(ft, parent_nf)->state,
-			(void *) live, FT_STATE_PROXY);
 }
 
 /* The ctx-less spelling: a site that has no lock context to offer. */
@@ -19601,31 +19400,16 @@ enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
  * parent slot in [[project_ft_retire_still_linked_forward_edge]].  Every
  * occurrence of it came through here.
  *
- * The guard is the same {live_state -> live_state} edge that the re-parent
- * sweep records (ft_reparent_record_meta), for the same reason and with the
- * same three rules:
- *
- *  - Waiting load, not a raw one.  A raw read bakes a peer's parked
- *    FT_STATE_PROXY into the expected-old.  A validate that matches it
- *    publishes that pointer back into the live word, and latches the node
- *    forever.
- *  - Mask TOMBSTONE and LOCK out of the expected value.  A node that a peer
- *    froze or locked then mismatches and aborts this commit.
- *  - MW kind, unconditionally.  An SW park validates nothing (it cannot
- *    fail).  So recording this through the structural_sw-dispatching helper
- *    would be a guard in name only.
- *
- * Skipped when the op holds the node.  Its own terminal already governs that
- * word.  An MW edge expecting live_state would mismatch the op's own lock and
- * abort every commit.  This mirrors ft_reparent_record_meta's @child_marked
- * arm.
+ * This used to record an MW {live_state -> live_state} validate of the
+ * node's state word.  Under locking, the op holds that word or its trie
+ * excludes every writer, and the guard returns early.  Any other case is a
+ * missing take, so it aborts (FT_GUARD_STOP).
  */
 static inline
 void ft_flip_txn_guard_installed_child(struct cds_ft *ft, struct ft_flip_txn *t,
 		struct cds_ft_inode_flag *nf)
 {
 	struct cds_ft_metadata *meta;
-	uintptr_t old_state, live_state;
 
 	/*
 	 * There is nothing to validate in three cases:
@@ -19644,7 +19428,6 @@ void ft_flip_txn_guard_installed_child(struct cds_ft *ft, struct ft_flip_txn *t,
 	if (ft_flip_txn_holds(t, meta)) {
 		return;
 	}
-#ifndef FT_DEBUG_VALIDATE_WHEN_COVERED
 	/*
 	 * ...and when the op's lock covers the word without naming it:
 	 *  - at ROOT-ONLY, a txn holding the root's word excludes every
@@ -19656,7 +19439,6 @@ void ft_flip_txn_guard_installed_child(struct cds_ft *ft, struct ft_flip_txn *t,
 	 */
 	if (ft_flip_txn_owns(t, meta) || ft_flip_txn_excludes_all(t, ft))
 		return;
-#endif
 	/*
 	 * ☠ And skip it when this commit already writes that word.  The
 	 * hold test above cannot tell you that.
@@ -19711,24 +19493,7 @@ void ft_flip_txn_guard_installed_child(struct cds_ft *ft, struct ft_flip_txn *t,
 		if (ft_flip_txn_releases_after(t, meta))
 			return;		/* the staged release's word: held */
 	}
-	if (!ft_flip_txn_reserve_extra(t, 1)) {
-		return;
-	}
-	old_state = (uintptr_t) ft_txn_load(t->mtxn,
-		(void **) &meta->state, FT_STATE_PROXY);
-	live_state = old_state & ~(FT_STATE_TOMBSTONE | FT_STATE_LOCK);
-	/*
-	 * Spelled as the record_tag_excluded that the record_state_excluded macro
-	 * expands to.  The only reason is to let this guard name its own
-	 * always-MW class.  This guard and the recompaction sweep's child
-	 * validate have the same shape: {live -> live} on a word the op does
-	 * not hold.  Their sizes differ.  The C.1 decomposition exists to
-	 * stop one number from covering both.
-	 */
 	FT_GUARD_STOP("installed-child guard", &meta->state);
-	ft_flip_txn_record_tag_excluded(t, (void **) &meta->state,
-		(void *) live_state, (void *) live_state, FT_STATE_PROXY
-		FT_TK_MWA(FT_TK_MWA_GUARD));
 }
 
 static inline
@@ -20827,9 +20592,7 @@ int ft_remove_one_commit(struct cds_ft *ft,
 		 *
 		 * MEASURED before (FT_DEBUG_MW_KEPT, ft_inv MW): the largest
 		 * producer of committed CAS left on fine tries (39%).
-		 * -DFT_DEBUG_FREEZE_LEAF_MW keeps it MW.
 		 */
-#ifndef FT_DEBUG_FREEZE_LEAF_MW
 		if (txn && slot_owner && ft_flip_txn_owns(txn, slot_owner)) {
 			if (rcu_dereference(freeze_leaf->next) != NULL) {
 				ft_remove_take_refused(txn, record_only);
@@ -20840,7 +20603,6 @@ int ft_remove_one_commit(struct cds_ft *ft,
 				ft_hlist_set_mark(NULL), FT_HLIST_TAG);
 			goto freeze_done;
 		}
-#endif
 		edges[n].slot = (struct ft_ord_cell **) &freeze_leaf->next;
 		edges[n].owner_cell = NULL;	/* not a cell link */
 		edges[n].old_target = NULL;
@@ -20849,9 +20611,7 @@ int ft_remove_one_commit(struct cds_ft *ft,
 		edges[n].tag = FT_HLIST_TAG;
 		n++;
 	}
-#ifndef FT_DEBUG_FREEZE_LEAF_MW
 freeze_done:
-#endif
 	/*
 	 * @state_meta non-NULL (a delete): fuse its nr_child-- into THIS flip,
 	 * so that the structural unlink and the count decrement go live
@@ -25126,7 +24886,6 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 			 */
 			&& !ft_flip_txn_holds(txn, meta)
 #endif
-#ifndef FT_DEBUG_VALIDATE_WHEN_COVERED
 			/*
 			 * ...and a word the op's lock covers without
 			 * naming it:
@@ -25145,7 +24904,6 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 			 */
 			&& !ft_flip_txn_owns(txn, meta)
 			&& !ft_flip_txn_excludes_all(txn, ft)
-#endif
 			) {
 #ifdef FT_DEBUG_LIVE_VALIDATE
 		int lv_self = -1, lv_held = -1;
@@ -25162,8 +24920,6 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 			lv_self, lv_held);
 #endif
 		FT_GUARD_STOP("re-parent guard", &meta->state);
-		ft_flip_txn_record_state_excluded(txn, meta,
-			(void *) live_state, (void *) live_state);
 	}
 	/*
 	 * !@check_child: the caller re-homes this child while keeping EVERY

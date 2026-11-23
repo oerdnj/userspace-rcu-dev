@@ -442,7 +442,7 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 		 * @gp_slot.  The caller read the slot out of it, so it passes
 		 * it.  The recorder parks the edge SW when the txn owns that
 		 * node or excludes every writer.  It records no MW: any other
-		 * record aborts (FT_STRUCT_SW_STRICT).
+		 * record aborts.
 		 */
 		/*
 		 * Under the lock, hand the marks to @t BEFORE the slot record.

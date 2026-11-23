@@ -1093,7 +1093,6 @@ void ft_detach_freeze_one(struct ft_flip_txn *txn,
 		retires = ft_flip_txn_record_anchor_release(txn, h, m);
 		if (owned && retires)
 			txn->locks[slot].tombstone_terminal = true;
-#ifndef FT_DEBUG_FREEZE_TOMBSTONE_MW
 		/*
 		 * ...and where the anchor is the orphan, say that this txn
 		 * holds it.
@@ -1119,7 +1118,6 @@ void ft_detach_freeze_one(struct ft_flip_txn *txn,
 		 */
 		if (h->lock == m)
 			ft_flip_txn_cover_member(txn, m);
-#endif
 	}
 	ft_flip_txn_record_retire_anchored(txn, ctx, h, m);
 }
