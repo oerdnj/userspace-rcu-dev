@@ -10380,47 +10380,75 @@ bool ft_flip_txn_record_is_noop(const struct ft_flip_txn *t, void **slot,
 }
 
 /*
- * ☞ A NAMED OWNER THE OP DOES NOT HOLD ENDS THE ATTEMPT.
- *
- * This is about a structural write whose producer NAMED the lock covering the
- * word, when the op does not hold that lock.  Such a write used to be recorded
- * MW, and the install CAS arbitrated.  That CAS was the safety net for a stale
- * plan.
- *
- * The case measured is the SKIP_X dual into a grandparent.  The op reads the
- * grandparent's slot twice:
- *   1. once to decide whether to take the grandparent;
- *   2. again to build the edge.
- * A peer that re-encodes the slot into skip form in between leaves a dual edge
- * on a grandparent the op never took.  The DEBUG_RCU gate sweep's no-MW trap
- * caught it on bulkfence, no-in-place-delete and excl.
- *
- * The SW engine has no CAS.  So the attempt ends here instead, exactly like a
- * missed take:
- *   - @acquire_miss dooms the txn;
- *   - the MW funnel drops the record;
- *   - the commit returns ABORT;
- *   - the retry re-plans against the slot as it now is, and takes the owner.
- *
- * This is narrow on purpose.  It needs all three of:
- *   - a WRITE (a validate is not a stale write);
- *   - a NAMED owner (an unnamed one is plumbing, not a missed take, and
- *     dooming it could loop);
- *   - no trie-wide exclusion (door 1 parks it legitimately there).
- * What is left still reaches the funnel, and the DEBUG_RCU trap.
- * -DFT_DEBUG_UNHELD_EDGE_MW records it MW as before.
+ * Park a structural write SW.  The caller has established that nothing else
+ * can write @slot: its trie excludes every writer (ft_flip_txn_excludes_all).
  */
 static inline
-void ft_flip_txn_doom_unheld_edge(struct ft_flip_txn *t,
-		const struct cds_ft_metadata *owner, const void *old_ptr,
-		const void *new_ptr)
+void ft_flip_txn_park_excluded(struct ft_flip_txn *t, void **slot,
+		void *old_ptr, void *new_ptr, uintptr_t tag)
 {
-#ifndef FT_DEBUG_UNHELD_EDGE_MW
-	if (owner && old_ptr != new_ptr && !t->trie_wide_sw)
-		t->acquire_miss = true;
+	int ret;
+
+	if (ft_flip_txn_record_is_noop(t, slot, old_ptr, new_ptr))
+		return;
+	FT_AB_ARM(FT_AB_SW, FT_AB_OWN_NA);
+	FT_LL_REC(t, slot, old_ptr, new_ptr, true);
+	ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
+	assert(!ret);
+	(void) ret;
+}
+
+/*
+ * Record a structural edge whose owner the op does not hold.  The case
+ * measured is the SKIP_X dual into a grandparent.  The op reads the
+ * grandparent's slot twice: once to decide whether to take the grandparent,
+ * then again to build the edge.  A peer that re-encodes the slot into skip
+ * form in between leaves a dual edge on a grandparent the op never took.
+ *
+ *   - A doomed attempt (@acquire_miss) records nothing.
+ *   - Where @ft excludes every writer, the edge parks SW.
+ *   - On a shared fine trie, a write with a NAMED owner dooms the attempt.
+ *     The commit returns ABORT, and the retry re-plans against the slot as
+ *     it now is, and takes the owner.  There is no CAS left to catch a
+ *     stale plan, so the attempt must end.
+ *   - Anything else would be a blind store.  So stop there, in every build.
+ *
+ * Measured over ft_unit and the list-on, list-off and FT_INV_MW=1 runs of
+ * ft_inv: on a shared fine trie, every unheld edge (up to 8,800 per run, a
+ * few with no owner named) came in an attempt already doomed by an earlier
+ * miss.  The live ones, one or two per run, were on tries that exclude every
+ * writer.  -DFT_DEBUG_UNHELD_EDGE_PLANT stops at the first live unheld edge:
+ * that is the red control.
+ */
+#ifdef FT_DEBUG_UNHELD_EDGE_PLANT
+# define FT_UNHELD_EDGE_PLANT	1
 #else
-	(void) t; (void) owner; (void) old_ptr; (void) new_ptr;
+# define FT_UNHELD_EDGE_PLANT	0
 #endif
+static inline
+void ft_flip_txn_record_unheld_edge(struct ft_flip_txn *t,
+		const struct cds_ft *ft, const struct cds_ft_metadata *owner,
+		void **slot, void *old_ptr, void *new_ptr, uintptr_t tag)
+{
+	if (t->acquire_miss)
+		return;
+	if (!FT_UNHELD_EDGE_PLANT) {
+		if (ft_flip_txn_excludes_all(t, ft)) {
+			ft_flip_txn_park_excluded(t, slot, old_ptr, new_ptr,
+				tag);
+			return;
+		}
+		if (owner && old_ptr != new_ptr) {
+			t->acquire_miss = true;
+			return;
+		}
+	}
+	fprintf(stderr, "FT EDGE UNHELD: slot %p owner %p producer %p -- a "
+		"live edge on a word the op neither holds nor excludes\n",
+		(void *) slot, (const void *) owner,
+		__builtin_return_address(0));
+	fflush(stderr);
+	abort();
 }
 
 /*
@@ -12420,17 +12448,10 @@ void ft_flip_txn_record_pub_rec(struct ft_flip_txn *t,
 			 * takes it), so DUAL_ROOT is not a possible answer at
 			 * this site.
 			 */
-		{
-			ft_flip_txn_doom_unheld_edge(t, rec->owner[i],
-				rec->old_val[i], rec->new_val[i]);
-			ft_flip_txn_record_tag_mw(t, (void **) rec->slot[i],
+			ft_flip_txn_record_unheld_edge(t, t->ft, rec->owner[i],
+				(void **) rec->slot[i],
 				(void *) rec->old_val[i],
-				(void *) rec->new_val[i],
-				FT_FLIP_PROXY_TAG
-				FT_TK_MWA(rec->owner[i] ?
-					FT_TK_MWA_DUAL_NAMED :
-					FT_TK_MWA_DUAL_UNNAMED));
-		}
+				(void *) rec->new_val[i], FT_FLIP_PROXY_TAG);
 		else
 			ft_flip_txn_record_reserved(t, rec->owner[i],
 				(void **) rec->slot[i],
@@ -19490,24 +19511,15 @@ enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
 					(void **) edges[i].slot,
 					(void *) edges[i].old_target,
 					(void *) edges[i].new_target, tag);
-			else {
-			if (tag == FT_FLIP_PROXY_TAG &&
-					(void *) edges[i].slot != (void *) &ft->root)
-				ft_flip_txn_doom_unheld_edge(t, edges[i].owner,
-					edges[i].old_target,
-					edges[i].new_target);
-			ft_flip_txn_record_tag_mw(t, (void **) edges[i].slot,
-				(void *) edges[i].old_target,
-				(void *) edges[i].new_target, tag
-				FT_TK_MWA(tag != FT_FLIP_PROXY_TAG ?
-					FT_TK_MWA_CELL :
-					(void *) edges[i].slot ==
-						(void *) &ft->root ?
-					FT_TK_MWA_DUAL_ROOT :
-					edges[i].owner ?
-					FT_TK_MWA_DUAL_NAMED :
-					FT_TK_MWA_DUAL_UNNAMED));
-			}
+			else
+				ft_flip_txn_record_unheld_edge(t, ft,
+					(tag == FT_FLIP_PROXY_TAG &&
+					 (void *) edges[i].slot !=
+						(void *) &ft->root) ?
+						edges[i].owner : NULL,
+					(void **) edges[i].slot,
+					(void *) edges[i].old_target,
+					(void *) edges[i].new_target, tag);
 	}
 	return ft_flip_txn_commit(ft, t);
 }
@@ -19692,19 +19704,12 @@ void ft_ord_cell_record_into_ft(struct cds_ft *ft, struct ft_flip_txn *t,
 				 * acquired): MW, whatever the txn's mode.
 				 */
 				/* NAMED vs UNNAMED; the root branch is above. */
-			{
-				ft_flip_txn_doom_unheld_edge(t, edges[i].owner,
-					edges[i].old_target,
-					edges[i].new_target);
-				ft_flip_txn_record_tag_mw(t,
+				ft_flip_txn_record_unheld_edge(t, ft,
+					edges[i].owner,
 					(void **) edges[i].slot,
 					(void *) edges[i].old_target,
 					(void *) edges[i].new_target,
-					ft_edge_tag(&edges[i])
-					FT_TK_MWA(edges[i].owner ?
-						FT_TK_MWA_DUAL_NAMED :
-						FT_TK_MWA_DUAL_UNNAMED));
-			}
+					ft_edge_tag(&edges[i]));
 			else
 				ft_flip_txn_record_tag(t, edges[i].owner,
 					(void **) edges[i].slot,
@@ -24509,8 +24514,6 @@ void ft_flip_txn_record_rehome_excluded(struct ft_flip_txn *t,
 		const struct cds_ft *ft, void **slot, void *old_ptr,
 		void *new_ptr, uintptr_t tag, const char *what)
 {
-	int ret;
-
 	if (caa_unlikely(FT_REHOME_UNOWNED_PLANT ||
 			!ft_flip_txn_excludes_all(t, ft))) {
 		fprintf(stderr, "FT REHOME UNOWNED: %s slot %p producer %p -- "
@@ -24519,13 +24522,7 @@ void ft_flip_txn_record_rehome_excluded(struct ft_flip_txn *t,
 		fflush(stderr);
 		abort();
 	}
-	if (ft_flip_txn_record_is_noop(t, slot, old_ptr, new_ptr))
-		return;
-	FT_AB_ARM(FT_AB_SW, FT_AB_OWN_NA);
-	FT_LL_REC(t, slot, old_ptr, new_ptr, true);
-	ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
-	assert(!ret);
-	(void) ret;
+	ft_flip_txn_park_excluded(t, slot, old_ptr, new_ptr, tag);
 }
 
 static inline
