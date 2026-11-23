@@ -295,7 +295,13 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 	 * adopt the owner stamp that the metadata parent words already carry.
 	 * It would otherwise silently dereference a struct cds_ft as a node.
 	 */
-	nf = ft_parent_node_resolved(rcu_dereference(cell->parent));
+	/*
+	 * ACQUIRE, not rcu_dereference: the head's incoming_byte below is
+	 * read from @cell, not through this pointer.  Its writer stores the
+	 * byte before it publishes the parent (ft_set_parent_at), so only an
+	 * acquire here orders the byte read after this load.
+	 */
+	nf = ft_parent_node_resolved(ft_dereference_acquire(cell->parent));
 	/*
 	 * A PREFIX head's parent word says so on the word itself, with
 	 * FT_PARENT_PREFIX_HEAD.  The flag was set when the head was installed
@@ -484,9 +490,10 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 		 * contributes none.
 		 */
 		{
+			/* ACQUIRE: see the head's parent load above. */
 			struct cds_ft_inode_flag *parent =
 				ft_parent_node_resolved(
-					rcu_dereference(meta->parent_word));
+					ft_dereference_acquire(meta->parent_word));
 
 			if (parent && !ft_node_compressed(
 					ft_resolve_skip_compressed(ft, parent))) {
