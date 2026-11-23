@@ -384,9 +384,7 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 		void **slot, void *old_ptr, void *new_ptr, uintptr_t tag)
 {
 	/*
-	 * ☑ THIS CLASS PARKS.  cds_ft_node.next / .prev are SW by default.  The
-	 * MW arm below is an ABLATION (-DNO_FEATURE_FT_CHAIN_SW), not a
-	 * fallback.
+	 * ☑ THIS CLASS PARKS.  cds_ft_node.next / .prev are SW.
 	 *
 	 * It is the largest conversion in the tree: 14.5M stores per ft_inv
 	 * leg.  That is an order of magnitude above every row of the §11.6
@@ -414,8 +412,7 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 	 *
 	 *   3 AN SW ABORT WRITES.  urcu_txn_settle stores old_ptr back BLIND.
 	 *     So an expected-old that is a caller's BELIEF becomes a published
-	 *     lie.  FT_CHAIN_OLD converts the five of them to loads under this
-	 *     same switch, so the two can never drift apart.
+	 *     lie.  FT_CHAIN_OLD converts the five of them to loads.
 	 *
 	 *   4 THE SERIALIZING NULL ON THE APPEND SIDE (ft_hlist_append_run_
 	 *     prepare) was missed entirely last time.  It had ZERO concurrent
@@ -437,8 +434,7 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 	 *     re-argued.  See ft_node_mark_removed_flip's header for the exact
 	 *     ordering hazard.
 	 *
-	 * ☞ WHAT IS STILL MW HERE, and stays.  The ordinal CELL list
-	 * (ft_ord_cell.lnode) is [DESIGN] MW forever.  It does not come through
+	 * ☞ The ordinal CELL list (ft_ord_cell.lnode) does not come through
 	 * this function at all.
 	 *
 	 * ☞ COARSE RECORDS SW, WHATEVER THE WORD IS.  A coarse trie takes the
@@ -456,8 +452,8 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 	/*
 	 * ☑ THE COUNTER SAYS "CHAIN", BECAUSE THIS IS NOT A CELL.  Every store
 	 * here writes a DUPLICATE-CHAIN word (cds_ft_node.next/.prev).  The
-	 * ordinal CELL list (ft_ord_cell.lnode) is [DESIGN] MW forever and does
-	 * not come through this function.
+	 * ordinal CELL list (ft_ord_cell.lnode) does not come through this
+	 * function.
 	 *
 	 * ☠ AND THE TAG CANNOT DO THIS JOB.  FT_HLIST_TAG *IS* URCU_TXN_TAG
 	 * (1), the ordered-cell tag.  So a tag test classes a chain word as a
@@ -469,9 +465,8 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 	FT_AB_ARM(FT_AB_CELL_HANDLE, FT_AB_OWN_NA);
 	FT_CH_COARSE(fn, line);
 	FT_CHAIN_CANARY_STAMP(fn, line, slot);
-#ifndef NO_FEATURE_FT_CHAIN_SW
 	/*
-	 * ★ THE FLIP, NOW THE DEFAULT.  It is unconditional, and that is the
+	 * ★ THE FLIP.  It is unconditional, and that is the
 	 * point.  The 2026-09-17 attempt dispatched on a per-TXN predicate.
 	 * That made the kind a property of the ASKING TRANSACTION rather than
 	 * of the SLOT.  The three point ops take the holder into a STACK
@@ -488,7 +483,7 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 	 *                           converted site; the two unconverted ones
 	 *                           are measured UNREACHED, not argued safe
 	 *   3 SW abort WRITES ..... the five belief expected-olds become loads
-	 *                           with FT_CHAIN_OLD, under this same switch
+	 *                           with FT_CHAIN_OLD
 	 *   4 append_run missed ... covered at last by the colliding-key merge
 	 *                           test, 0 stale of ~19k concurrent events
 	 *   5 the re-read was RYW .. ft_hlist_chain_plan_ok uses
@@ -497,21 +492,9 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 	 *                           one raw producer on a live chain word is
 	 *                           measured unreachable (see
 	 *                           ft_node_mark_removed_flip's header)
-	 *
-	 * ☠ THE MW ARM IS KEPT AS AN ABLATION, not as a fallback.  The gate
-	 * runs it (config "chainmw").  There are two reasons, both learned
-	 * here.  A conversion this size needs a control to bisect against.
-	 * And an arm that no config builds ROTS: NO_FEATURE_FT_MERGE went
-	 * unbuildable for fourteen commits with no gate to say so.  The MW arm
-	 * is never selected at runtime.  The kind is a property of the SLOT,
-	 * so a build either parks this class or does not.
 	 */
 	FT_TK_COUNT_CHAIN_SW();
 	return urcu_txn_store_sw(txn, slot, old_ptr, new_ptr, tag);
-#else
-	FT_TK_COUNT_CHAIN_MW();
-	return urcu_txn_store_mw(txn, slot, old_ptr, new_ptr, tag);
-#endif
 }
 
 #define ft_hlist_store_chain(ft, txn, slot, old_ptr, new_ptr, tag)	\
@@ -534,11 +517,7 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
  *
  * MEASURED with -DFT_DEBUG_HLIST_EXPECTED_OLD: these five disagree with the
  * word ZERO times over both suites and all three spacings.  So the
- * conversion is value-neutral.  That is exactly why it must ship WITH the
- * flip and not before it.  Before the flip, replacing a belief with a load
- * only weakens a check that is currently doing real work.  After the flip,
- * the belief is a blind write.  One macro, one switch, so the two can never
- * drift apart.
+ * conversion is value-neutral.  Under SW, a belief would be a blind write.
  *
  * ☠ urcu_txn_load, not _load_committed: this IS the read-your-own-writes case
  * the engine documents.  A fused commit chains several edges on one chain.
@@ -548,12 +527,8 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
  * in ft_hlist_chain_plan_ok is the opposite case.  It uses _committed for
  * exactly the opposite reason.)
  */
-#ifndef NO_FEATURE_FT_CHAIN_SW
-# define FT_CHAIN_OLD(txn, slot, believed, tag)				\
+#define FT_CHAIN_OLD(txn, slot, believed, tag)				\
 	ft_txn_load((txn), (void **) (slot), (tag))
-#else
-# define FT_CHAIN_OLD(txn, slot, believed, tag)		((void *) (believed))
-#endif
 
 
 /*

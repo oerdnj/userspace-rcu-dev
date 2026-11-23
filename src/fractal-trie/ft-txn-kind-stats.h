@@ -400,13 +400,12 @@ struct ft_tk_tls {
 	 *   - ft_ord_cell.lnode is [DESIGN] MW forever.  A splice rewrites the
 	 *     cells of NEIGHBOURING keys, and the op never acquires their
 	 *     holders.
-	 *   - cds_ft_node.next/.prev is [debt], bound for SW under the nearest
-	 *     ancestor lock.
+	 *   - cds_ft_node.next/.prev is SW under the nearest ancestor lock.
 	 * With one shared bucket, any "MW is correct here" earned by the cell
 	 * list read as though it covered the chain.  Neither could be SIZED.
 	 * The header of ft_hlist_store_mw_at asked for this split.
 	 */
-	unsigned long chain_mw, chain_sw;
+	unsigned long chain_sw;
 	unsigned long mwa[FT_TK_MWA_NR];
 #ifdef FT_ABORT_ATTRIB
 	/*
@@ -611,13 +610,7 @@ void ft_tk_count_cell_sw(void)
 	ft_tk_tls_get()->cell_sw++;
 }
 
-/* The duplicate chain's own pair -- see @chain_mw. */
-static inline
-void ft_tk_count_chain_mw(void)
-{
-	ft_tk_tls_get()->chain_mw++;
-}
-
+/* The duplicate chain's own counter -- see @chain_sw. */
 static inline
 void ft_tk_count_chain_sw(void)
 {
@@ -1589,7 +1582,7 @@ void ft_tk_dump(void)
 {
 	struct ft_tk_row *rows;
 	struct ft_tk_tls *tls;
-	unsigned long cell_mw = 0, cell_sw = 0, chain_mw = 0, chain_sw = 0;
+	unsigned long cell_mw = 0, cell_sw = 0, chain_sw = 0;
 	unsigned long mwa[FT_TK_MWA_NR];
 	unsigned long mwa_tot = 0;
 #ifdef FT_ABORT_ATTRIB
@@ -1640,7 +1633,6 @@ void ft_tk_dump(void)
 		threads++;
 		cell_mw += tls->cell_mw;
 		cell_sw += tls->cell_sw;
-		chain_mw += tls->chain_mw;
 		chain_sw += tls->chain_sw;
 		for (i = 0; i < FT_TK_MWA_NR; i++)
 			mwa[i] += tls->mwa[i];
@@ -1766,8 +1758,8 @@ void ft_tk_dump(void)
 "    ORDERED-CELL list stores (ft_ord_cell.lnode, [DESIGN] MW; straight on the engine handle, not site-attributed): MW=%lu SW=%lu\n",
 		cell_mw, cell_sw);
 	fprintf(stderr,
-"    DUPLICATE-CHAIN stores (cds_ft_node.next/.prev, [debt]; same caveat):                                          MW=%lu SW=%lu\n",
-		chain_mw, chain_sw);
+"    DUPLICATE-CHAIN stores (cds_ft_node.next/.prev; same caveat):                                                  SW=%lu\n",
+		chain_sw);
 
 	/*
 	 * MW_ALWAYS, SPLIT BY THE BRANCH THAT RECORDED IT.  The classes sum
@@ -2198,7 +2190,6 @@ static void ft_tk_miss_pc_report(void)
 #define FT_TK_COUNT_ARMED(t)		ft_tk_count_armed((t)->dbg_site)
 #define FT_TK_COUNT_CELL_MW()		ft_tk_count_cell_mw()
 #define FT_TK_COUNT_CELL_SW()		ft_tk_count_cell_sw()
-#define FT_TK_COUNT_CHAIN_MW()		ft_tk_count_chain_mw()
 #define FT_TK_COUNT_CHAIN_SW()		ft_tk_count_chain_sw()
 /*
  * THE CLASS ARGUMENT EXISTS ONLY IN THE INSTRUMENTED BUILD, for the same
@@ -2279,7 +2270,6 @@ struct ft_tk_site;	/* incomplete: the NULL the constructors take */
 #define FT_TK_COUNT_ARMED(t)		do { } while (0)
 #define FT_TK_COUNT_CELL_MW()		do { } while (0)
 #define FT_TK_COUNT_CELL_SW()		do { } while (0)
-#define FT_TK_COUNT_CHAIN_MW()		do { } while (0)
 #define FT_TK_COUNT_CHAIN_SW()		do { } while (0)
 #define FT_TK_MWA_PARAM
 #define FT_TK_MWA(c)

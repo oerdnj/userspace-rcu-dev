@@ -220,18 +220,6 @@ ALL_CONFIGS=(
 	# engine's own asserts stay armed.
 	"holdtrace|-DDEBUG_RCU -DFEATURE_FT_HOLD_TRACE -DFEATURE_FT_ANCHOR_VALIDATE|u ion ioff imw"
 	"noskip|-DNO_FEATURE_FT_SKIP_COMPRESSED|u ioff"
-	# ★ THE DUPLICATE CHAIN'"'"'S MW ABLATION.  cds_ft_node.next/.prev park SW by
-	# default; this builds the MW arm back.  It is here so the arm cannot ROT:
-	# -DNO_FEATURE_FT_MERGE went unbuildable for fourteen commits precisely
-	# because no config compiled it, and an ablation nobody builds is worthless
-	# exactly when a bisect needs it.
-	#
-	# ☠ It needs imw.  The property the flip changes is what happens when a
-	# commit ABORTS -- an SW record parks and its abort writes old_ptr back
-	# blind, where a failed MW CAS writes nothing -- and aborts are a
-	# multi-writer phenomenon.  A leg without concurrent writers cannot tell
-	# the two arms apart at all.
-	"chainmw|-DNO_FEATURE_FT_CHAIN_SW|u ion ioff imw"
 	#
 	# THE ABLATION FOR THE BULK-GATE FENCE (2026-09-20).  The shipping build
 	# fences @bulk_state only where something LOADS it -- a FINE trie, at any

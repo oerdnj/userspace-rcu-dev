@@ -2639,9 +2639,9 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	 *
 	 * MEASURED under preemption (2 cpus, 2 competing spinners), per-node
 	 * and root-only: 9 stale plans here of ~5.9M.  That is one per lost
-	 * node.  0 with -DNO_FEATURE_FT_CHAIN_SW.  The comment that stood at
-	 * the freeze said "MEASURED 0 of 279,029".  That was a fact about
-	 * unpreempted load.
+	 * node.  0 with the MW chain arm (since removed).  The comment that
+	 * stood at the freeze said "MEASURED 0 of 279,029".  That was a fact
+	 * about unpreempted load.
 	 *
 	 * @freeze_leaf's chain holder is HELD here, so the word can be asked:
 	 *   - On the prefix arms (cds_ft_remove, cds_ft_remove_all) the leaf
