@@ -17515,23 +17515,17 @@ bool ft_flip_txn_record_anchor_release(struct ft_flip_txn *t,
 }
 
 /*
- * THE RETIRE half: tombstone @node.  It is fused with the release while they
- * share a word.  It is plain once ft_flip_txn_record_anchor_release has lifted
- * the lock off a surviving ancestor.
+ * THE RETIRE half: tombstone @node, whose word the op holds.  Per-node
+ * anchoring locks every member on its own word (ft_anchor_meta), and every
+ * caller passes the held entry of the node it retires.  So either this member
+ * took @node's word (@h->lock == @node), or an earlier member of the op did
+ * (@h->node_held).  The retire is the FUSED transition: drop LOCK, set
+ * TOMBSTONE.
  *
- * The expected old is a snapshot taken at the ACQUIRE, not a fresh raw read of
- * the word.  This keeps the fenced contract.  A peer state change on the
- * retired node between the acquire and the commit aborts this op.  A late
- * capture that matched by coincidence would ratify that change instead.  The
- * snapshot is allowed to miss one value: a LOCK THIS OP took on @node's own
- * word after the member was acquired.  See the arm that reads it back through
- * the txn.
- *
- * @ctx is the op's LEDGER, and that arm is the only reader of it.  Whether the
- * op holds @node's own word is a fact about the OP.  The word cannot be asked:
- * an owner-less LOCK bit does not say whose it is.  NULL is the conservative
- * answer, "not known to be held", which keeps the snapshot.  So the worst case
- * for a caller with no ledger is an abort it could have avoided.
+ * The coarse spacings (exponential, root-only) anchored a member on an
+ * ancestor, and needed three more arms here.  The spacings are gone, and so
+ * are the arms.  A held entry for another word would make this a blind store
+ * on a word the op does not hold.  So stop there instead, in every build.
  */
 static inline
 void ft_flip_txn_record_retire_anchored_arms(struct ft_flip_txn *t,
@@ -17539,218 +17533,70 @@ void ft_flip_txn_record_retire_anchored_arms(struct ft_flip_txn *t,
 		const struct ft_held_anchor *h, struct cds_ft_metadata *node)
 {
 	/*
-	 * Every arm below hands @node's LOCK to the commit.  Where the op holds
-	 * @node's own word, the release is fused into the tombstone.  Where it
-	 * does not, ft_flip_txn_record_anchor_release lifted it beforehand.
-	 * Either way the op stops owing a release on it, so the ledger must
-	 * forget it.  See ft_flip_txn_record_anchor_release_held for what a
-	 * surviving entry does to the next op that refuses this word.  A no-op
-	 * when @node was never in the ledger (the anchored case, where its own
-	 * word is unlocked).
-	 */
-	/*
-	 * EVERY arm below ends in a TOMBSTONE on @node.  Any of them may chain
-	 * onto a release this txn already recorded on that word.  So the slot's
-	 * terminal is a RETIRE, marked ONCE here rather than in four arms.  See
+	 * The retire below hands @node's LOCK to the commit: the release is
+	 * fused into the tombstone.  So the op stops owing a release on it, and
+	 * the ledger must forget it (ft_flip_txn_record_retire_anchored).  See
+	 * ft_flip_txn_record_anchor_release_held for what a surviving entry
+	 * does to the next op that refuses this word.
+	 *
+	 * The retire may chain onto a release this txn already recorded on that
+	 * word.  So mark the slot's terminal as a RETIRE.  See
 	 * ft_flip_txn_record_tombstone for what an unmarked retire costs.
 	 */
 	ft_flip_txn_lock_mark_retiring(t, node);
-	if (h->lock == node || h->node_held) {
+	if (caa_unlikely(h->lock != node && !h->node_held)) {
+		fprintf(stderr, "FT RETIRE UNHELD: node %p lock %p -- an "
+			"anchored retire of a word the op does not hold\n",
+			(void *) node, (void *) h->lock);
+		fflush(stderr);
+		abort();
+	}
+	/*
+	 * The op holds @node's OWN word.  Either the member anchored on
+	 * itself, or an EARLIER member of this op did.  Either way the
+	 * retire is the FUSED transition: drop LOCK, set TOMBSTONE.  It
+	 * never uses a clean-word expected old, which would name a
+	 * value the word has not carried since that mark landed.
+	 */
+	if (caa_unlikely(h->shared || h->node_held)) {
 		/*
-		 * The op holds @node's OWN word.  Either the member anchored on
-		 * itself, or an EARLIER member of this op did.  Either way the
-		 * retire is the FUSED transition: drop LOCK, set TOMBSTONE.  It
-		 * never uses a clean-word expected old, which would name a
-		 * value the word has not carried since that mark landed.
+		 * The op already held the very node it now retires.  An
+		 * earlier member ANCHORED on @node, and that acquire kept
+		 * the clean snapshot this retire would want.  There is no
+		 * snapshot in @h to use: a deduped member carries none.
+		 * So take the word's value from THIS txn
+		 * (read-your-own-writes).  That is exact for both
+		 * shapes the collapse produces:
+		 *   - with an earlier release on @node, the load
+		 *     returns its clean pending value and the retire
+		 *     chains onto it;
+		 *   - with no earlier record, the load returns the
+		 *     committed word, which no peer can have moved
+		 *     because we hold it LOCKED.
+		 *
+		 * The transition is the fused one either way: drop
+		 * LOCK, set TOMBSTONE.  The mask expresses it.  The
+		 * mask is a no-op where a release already cleared the
+		 * bit.
 		 */
-		if (caa_unlikely(h->shared || h->node_held)) {
-			/*
-			 * The op already held the very node it now retires.  An
-			 * earlier member ANCHORED on @node, and that acquire kept
-			 * the clean snapshot this retire would want.  There is no
-			 * snapshot in @h to use: a deduped member carries none.
-			 * So take the word's value from THIS txn
-			 * (read-your-own-writes).  That is exact for both
-			 * shapes the collapse produces:
-			 *   - with an earlier release on @node, the load
-			 *     returns its clean pending value and the retire
-			 *     chains onto it;
-			 *   - with no earlier record, the load returns the
-			 *     committed word, which no peer can have moved
-			 *     because we hold it LOCKED.
-			 *
-			 * The transition is the fused one either way: drop
-			 * LOCK, set TOMBSTONE.  The mask expresses it.  The
-			 * mask is a no-op where a release already cleared the
-			 * bit.
-			 */
-			uintptr_t pending = (uintptr_t) ft_txn_load(t->mtxn,
-					(void **) &node->state, FT_STATE_PROXY);
-
-			ft_flip_txn_record_state_ctx(t, ctx, node,
-				(void *) pending,
-				(void *) ((pending & ~(uintptr_t) FT_STATE_LOCK)
-					| FT_STATE_TOMBSTONE));
-			return;
-		}
-		ft_flip_txn_record_tombstone_locked_ctx(t, ctx, node,
-			h->lock_snap);
-		return;
-	}
-	/*
-	 * @node's own word is not one this member locked, so the snapshot is the
-	 * expected old -- UNLESS the op has marked that word since.  Under a
-	 * coarse spacing that is ordinary.  A LATER member anchoring ON @node
-	 * locks it.  The two acquires are separate commits, so nothing updated
-	 * @h.  The snapshot then names a value the word has not carried since
-	 * that mark landed.  The install CAS can only fail, and every retry
-	 * rebuilds the same shape.  This is a deterministic abort with no
-	 * diagnostic (measured single-writer, so not contention).
-	 *
-	 * So take the FUSED transition when the txn's own view differs from the
-	 * snapshot BY THE LOCK BIT ALONE -- but ONLY once @ctx has confirmed the
-	 * op holds @node's own word.
-	 *
-	 * ☠ The bit alone does NOT identify its owner.  Holding the ANCHOR does
-	 * not exclude every mutator of @node either: a peer whose descent dates
-	 * @node differently -- across a graft, a merge, or any move that puts the
-	 * node on a second path -- anchors it elsewhere and locks it legitimately.
-	 * Swallowing that bit into the expected old turns the retire into a
-	 * COMMITTING write over a peer's fence.  The tombstone lands and the
-	 * peer's lock silently vanishes with it.  The peer's own release then
-	 * asserts on a word no writer is accountable for.
-	 *
-	 * Any OTHER difference stays on the snapshot.  The commit then aborts
-	 * rather than ratify a world that moved, which is the fenced contract
-	 * this arm exists for.  Per-node granularity never reaches here
-	 * (@h->lock is always @node), so the default stays byte-identical.
-	 */
-	/*
-	 * ☠ BUT FIRST, ASK THE DESCRIPTOR WHETHER THIS OP ALREADY SEALED
-	 * @node's FATE.  @h->node_snap is ONE member's pre-txn snapshot.  Under
-	 * a coarse spacing two steps of one op can reach the SAME node.  The
-	 * rekey fold's ft_rekey_cow_stop retires @stop.  The graft glue
-	 * separately retires its split_cn, which IS that node on a cut-run dst
-	 * split.  Per-node granularity resolves the collapse in the held
-	 * branch above: the second member arrives @shared and reads its own
-	 * writes.  This arm was the one place that still trusted the snapshot.
-	 * So both retires named the SAME pre-txn value, the second failed
-	 * urcu_txn_record_chain's value reconcile, and the descriptor was
-	 * POISONED.  That is an ABORT with no losing record and no peer, which
-	 * the retry loop replays identically forever.  Measured: ft_unit 114
-	 * leak-hangs on both coarse spacings while per-node stays green.
-	 *
-	 * ☠☠ urcu_txn_load cannot carry this dedupe.  With no record for the
-	 * slot it falls through to a PHYSICAL read.  Ratifying a fresh read
-	 * here would bless a peer's change, which is exactly what the
-	 * snapshot's fenced contract exists to abort.  So ask urcu_txn_find,
-	 * the descriptor and nothing else (the ft_flip_txn_guard_parent
-	 * carve-out is the same idiom).  Keep the snapshot whenever the txn
-	 * holds no record.
-	 *
-	 * A staged value already carrying TOMBSTONE is the op's OWN terminal.
-	 * ONE WORD TAKES ONE TERMINAL (the law ft_flip_txn_record_anchor_
-	 * release yields to, in the other order).  So this retire owes
-	 * NOTHING.  It does not even owe the idempotent {v -> v} re-record,
-	 * which adds an edge for no value and re-opens the slot's KIND
-	 * question.
-	 *
-	 * ★ AND IT DEDUPES, IT DOES NOT RATIFY.  Every OTHER staged value
-	 * falls through to the arms below deliberately.  They already answer
-	 * it, and they answer it more tightly.  An earlier RELEASE on @node's
-	 * own word stages {LOCK|s -> s}.  The snapshot fallback's expected old
-	 * IS that @s, so urcu_txn_record_chain reconciles the pair with no
-	 * help from here.  Anything else is a word this op did not put there.
-	 * The snapshot turns that into the ABORT the fenced contract owes.
-	 * Chaining from the staged value instead would RATIFY a world that
-	 * moved, which is the one thing this arm exists to refuse.  (Measured:
-	 * the chain case is unreached -- 0 on every spacing across ft_unit and
-	 * ft_inv -- so this costs nothing and removes a path nothing covers.)
-	 */
-	{
-		const struct ft_txn_rec *r = ft_txn_find(t->mtxn,
-			(void **) &node->state);
-
-		if (caa_unlikely(r != NULL &&
-				((uintptr_t) ft_txn_rec_new(r) &
-					FT_STATE_TOMBSTONE)))
-			return;		/* the terminal is already recorded */
-	}
-	{
 		uintptr_t pending = (uintptr_t) ft_txn_load(t->mtxn,
 				(void **) &node->state, FT_STATE_PROXY);
-		uintptr_t held_snap;
-		bool ratified;
 
-		if (caa_unlikely(pending == (h->node_snap | FT_STATE_LOCK) &&
-				(ft_flip_txn_releases_after(t, node) ||
-				 ft_lock_ctx_holds(ctx, node, &held_snap,
-					&ratified)))) {
-			ft_flip_txn_record_state_ctx(t, ctx, node,
-				(void *) pending,
-				(void *) ((pending & ~(uintptr_t) FT_STATE_LOCK)
-					| FT_STATE_TOMBSTONE));
-			return;
-		}
+		ft_flip_txn_record_state_ctx(t, ctx, node,
+			(void *) pending,
+			(void *) ((pending & ~(uintptr_t) FT_STATE_LOCK)
+				| FT_STATE_TOMBSTONE));
+		return;
 	}
-	/*
-	 * ☠ MW, BECAUSE THIS ARM IS BY CONSTRUCTION THE ONE WHERE THE OP DOES
-	 * NOT HOLD @node'S OWN WORD.
-	 *
-	 * The branch above took every shape where it does (@h->lock == node, or
-	 * an earlier member anchored on @node).  Those retire SW legitimately:
-	 * step 1 won the word, so step 2 may park.  Reaching HERE means the
-	 * acquire went to an ANCHOR ANCESTOR, and the held set does not report
-	 * @node either.  An SW park would then be step 2 WITHOUT step 1: a
-	 * blind store on a word this op never excluded.  This function's own
-	 * header says as much: "Holding the ANCHOR does not exclude every
-	 * mutator of @node either: a peer whose descent dates @node differently
-	 * -- across a graft, a merge, or any move that puts the node on a
-	 * second path -- anchors it elsewhere and locks it legitimately".  It
-	 * names the MW snapshot expected-old as the defence.  The record has to
-	 * BE MW for that defence to exist: an SW park has no expected-old at
-	 * all.
-	 *
-	 * ☞ AND IT IS THE SAME PREDICATE THE GUARD SIDE ALREADY USES.
-	 * ft_flip_txn_lock_or_guard_parent_at plants a §4.B guard on exactly
-	 * `held.lock != node_meta && !held.node_held`, because the op does not
-	 * hold the word.  That is this arm's condition.  With the retire
-	 * recorded SW, the two halves of ONE op contradicted each other on ONE
-	 * word.  The guard recorded an MW {live -> live} validate, then this
-	 * arm an SW {s -> s|TOMBSTONE}.  ONE SLOT, TWO KINDS.
-	 * --enable-rcu-debug aborts at urcu_txn_record_chain's
-	 * `r->kind == kind`.  A release build takes the MW-domination
-	 * fail-safe.  So it already behaved as this line now does, but by luck
-	 * and without the debug build agreeing.
-	 *
-	 * MEASURED: ft_unit test_rekey_displaced_external_dst at
-	 * CDS_FT_LOCK_SPACING_ROOT_ONLY aborted on that assert.  The pair was
-	 * caught in order on one slot:
-	 *   - MW {0xc->0xc} from ft_glue_txn_commit_edges' coarsened-shared
-	 *     guard;
-	 *   - then SW {0xc->0xe} from here, via
-	 *     ft_node_recompact(FT_RECOMPACT_DEL) out of the detach.
-	 * The acquire did NOT miss: it returned shared, anchor != node,
-	 * node_held == 0.
-	 *
-	 * Byte-neutral wherever the txn is not structural_sw, because such a
-	 * txn records MW whatever @sw_ok says.  Also byte-neutral at PER-NODE
-	 * spacing, where the anchor IS the node and this arm is unreachable.
-	 */
-#ifdef FT_DEBUG_STRUCT_ANCHOR
-	ft_sa_anchor_props(t, ctx, node, h->lock);
-#endif
-	ft_flip_txn_record_state_kind_ctx(t, ctx, node,
-			(void *) h->node_snap,
-			(void *) (h->node_snap | FT_STATE_TOMBSTONE),
-			/*sw_ok=*/ 0);
+	ft_flip_txn_record_tombstone_locked_ctx(t, ctx, node,
+		h->lock_snap);
 }
 
 /*
- * ☠ THE LEDGER DROP HAPPENS AFTER THE ARMS, NOT BEFORE THEM.
+ * ☠ THE LEDGER DROP HAPPENS AFTER THE RECORDS, NOT BEFORE THEM.
  *
- * Every arm above hands @node's LOCK to the commit, so the ledger must forget
- * it.  But it must do so only after the arm has planted its records.  Each
+ * The retire above hands @node's LOCK to the commit, so the ledger must forget
+ * it.  But it must do so only after the retire has planted its records.  Each
  * record asks, when it is planted, whether the op OWNS the word
  * (ft_flip_txn_owns, and the OWN_LEDGER counter beside it).  Dropping first
  * answers "no", although this branch has already established the true
@@ -17759,8 +17605,8 @@ void ft_flip_txn_record_retire_anchored_arms(struct ft_flip_txn *t,
  * under the MW oracle hold @node's own word with the registry silent.  The
  * ledger is the only witness left.
  *
- * A no-op when @node was never in the ledger (the anchored case, where its own
- * word is unlocked).  Compiled out entirely without FEATURE_FT_HOLD_TRACE.
+ * A no-op when @node was never in the ledger.  Compiled out entirely without
+ * FEATURE_FT_HOLD_TRACE.
  */
 static inline
 void ft_flip_txn_record_retire_anchored(struct ft_flip_txn *t,
