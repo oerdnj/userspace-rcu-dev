@@ -11146,6 +11146,11 @@ void ft_flip_txn_record_tag_mw_pinned(struct ft_flip_txn *t, void **slot,
 #else
 # define FT_ROOT_OWNED_STRICT	0
 #endif
+#ifdef FT_DEBUG_ROOT_VALIDATE_PLANT
+# define FT_ROOT_VALIDATE_PLANT	1
+#else
+# define FT_ROOT_VALIDATE_PLANT	0
+#endif
 
 /*
  * The root's own two census counters, declared here because the recorder that
@@ -11194,10 +11199,14 @@ enum { FT_RTAKE_CALL, FT_RTAKE_HELD, FT_RTAKE_TOOK, FT_RTAKE_MISS,
  * not on @t's named trie (see the body):
  *   - @t holds that trie's @root_lock: record through ft_flip_txn_record_tag
  *     with @root_lock as the owner.
- *   - That trie is COARSE or EXCLUSIVE: park a write SW.  A validate stays MW.
+ *   - That trie is COARSE or EXCLUSIVE: park SW.
  *   - Otherwise the trie is FINE and shared, and @t does not hold its
  *     @root_lock.  Abort under FT_ROOT_OWNED_STRICT, the default.  Without
  *     it, record MW through ft_flip_txn_record_tag_mw_pinned.
+ * A validate (old == new) aborts first, under FT_ROOT_OWNED_STRICT.  No
+ * producer records one: a probe counted none in ft_unit and ft_inv.
+ * -DFT_DEBUG_ROOT_VALIDATE_PLANT fails that check on the first root record:
+ * that is its red control.
  *
  * This header used to say "ALWAYS MW" and "a root can never convert".  Stage 5
  * gave &ft->root an owner, @root_lock.  The text below is the reasoning for
@@ -11235,12 +11244,11 @@ enum { FT_RTAKE_CALL, FT_RTAKE_HELD, FT_RTAKE_TOOK, FT_RTAKE_MISS,
  *     TOMBSTONE, so nobody re-locks that word").  A trie-level word never
  *     dies, so a mark leaked on it would have no natural end.
  *
- * The rule is a property of the SLOT, not of the txn's named trie.  That is
- * what lets a CROSS-TRIE dual record both of its roots MW while its own
- * trie's content parks SW.  Such a dual is one txn with two roots (the
- * empty-dst ft_graft).  The pinned form is counted MW_ALWAYS
- * (FT_TK_MWA_ROOT).  The old text gave the reason: "a root can never convert,
- * so it is not part of the MW_STRUCT conversion surface."
+ * Since Stage 5, the kind is a property of the SLOT, not of the txn's named
+ * trie.  A CROSS-TRIE dual is one txn with two roots (the empty-dst
+ * ft_graft).  Each root is asked about its own trie and its own @root_lock, so
+ * a root never stays MW because of the other trie.  The pinned form is reached
+ * only without FT_ROOT_OWNED_STRICT, and is counted MW_ALWAYS (FT_TK_MWA_ROOT).
  */
 static inline
 void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
@@ -11278,6 +11286,21 @@ void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
 				(struct cds_ft_inode_flag **) slot,
 				struct cds_ft, root);
 
+		/*
+		 * A root VALIDATE (old == new) has no producer: every root
+		 * record is a publish.  The SW engine cannot express a
+		 * validate, and an SW park of one would store a possibly
+		 * stale value blind.  So stop rather than record it MW.
+		 */
+		if (FT_ROOT_OWNED_STRICT &&
+				(old_ptr == new_ptr || FT_ROOT_VALIDATE_PLANT)) {
+			fprintf(stderr, "FT ROOT VALIDATE: slot %p value %p "
+				"producer %p -- a root record with old == new\n",
+				(void *) slot, old_ptr,
+				__builtin_return_address(0));
+			fflush(stderr);
+			abort();
+		}
 		if (ft_flip_txn_holds(t, &owner_ft->root_lock)) {
 			FT_COW_ROOT_HELD();
 			ft_flip_txn_record_tag(t, &owner_ft->root_lock,
@@ -11294,8 +11317,9 @@ void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
 			 * race.  The question is asked of @owner_ft, the trie
 			 * the SLOT belongs to.  That is what the pin exists
 			 * for: door 1 answers for @t->ft only, and a cross-trie
-			 * dual writes a second root.  A validate (old == new)
-			 * stays MW: a park cannot fail.
+			 * dual writes a second root.  A validate aborted above.
+			 * Without FT_ROOT_OWNED_STRICT it stays MW: a park cannot
+			 * fail.
 			 */
 			if (old_ptr != new_ptr) {
 				int ret;
