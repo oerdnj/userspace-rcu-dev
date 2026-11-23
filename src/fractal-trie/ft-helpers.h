@@ -4346,10 +4346,21 @@ void _ft_publish_to_parent_meta_at(const char *pub_fn, int pub_line,
 				child_meta = cds_ft_item_to_metadata(
 					ft_node_ptr(new_child));
 		}
-		if (child_meta && ft_parent_node(child_meta->parent_word))
+		if (child_meta && ft_parent_node(child_meta->parent_word)) {
+			/*
+			 * The caller's contract above: the parent word already
+			 * names the node that holds @parent_slot.  A child whose
+			 * re-home is only recorded would still name its old
+			 * parent, and the offset below would be computed off
+			 * the wrong body.
+			 */
+			urcu_assert_debug(ft_slot_in_node(
+				ft_parent_node(child_meta->parent_word),
+				parent_slot));
 			ft_set_parent_slot(child_meta,
 				ft_parent_node(child_meta->parent_word),
 				parent_slot);
+		}
 	}
 
 	if (parent_nf && ft_node_compressed(parent_nf)) {
