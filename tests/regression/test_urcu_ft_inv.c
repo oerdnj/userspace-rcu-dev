@@ -92,7 +92,7 @@
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
 /* +1 inv_graft_swap_whole_seam_points */
-#define NR_TESTS	(146 + NR_TESTS_REKEY_DLM)	/* +1: inv_owned_long_runs; +1: inv_owned_prefix_dense_remove_all; +1: inv_ir_prefix_roundtrip; +1: inv_owned_prefix_dense_replace; +1: inv_owned_prefix_dense; +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension; +1: inv_prefix_shape_zoo */
+#define NR_TESTS	(147 + NR_TESTS_REKEY_DLM)	/* +1: inv_detach_orphan_shape; +1: inv_owned_long_runs; +1: inv_owned_prefix_dense_remove_all; +1: inv_ir_prefix_roundtrip; +1: inv_owned_prefix_dense_replace; +1: inv_owned_prefix_dense; +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension; +1: inv_prefix_shape_zoo */
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -15780,6 +15780,232 @@ static int inv_concurrent_insert_unique_prefix(void)
 	return ret;
 }
 
+/*
+ * Point removes that prune a chain of single-child nodes, racing peers that
+ * insert into and remove from the same chains.
+ *
+ * Removing the last key below a branch makes ft_detach_node walk up and lock
+ * every node it will retire.  It keeps those locks in its own array
+ * (orphan_held), outside the commit txn's registry.  Then it locks or guards
+ * the holder and the grandparent through that frame.  If one of them is also
+ * an orphan, the take is a SHARED dedupe the txn cannot see.  Its records
+ * would then fall back to MW.
+ *
+ * The writers share DETACH_ORPHAN_PREFIXES random prefixes.  Each is a short
+ * head, a run that the trie stores as a compressed node, and a short tail.  So
+ * a remove prunes through a compressed node.  Each writer appends its own id
+ * byte, so it owns its keys and frees what it removes.  Some tails contain id
+ * bytes, so some keys end where other keys continue.  Oracle: an insert of
+ * an absent own key returns OK; a remove of a present one finds the writer's
+ * own node and succeeds; the trie verifies and holds exactly the keys the
+ * writers believe present.
+ */
+#define DETACH_ORPHAN_WRITERS	8
+#define DETACH_ORPHAN_PREFIXES	256
+#define DETACH_ORPHAN_RUN	16
+#define DETACH_ORPHAN_MAX_LEN	(2 + DETACH_ORPHAN_RUN + 2)
+#define DETACH_ORPHAN_MS	2000
+static uint8_t detach_orphan_prefix[DETACH_ORPHAN_PREFIXES]
+		[DETACH_ORPHAN_MAX_LEN + 2];
+static size_t detach_orphan_len[DETACH_ORPHAN_PREFIXES];
+static unsigned long detach_orphan_bad;
+struct detach_orphan_arg {
+	struct cds_ft *ft;
+	unsigned int id;
+	unsigned long inserts, removes;
+	unsigned long present;
+	struct ft_test_node *own[DETACH_ORPHAN_PREFIXES];
+};
+
+static size_t detach_orphan_key(uint8_t *key, unsigned int p, unsigned int id)
+{
+	size_t len = detach_orphan_len[p];
+
+	memcpy(key, detach_orphan_prefix[p], len);
+	key[len] = (uint8_t) id;
+	return len + 1;
+}
+
+static void *detach_orphan_writer(void *arg)
+{
+	struct detach_orphan_arg *a = (struct detach_orphan_arg *) arg;
+	unsigned int seed = 0x5eed0000u + a->id;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(a->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		rcu_quiescent_state();
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	while (!test_stop) {
+		unsigned int p = (unsigned int) rand_r(&seed) %
+			DETACH_ORPHAN_PREFIXES;
+		uint8_t key[DETACH_ORPHAN_MAX_LEN + 2];
+		size_t klen = detach_orphan_key(key, p, a->id);
+		struct ft_test_node *n = a->own[p];
+
+		rcu_read_lock();
+		if (!n) {
+			n = node_alloc(((uint64_t) a->id << 32) | p);
+			n->value = klen;
+			if (cds_ft_insert(a->ft, key, klen, &n->node)
+					!= CDS_FT_STATUS_OK) {
+				rcu_read_unlock();
+				node_free(n);
+				uatomic_inc(&detach_orphan_bad);
+				break;
+			}
+			a->own[p] = n;
+			a->present++;
+			a->inserts++;
+		} else {
+			cds_ft_iter_set_key(iter, key, klen);
+			if (cds_ft_lookup(a->ft, iter) != CDS_FT_STATUS_OK ||
+					cds_ft_iter_node(iter) != &n->node ||
+					cds_ft_remove(a->ft, iter, &n->node)
+						!= CDS_FT_STATUS_OK) {
+				rcu_read_unlock();
+				uatomic_inc(&detach_orphan_bad);
+				break;
+			}
+			node_free_rcu(n);
+			a->own[p] = NULL;
+			a->present--;
+			a->removes++;
+		}
+		rcu_read_unlock();
+		rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_detach_orphan_shape_one(bool list_on)
+{
+	enum cds_ft_writer_strategy ws = CDS_FT_WRITER_LOCK_FINE;
+	struct cds_ft_group *group;
+	struct cds_ft *ft = list_on ? create_varlen_ord_ft_ws(&group, &ws)
+		: create_varlen_fine_lock_ft(&group);
+	pthread_t th[DETACH_ORPHAN_WRITERS];
+	static struct detach_orphan_arg a[DETACH_ORPHAN_WRITERS];
+	const char *env = getenv("FT_INV_DETACH_ORPHAN_MS");
+	unsigned long long ms = env ? strtoull(env, NULL, 10) :
+		DETACH_ORPHAN_MS;
+	unsigned long inserts = 0, removes = 0, present = 0, nr_keys = 0;
+	struct timespec t0;
+	unsigned int i;
+	int ret = 0;
+
+	detach_orphan_bad = 0;
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < DETACH_ORPHAN_WRITERS; i++) {
+		memset(&a[i], 0, sizeof(a[i]));
+		a[i].ft = ft;
+		a[i].id = i;
+		pthread_create(&th[i], NULL, detach_orphan_writer, &a[i]);
+	}
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < ms)
+		rcu_quiescent_state();
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	rcu_thread_offline();
+	for (i = 0; i < DETACH_ORPHAN_WRITERS; i++) {
+		pthread_join(th[i], NULL);
+		inserts += a[i].inserts;
+		removes += a[i].removes;
+		present += a[i].present;
+	}
+	rcu_thread_online();
+
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "inv_detach_orphan_shape: verify failed "
+			"(list %s)\n", list_on ? "on" : "off");
+		ret = -1;
+	}
+	rcu_read_lock();
+	nr_keys = cds_ft_count_keys(ft);
+	rcu_read_unlock();
+	fprintf(stderr, "# inv_detach_orphan_shape list %s: %lu inserts, "
+		"%lu removes, %lu present, %lu keys, %lu bad\n",
+		list_on ? "on" : "off", inserts, removes, present, nr_keys,
+		detach_orphan_bad);
+	if (detach_orphan_bad) {
+		fprintf(stderr, "inv_detach_orphan_shape: %lu insert(s) or "
+			"remove(s) of a writer's own key failed\n",
+			detach_orphan_bad);
+		ret = -1;
+	}
+	if (nr_keys != present) {
+		fprintf(stderr, "inv_detach_orphan_shape: trie holds %lu keys, "
+			"writers hold %lu\n", nr_keys, present);
+		ret = -1;
+	}
+	if (removes == 0) {
+		fprintf(stderr, "inv_detach_orphan_shape: no removes\n");
+		ret = -1;
+	}
+	drain_trie_keep_group(ft);
+	rcu_barrier();
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int inv_detach_orphan_shape(void)
+{
+	unsigned int seed = 0xd7ac0u;
+	unsigned int p, j;
+	int ret = 0;
+
+	/* Distinct prefixes: a repeat would give a writer one key twice. */
+	for (p = 0; p < DETACH_ORPHAN_PREFIXES; p++) {
+		unsigned int q;
+
+		unsigned int head, tail;
+		uint8_t *k = detach_orphan_prefix[p];
+
+retry:
+		/*
+		 * A head of 1-2 letters, a run, then a tail of 0-2 bytes.  The
+		 * run under each head is a compressed node.  A tail byte is a
+		 * letter or a writer id.  An id makes one key a prefix of
+		 * others, ending at the run or just below it.  Two writers'
+		 * keys never collide: their last bytes differ.
+		 */
+		head = 1 + (unsigned int) rand_r(&seed) % 2;
+		tail = (unsigned int) rand_r(&seed) % 3;
+		for (j = 0; j < head; j++)
+			k[j] = (uint8_t) ('a' + rand_r(&seed) % 3);
+		memset(&k[head], 'r', DETACH_ORPHAN_RUN);
+		for (j = 0; j < tail; j++) {
+			unsigned int r = (unsigned int) rand_r(&seed) % 5;
+
+			k[head + DETACH_ORPHAN_RUN + j] = r < 3 ?
+				(uint8_t) ('a' + r) :
+				(uint8_t) (rand_r(&seed) %
+					DETACH_ORPHAN_WRITERS);
+		}
+		detach_orphan_len[p] = head + DETACH_ORPHAN_RUN + tail;
+		for (q = 0; q < p; q++)
+			if (detach_orphan_len[q] == detach_orphan_len[p] &&
+					!memcmp(detach_orphan_prefix[q],
+						detach_orphan_prefix[p],
+						detach_orphan_len[p]))
+				goto retry;
+	}
+	if (inv_detach_orphan_shape_one(true))
+		ret = -1;
+	if (inv_detach_orphan_shape_one(false))
+		ret = -1;
+	return ret;
+}
+
 /* ================================================================== */
 /*                                                                    */
 /*   TWO graft_swaps exchanging at ONE destination position           */
@@ -29908,6 +30134,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_prefix_pair_compressed_holder);
 	RUN_TEST(inv_prefix_siblings_compressed_holder);
 	RUN_TEST(inv_concurrent_insert_unique_prefix);
+	RUN_TEST(inv_detach_orphan_shape);
 	RUN_TEST(inv_prefix_dup_promote_vs_extension);
 	RUN_TEST(inv_prefix_shape_zoo);
 	RUN_TEST(inv_owned_prefix_dense);
