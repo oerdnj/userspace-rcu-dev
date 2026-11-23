@@ -3437,10 +3437,9 @@ int ft_detach_node(struct cds_ft *ft,
 	 * safety + nr_keys fold).
 	 *
 	 * The caller supplies no @pub in list-off: there is no ordered-list
-	 * cell to fuse.  An in-place external promote would then store bare
-	 * into the LIVE holder's child slot, via ft_node_replace_ptr's
-	 * lone-edge arm (ft_node_child_edge_flip).  That is a blind
-	 * rcu_assign.  Under MW it resurrects a peer's relocated node or
+	 * cell to fuse.  ft_node_replace_ptr used to store bare into the LIVE
+	 * holder's child slot for a NULL @pub.  That arm is gone, and a NULL
+	 * @pub now faults.  Such a store would be a blind rcu_assign.  Under MW it resurrects a peer's relocated node or
 	 * smashes a parked latch.  It is NOT §4.B-guarded: the
 	 * concurrent-recompaction premise requires EVERY live child-slot
 	 * mutation to be a proxy'd, holder-serialized txn.
