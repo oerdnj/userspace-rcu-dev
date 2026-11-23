@@ -438,31 +438,11 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 			/*child_marked=*/ false, /*hold_ctx=*/ NULL,
 			/*check_child=*/ false);	/* span-preserving */
 		/*
-		 * ☑ THE DUAL'S OWNER IS NAMED NOW.  It is the GRANDPARENT node
-		 * that contains @gp_slot.  This helper used to be handed the
-		 * bare slot, so the meta was not in scope.  The record then
-		 * said FT_OWNER_UNPLUMBED: "plumbing, not a missing lock",
-		 * since the compaction pass runs under whole-trie exclusion.
-		 * The caller has that node in hand, because it read the slot
-		 * out of it.  So it passes it.
-		 *
-		 * ☠ AND THIS CHANGES NO BEHAVIOUR, deliberately.
-		 * @t->structural_sw decides the record's KIND, never @owner.
-		 * So naming the owner cannot park anything SW.
-		 *
-		 * This matters because the SKIP_X dual must stay MW until
-		 * EVERY producer can vouch.  One lane parking SW while another
-		 * CASes the same slot is a cross-thread kind disagreement.
-		 * The engine cannot check it.
-		 *
-		 * FT_OWNER_ASSERT_OWNED is likewise inert here.  It is guarded
-		 * on dbg_arm_per_op && nr_locks.  This bounded txn is neither
-		 * armed nor lock-carrying.
-		 *
-		 * The name buys one thing: the edge stops counting as
-		 * UNPLUMBED.  Note (1) of the word-kind table names two
-		 * producers as blocking the dual's conversion.  This edge is
-		 * one of them.
+		 * The dual's owner is the GRANDPARENT node that contains
+		 * @gp_slot.  The caller read the slot out of it, so it passes
+		 * it.  The recorder parks the edge SW when the txn owns that
+		 * node or excludes every writer.  It records no MW: any other
+		 * record aborts (FT_STRUCT_SW_STRICT).
 		 */
 		/*
 		 * Under the lock, hand the marks to @t BEFORE the slot record.

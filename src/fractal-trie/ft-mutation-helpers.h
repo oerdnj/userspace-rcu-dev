@@ -10478,6 +10478,47 @@ void ft_flip_txn_record_unheld_edge(struct ft_flip_txn *t,
 # define FT_BODY_UNOWNED_PLANT	0
 #endif
 /*
+ * A structural record that is neither owned nor excluded aborts in every
+ * build.  The flip txn records SW only.  No record of the suites reaches the
+ * MW branch, and the DEBUG_RCU trap there only covers debug builds.  An
+ * ablation build that restores MW on purpose defines FT_ALLOW_MW_RECORDS or
+ * NO_FT_STRUCT_SW_STRICT.  FT_DEBUG_STRUCT_MW_PLANT sends every record to the
+ * MW branch: the red control.
+ */
+#if !defined(NO_FT_STRUCT_SW_STRICT) && !defined(FT_ALLOW_MW_RECORDS)
+# define FT_STRUCT_SW_STRICT	1
+#else
+# define FT_STRUCT_SW_STRICT	0
+#endif
+#ifdef FT_DEBUG_STRUCT_MW_PLANT
+# define FT_STRUCT_MW_PLANT	1
+#else
+# define FT_STRUCT_MW_PLANT	0
+#endif
+static __attribute__((noinline, noreturn))
+void ft_flip_txn_struct_mw_abort(const struct ft_flip_txn *t,
+		const struct cds_ft_metadata *owner, void **slot,
+		void *old_ptr, void *new_ptr, const void *producer)
+{
+	const struct cds_ft *ft = t->ft;
+	Dl_info di;
+
+	fprintf(stderr, "FT STRUCT MW: slot %p {%p -> %p} owner %p owned %d "
+		"armed %d per_op %d body %d trie_wide %d fine %d excl %d "
+		"wlock %d producer %s+%#lx -- a structural record that is "
+		"neither owned nor excluded\n", (void *) slot, old_ptr,
+		new_ptr, (const void *) owner,
+		(int) ft_flip_txn_owns(t, owner), (int) t->structural_sw,
+		(int) t->sw_per_op, (int) t->sw_body, (int) t->trie_wide_sw,
+		ft ? (int) ft->lock_fine : -1, ft ? (int) ft->exclusive : -1,
+		ft ? (int) (ft_wlock_held == ft) : -1,
+		dladdr(producer, &di) && di.dli_fname ? di.dli_fname : "?",
+		dladdr(producer, &di) ? (unsigned long) ((const char *)
+			producer - (const char *) di.dli_fbase) : 0UL);
+	fflush(stderr);
+	abort();
+}
+/*
  * THE RECORDER CORE, taking the op's held-set witness as a PARAMETER.
  *
  * Only FT_OWNER_ASSERT_OWNED_CTX consumes @dbg_ctx.  It is the debug-only
@@ -10752,8 +10793,8 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 	 * per-record answer is what licenses the park, so it needs no txn-wide
 	 * arm to be asked.
 	 */
-	if (held_sw || (t->structural_sw &&
-	    (!t->sw_per_op || t->sw_body || ft_flip_txn_owns(t, owner)))) {
+	if (!FT_STRUCT_MW_PLANT && (held_sw || (t->structural_sw &&
+	    (!t->sw_per_op || t->sw_body || ft_flip_txn_owns(t, owner))))) {
 		/*
 		 * Door 3 parks on the claim that the op fenced the word
 		 * itself.  Check that claim where nothing else excludes the
@@ -10849,6 +10890,9 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 		FT_LL_REC(t, slot, old_ptr, new_ptr, true);
 		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	} else {
+		if (FT_STRUCT_SW_STRICT)
+			ft_flip_txn_struct_mw_abort(t, owner, slot, old_ptr,
+				new_ptr, __builtin_return_address(0));
 		/*
 		 * The DLM lock TAKE reaches this same branch.  It is the one MW
 		 * record that must never become SW.  So it is counted apart
