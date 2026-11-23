@@ -3078,7 +3078,16 @@ struct cds_ft_inode_flag **ft_resolve_parent_slot(
 	void *state;
 
 	for (;;) {
-		struct cds_ft_inode_flag *praw = rcu_dereference(meta->parent_word);
+		/*
+		 * ACQUIRE, not rcu_dereference.  The offset load below does not
+		 * depend on this value, so only an acquire orders it after this
+		 * one.  Without it, this load can see a re-home's settled NEW
+		 * parent and the offset load the OLD offset.  The re-read below
+		 * then accepts the torn pair.  An acquire on the offset load
+		 * orders nothing before it.
+		 */
+		struct cds_ft_inode_flag *praw =
+			ft_dereference_acquire(meta->parent_word);
 		void *sraw = uatomic_load(
 				(void **) (uintptr_t) &meta->parent_slot_offset,
 				CMM_ACQUIRE);
@@ -3110,10 +3119,12 @@ struct cds_ft_inode_flag **ft_resolve_parent_slot(
 				state = ft_txn_parked_value(rs, committed);
 			} else {
 				/*
-				 * Parent parked, offset plain.  The offset was
-				 * either never recorded (the slot index did not
-				 * change) or already settled.  Neither can be
-				 * told from here, so wait for the parent word.
+				 * Parent parked, offset plain.  The commit parks
+				 * the parent word first, so the offset may not
+				 * be parked yet.  It may also be unrecorded (the
+				 * slot index did not change) or already settled.
+				 * None of these can be told from here, so wait
+				 * for the parent word.
 				 */
 				continue;
 			}
