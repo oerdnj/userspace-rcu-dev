@@ -9548,6 +9548,53 @@ void ft_mw_record_trap(const char *what, void **slot, void *old_ptr,
 # define FT_MW_RECORD_TRAP(what, slot, o, n)	do { } while (0)
 #endif
 
+/*
+ * A §4.B guard is an MW {live -> live} validate of a word the op does not
+ * hold.  Ownership is taken, never observed: in the lock-before-write model
+ * the op holds the word, or its trie excludes every writer.  Each guard below
+ * returns early in those cases.  In ft_unit and ft_inv, no guard got past its
+ * early returns, over thousands to millions of calls per run.  The rekey
+ * re-home guard cannot get there at all: it needs an earlier MW record.
+ *
+ * So reaching the record is a missing take, not a case to validate.  Stop
+ * there, in every build.  -DNO_FT_GUARD_OWNED_STRICT records the MW guard as
+ * before.  -DFT_DEBUG_GUARD_UNOWNED_PLANT stops at the first call of the
+ * parent, installed-child and re-parent guards: that is the red control.
+ */
+#if !defined(NO_FT_GUARD_OWNED_STRICT)
+# define FT_GUARD_OWNED_STRICT	1
+#else
+# define FT_GUARD_OWNED_STRICT	0
+#endif
+#ifdef FT_DEBUG_GUARD_UNOWNED_PLANT
+# define FT_GUARD_UNOWNED_PLANT	1
+#else
+# define FT_GUARD_UNOWNED_PLANT	0
+#endif
+
+static __attribute__((noinline, noreturn, unused))
+void ft_guard_unheld_abort(const char *what, const void *slot,
+		const void *producer)
+{
+	fprintf(stderr, "FT GUARD UNHELD: %s on slot %p producer %p -- the op "
+		"neither holds the word nor excludes its writers\n", what,
+		slot, producer);
+	fflush(stderr);
+	abort();
+}
+#define FT_GUARD_STOP(what, slot)					\
+	do {								\
+		if (FT_GUARD_OWNED_STRICT)				\
+			ft_guard_unheld_abort((what), (slot),		\
+				__builtin_return_address(0));		\
+	} while (0)
+#define FT_GUARD_PLANT(what, slot)					\
+	do {								\
+		if (FT_GUARD_OWNED_STRICT && FT_GUARD_UNOWNED_PLANT)	\
+			ft_guard_unheld_abort((what), (slot),		\
+				__builtin_return_address(0));		\
+	} while (0)
+
 #ifdef FT_DEBUG_MW_KEPT
 # ifndef FT_ABORT_ATTRIB
 #  error "-DFT_DEBUG_MW_KEPT needs -DFT_DEBUG_TXN_KIND and -DURCU_TXN_REC_DBG"
@@ -17842,6 +17889,7 @@ void ft_flip_txn_guard_parent_ctx(const struct cds_ft *ft, struct ft_flip_txn *t
 
 	if (!t || !parent_nf)
 		return;
+	FT_GUARD_PLANT("parent guard", parent_nf);
 #ifndef FT_DEBUG_GUARD_ON_MISS
 	/*
 	 * A DISCARDED TXN INSTALLS NOTHING.  @acquire_miss is set-only for the
@@ -17994,6 +18042,8 @@ void ft_flip_txn_guard_parent_ctx(const struct cds_ft *ft, struct ft_flip_txn *t
 		ft_guard_note_site(__builtin_return_address(0));
 	}
 #endif
+	FT_GUARD_STOP("parent guard",
+		&ft_flag_to_metadata(ft, parent_nf)->state);
 	FT_AB_ARM(FT_AB_VALIDATE, FT_AB_OWN_NA);
 	FT_MK_SAMPLE(FT_AB_VALIDATE);
 	FT_MW_RECORD_TRAP("parent-guard validate",
@@ -19700,6 +19750,7 @@ void ft_flip_txn_guard_installed_child(struct cds_ft *ft, struct ft_flip_txn *t,
 	 */
 	if (!nf || ft_node_flip_proxy(nf) || ft_node_external(nf))
 		return;
+	FT_GUARD_PLANT("installed-child guard", nf);
 	meta = ft_node_compressed(nf) ?
 		cds_ft_item_to_metadata((struct cds_ft_inode *)
 			ft_compressed_node_ptr(nf)) :
@@ -19789,6 +19840,7 @@ void ft_flip_txn_guard_installed_child(struct cds_ft *ft, struct ft_flip_txn *t,
 	 * not hold.  Their sizes differ.  The C.1 decomposition exists to
 	 * stop one number from covering both.
 	 */
+	FT_GUARD_STOP("installed-child guard", &meta->state);
 	ft_flip_txn_record_tag_mw(t, (void **) &meta->state,
 		(void *) live_state, (void *) live_state, FT_STATE_PROXY
 		FT_TK_MWA(FT_TK_MWA_GUARD));
@@ -25190,6 +25242,8 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 * a holder funnelled behind that turn.  Validating aborts the COMMIT
 	 * instead, which is precisely what the escalation lane arbitrates.
 	 */
+	if (check_child)
+		FT_GUARD_PLANT("re-parent guard", &meta->state);
 	if (held_earlier) {
 		/*
 		 * NEITHER, and the ledger is NOT dropped.  The step that took
@@ -25270,6 +25324,7 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		ft_lv_note((void **) &meta->state, __builtin_return_address(0),
 			lv_self, lv_held);
 #endif
+		FT_GUARD_STOP("re-parent guard", &meta->state);
 		ft_flip_txn_record_state_mw(txn, meta,
 			(void *) live_state, (void *) live_state);
 	}

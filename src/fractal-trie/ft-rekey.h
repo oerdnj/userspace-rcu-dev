@@ -558,11 +558,15 @@ int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 					ft_flip_txn_record_reserved(txn, cm,
 						(void **) &cm->parent_word, old_pw,
 						new_pw);
-				else
+				else {
+					/* Needs an earlier MW @pr: see FT_GUARD_STOP. */
+					FT_GUARD_STOP("rekey re-home parent word",
+						&cm->parent_word);
 					ft_flip_txn_record_tag_mw(txn,
 						(void **) &cm->parent_word, old_pw,
 						new_pw, FT_FLIP_PROXY_TAG
 						FT_TK_MWA(FT_TK_MWA_PARENT_WORD));
+				}
 				/*
 				 * The state word has three cases:
 				 *  - a held word: its terminal belongs to the
@@ -585,6 +589,8 @@ int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 						FT_STATE_PROXY) &
 						~(FT_STATE_TOMBSTONE | FT_STATE_LOCK);
 
+					FT_GUARD_STOP("rekey re-home guard",
+						&cm->state);
 					ft_flip_txn_record_state_mw(txn, cm,
 						(void *) live, (void *) live);
 				}
