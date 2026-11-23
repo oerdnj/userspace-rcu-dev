@@ -10388,6 +10388,21 @@ void ft_flip_txn_doom_unheld_edge(struct ft_flip_txn *t,
  * guards the reserved use.
  */
 /*
+ * Door 3's ownership check (see the park in __ft_flip_txn_record_tag_ctx).
+ * -DNO_FT_BODY_OWNED_STRICT removes it.  -DFT_DEBUG_BODY_UNOWNED_PLANT fails
+ * it on the first door-3 park it covers: that is its red control.
+ */
+#if !defined(NO_FT_BODY_OWNED_STRICT)
+# define FT_BODY_OWNED_STRICT	1
+#else
+# define FT_BODY_OWNED_STRICT	0
+#endif
+#ifdef FT_DEBUG_BODY_UNOWNED_PLANT
+# define FT_BODY_UNOWNED_PLANT	1
+#else
+# define FT_BODY_UNOWNED_PLANT	0
+#endif
+/*
  * THE RECORDER CORE, taking the op's held-set witness as a PARAMETER.
  *
  * Only FT_OWNER_ASSERT_OWNED_CTX consumes @dbg_ctx.  It is the debug-only
@@ -10664,6 +10679,28 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 	 */
 	if (held_sw || (t->structural_sw &&
 	    (!t->sw_per_op || t->sw_body || ft_flip_txn_owns(t, owner)))) {
+		/*
+		 * Door 3 parks on the claim that the op fenced the word
+		 * itself.  Check that claim where nothing else excludes the
+		 * peers: a FINE, shared trie, outside the FT-wide lock.  There
+		 * the op must own the word.  The public rekey takes the FT-wide
+		 * lock (it enters the move gate first), so it never gets here.
+		 * Only _cds_ft_debug_cow_replace_root does, and it owns every
+		 * word it parks (FT_DEBUG_TXN_KIND, ft_unit).
+		 */
+		if (FT_BODY_OWNED_STRICT && !held_sw && t->sw_body &&
+				t->ft && t->ft->lock_fine && !t->ft->exclusive &&
+				ft_wlock_held != t->ft &&
+				(FT_BODY_UNOWNED_PLANT ||
+				 !ft_flip_txn_owns(t, owner))) {
+			fprintf(stderr, "FT BODY UNOWNED: slot %p owner %p "
+				"producer %p -- a whole-body writer parked a "
+				"word it does not own\n",
+				(void *) slot, (void *) owner,
+				__builtin_return_address(0));
+			fflush(stderr);
+			abort();
+		}
 		FT_TK_COUNT_REC(t, FT_TK_SW);
 		FT_AB_ARM(FT_AB_SW, FT_AB_OWN_NA);
 #ifdef FT_DEBUG_TXN_KIND

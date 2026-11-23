@@ -9781,9 +9781,12 @@ int ft_rekey_one_decide(struct cds_ft *ft,
 	 * because it does not arbitrate.  So it is legal only where the op
 	 * excludes every peer writer over those slots.
 	 *
-	 * FINE mode: the per-node DLM LOCK try-locks this op takes ARE that
-	 * protocol.  CDS_FT_SCOPED_WRITER skips the FT-wide mutex there (the
-	 * §11 drop).  So this costs nothing and changes nothing.
+	 * FINE mode: a point writer skips the FT-wide mutex (the §11 drop).
+	 * This op does not.  Its caller entered ft_move_gate_enter, so
+	 * ft_bulk_active is true and CDS_FT_SCOPED_WRITER takes the mutex.
+	 * Its SW parks therefore run in a bulk window, like door 1's.  The
+	 * whole-body ownership check in __ft_flip_txn_record_tag_ctx relies
+	 * on that.
 	 *
 	 * COARSE mode: every OTHER writer excludes through the FT-WIDE MUTEX
 	 * this macro takes.  These writers are insert, remove, graft and merge.
