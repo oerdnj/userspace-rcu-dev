@@ -10478,12 +10478,14 @@ void ft_flip_txn_record_unheld_edge(struct ft_flip_txn *t,
 # define FT_BODY_UNOWNED_PLANT	0
 #endif
 /*
- * A structural record that is neither owned nor excluded aborts in every
- * build.  The flip txn records SW only.  No record of the suites reaches the
- * MW branch, and the DEBUG_RCU trap there only covers debug builds.  An
- * ablation build that restores MW on purpose defines FT_ALLOW_MW_RECORDS or
- * NO_FT_STRUCT_SW_STRICT.  FT_DEBUG_STRUCT_MW_PLANT sends every record to the
- * MW branch: the red control.
+ * A record that is neither owned nor excluded aborts in every build.  The flip
+ * txn records SW only.  No record of the suites reaches the MW branch of
+ * __ft_flip_txn_record_tag_ctx or of __ft_flip_txn_record_tag_mw, and the
+ * DEBUG_RCU trap there only covers debug builds.  An ablation build that
+ * restores MW on purpose defines FT_ALLOW_MW_RECORDS or
+ * NO_FT_STRUCT_SW_STRICT.  The red controls send every record to the MW
+ * branch: FT_DEBUG_STRUCT_MW_PLANT in the first recorder,
+ * FT_DEBUG_LANE_MW_PLANT in the second.
  */
 #if !defined(NO_FT_STRUCT_SW_STRICT) && !defined(FT_ALLOW_MW_RECORDS)
 # define FT_STRUCT_SW_STRICT	1
@@ -10495,20 +10497,27 @@ void ft_flip_txn_record_unheld_edge(struct ft_flip_txn *t,
 #else
 # define FT_STRUCT_MW_PLANT	0
 #endif
+#ifdef FT_DEBUG_LANE_MW_PLANT
+# define FT_LANE_MW_PLANT	1
+#else
+# define FT_LANE_MW_PLANT	0
+#endif
 static __attribute__((noinline, noreturn))
-void ft_flip_txn_struct_mw_abort(const struct ft_flip_txn *t,
+void ft_flip_txn_struct_mw_abort(const char *what,
+		const struct ft_flip_txn *t,
 		const struct cds_ft_metadata *owner, void **slot,
 		void *old_ptr, void *new_ptr, const void *producer)
 {
 	const struct cds_ft *ft = t->ft;
 	Dl_info di;
 
-	fprintf(stderr, "FT STRUCT MW: slot %p {%p -> %p} owner %p owned %d "
+	fprintf(stderr, "FT %s MW: slot %p {%p -> %p} owner %p owned %d "
 		"armed %d per_op %d body %d trie_wide %d fine %d excl %d "
-		"wlock %d producer %s+%#lx -- a structural record that is "
-		"neither owned nor excluded\n", (void *) slot, old_ptr,
+		"wlock %d producer %s+%#lx -- a record that is neither owned "
+		"nor excluded\n", what, (void *) slot, old_ptr,
 		new_ptr, (const void *) owner,
-		(int) ft_flip_txn_owns(t, owner), (int) t->structural_sw,
+		owner ? (int) ft_flip_txn_owns(t, owner) : 0,
+		(int) t->structural_sw,
 		(int) t->sw_per_op, (int) t->sw_body, (int) t->trie_wide_sw,
 		ft ? (int) ft->lock_fine : -1, ft ? (int) ft->exclusive : -1,
 		ft ? (int) (ft_wlock_held == ft) : -1,
@@ -10891,8 +10900,8 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	} else {
 		if (FT_STRUCT_SW_STRICT)
-			ft_flip_txn_struct_mw_abort(t, owner, slot, old_ptr,
-				new_ptr, __builtin_return_address(0));
+			ft_flip_txn_struct_mw_abort("STRUCT", t, owner, slot,
+				old_ptr, new_ptr, __builtin_return_address(0));
 		/*
 		 * The DLM lock TAKE reaches this same branch.  It is the one MW
 		 * record that must never become SW.  So it is counted apart
@@ -11197,12 +11206,21 @@ void __ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
 	 * STRUCTURAL, not a list of lanes to remember: same value in and out
 	 * means MW.
 	 */
-	if (!pinned && old_ptr != new_ptr && t->trie_wide_sw
-			&& !(t->ft && slot == (void **) &t->ft->root)) {
+	if (!FT_LANE_MW_PLANT && !pinned && old_ptr != new_ptr &&
+			t->trie_wide_sw &&
+			!(t->ft && slot == (void **) &t->ft->root)) {
 		FT_MWA_DOOR1_CONV();
 		FT_LL_REC(t, slot, old_ptr, new_ptr, true);
 		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	} else {
+		/*
+		 * Every caller now reaches this lane only on a trie that
+		 * excludes writers.  A root, a same-value validate or a fine,
+		 * shared trie would need MW here, so it aborts.
+		 */
+		if (FT_STRUCT_SW_STRICT)
+			ft_flip_txn_struct_mw_abort("LANE", t, NULL, slot,
+				old_ptr, new_ptr, __builtin_return_address(0));
 		if (!pinned && old_ptr != new_ptr && t->trie_wide_sw)
 			FT_MWA_DOOR1_ROOT_SLOT();
 		FT_MWA_DOOR1_KEPT(t, old_ptr == new_ptr);
