@@ -1129,8 +1129,9 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 	 */
 	assert(node_flag_expected != NULL);
 	/*
-	 * Fusion armed: DEFER the forward store into @pub.  ft_detach_node
-	 * then commits it in one flip with the dead head cell's unsplice.
+	 * DEFER the forward store into @pub.  The caller commits it in one
+	 * flip with the dead head cell's unsplice.  There is no immediate
+	 * store: every caller passes @pub (see ft_node_replace_ptr).
 	 *   - A delete (NULL newptr) stores NULL and decrements nr_child in
 	 *     place (reader-invisible for navigation).
 	 *   - An external promote (non-NULL newptr) replaces the child with
@@ -1141,88 +1142,67 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 	 * the retrying remove left the still-chained head pointing at the
 	 * holder.
 	 */
-	if (pub) {
-		if (newptr) {
-			struct cds_ft_node *en = (struct cds_ft_node *)
-				ft_node_ptr(newptr);
+	if (newptr) {
+		struct cds_ft_node *en = (struct cds_ft_node *)
+			ft_node_ptr(newptr);
 
-			pub->head_parent_field = ft->ordered_list ?
-				&ft_ord_cell_ptr(en->prev)->parent :
-				(struct cds_ft_inode_flag **) &en->prev;
-			pub->head_parent_old = *pub->head_parent_field;
-			/*
-			 * An external PROMOTE moves the head into
-			 * @node_flag's child SLOT @node_flag_ptr.  So it is
-			 * a SLOT head: clear any prefix-head answer it
-			 * carried at its old home (FT_PARENT_PREFIX_HEAD).
-			 * The non-fused arm below reaches the same value
-			 * through ft_set_parent's non-NULL @slot.
-			 */
-			pub->head_parent_new = ft_head_parent_word(node_flag,
-				/*prefix=*/ false);
-		}
-		pub->slot = node_flag_ptr;
-		/* @slot is a child slot of THIS node, promote or delete alike. */
-		pub->slot_owner = metadata;
+		pub->head_parent_field = ft->ordered_list ?
+			&ft_ord_cell_ptr(en->prev)->parent :
+			(struct cds_ft_inode_flag **) &en->prev;
+		pub->head_parent_old = *pub->head_parent_field;
 		/*
-		 * ☠ THE EXPECTED-OLD IS THE PLAN'S VALUE, NEVER A RE-READ OF THE
-		 * SLOT.  @node_flag_expected is the child the caller's climb
-		 * condemned.  It is ft_detach_node's @plan_old_child, enforced
-		 * against its own re-read pre-fence.  It is what "this delete
-		 * drops THAT subtree" means.  So it is the only value whose
-		 * mismatch at commit says "a peer republished this slot since
-		 * the plan".
-		 *
-		 * A raw `*node_flag_ptr` here is a SECOND, unheld read of a
-		 * word the in-place tier leaves contended.  Two cases:
-		 *   - A peer's in-place delete of the same chain NULLs it.
-		 *     The raw value then RE-PLANS this op onto the peer's
-		 *     outcome: {NULL -> NULL} on the slot, with a fresh
-		 *     nr_child-- fused on top.  The chain freeze's derived
-		 *     NULL is what aborted that commit.  That was an accident
-		 *     of the freeze's own arbitration, not the design of this
-		 *     one.
-		 *   - A peer's commit in flight parks a flip-proxy there.
-		 *     The raw value then hands the engine a proxy as
-		 *     expected-old (rcu-txn-mcas.h's `!urcu_txn_is_proxy`
-		 *     assert).
-		 * Both were MEASURED on inv_concurrent_remove_all_nolist.
-		 *
-		 * The recompacting tier read the slot under the {C,P,GP} lock.
-		 * There the two values could not differ.  The in-place tier
-		 * has no such lock, so the commit must use the plan value.
+		 * An external PROMOTE moves the head into
+		 * @node_flag's child SLOT @node_flag_ptr.  So it is
+		 * a SLOT head: clear any prefix-head answer it
+		 * carried at its old home (FT_PARENT_PREFIX_HEAD).
 		 */
-		FT_DT_INC(ft_dt_arm_reach);
-		if (*node_flag_ptr != node_flag_expected) {
-			FT_DT_INC(ft_dt_arm_mismatch);
-			if (!*node_flag_ptr)
-				FT_DT_INC(ft_dt_arm_raw_null);
-			else if (ft_node_flip_proxy(*node_flag_ptr))
-				FT_DT_INC(ft_dt_arm_raw_proxy);
-		}
-		pub->old_val = node_flag_expected;
-		pub->new_val = newptr;
-		pub->armed = true;
-		if (!newptr)
-			pub->state_meta = metadata;	/* nr_child-- fuses into the commit flip */
-		return 0;
+		pub->head_parent_new = ft_head_parent_word(node_flag,
+			/*prefix=*/ false);
 	}
+	pub->slot = node_flag_ptr;
+	/* @slot is a child slot of THIS node, promote or delete alike. */
+	pub->slot_owner = metadata;
 	/*
-	 * Parent-first: wire the replacement's back-pointer before the
-	 * forward publish (a reader descending here then walking back up must
-	 * not see a NULL/stale parent).  Placed past the -EFBIG check: the
-	 * recompaction path re-parents via its rebuilt copy itself, so setting
-	 * it here would re-parent through a copy recompaction frees.  (NULL
-	 * newptr == delete: ft_set_parent is a no-op.)
+	 * ☠ THE EXPECTED-OLD IS THE PLAN'S VALUE, NEVER A RE-READ OF THE
+	 * SLOT.  @node_flag_expected is the child the caller's climb
+	 * condemned.  It is ft_detach_node's @plan_old_child, enforced
+	 * against its own re-read pre-fence.  It is what "this delete
+	 * drops THAT subtree" means.  So it is the only value whose
+	 * mismatch at commit says "a peer republished this slot since
+	 * the plan".
+	 *
+	 * A raw `*node_flag_ptr` here is a SECOND, unheld read of a
+	 * word the in-place tier leaves contended.  Two cases:
+	 *   - A peer's in-place delete of the same chain NULLs it.
+	 *     The raw value then RE-PLANS this op onto the peer's
+	 *     outcome: {NULL -> NULL} on the slot, with a fresh
+	 *     nr_child-- fused on top.  The chain freeze's derived
+	 *     NULL is what aborted that commit.  That was an accident
+	 *     of the freeze's own arbitration, not the design of this
+	 *     one.
+	 *   - A peer's commit in flight parks a flip-proxy there.
+	 *     The raw value then hands the engine a proxy as
+	 *     expected-old (rcu-txn-mcas.h's `!urcu_txn_is_proxy`
+	 *     assert).
+	 * Both were MEASURED on inv_concurrent_remove_all_nolist.
+	 *
+	 * The recompacting tier read the slot under the {C,P,GP} lock.
+	 * There the two values could not differ.  The in-place tier
+	 * has no such lock, so the commit must use the plan value.
 	 */
-	ft_set_parent(ft, newptr, node_flag, node_flag_ptr);
-	ft_node_child_edge_flip(ft, node_flag_ptr, *node_flag_ptr, newptr);
+	FT_DT_INC(ft_dt_arm_reach);
+	if (*node_flag_ptr != node_flag_expected) {
+		FT_DT_INC(ft_dt_arm_mismatch);
+		if (!*node_flag_ptr)
+			FT_DT_INC(ft_dt_arm_raw_null);
+		else if (ft_node_flip_proxy(*node_flag_ptr))
+			FT_DT_INC(ft_dt_arm_raw_proxy);
+	}
+	pub->old_val = node_flag_expected;
+	pub->new_val = newptr;
+	pub->armed = true;
 	if (!newptr)
-		ft_meta_nr_child_dec_flip(metadata);
-	dbg_printf("popcount replace ptr: %u child, metadata: %u child, for node %p newptr %p\n",
-		(unsigned int) ft_popcount_node_get_nr_child(type, node),
-		(unsigned int) ft_meta_nr_child_load(metadata),
-		node, newptr);
+		pub->state_meta = metadata;	/* nr_child-- fuses into the commit flip */
 	return 0;
 }
 
@@ -1256,8 +1236,9 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 	/* The plan's value, not a raw re-read: see the popcount variant. */
 	assert(node_flag_expected != NULL);
 	/*
-	 * Fusion armed: DEFER the forward store into @pub (committed in one
-	 * flip with the dead head cell's unsplice).
+	 * DEFER the forward store into @pub (committed in one flip with the
+	 * dead head cell's unsplice).  There is no immediate store: every
+	 * caller passes @pub (see ft_node_replace_ptr).
 	 *
 	 * A DELETE (NULL newptr) fuses its nr_child-- into the commit flip
 	 * (via @state_meta).  It leaves the occupancy bitmap bit SET.  The
@@ -1273,60 +1254,40 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 	 * popcount variant).  The promote leaves the slot occupied and
 	 * nr_child unchanged.
 	 */
-	if (pub) {
-		if (newptr) {
-			struct cds_ft_node *en = (struct cds_ft_node *)
-				ft_node_ptr(newptr);
+	if (newptr) {
+		struct cds_ft_node *en = (struct cds_ft_node *)
+			ft_node_ptr(newptr);
 
-			pub->head_parent_field = ft->ordered_list ?
-				&ft_ord_cell_ptr(en->prev)->parent :
-				(struct cds_ft_inode_flag **) &en->prev;
-			pub->head_parent_old = *pub->head_parent_field;
-			/*
-			 * An external PROMOTE moves the head into
-			 * @node_flag's child SLOT @node_flag_ptr.  So it is
-			 * a SLOT head: clear any prefix-head answer it
-			 * carried at its old home (FT_PARENT_PREFIX_HEAD).
-			 * The non-fused arm below reaches the same value
-			 * through ft_set_parent's non-NULL @slot.
-			 */
-			pub->head_parent_new = ft_head_parent_word(node_flag,
-				/*prefix=*/ false);
-		}
-		pub->slot = node_flag_ptr;
-		/* @slot is a child slot of THIS node, promote or delete alike. */
-		pub->slot_owner = metadata;
-		/* The plan's value as expected-old: see the popcount variant. */
-		FT_DT_INC(ft_dt_arm_reach);
-		if (*node_flag_ptr != node_flag_expected) {
-			FT_DT_INC(ft_dt_arm_mismatch);
-			if (!*node_flag_ptr)
-				FT_DT_INC(ft_dt_arm_raw_null);
-			else if (ft_node_flip_proxy(*node_flag_ptr))
-				FT_DT_INC(ft_dt_arm_raw_proxy);
-		}
-		pub->old_val = node_flag_expected;
-		pub->new_val = newptr;
-		pub->armed = true;
-		if (!newptr)
-			pub->state_meta = metadata;	/* nr_child-- fuses into the commit flip */
-		return 0;
-	}
-	/* Parent-first: wire the back-pointer before the forward publish,
-	 * past the -EFBIG recompaction check (see popcount variant). */
-	ft_set_parent(ft, newptr, node_flag, node_flag_ptr);
-	ft_node_child_edge_flip(ft, node_flag_ptr, *node_flag_ptr, newptr);
-	if (!newptr) {
+		pub->head_parent_field = ft->ordered_list ?
+			&ft_ord_cell_ptr(en->prev)->parent :
+			(struct cds_ft_inode_flag **) &en->prev;
+		pub->head_parent_old = *pub->head_parent_field;
 		/*
-		 * Soft-delete: the slot is NULLed (the flip above) and
-		 * nr_child decrements as a committed flip.  The occupancy
-		 * bitmap bit is left SET.  It is a sticky hint, never cleared
-		 * in place.  The pointer load is the source of truth, and
-		 * recompact rebuilds the bitmap clean.  The popcount layout
-		 * already does exactly this.
+		 * An external PROMOTE moves the head into
+		 * @node_flag's child SLOT @node_flag_ptr.  So it is
+		 * a SLOT head: clear any prefix-head answer it
+		 * carried at its old home (FT_PARENT_PREFIX_HEAD).
 		 */
-		ft_meta_nr_child_dec_flip(metadata);
+		pub->head_parent_new = ft_head_parent_word(node_flag,
+			/*prefix=*/ false);
 	}
+	pub->slot = node_flag_ptr;
+	/* @slot is a child slot of THIS node, promote or delete alike. */
+	pub->slot_owner = metadata;
+	/* The plan's value as expected-old: see the popcount variant. */
+	FT_DT_INC(ft_dt_arm_reach);
+	if (*node_flag_ptr != node_flag_expected) {
+		FT_DT_INC(ft_dt_arm_mismatch);
+		if (!*node_flag_ptr)
+			FT_DT_INC(ft_dt_arm_raw_null);
+		else if (ft_node_flip_proxy(*node_flag_ptr))
+			FT_DT_INC(ft_dt_arm_raw_proxy);
+	}
+	pub->old_val = node_flag_expected;
+	pub->new_val = newptr;
+	pub->armed = true;
+	if (!newptr)
+		pub->state_meta = metadata;	/* nr_child-- fuses into the commit flip */
 	return 0;
 }
 
@@ -4230,23 +4191,22 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 	struct cds_ft_inode *node;
 
 	/*
-	 * @pub is NOT optional here, and the external-PROMOTE arm below depends
-	 * on it.  With @pub, the promote's single reader-visible forward store
-	 * is DEFERRED into it.  It is committed after the §4.B acquire of the
-	 * holder (ft-remove.h, `!boundary_fused && pub && pub->armed`).
-	 * Without @pub, that arm stores into the LIVE holder immediately.  It
-	 * then mutates before acquiring, which is what the acquire exists to
-	 * prevent.  A peer that recompacts the holder through its grandparent
-	 * slot leaves the value intact in the retired copy.  So the CAS still
-	 * matches, and the promoted head is published into a reclaimed node.
+	 * @pub is NOT optional.  Both replace variants DEFER their single
+	 * reader-visible forward store into it.  It is committed after the
+	 * §4.B acquire of the holder (ft-remove.h, `!boundary_fused && pub &&
+	 * pub->armed`).  A store made before that acquire would let a peer
+	 * recompact the holder through its grandparent slot in between.  The
+	 * value stays intact in the retired copy, so the CAS would still
+	 * match, and the promoted head would be published into a reclaimed
+	 * node.
 	 *
-	 * The invariant holds structurally, not by convention.  ft_detach_node
-	 * is this family's ONLY caller.  It substitutes its own @local_pub for
-	 * a NULL argument (ft-remove.h) before reaching here.  So a list-off
-	 * caller passing NULL still arrives with @pub set.  It is asserted
-	 * rather than left implicit because the failure is silent.  The
-	 * pub-less arm compiles, runs, and corrupts only under a concurrent
-	 * recompaction.
+	 * The variants used to keep an immediate-store arm for a NULL @pub.
+	 * No caller reached it, so it was removed: a NULL @pub now faults on
+	 * its first use instead of corrupting silently.  The callers are:
+	 *   - ft_detach_node, which substitutes its own @local_pub for a NULL
+	 *     argument (ft-remove.h);
+	 *   - the graft's old-direction drop and the rekey fold's drop, which
+	 *     pass their own @rpub (ft-graft.h, ft-rekey.h).
 	 */
 	assert(pub != NULL);
 
