@@ -69,7 +69,7 @@
 #endif
 
 /*
- * 364 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
+ * 365 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  *
  * ☠ BUMP BOTH ARMS.  A new unconditional test belongs to the fault-inject
@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (417 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (418 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (364 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (365 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -27273,6 +27273,110 @@ fail_detach:
 }
 
 /*
+ * Detach at a key that ends INSIDE a compressed run, or diverges inside it.
+ *
+ * "jAbcdef1" and "jAbcdef2" share the run "Abcdef" below 'j', next to "kZ".
+ *   - "jAbX" diverges inside the run: NOT_FOUND, and the source keeps every
+ *     key.
+ *   - "jAbc" ends inside the run: the detached trie holds exactly "def1" and
+ *     "def2", the run's tail plus the leaf byte.  Grafted at "jQ", the keys
+ *     read "jQdef1" and "jQdef2".
+ * The detach used to step through the whole run without comparing it.  It
+ * then detached the run's child: "jAbX" took both keys, and "jAbc" dropped
+ * the "def" bytes from them.  cds_ft_verify and the key count passed both.
+ */
+static int test_detach_inside_run(void)
+{
+	static const char *keys[] = { "jAbcdef1", "jAbcdef2", "kZ" };
+	static const char *tail[] = { "def1", "def2" };
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
+	struct cds_ft *detached = NULL;
+	struct cds_ft_iter *dit = NULL;
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	unsigned int i, n = 0;
+	int ret = 0;
+
+	rcu_read_lock();
+	for (i = 0; i < 3; i++)
+		cds_ft_insert(ft, (const uint8_t *) keys[i], strlen(keys[i]),
+			&node_alloc(i)->node);
+	rcu_read_unlock();
+
+	s = cds_ft_detach(ft, (const uint8_t *) "jAbX", 4, &detached);
+	if (s != CDS_FT_STATUS_NOT_FOUND || cds_ft_count_keys(ft) != 3) {
+		fprintf(stderr, "detach_inside_run: diverging key: %s, %lu keys "
+			"left\n", cds_ft_status_to_string(s),
+			cds_ft_count_keys(ft));
+		if (detached) {
+			drain_trie(detached);
+			rcu_barrier();
+			cds_ft_destroy(detached);
+		}
+		return drain_and_destroy(ft, group) | -1;
+	}
+
+	s = cds_ft_detach(ft, (const uint8_t *) "jAbc", 4, &detached);
+	if (s != CDS_FT_STATUS_OK || !detached) {
+		fprintf(stderr, "detach_inside_run: detach: %s\n",
+			cds_ft_status_to_string(s));
+		return drain_and_destroy(ft, group) | -1;
+	}
+	if (cds_ft_iter_create(detached, &dit) < 0)
+		abort();
+	rcu_read_lock();
+	cds_ft_for_each_rcu(detached, dit) {
+		uint8_t k[16];
+		size_t klen = 0;
+
+		if (cds_ft_iter_get_key(dit, k, sizeof(k), &klen) !=
+				CDS_FT_STATUS_OK || n >= 2 ||
+				klen != strlen(tail[n]) ||
+				memcmp(k, tail[n], klen)) {
+			fprintf(stderr, "detach_inside_run: detached key %u is "
+				"%.*s, want %s\n", n, (int) klen, k,
+				n < 2 ? tail[n] : "(none)");
+			ret = -1;
+		}
+		n++;
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(dit);
+	if (n != 2) {
+		fprintf(stderr, "detach_inside_run: %u detached keys, want 2\n",
+			n);
+		ret = -1;
+	}
+
+	s = cds_ft_graft(ft, (const uint8_t *) "jQ", 2, detached);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "detach_inside_run: graft: %s\n",
+			cds_ft_status_to_string(s));
+		drain_trie(detached);
+		rcu_barrier();
+		cds_ft_destroy(detached);
+		return drain_and_destroy(ft, group) | -1;
+	}
+	cds_ft_destroy(detached);	/* the graft consumed its content */
+	rcu_read_lock();
+	if (cds_ft_eager_lookup_key(ft, (const uint8_t *) "jQdef1", 6, 0,
+				&found) != CDS_FT_STATUS_OK ||
+			cds_ft_eager_lookup_key(ft, (const uint8_t *) "jQdef2", 6,
+				0, &found) != CDS_FT_STATUS_OK ||
+			cds_ft_eager_lookup_key(ft, (const uint8_t *) "kZ", 2, 0,
+				&found) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "detach_inside_run: a key is missing after "
+			"the graft\n");
+		ret = -1;
+	}
+	rcu_read_unlock();
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK)
+		ret = -1;
+	return drain_and_destroy(ft, group) | ret;
+}
+
+/*
  * Iteration order through compressed paths: insert 10 keys with
  * 4-byte fixed length (0..9), verify forward iteration is sorted.
  */
@@ -42354,6 +42458,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_compress_varlen_external_nodes);
 	RUN_TEST(test_compress_graft_diverge);
 	RUN_TEST(test_compress_detach_through);
+	RUN_TEST(test_detach_inside_run);
 	RUN_TEST(test_compress_iteration_order);
 	RUN_TEST(test_compress_lookup_nth_through);
 	RUN_TEST(test_compress_inequality_through);

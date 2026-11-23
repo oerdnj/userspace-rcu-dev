@@ -4826,7 +4826,7 @@ retry_swap:
 				goto prep_oom;
 		} else if (!old_child_external && old_child) {
 			top_B = ft_make_root_internal_glue(swap_ft, &glue_extract,
-					old_child);
+					old_child, 0);
 			if (top_B == (struct cds_ft_inode_flag *) (long) -ENOMEM)
 				goto prep_oom;
 		}

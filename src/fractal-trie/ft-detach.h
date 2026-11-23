@@ -252,6 +252,8 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 	{
 		struct ft_descent d;
 		const uint8_t *ik = key;
+		/* The key ends this many bytes into the run @child. */
+		unsigned int cut = 0;
 
 		ft_descent_init(&d, ft);
 
@@ -265,7 +267,27 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			if (ft_node_compressed(d.nf)) {
 				struct cds_ft_compressed_node *cn =
 					ft_compressed_node_ptr(d.nf);
+				unsigned int remaining =
+					(unsigned int) (key_len - d.depth);
 
+				/*
+				 * The run's bytes must match the key.  A key
+				 * that ends inside the run detaches the run's
+				 * tail: stop at the run, and build the
+				 * detached root from the bytes after the cut.
+				 * This is the rekey's src_cut.
+				 */
+				if ((unsigned int) cn->len > remaining) {
+					if (ft_match_compressed_key(ik, cn,
+							remaining) != remaining)
+						return CDS_FT_STATUS_NOT_FOUND;
+					cut = remaining;
+					break;
+				}
+				if (ft_match_compressed_key(ik, cn,
+						(unsigned int) cn->len) !=
+						(unsigned int) cn->len)
+					return CDS_FT_STATUS_NOT_FOUND;
 				ft_descent_traverse_compressed(ft, &d, cn, &ik);
 				continue;
 			}
@@ -351,7 +373,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			 */
 			if (!ft_node_external(child)) {
 				new_root = ft_make_root_internal_glue(detached,
-						&glue, child);
+						&glue, child, cut);
 				if (new_root ==
 				    (struct cds_ft_inode_flag *) (long) -ENOMEM) {
 					ft_glue_abort(detached, &glue);

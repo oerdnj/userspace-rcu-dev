@@ -845,11 +845,16 @@ struct cds_ft_inode_flag *ft_build_extracted_root_glue(struct cds_ft *ft,
  *   - @old_child internal:    returned unchanged (already a valid internal
  *                             root; the caller clears its parent at commit).
  *                             No glue node, no deferred edge.
- *   - @old_child compressed:  peel the first path byte into a fresh internal
+ *   - @old_child compressed:  peel the byte at @cut into a fresh internal
  *                             root.  Peel the rest (if any) into a fresh
  *                             compressed node.  Defer the live grandchild's
  *                             back-pointer.  Record the old compressed node
  *                             for deferred free.
+ *
+ * @cut is the number of the run's leading bytes that the caller's key already
+ * consumed: a detach whose key ends inside the run moves only its tail.  It
+ * must be 0 for an internal @old_child, and less than a compressed run's
+ * length.
  *
  * External @old_child must be filtered by the caller (externals attach as
  * external_nodes, not via this helper).
@@ -858,20 +863,24 @@ struct cds_ft_inode_flag *ft_build_extracted_root_glue(struct cds_ft *ft,
  */
 static
 struct cds_ft_inode_flag *ft_make_root_internal_glue(struct cds_ft *ft,
-		struct ft_glue *glue, struct cds_ft_inode_flag *old_child)
+		struct ft_glue *glue, struct cds_ft_inode_flag *old_child,
+		unsigned int cut)
 {
 	struct cds_ft_compressed_node *cn;
 	struct cds_ft_metadata *cn_meta;
 	struct cds_ft_inode_flag *root;
 
 	old_child = ft_resolve_skip_compressed(ft, old_child);
-	if (caa_likely(!ft_node_compressed(old_child)))
+	if (caa_likely(!ft_node_compressed(old_child))) {
+		assert(!cut);
 		return old_child;	/* already internal */
+	}
 	cn = ft_compressed_node_ptr(old_child);
+	assert(cut < cn->len);
 	cn_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 	root = ft_build_extracted_root_glue(ft, glue,
-			cn->key_bytes[0], &cn->key_bytes[1], cn->len - 1,
-			cn->child, ft_nr_keys_get(cn_meta));
+			cn->key_bytes[cut], &cn->key_bytes[cut + 1],
+			cn->len - cut - 1, cn->child, ft_nr_keys_get(cn_meta));
 	if (root == (struct cds_ft_inode_flag *) (long) -ENOMEM)
 		return root;
 	/* Reclaim the peeled-away compressed node after the commit. */
