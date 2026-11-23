@@ -1072,6 +1072,44 @@ void ft_recompact_alloc_set_active(struct ft_recompact_alloc_ctx *ctx)
 	ft_recompact_alloc_tls = ctx;
 }
 
+/*
+ * Can an EMPTY range on @arena's general list be reclaimed?
+ *
+ * The frontier, the first range on the list, is kept while it still has bump
+ * room: the next allocation would bump into it.  Reclaiming it there would
+ * make a single node that comes and goes recycle a range each time.  Any other
+ * empty range is reclaimed, whether or not its bump pointer reached the end.
+ * A compaction leaves such ranges behind: a merged private range is bumped
+ * only partway, and the next pass empties it.  Kept, it stays resident until
+ * the trie is destroyed.
+ *
+ * Call with @arena->lock held.
+ */
+static
+bool ft_range_reclaimable(const struct cds_ft_alloc_arena *arena,
+		const struct cds_ft_alloc_range *range)
+{
+	if (range->nr_live)
+		return false;
+	if (range->next_unused == arena->max_nr_items_per_range)
+		return true;
+	return cds_list_first_entry(&arena->ranges, struct cds_ft_alloc_range,
+			node) != range;
+}
+
+/*
+ * Unlink an empty range from @arena's general and partial lists, so that
+ * ft_arena_reclaim_range can reclaim it after the lock is dropped.  Its
+ * freed slots are discarded with it.  Call with @arena->lock held.
+ */
+static
+void ft_range_unlink_for_reclaim(struct cds_ft_alloc_range *range)
+{
+	if (range->free_list_head)
+		cds_list_del(&range->partial_node);
+	cds_list_del(&range->node);
+}
+
 void ft_recompact_alloc_merge(struct ft_recompact_alloc_ctx *ctx)
 {
 	struct cds_ft_alloc_range *range, *tmp;
@@ -1085,17 +1123,31 @@ void ft_recompact_alloc_merge(struct ft_recompact_alloc_ctx *ctx)
 	 */
 	cds_list_for_each_entry_safe(range, tmp, &ctx->all, node) {
 		struct cds_ft_alloc_arena *arena = range->arena;
+		struct cds_ft_alloc_range *prev = NULL;
 		bool reclaim = false;
 
 		pthread_mutex_lock(&arena->lock);
 		cds_list_del(&range->node);
 		range->recompact_private = false;
-		if (range->nr_live == 0 &&
-		    range->next_unused == arena->max_nr_items_per_range) {
-			/* Fully drained while private: reclaim it now. */
+		if (range->nr_live == 0) {
+			/* Drained while private: reclaim it now. */
 			reclaim = true;
 		} else {
+			/*
+			 * Prepending makes this range the frontier.  The range
+			 * that was the frontier no longer is, so reclaim it if
+			 * it is empty.  It emptied while it was the frontier,
+			 * and no later free would reclaim it.
+			 */
+			if (!cds_list_empty(&arena->ranges)) {
+				prev = cds_list_first_entry(&arena->ranges,
+					struct cds_ft_alloc_range, node);
+				if (prev->nr_live)
+					prev = NULL;
+			}
 			cds_list_add(&range->node, &arena->ranges);
+			if (prev)
+				ft_range_unlink_for_reclaim(prev);
 			/*
 			 * Slots freed while the range was private were threaded
 			 * on its own free list WITHOUT the partial_ranges
@@ -1110,6 +1162,8 @@ void ft_recompact_alloc_merge(struct ft_recompact_alloc_ctx *ctx)
 		pthread_mutex_unlock(&arena->lock);
 		if (reclaim)
 			ft_arena_reclaim_range(arena, range);
+		if (prev)
+			ft_arena_reclaim_range(arena, prev);
 	}
 }
 
@@ -1918,19 +1972,17 @@ void cds_ft_do_free_item(struct cds_ft_metadata *metadata)
 			pthread_mutex_unlock(&arena->lock);
 			return;
 		}
-		if (range->nr_live == 0 &&
-				range->next_unused == arena->max_nr_items_per_range) {
+		if (ft_range_reclaimable(arena, range)) {
 			/*
-			 * Range was filled and is now fully drained: reclaim it.
-			 * It still sits on partial_ranges via its earlier-freed
-			 * slots (free_list_head != NULL), unless it held a single
-			 * item.  Unlink it from both lists under the lock so it is
-			 * unreachable, then return its pages outside the lock.  The
-			 * slot being freed is discarded with the range, not pushed.
+			 * Range is now fully drained: reclaim it (see
+			 * ft_range_reclaimable).  It still sits on partial_ranges
+			 * via its earlier-freed slots (free_list_head != NULL),
+			 * unless it held a single item.  Unlink it from both lists
+			 * under the lock so it is unreachable, then return its
+			 * pages outside the lock.  The slot being freed is
+			 * discarded with the range, not pushed.
 			 */
-			if (range->free_list_head)
-				cds_list_del(&range->partial_node);
-			cds_list_del(&range->node);
+			ft_range_unlink_for_reclaim(range);
 			reclaim = true;
 		} else {
 			bool was_empty = (range->free_list_head == NULL);
