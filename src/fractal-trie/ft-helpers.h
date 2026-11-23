@@ -3109,7 +3109,12 @@ struct cds_ft_inode_flag **ft_resolve_parent_slot(
 					continue;	/* stale offset edge: re-snapshot */
 				state = ft_txn_parked_value(rs, committed);
 			} else {
-				/* Parent parked but offset already settled: re-snapshot. */
+				/*
+				 * Parent parked, offset plain.  The offset was
+				 * either never recorded (the slot index did not
+				 * change) or already settled.  Neither can be
+				 * told from here, so wait for the parent word.
+				 */
 				continue;
 			}
 		}

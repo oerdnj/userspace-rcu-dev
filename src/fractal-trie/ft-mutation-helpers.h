@@ -25036,16 +25036,19 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 }
 
 /*
- * ft_reparent_record_meta: record a metadata-bearing child's re-home as a
- * co-committed (parent, offset) PAIR into @txn.  The parent pointer flips via a
- * type-7 structural edge and the state-word offset via an FT_STATE_PROXY edge, so
- * a concurrent reader recovering (parent, slot) through ft_resolve_parent_slot
- * observes them atomically -- a plain two-store update tears (the dominant
- * FT_INV_MW crash: parent = new copy, offset = stale index of the old one).  Both
- * edges are ALWAYS recorded (a same-value offset when the slot index is
- * unchanged) so a reader that finds the parent proxy is guaranteed the paired
- * offset proxy -- no snapshot re-spin.  incoming_byte is key-invariant across a
- * recompact, so its plain store is a same-value write, safe before the commit.
+ * ft_reparent_record_meta: record a metadata-bearing child's re-home into
+ * @txn.  The child's parent word and its parent_slot_offset word commit in the
+ * same txn.  So a reader that recovers (parent, slot) through
+ * ft_resolve_parent_slot sees one consistent pair.  Two plain stores would
+ * tear: the new parent with the old parent's slot index.
+ *
+ * The offset is recorded only when the slot index changes (see the record
+ * below).  So a reader can find the parent word parked and the offset word
+ * plain.  ft_resolve_parent_slot then waits until the commit settles the
+ * parent word.
+ *
+ * incoming_byte is key-invariant across a recompact, so its plain store is a
+ * same-value write, safe before the commit.
  */
 static
 #ifdef FT_DEBUG_LIVE_VALIDATE
