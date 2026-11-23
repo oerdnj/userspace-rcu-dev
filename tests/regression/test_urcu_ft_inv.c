@@ -92,7 +92,7 @@
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
 /* +1 inv_graft_swap_whole_seam_points */
-#define NR_TESTS	(147 + NR_TESTS_REKEY_DLM)	/* +1: inv_detach_orphan_shape; +1: inv_owned_long_runs; +1: inv_owned_prefix_dense_remove_all; +1: inv_ir_prefix_roundtrip; +1: inv_owned_prefix_dense_replace; +1: inv_owned_prefix_dense; +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension; +1: inv_prefix_shape_zoo */
+#define NR_TESTS	(148 + NR_TESTS_REKEY_DLM)	/* +1: inv_compact_vs_rekey; +1: inv_detach_orphan_shape; +1: inv_owned_long_runs; +1: inv_owned_prefix_dense_remove_all; +1: inv_ir_prefix_roundtrip; +1: inv_owned_prefix_dense_replace; +1: inv_owned_prefix_dense; +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension; +1: inv_prefix_shape_zoo */
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -16006,6 +16006,287 @@ retry:
 	return ret;
 }
 
+/*
+ * Compaction racing in-trie rekeys, the bulk op it may run beside.
+ *
+ * cds_ft_compact_step excludes point writers by contract, not bulk ops.  On
+ * a fine trie a step and a bulk op serialize on the trie-wide writer lock,
+ * except at the bulk gate's edges, where both hold DLM locks only.  There a
+ * relocation copies a live compressed node's parent word and slot offset
+ * into its replacement.  Only its locks keep a rekey from re-homing that
+ * node meanwhile.  No other test runs compaction beside another writer.
+ *
+ * Each mover owns two junctions and moves a subtree between them with
+ * cds_ft_rekey_graft.  The subtree is a 16-byte run (a compressed node)
+ * that branches at its end.  Filler keys, mostly removed again, leave the
+ * arenas sparse, so compaction has nodes to relocate.  Oracle: the trie
+ * verifies, holds every key, and each mover's subtree is whole at the
+ * junction where the mover left it.  The process RSS also must not grow by
+ * more than CR_RSS_GROWTH_MB: the key set does not change, so repeated
+ * compaction passes must not keep memory.
+ */
+#define CR_MOVERS	4
+#define CR_RUN		16
+#define CR_LEAVES	8
+#define CR_FILLER	16000
+#define CR_STRIDE	8
+#define CR_MS		2000
+#define CR_RSS_GROWTH_MB	1024
+struct cr_mover_arg {
+	struct cds_ft *ft;
+	unsigned int m;
+	int at_b;
+	unsigned long ops, busy;
+	int failed;
+};
+
+/* This process's resident set, in MB (0 if /proc is not readable). */
+static unsigned long cr_rss_mb(void)
+{
+	unsigned long size, resident = 0;
+	FILE *f = fopen("/proc/self/statm", "r");
+
+	if (!f)
+		return 0;
+	if (fscanf(f, "%lu %lu", &size, &resident) != 2)
+		resident = 0;
+	fclose(f);
+	return resident * (unsigned long) sysconf(_SC_PAGESIZE) >> 20;
+}
+
+static size_t cr_key(uint8_t *k, unsigned int m, int b, unsigned int leaf,
+		bool tail)
+{
+	size_t n = 0;
+
+	k[n++] = 'j';
+	k[n++] = (uint8_t) m;
+	k[n++] = b ? 'B' : 'A';
+	memset(&k[n], 'r', CR_RUN);
+	n += CR_RUN;
+	k[n++] = (uint8_t) leaf;
+	if (tail) {
+		memcpy(&k[n], "tail", 4);
+		n += 4;
+	}
+	return n;
+}
+
+static void *cr_mover(void *arg)
+{
+	struct cr_mover_arg *a = (struct cr_mover_arg *) arg;
+
+	rcu_register_thread();
+	while (!test_go)
+		rcu_quiescent_state();
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	while (!test_stop) {
+		uint8_t src[3] = { 'j', (uint8_t) a->m, a->at_b ? 'B' : 'A' };
+		uint8_t dst[3] = { 'j', (uint8_t) a->m, a->at_b ? 'A' : 'B' };
+		enum cds_ft_status st;
+
+		/* No read section: the move waits for a grace period. */
+		st = cds_ft_rekey_graft(a->ft, dst, 3, src, 3);
+		if (st == CDS_FT_STATUS_OK) {
+			a->at_b = !a->at_b;
+			a->ops++;
+		} else if (st == CDS_FT_STATUS_BUSY_ERROR ||
+				st == CDS_FT_STATUS_MEMORY_ERROR) {
+			a->busy++;
+		} else {
+			fprintf(stderr, "inv_compact_vs_rekey: mover %u: %s\n",
+				a->m, cds_ft_status_to_string(st));
+			a->failed = 1;
+			break;
+		}
+		rcu_quiescent_state();
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int cr_insert(struct cds_ft *ft, const uint8_t *k, size_t len,
+		uint64_t tag)
+{
+	struct ft_test_node *n = node_alloc(tag);
+	enum cds_ft_status st;
+
+	n->value = len;
+	rcu_read_lock();
+	st = cds_ft_insert(ft, k, len, &n->node);
+	rcu_read_unlock();
+	if (st != CDS_FT_STATUS_OK) {
+		node_free(n);
+		return -1;
+	}
+	return 0;
+}
+
+static int inv_compact_vs_rekey_one(bool list_on)
+{
+	enum cds_ft_writer_strategy ws = CDS_FT_WRITER_LOCK_FINE;
+	struct cds_ft_group *group;
+	struct cds_ft *ft = list_on ? create_varlen_ord_ft_ws(&group, &ws)
+		: create_varlen_fine_lock_ft(&group);
+	pthread_t th[CR_MOVERS];
+	struct cr_mover_arg a[CR_MOVERS];
+	const char *env = getenv("FT_INV_COMPACT_REKEY_MS");
+	unsigned long long ms = env ? strtoull(env, NULL, 10) : CR_MS;
+	unsigned long passes = 0, steps = 0, stopped = 0, ops = 0, busy = 0;
+	unsigned long nr_keys, want_keys = 0, missing = 0;
+	unsigned long rss0, rss = 0, rss_max = 0;
+	struct cds_ft_iter *iter;
+	struct timespec t0;
+	unsigned int i, m, l;
+	int ret = 0;
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	for (m = 0; m < CR_MOVERS; m++)
+		for (l = 0; l < CR_LEAVES; l++) {
+			uint8_t k[3 + CR_RUN + 1 + 4];
+
+			if (cr_insert(ft, k, cr_key(k, m, 0, l, false),
+					m * 100 + l) ||
+					cr_insert(ft, k, cr_key(k, m, 0, l, true),
+						m * 100 + l + 50))
+				abort();
+			want_keys += 2;
+		}
+	/* Filler, mostly removed again: sparse arenas to compact. */
+	for (i = 0; i < CR_FILLER; i++) {
+		uint8_t k[5] = { 'f', (uint8_t) (i >> 16), (uint8_t) (i >> 8),
+			(uint8_t) i, 'x' };
+
+		if (cr_insert(ft, k, sizeof(k), 100000 + i))
+			abort();
+	}
+	for (i = 0; i < CR_FILLER; i++) {
+		uint8_t k[5] = { 'f', (uint8_t) (i >> 16), (uint8_t) (i >> 8),
+			(uint8_t) i, 'x' };
+		struct cds_ft_node *found;
+
+		if (i % CR_STRIDE == 0) {
+			want_keys++;
+			continue;
+		}
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, k, sizeof(k));
+		if (cds_ft_lookup(ft, iter) == CDS_FT_STATUS_OK &&
+				(found = cds_ft_iter_node(iter)) != NULL &&
+				cds_ft_remove(ft, iter, found) == CDS_FT_STATUS_OK)
+			node_free_rcu(to_test_node(found));
+		rcu_read_unlock();
+	}
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (m = 0; m < CR_MOVERS; m++) {
+		memset(&a[m], 0, sizeof(a[m]));
+		a[m].ft = ft;
+		a[m].m = m;
+		pthread_create(&th[m], NULL, cr_mover, &a[m]);
+	}
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	/* This thread is the compactor. */
+	rss0 = cr_rss_mb();
+	while (elapsed_ms(&t0) < ms) {
+		struct cds_ft_compact_state *st = cds_ft_compact_begin(ft);
+		enum cds_ft_compact_status cs;
+
+		if (!st)
+			abort();
+		do {
+			cs = cds_ft_compact_step(st, 4);
+			steps++;
+			if (cs == CDS_FT_COMPACT_OOM || cs == CDS_FT_COMPACT_BUSY)
+				stopped++;
+			rcu_quiescent_state();
+		} while (cs != CDS_FT_COMPACT_DONE && elapsed_ms(&t0) < ms);
+		cds_ft_compact_end(st);
+		passes++;
+		rcu_quiescent_state();
+		/*
+		 * The trie holds the same keys throughout, so its memory
+		 * must not grow with the number of passes.
+		 */
+		rss = cr_rss_mb();
+		if (rss > rss_max)
+			rss_max = rss;
+		if (rss > rss0 + CR_RSS_GROWTH_MB) {
+			fprintf(stderr, "inv_compact_vs_rekey: RSS grew from "
+				"%lu MB to %lu MB in %lu passes\n", rss0, rss,
+				passes);
+			ret = -1;
+			break;
+		}
+	}
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	rcu_thread_offline();
+	for (m = 0; m < CR_MOVERS; m++) {
+		pthread_join(th[m], NULL);
+		ops += a[m].ops;
+		busy += a[m].busy;
+		if (a[m].failed)
+			ret = -1;
+	}
+	rcu_thread_online();
+
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "inv_compact_vs_rekey: verify failed (list %s)\n",
+			list_on ? "on" : "off");
+		ret = -1;
+	}
+	rcu_read_lock();
+	nr_keys = cds_ft_count_keys(ft);
+	for (m = 0; m < CR_MOVERS; m++)
+		for (l = 0; l < CR_LEAVES; l++) {
+			uint8_t k[3 + CR_RUN + 1 + 4];
+			int t;
+
+			for (t = 0; t < 2; t++) {
+				cds_ft_iter_set_key(iter, k,
+					cr_key(k, m, a[m].at_b, l, t));
+				if (cds_ft_lookup(ft, iter) != CDS_FT_STATUS_OK)
+					missing++;
+			}
+		}
+	rcu_read_unlock();
+	fprintf(stderr, "# inv_compact_vs_rekey list %s: %lu passes, %lu steps "
+		"(%lu stopped early), %lu moves, %lu busy, %lu keys of %lu, "
+		"%lu moved keys missing, RSS %lu -> max %lu MB\n",
+		list_on ? "on" : "off", passes, steps, stopped, ops, busy,
+		nr_keys, want_keys, missing, rss0, rss_max);
+	if (nr_keys != want_keys || missing) {
+		fprintf(stderr, "inv_compact_vs_rekey: keys lost or misplaced\n");
+		ret = -1;
+	}
+	if (ops == 0 || passes == 0) {
+		fprintf(stderr, "inv_compact_vs_rekey: no moves or no passes\n");
+		ret = -1;
+	}
+	cds_ft_iter_destroy(iter);
+	drain_trie_keep_group(ft);
+	rcu_barrier();
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int inv_compact_vs_rekey(void)
+{
+	int ret = 0;
+
+	if (inv_compact_vs_rekey_one(true))
+		ret = -1;
+	if (inv_compact_vs_rekey_one(false))
+		ret = -1;
+	return ret;
+}
+
 /* ================================================================== */
 /*                                                                    */
 /*   TWO graft_swaps exchanging at ONE destination position           */
@@ -30135,6 +30416,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_prefix_siblings_compressed_holder);
 	RUN_TEST(inv_concurrent_insert_unique_prefix);
 	RUN_TEST(inv_detach_orphan_shape);
+	RUN_TEST(inv_compact_vs_rekey);
 	RUN_TEST(inv_prefix_dup_promote_vs_extension);
 	RUN_TEST(inv_prefix_shape_zoo);
 	RUN_TEST(inv_owned_prefix_dense);
