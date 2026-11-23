@@ -666,8 +666,9 @@ no_old_dir_replace:
 		 * readers resolve a flip proxy parked on an external's parent:
 		 * ft_get_parent_rcu / ft_skip_to_compressed / ft_skip_reanchor.
 		 *
-		 * The merge-rekey path has no txn (glue->txn NULL).  There the
-		 * edge stays on the legacy fresh-before-live immediate store.
+		 * Every caller of the build creates @glue->txn first:
+		 * cds_ft_graft, cds_ft_merge_at and the rekey.  So the edge is
+		 * recorded.
 		 */
 		if (glue->old_dir_replace.done && !glue->old_dir_replace.live)
 			ft_set_parent(ft, cn_child, old_suffix_flag,
@@ -1142,8 +1143,8 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 		 * reader-visible for the whole build-to-commit window, via
 		 * up-walks from the still-reachable children.
 		 *
-		 * The txn is NULL only on the txn-less merge-rekey flow, which
-		 * keeps the legacy immediate wiring (its own item).
+		 * Every caller of the build creates @glue->txn first:
+		 * cds_ft_graft, cds_ft_merge_at and the rekey.
 		 */
 		ret = ft_node_set_nth_rec(ft, &dest, key[key_len - 1], NULL,
 			&st->old_recompacted_node, pmeta, d->depth - 1, false,

@@ -138,16 +138,19 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		FT_TP(root_publish, (const void *) detached,
 			(const void *) detached->root);
 		/*
-		 * The node changes trie, so its back-edge names @detached now --
-		 * it was @ft's root and still names @ft.  The parent_slot_offset
-		 * is stale for the same reason.  @detached is a fresh handle with
-		 * no readers, so a plain store is enough.
+		 * The node changes trie, so its back-edge must name @detached:
+		 * it still names @ft.  The node is still @ft's live root until
+		 * the root flip below, so @ft's readers can load this word.
+		 * Store it with CMM_STORE_SHARED for them.  The pair cannot
+		 * tear: the old and the new parent word are both root
+		 * positions, and ft_resolve_parent_slot returns the trie's root
+		 * slot for a root position without reading the offset.
 		 */
 		{
 			struct cds_ft_metadata *m = cds_ft_item_to_metadata(
 				ft_node_ptr(detached->root));
 
-			m->parent_word = ft_trie_parent(detached);
+			CMM_STORE_SHARED(m->parent_word, ft_trie_parent(detached));
 			ft_meta_parent_slot_offset_set(m, 0);
 		}
 		uatomic_store(&detached->max_used_key_len,
