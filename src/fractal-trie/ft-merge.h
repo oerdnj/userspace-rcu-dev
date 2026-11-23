@@ -2455,10 +2455,11 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	assert(src_ft->exclusive);
 
 	/*
-	 * 2. Re-parent the SRC-origin referenced subtrees directly: the src
-	 *    drain above made them unreachable to readers, and the cluster is
-	 *    not yet forward-published, so this is invisible.  dst-origin
-	 *    edges are NOT applied here -- they go through the flip.
+	 * 2. Re-parent the SRC-origin referenced subtrees directly.  The src
+	 *    trie is exclusive (asserted above), so no reader sees them.  The
+	 *    cluster is not yet forward-published either, so this is
+	 *    invisible.  dst-origin edges are NOT applied here -- they go
+	 *    through the flip.
 	 */
 	ft_glue_apply_deferred(dst_ft, &gd);
 
