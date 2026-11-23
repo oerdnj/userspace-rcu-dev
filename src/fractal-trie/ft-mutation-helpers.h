@@ -18022,9 +18022,9 @@ extern long cds_ft_fault_lock_countdown;
 /*
  * WHICH EXIT ft_flip_txn_lock_or_guard_parent TOOK.  The three are not
  * interchangeable for a caller that has to answer @owner_held:
- *   - only REGISTERED makes ft_flip_txn_owns true;
- *   - SHARED means the op holds the word in a registry THIS txn cannot see;
- *   - MISS means the commit is due to ABORT, so the record never installs and
+ *   - REGISTERED: this call took the lock and registered it in @t;
+ *   - SHARED: @t already held the lock, so ft_flip_txn_owns is true;
+ *   - MISS: the commit is due to ABORT, so the record never installs and
  *     cannot clobber anyone.
  * A caller that collapses them into one bool ships an ownership-assert
  * violation -- see ft_lock_skip_dual_gp.
@@ -18032,9 +18032,33 @@ extern long cds_ft_fault_lock_countdown;
 enum ft_lock_or_guard_exit {
 	FT_LOG_EXIT_NOT_FINE = 0,	/* coarse trie / no txn / no parent */
 	FT_LOG_EXIT_REGISTERED,		/* lock taken and registered in @t */
-	FT_LOG_EXIT_SHARED,		/* already held; registry unknown */
+	FT_LOG_EXIT_SHARED,		/* already held by @t */
 	FT_LOG_EXIT_MISS,		/* acquire_miss set: the commit aborts */
 };
+
+/*
+ * A SHARED exit must find the lock in @t's own registry.  The dedupe can also
+ * match a lock held in another frame of the op (@extra, @glue, @outer).  @t
+ * cannot see such a lock.  So a record made under it would fall back to MW,
+ * on a word the SW records of its other writers do not arbitrate against.
+ *
+ * No caller produces that case.  Point ops build their lock context with no
+ * other frame (ft_lock_ctx_init).  ft_detach_node's orphan frame dedupes only
+ * locks that @t also holds (inv_detach_orphan_shape).  So stop there instead
+ * of recording MW.  -DNO_FT_SHARED_OWNED_STRICT removes the check.
+ * -DFT_DEBUG_SHARED_UNOWNED_PLANT fails it on the first SHARED exit: that is
+ * its red control.
+ */
+#if !defined(NO_FT_SHARED_OWNED_STRICT)
+# define FT_SHARED_OWNED_STRICT	1
+#else
+# define FT_SHARED_OWNED_STRICT	0
+#endif
+#ifdef FT_DEBUG_SHARED_UNOWNED_PLANT
+# define FT_SHARED_UNOWNED_PLANT	1
+#else
+# define FT_SHARED_UNOWNED_PLANT	0
+#endif
 
 static inline
 void ft_flip_txn_lock_or_guard_parent_ex(const char *fn, int line,
@@ -18148,6 +18172,16 @@ void ft_flip_txn_lock_or_guard_parent_ex(const char *fn, int line,
 			 * nothing here.
 			 */
 			if (held.shared) {
+				if (FT_SHARED_OWNED_STRICT &&
+						(FT_SHARED_UNOWNED_PLANT ||
+						 !ft_flip_txn_owns(t, held.lock))) {
+					fprintf(stderr, "FT SHARED UNOWNED: lock %p "
+						"at %s:%d -- the op holds it in a "
+						"frame the txn cannot see\n",
+						(void *) held.lock, fn, line);
+					fflush(stderr);
+					abort();
+				}
 				if (held.lock != ft_flag_to_metadata(ft, parent_nf)
 						&& !held.node_held)
 					ft_flip_txn_guard_parent_ctx(ft, t,
