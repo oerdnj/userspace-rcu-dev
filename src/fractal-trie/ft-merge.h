@@ -155,7 +155,20 @@ int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
 		if (ft_node_compressed(d.nf)) {
 			struct cds_ft_compressed_node *cn =
 				ft_compressed_node_ptr(d.nf);
+			unsigned int remaining =
+				(unsigned int) (src_key_len - d.depth);
+			unsigned int cmp = (unsigned int) cn->len < remaining ?
+				(unsigned int) cn->len : remaining;
 
+			/*
+			 * This step does not compare the run with the key.  The
+			 * caller's ft_merge_descend did, on this same source.
+			 * Check it, so that a caller which skipped that
+			 * classification does not unlink a subtree @src_key
+			 * does not name.
+			 */
+			urcu_assert_debug(ft_match_compressed_key(ik, cn, cmp) ==
+				cmp);
 			ft_descent_traverse_compressed(src_ft, &d, cn, &ik);
 			continue;
 		}
