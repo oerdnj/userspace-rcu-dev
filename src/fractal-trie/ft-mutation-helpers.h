@@ -24404,26 +24404,6 @@ void ft_red_pw_sw_report(void)
 }
 #endif
 
-/*
- * FT-SLOT-3's LEGACY LICENCE, COUNTED IN EVERY BUILD: a record the op could
- * vouch for through the CHILD but not through the PARENT the word belongs to
- * (§8.2).  The parent is the single rule the kind rests on; this counts the
- * shape that would contradict it, and it is MEASURED ZERO per ft_inv leg at
- * all three spacings (every +child record was also +parent).  Three words, and
- * it is the evidence the rule rests on -- so it is not behind a debug macro.
- */
-static unsigned long ft_slot3_child_only;	/* [0] trie-wide, [1] fine shared */
-static unsigned long ft_slot3_child_only_fine;
-
-static void ft_slot3_child_only_report(void) __attribute__((destructor));
-static void ft_slot3_child_only_report(void)
-{
-	if (uatomic_read(&ft_slot3_child_only))
-		fprintf(stderr, "FT_SLOT3 child_only=%lu of which FINE SHARED=%lu -- a re-homed child's back edge the CHILD licensed and its PARENT did not\n",
-			uatomic_read(&ft_slot3_child_only),
-			uatomic_read(&ft_slot3_child_only_fine));
-}
-
 #ifdef FT_DEBUG_SLOT3
 /*
  * FT-SLOT-3, PRICED PER PRODUCER (probe).  A child's back-edge word has two
@@ -24541,6 +24521,46 @@ static void ft_slot3_report(void)
 # define FT_SLOT3_COUNT(ft, txn, meta, parent_nf, old_pw)	do { } while (0)
 #endif
 
+/*
+ * Park a re-home's write SW on a word of @ft whose owner the op does not hold.
+ * This is legal only where @ft excludes every writer
+ * (ft_flip_txn_excludes_all): a coarse or exclusive trie, or the FT-wide
+ * writer lock held for a bulk op.  Nothing else can write the word, so the
+ * park needs no arbitration.  On a shared fine trie outside a bulk window the
+ * op must hold the owner.  Recording the write anyway would be a blind store,
+ * so stop there instead, in every build.
+ * -DFT_DEBUG_REHOME_UNOWNED_PLANT stops at the first call: that is the red
+ * control.
+ */
+#ifdef FT_DEBUG_REHOME_UNOWNED_PLANT
+# define FT_REHOME_UNOWNED_PLANT	1
+#else
+# define FT_REHOME_UNOWNED_PLANT	0
+#endif
+static inline
+void ft_flip_txn_record_rehome_excluded(struct ft_flip_txn *t,
+		const struct cds_ft *ft, void **slot, void *old_ptr,
+		void *new_ptr, uintptr_t tag, const char *what)
+{
+	int ret;
+
+	if (caa_unlikely(FT_REHOME_UNOWNED_PLANT ||
+			!ft_flip_txn_excludes_all(t, ft))) {
+		fprintf(stderr, "FT REHOME UNOWNED: %s slot %p producer %p -- "
+			"the op holds neither the owner nor a trie-wide lock\n",
+			what, (void *) slot, __builtin_return_address(0));
+		fflush(stderr);
+		abort();
+	}
+	if (ft_flip_txn_record_is_noop(t, slot, old_ptr, new_ptr))
+		return;
+	FT_AB_ARM(FT_AB_SW, FT_AB_OWN_NA);
+	FT_LL_REC(t, slot, old_ptr, new_ptr, true);
+	ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
+	assert(!ret);
+	(void) ret;
+}
+
 static inline
 struct cds_ft_metadata *ft_flip_txn_record_parent_word(const struct cds_ft *ft,
 		struct ft_flip_txn *txn, struct cds_ft_metadata *meta,
@@ -24569,41 +24589,21 @@ struct cds_ft_metadata *ft_flip_txn_record_parent_word(const struct cds_ft *ft,
 	 *   - 1,390,410 of 1,390,475 at exponential;
 	 *   - 1,272,852 of 1,272,917 at root-only.
 	 * EVERY +child record was also +oldP, so the parent rule strictly
-	 * covers the child one.  The residue is compaction's own txns
-	 * (ft-compact.h:92 / :418, nr_locks 0).  The API still leaves that
-	 * exclusion to the caller.  They stay MW.
+	 * covers the child one.
 	 *
-	 * ☠ NOT A THIRD PREDICATE.  The register's rule is "two predicates, one
-	 * word -- do not add a third".  This REPLACES the child predicate as
-	 * the licence.  @child_held survives only as the legacy path below,
-	 * counted by @ft_slot3_child_only.  BOTH branches produce the same
-	 * kind, so they cannot disagree on one word.
+	 * TODAY, on a shared fine trie, every record here holds the parent:
+	 * compaction takes its DLM set too.  The op holds no owner only where
+	 * the trie excludes every writer, so the write is parked SW there
+	 * (ft_flip_txn_record_rehome_excluded).  Measured, ft_unit and the
+	 * three ft_inv runs: 0 records without the parent on a shared fine
+	 * trie; up to 22k with the child held and 28k with neither, all on
+	 * tries that exclude every writer.  @child_held now only serves the
+	 * FT_RED_PARENT_WORD_SW red control.
 	 */
 	struct cds_ft_metadata *pow = ft_owner_of_parent_word(ft, old_pw);
 
 	FT_SLOT3_COUNT(ft, txn, meta, parent_nf, old_pw);
 
-	/*
-	 * EDGE KIND follows who HOLDS the child, exactly as the state edge in
-	 * ft_reparent_record_meta does -- same node, same reason.
-	 *
-	 * A structural edge may park SW only "when the op holds the DLM lock
-	 * over @slot" (ft_flip_txn_record_tag), and an SW park CANNOT FAIL: it
-	 * does not arbitrate against a peer.  @slot here is the CHILD's
-	 * parent_word, while the DLM set is {C,(P),(GP)} whose acquire states
-	 * that "C's CHILDREN are never in it".  Parking unconditionally
-	 * therefore claims an exclusion the op does not have whenever
-	 * @child_held is false, and two ops re-parenting one unheld child both
-	 * park, neither fails, and the last install wins -- a lost update that
-	 * leaves the loser's child naming a node the winner then retires.
-	 *
-	 * The {live_state -> live_state} validates recorded beside this cannot
-	 * arbitrate that pair either: both expect the same value and neither
-	 * moves it.
-	 *
-	 * MW makes the second writer's expected-old mismatch and abort, which is
-	 * what the retry lane exists to absorb.
-	 */
 #ifdef FT_RED_PARENT_WORD_SW
 	/*
 	 * RED CONTROL, never a shipped configuration: park unconditionally.
@@ -24630,44 +24630,16 @@ struct cds_ft_metadata *ft_flip_txn_record_parent_word(const struct cds_ft *ft,
 		(void **) &meta->parent_word, old_pw, new_pw);
 	return pow;
 #endif
-	/*
-	 * @child_held IS the ownership predicate this word needs, and @meta --
-	 * the CHILD -- is the node it tests: the DLM set here is {C,(P),(GP)}
-	 * and what makes the park legal is holding the child whose parent word
-	 * moves.  So the owner named here is the same node the branch above
-	 * already decides on; the record-time check re-asks it against the
-	 * registry, which is where a hold taken on a frame the txn never
-	 * registered shows up.
-	 */
+	(void) child_held;
 	if (pow && ft_flip_txn_owns(txn, pow)) {
 		/* The word's own parent, held: the ordinary dispatch. */
 		ft_flip_txn_record_reserved(txn, /*owner=*/ pow,
 			(void **) &meta->parent_word, old_pw, new_pw);
 		return pow;
 	}
-	if (child_held) {
-		uatomic_inc(&ft_slot3_child_only);
-		/*
-		 * On a trie whose exclusion is TRIE-WIDE, the named owner does
-		 * not decide the kind: door 1 armed the txn.  TRIE-WIDE means
-		 * coarse, exclusive, or inside the FT-wide writer lock.  So
-		 * only a FINE SHARED record here would contradict the parent
-		 * rule.
-		 */
-		if (ft->lock_fine && !ft->exclusive &&
-				ft_wlock_held != (struct cds_ft *) ft)
-			uatomic_inc(&ft_slot3_child_only_fine);
-		ft_flip_txn_record_reserved(txn, /*owner=*/ meta,
-			(void **) &meta->parent_word, old_pw, new_pw);
-	} else {
-#ifdef FT_DEBUG_STRUCT_ANCHOR
-		/* Owner: the parent being replaced (§8.2). */
-		ft_sa_lane_ask(txn, NULL, pow, meta);
-#endif
-		ft_flip_txn_record_tag_mw(txn, (void **) &meta->parent_word,
-			old_pw, new_pw, FT_FLIP_PROXY_TAG
-			FT_TK_MWA(FT_TK_MWA_PARENT_WORD));
-	}
+	ft_flip_txn_record_rehome_excluded(txn, ft,
+		(void **) &meta->parent_word, old_pw, new_pw,
+		FT_FLIP_PROXY_TAG, "parent word");
 	return pow;
 }
 
@@ -25189,24 +25161,10 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 * writes.
 	 */
 	/*
-	 * THE OFFSET IS THE THIRD WORD OF THE SAME CHILD.  It takes the same
-	 * kind dispatch as the two above it: @meta->parent_word
-	 * (ft_flip_txn_record_parent_word) and @meta->state.  It is the one
-	 * word of the parentage triple that was left on the unconditional
-	 * recorder.  That recorder dispatches on @txn->structural_sw ALONE.
-	 * In a fold commit, that parks an UNVALIDATED plain store on a word
-	 * the op does not own.  The DLM set here is {C,(P),(GP)}, and C's
-	 * CHILDREN are never in it.
-	 *
-	 * An SW park cannot fail.  So two ops re-homing one unheld child
-	 * both park, and neither aborts.  The later SETTLE stores its offset
-	 * over the winner's.  The settle is a plain store, so it also erases
-	 * whatever the peer left in the word after that.
-	 *
-	 * MW makes the second writer's expected-old mismatch and abort,
-	 * which is what the retry lane absorbs.  Byte-neutral for every
-	 * non-fold caller: with structural_sw false, record_tag IS
-	 * record_tag_mw.
+	 * THE OFFSET IS THE THIRD WORD OF THE SAME CHILD, and it follows the
+	 * parent word's rule (ft_flip_txn_record_parent_word).  The op holds
+	 * the parent, or the trie excludes every writer and the offset parks
+	 * SW (ft_flip_txn_record_rehome_excluded).  Anything else stops there.
 	 */
 	if (record_pso) {
 		/*
@@ -25217,25 +25175,19 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		 * the recorder above already resolved.  Asking again would
 		 * load @meta->parent_word a second time for one answer.
 		 */
-		if (pow && ft_flip_txn_owns(txn, pow))
+		if (pow && ft_flip_txn_owns(txn, pow)) {
 			ft_flip_txn_record_tag(txn, /*owner=*/ pow,
 				(void **) &meta->parent_slot_offset,
 				(void *) old_pso, (void *) new_pso,
 				FT_STATE_PROXY);
-		else if (child_marked || held_earlier)
-			ft_flip_txn_record_tag(txn, /*owner=*/ meta,
-				(void **) &meta->parent_slot_offset,
-				(void *) old_pso, (void *) new_pso,
-				FT_STATE_PROXY);
-		else {
+		} else {
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 			ft_sa_lane_ask(txn, hold_ctx, sa_pso_owner, meta);
 #endif
-			ft_flip_txn_record_tag_mw(txn,
+			ft_flip_txn_record_rehome_excluded(txn, ft,
 				(void **) &meta->parent_slot_offset,
 				(void *) old_pso, (void *) new_pso,
-				FT_STATE_PROXY
-				FT_TK_MWA(FT_TK_MWA_PSO));
+				FT_STATE_PROXY, "parent slot offset");
 		}
 	}
 }

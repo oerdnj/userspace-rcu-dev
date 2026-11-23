@@ -1592,11 +1592,10 @@ struct ft_pub_rec {
  *     After the switch the lane reads PARENT_WORD 65 and PSO 0 per leg at
  *     every spacing.  The 65 are compaction's own txns (nr_locks 0), whose
  *     exclusion the API still leaves to the caller.
- *     ☞ @child_held survives as a LEGACY branch, counted by
- *     @ft_slot3_child_only: 5-18 per ft_unit leg, FINE SHARED = 0.  So it
- *     is taken only on tries whose exclusion is trie-wide, where door 1
- *     decides the kind and the named owner does not.  Both branches record
- *     the same kind, so they cannot disagree on one word.
+ *     ☞ Since then compaction takes its DLM set too: a shared fine trie
+ *     records no re-home without the parent.  Where the op holds no owner,
+ *     the trie excludes every writer, and the word parks SW
+ *     (ft_flip_txn_record_rehome_excluded).  Anything else aborts.
  * (4) ☠ See FT-SLOT-2 for this word's dropped mark check.  And MW is
  *     load-bearing here TODAY: ft_hlist_freeze_sole_prepare's derived
  *     NULL is the only thing that turns an UNHELD sole-entry derivation into
