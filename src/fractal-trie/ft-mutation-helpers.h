@@ -5732,17 +5732,16 @@ void ft_hold_trace_bad_release(const struct cds_ft_metadata *lock, uintptr_t s)
 static inline bool ft_flip_txn_owns(const struct ft_flip_txn *t,
 		const struct cds_ft_metadata *owner);
 /*
- * ☠ WITNESS 3.  WITHOUT IT THE THREE freeze_sole SITES READ AS VIOLATIONS BY
- * CONSTRUCTION.  ft_flip_txn_owns is the NARROW witness: it consults the
- * lock registry of the commit alone.  Its own header says so: "a miss here
- * is ... a VISIBILITY gap at the sites whose clearing stays with a sweep.  Read
- * it as 'the registry cannot see this hold', never as 'the op does not hold
- * it'."  The orphan freeze is the documented counterexample.  Where the
- * anchor IS the retired node, ft_detach_freeze_one records the fused
- * terminal and REGISTERS NOTHING.  It can do so for two reasons: a
- * tombstoned word is unclaimable forever, and the release sweep of the
- * caller covers both outcomes.  The marks of an op also live in three other
- * places:
+ * ☠ WITNESS 3.  WITHOUT IT THE THREE SOLE-ENTRY FREEZE SITES READ AS VIOLATIONS
+ * BY CONSTRUCTION.  ft_flip_txn_owns is the NARROW witness: it consults the
+ * lock registry of the commit alone.  Its own header says so: "a miss here is
+ * ... a VISIBILITY gap at the sites whose clearing stays with a sweep.  Read it
+ * as 'the registry cannot see this hold', never as 'the op does not hold it'."
+ * The orphan freeze is the documented counterexample.  Where the anchor IS the
+ * retired node, ft_detach_freeze_one records the fused terminal and REGISTERS
+ * NOTHING.  It can do so for two reasons: a tombstoned word is unclaimable
+ * forever, and the release sweep of the caller covers both outcomes.  The marks
+ * of an op also live in three other places:
  *   - @extra (an orphan chain is FT_MAX_DEPTH long, past the registry's
  *     size);
  *   - the named fields of the glue;
@@ -6405,11 +6404,11 @@ void ft_ch_audit_owner_at(const char *fn, int line, const struct cds_ft *ft,
 	 *   - an outer frame;
 	 *   - the anchor of a node this very commit retires.
 	 *     ft_detach_freeze_one registers that one NOWHERE, by design.
-	 * Scoring UNHELD without asking it condemns the freeze_sole sites by
-	 * construction.  "Fixing" one by adding an acquire on a word the op
+	 * Scoring UNHELD without asking it condemns the sole-entry freeze sites
+	 * by construction.  "Fixing" one by adding an acquire on a word the op
 	 * ALREADY holds is not harmless.  The second acquire returns -EAGAIN.
-	 * The site reads its OWN mark as contention, and the op waits on
-	 * itself forever (see the header of struct ft_held_set).
+	 * The site reads its OWN mark as contention, and the op waits on itself
+	 * forever (see the header of struct ft_held_set).
 	 */
 	{
 		uintptr_t snap;

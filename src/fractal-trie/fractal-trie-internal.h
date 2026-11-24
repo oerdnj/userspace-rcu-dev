@@ -1578,10 +1578,10 @@ struct ft_pub_rec {
  *     records no re-home without the parent.  Where the op holds no owner,
  *     the trie excludes every writer, and the word parks SW
  *     (ft_flip_txn_record_rehome_excluded).  Anything else aborts.
- * (4) ☠ See FT-SLOT-2 for this word's dropped mark check.  And MW is
- *     load-bearing here TODAY: ft_hlist_freeze_sole_prepare's derived
- *     NULL is the only thing that turns an UNHELD sole-entry derivation into
- *     an abort.  Re-derive under the holder lock before any SW park.
+ * (4) ☠ See FT-SLOT-2 for this word's dropped mark check.  A sole-entry
+ *     derivation is made UNHELD, so every freeze re-checks it under the
+ *     holder lock before recording (ft_hlist_chain_plan_ok, or freeze_leaf's
+ *     re-read of @next).  The single-writer engine stores the record blind.
  * (5) ☑ FT-SLOT-4 (text corrected).  ft_promote_head already parks a head's
  *     prev SW (owner = the holder), while ft-txn-hlist.h records the same
  *     word class MW.  This is not a live race: every producer holds the

@@ -659,8 +659,8 @@ static void ft_mark_refuse_report(void)
  * The header promises this: a structural head-remove's MARK(H->next) is what
  * makes "a concurrent insert_after(H) onto a sole-node chain see the mark and
  * abort".  The check below was deleted, so for a while nothing looked at the
- * mark.  The remove side upholds its half: ft_hlist_freeze_sole_prepare
- * marks a derived NULL.  The insert side no longer checks.  A MARK(NULL)
+ * mark.  The remove side upholds its half: its sole-entry freeze marks the
+ * tail NULL.  The insert side no longer checks.  A MARK(NULL)
  * @pos->next reads back as the bare value 2.  That value passes
  * `succ != NULL` and makes the second store record slot
  * &((struct cds_ft_node *) 2)->prev.  Under LOCK_FINE, insert and remove are
@@ -911,38 +911,6 @@ void ft_hlist_freeze_prepare(const struct cds_ft *ft, struct ft_txn *txn, struct
 
 	ret = ft_hlist_store_chain(ft, txn, (void **) &node->next, en,
 			ft_hlist_set_mark((struct cds_ft_node *) en), FT_HLIST_TAG);
-	assert(!ret);			/* caller reserved the edge up front */
-	(void) ret;
-}
-
-/*
- * ft_hlist_freeze_sole_prepare: freeze a head that the caller DERIVED to be
- * its key's SOLE entry.  The callers are the key-disappearing lanes.  They
- * prune the branch around the head.  They are a detach and the fused
- * ft_remove_one_commit.
- *
- * The expected-old is that derivation, NULL.  It is never the slot re-loaded
- * here.  The derivation was made with nothing held.  A same-key
- * cds_ft_insert can have APPENDED a duplicate to @node since.  Under
- * LOCK_FINE such an insert is concurrent with a remove in contract.
- * Re-loading would mark that duplicate into the tombstone (MARK(N)).  The
- * prune would then orphan it behind a retired head.  The results:
- *   - an OK insert whose key never resolves again;
- *   - a later remove of it that never terminates.
- * This was measured: "key LOST after an OK concurrent insert", in both list
- * modes.
- * Recorded against NULL, the append fails this commit's install CAS
- * instead -- the record is MW, so a mismatch is an ABORT, which every
- * key-disappearing caller already routes to a re-derivation that then finds
- * the successor and PROMOTES it.
- */
-static inline
-void ft_hlist_freeze_sole_prepare(const struct cds_ft *ft, struct ft_txn *txn, struct cds_ft_node *node)
-{
-	int ret;
-
-	ret = ft_hlist_store_chain(ft, txn, (void **) &node->next, NULL,
-			ft_hlist_set_mark(NULL), FT_HLIST_TAG);
 	assert(!ret);			/* caller reserved the edge up front */
 	(void) ret;
 }
@@ -1553,17 +1521,13 @@ bool ft_hlist_chain_plan_ok(const struct cds_ft *ft, struct ft_txn *txn,
 
 /*
  * ft_hlist_freeze_chain_prepare: freeze the chain at @head into @txn WITHOUT
- * committing.  Record one {v -> MARK(v)} edge for each of @len nodes.  This
- * is the whole-key counterpart of ft_hlist_freeze_sole_prepare.  It is for
- * the lane that retires a chain ENTIRE (cds_ft_remove_all), not only its
- * last entry.
- *
- * For @len == 1 this is byte-identical to ft_hlist_freeze_sole_prepare.  The
- * one node is the tail, and its record is {NULL -> MARK(NULL)}.
+ * committing.  Record one {v -> MARK(v)} edge for each of @len nodes.  It
+ * retires a chain ENTIRE (cds_ft_remove_all), or a sole entry (@len == 1).
+ * For @len == 1 the one node is the tail, and its record is
+ * {NULL -> MARK(NULL)}.
  *
  * ☠ @len IS THE CALLER'S DERIVATION, AND THE WALK MUST NOT OUTRUN IT.  That is
- * the whole arbitration.  ft_hlist_freeze_sole_prepare spells out the same
- * one for its derived NULL.  The derivation is made with NOTHING HELD.  So a
+ * the whole arbitration.  The derivation is made with NOTHING HELD.  So a
  * same-key cds_ft_insert can APPEND a duplicate before this commit.  Under
  * LOCK_FINE such an insert is concurrent with a remove in contract.
  * Stopping at @len records the derived tail against NULL.  Under the MCAS
