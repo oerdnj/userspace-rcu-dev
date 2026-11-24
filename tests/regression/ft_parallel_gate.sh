@@ -177,17 +177,20 @@ ALL_CONFIGS=(
 	# The TRANSACTION ENGINE's own debug features.  Every other config
 	# compiles them out, so an engine-contract violation the FT commits is
 	# invisible to the whole matrix:
-	#   DEBUG_RCU                 -> urcu_assert_debug.  A record value that
-	#                                is itself a proxy (the embedder read the
-	#                                slot raw instead of through
-	#                                urcu_txn_load), two records on one slot,
-	#                                an MW record on the sw-only commit, a
-	#                                same-slot kind conflict.
-	#   URCU_TXN_DEBUG_READ_POLICY-> a slot that enters the read/write set
-	#                                after an OPTIMISTIC load.
-	# The two are complementary: the read-policy table only marks slots
-	# loaded through the engine's API, so a RAW C read of a transacted word
-	# leaves no mark and only the assert catches it.
+	#   DEBUG_RCU                  -> urcu_assert_debug.  A txn load that
+	#                                 finds another commit's proxy on its
+	#                                 slot, two records on one slot, a
+	#                                 chained record whose old value is not
+	#                                 the txn's own pending value.
+	#   URCU_TXN_SW_EXCL_VALIDATE  -> a handle driven by two threads, a slot
+	#                                 recorded while another commit's proxy
+	#                                 is parked on it, a parked proxy
+	#                                 overwritten before its settle, and a
+	#                                 single-edge commit's slot that no
+	#                                 longer holds the recorded old value.
+	#                                 These are the single-writer engine's
+	#                                 exclusion assumptions, which FT's
+	#                                 locks must make true.
 	#
 	# imw matters MOST here, for the same reason it does on "default": the
 	# writers that do the heaviest transacted-slot work -- the concurrent-writer
@@ -197,7 +200,7 @@ ALL_CONFIGS=(
 	# arbitrates against a peer, so the raw-read class this config exists to
 	# detect is the class the missing leg hid.  The leg costs 82 s, alongside
 	# ioff's 76 s.
-	"txndbg|-DDEBUG_RCU -DURCU_TXN_DEBUG_READ_POLICY -DURCU_TXN_DEBUG_SETTLE -DFEATURE_FT_ANCHOR_VALIDATE|u ion ioff imw sp imb"
+	"txndbg|-DDEBUG_RCU -DURCU_TXN_SW_EXCL_VALIDATE -DFEATURE_FT_ANCHOR_VALIDATE|u ion ioff imw sp imb"
 	# The FT's own resolved-pointer assertion (ft_assert_resolved): a parked
 	# flip proxy handed to an accessor that requires a resolved flag.  It is
 	# the embedder-side counterpart to txndbg's engine-side DEBUG_RCU, and it

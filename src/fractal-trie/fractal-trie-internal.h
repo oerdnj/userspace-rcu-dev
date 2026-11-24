@@ -136,7 +136,8 @@
 #define URCU_TXN_RCU_READ_UNLOCK()	do { } while (0)
 #include <urcu/fair-mutex.h>	/* MW coarse lock-mode FT-wide writer lock */
 #include <urcu/rcu-txn.h>
-#include <urcu/rcu-txn-list.h>
+#include <urcu/rcu-txn-list.h>	/* the ordered-cell list's link format */
+#include <urcu/rcu-txn-sw.h>	/* the commit engine */
 #include "ft-txn-engine.h"	/* FT's view of the parked-slot format */
 
 /*
@@ -176,7 +177,6 @@ struct ft_op {
 	int in_lane;			/* we hold the lane */
 	int lane_published;		/* we raised lane->active and owe the clear */
 	int park_quiescent;		/* park OFFLINE (ft_op_set_park_quiescent) */
-	int retrying;			/* a COMMIT aborted: keep the turn */
 };
 
 /*

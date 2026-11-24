@@ -2843,8 +2843,7 @@ static unsigned long ft_miss_overflow;
 
 static inline unsigned int ft_miss_nr(const struct ft_txn *mtxn)
 {
-	return (mtxn && mtxn->e.desc && mtxn->e.desc != URCU_TXN_ENOMEM) ?
-		mtxn->e.desc->nr : 0;
+	return ft_txn_nr_records(mtxn);
 }
 
 static void ft_miss_account(const char *fn, int line, unsigned int wasted)
@@ -2913,6 +2912,7 @@ struct ft_flip_txn {
 	struct ft_txn own;	/* backing handle for standalone txns */
 	struct ft_op *op;	/* the op whose handle @mtxn is, or NULL */
 	bool reserved;			/* @mtxn pre-reserved (bounded) => infallible commit */
+	unsigned int resv;		/* records last reserved: what is owed */
 	bool list_locked;		/* holds class-1 words (ft_list_locked_txns) */
 	unsigned char glue_anchors;	/* ft_glue_lock_anchors: 0 not yet, 1 taken, 2 refused */
 	/*
@@ -3559,7 +3559,6 @@ void ft_txn_op_init(struct cds_ft *ft, struct ft_op *op)
 	op->in_lane = 0;
 	op->lane_published = 0;
 	op->park_quiescent = 0;
-	op->retrying = 0;
 }
 
 /*
@@ -3690,7 +3689,6 @@ void ft_op_begin(struct ft_op *op)
 	if (op->retry > ft_op_lane_maxretry)
 		ft_op_lane_maxretry = op->retry;	/* racy max, diagnosis only */
 #endif
-	op->retrying = 0;
 	if (op->lane && !op->in_lane) {
 		if (uatomic_load(&op->lane->active, CMM_RELAXED) ||
 				ft_op_earned_lane(op)) {
@@ -3701,46 +3699,35 @@ void ft_op_begin(struct ft_op *op)
 			ft_op_earned_lane(op)) {
 		ft_op_lane_publish(op);
 	}
-	urcu_txn_begin(&op->txn.e);
-	op->txn.nload = 0;	/* a new attempt counts its own loads */
+	ft_txn_attempt_begin(&op->txn);
 	if (op->flavor)
 		op->flavor->read_lock();
 }
 
 /*
- * Close the attempt ft_op_begin() opened.  Always paired with it.  The turn
- * is released unless a commit aborted and the op re-attempts.
+ * Close the attempt ft_op_begin() opened.  Always paired with it.  Drop
+ * any record the attempt did not commit, and release the turn.
  */
 static inline
 void ft_op_end(struct ft_op *op)
 {
-	urcu_txn_end(&op->txn.e);
+	ft_txn_discard(&op->txn);
 	if (op->flavor)
 		op->flavor->read_unlock();
-	if (op->in_lane && !op->retrying)
+	if (op->in_lane)
 		ft_op_lane_exit(op);
 }
 
 /*
  * The attempt lost before its commit: age the op.  The turn is forfeited at
- * ft_op_end(), since @retrying stays clear.  The attempt's cost counts
- * toward ft_op_cost().  The engine handle is aged too, for the engine's
- * own policy.
+ * ft_op_end().  The attempt's cost counts
+ * toward ft_op_cost().
  */
 static inline
 void ft_op_conflict(struct ft_op *op)
 {
 	ft_txn_learn_cost(&op->txn);
-	urcu_txn_conflict(&op->txn.e);
 	op->retry++;
-}
-
-/* A commit through the op's handle aborted: age it and keep the turn. */
-static inline
-void ft_op_commit_aborted(struct ft_op *op)
-{
-	op->retry++;
-	op->retrying = 1;
 }
 
 /*
@@ -3765,7 +3752,6 @@ void ft_flip_txn_conflict(struct ft_flip_txn *t)
 		ft_op_conflict(t->op);
 	} else {
 		ft_txn_learn_cost(t->mtxn);
-		urcu_txn_conflict(&t->mtxn->e);
 	}
 }
 
@@ -4179,18 +4165,9 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 #endif
 	t->mtxn = &t->own;
 	t->op = NULL;
-	ft_txn_init(t->mtxn);	/* flavor-agnostic: the caller brackets the
-				 * RCU read side; no escalation domain
-				 * under POC exclusion */
-	/* Skip the age-0 optimistic install and its fixed-size RYW Bloom
-	 * filter.  A growable FT commit (merge/graft spine folds) can
-	 * accumulate a large, dense write set that saturates the Bloom.  A
-	 * saturated Bloom reports a false same-slot coincidence, which becomes
-	 * a spurious escalate-ABORT (see the note in
-	 * ft_flip_txn_create_bounded).  The exact age-1+ reconcile has no
-	 * Bloom. */
-	urcu_txn_expect_conflict(&t->mtxn->e);
+	ft_txn_init(t->mtxn);	/* the caller brackets the RCU read side */
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
+	t->resv = 0;
 	t->list_locked = false;
 	t->glue_anchors = 0;
 	t->committed = false;
@@ -4480,8 +4457,8 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 #endif
 	t->mtxn = &op->txn;
 	t->op = op;
-	urcu_txn_expect_conflict(&t->mtxn->e);
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
+	t->resv = 0;
 	t->list_locked = false;
 	t->glue_anchors = 0;
 	t->committed = false;
@@ -4570,8 +4547,8 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
  * a standalone txn.
  *
  * Returns NULL on OOM: a failed malloc, or a failed reserve.  On a failed
- * reserve the sticky URCU_TXN_ENOMEM marker stays in @op, and the op's
- * terminal urcu_txn_end() clears it.  The caller bails with -ENOMEM.  Shares
+ * reserve the sticky out-of-memory mark stays on @op's handle, and the next
+ * attempt's ft_op_begin() clears it.  The caller bails with -ENOMEM.  Shares
  * the fault-injection countdown with create_bounded.
  */
 static inline
@@ -4598,11 +4575,12 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 #endif
 	t->mtxn = &op->txn;
 	t->op = op;
-	if (urcu_txn_reserve(&t->mtxn->e, cap) < 0) {
+	if (!ft_txn_reserve(t->mtxn, cap)) {
 		ft_flip_txn_free(t);
 		return NULL;
 	}
 	t->reserved = true;
+	t->resv = cap;
 	t->list_locked = false;
 	t->glue_anchors = 0;
 	t->committed = false;
@@ -4744,9 +4722,10 @@ struct ft_flip_txn *ft_flip_txn_acquire_bounded_at(FT_TK_SITE_PARAM
 static inline
 bool ft_flip_txn_reserve(struct ft_flip_txn *t, unsigned int cap)
 {
-	if (urcu_txn_reserve(&t->mtxn->e, cap) < 0)
+	if (!ft_txn_reserve(t->mtxn, cap))
 		return false;
 	t->reserved = true;
+	t->resv = cap;
 	t->committed = false;
 	return true;
 }
@@ -4761,27 +4740,27 @@ bool ft_flip_txn_reserve(struct ft_flip_txn *t, unsigned int cap)
  * may still fail cleanly (freeze-before-install leaves the structure
  * byte-for-byte untouched).  So an OOM here just aborts/retries the op.
  *
- * urcu_txn_reserve is grow-safe after records are recorded.  The records
- * move to the grown descriptor, and proxies form from the final address only
- * at install.
+ * The engine's reserve is grow-safe after records are recorded.  The
+ * records move to the grown array, and proxies form from the final address
+ * only at install.
  *
  * Returns false on OOM.  Nothing new is recorded then, and the caller aborts.
  */
 /*
- * ☠ THE BASE IS WHAT THE TXN OWES, NEVER THE DESCRIPTOR'S @cap.  @cap is the
- * ALLOCATED size, not the promise.  urcu_txn_grow DOUBLES it, and
- * urcu_txn_alloc_cap rounds that up to a slab.  So widening from @cap
- * re-inflates the reservation by the whole slack on every call.  Three
- * widens per attempt then multiply it ~8x per attempt.  The engine resets
- * the promise (@min_alloc = m->nr) only AT COMMIT.  So an op whose attempts
- * keep failing ratchets EXPONENTIALLY.  A two-key rekey_merge under
+ * ☠ THE BASE IS WHAT THE TXN OWES, NEVER THE HANDLE'S CAPACITY.  The capacity
+ * is the ALLOCATED size, not the promise: a grow DOUBLES it, and the slab
+ * rounds that up.  So widening from the capacity re-inflates the
+ * reservation by the whole slack on every call.  Three widens per attempt
+ * then multiply it ~8x per attempt.  When the promise lived on the OP
+ * handle, it was reset only AT COMMIT.  So an op whose attempts kept
+ * failing ratcheted EXPONENTIALLY.  A two-key rekey_merge under
  * exponential lock spacing reached cap == 2.8 BILLION records.  Every later
  * attempt spent its whole time zeroing gigabytes.  That reads as a hang.  It
  * also HIDES the real non-convergence underneath: attempt N costs 2^N.  So a
  * retry cap counted in attempts is never reached, and the livelock detector
  * stays silent.
  *
- * @min_alloc is the outstanding reservation: it still covers records
+ * @t->resv is the outstanding reservation: it still covers records
  * promised but not yet recorded.  @nr is what is already recorded.  The
  * floor is the larger of the two, since a caller may widen either before or
  * after spending what it first asked for.
@@ -4792,11 +4771,11 @@ bool ft_flip_txn_reserve_extra(struct ft_flip_txn *t, unsigned int extra)
 	unsigned int nr = ft_txn_nr_records(t->mtxn);
 	/*
 	 * ☠ WIDEN FROM WHAT THIS ATTEMPT OWES, AND @reserved IS WHAT SAYS SO.
-	 * @min_alloc lives on the OP handle, which outlives an attempt.  The
-	 * engine resets it only AT A COMMIT (urcu_txn_commit: min_alloc =
-	 * m->nr, on the abort path too).  So an op that bails PRE-COMMIT
-	 * carries the previous attempt's FLOOR into the next one.  Widening
-	 * from that floor adds @extra again every attempt, without bound.
+	 * The MCAS engine kept the promise (@min_alloc) on the OP handle,
+	 * which outlives an attempt, and reset it only AT A COMMIT.  So an op
+	 * that bailed PRE-COMMIT carried the previous attempt's FLOOR into
+	 * the next one.  Widening from that floor added @extra again every
+	 * attempt, without bound.  @t->resv lives on the per-attempt @t.
 	 *
 	 * MEASURED before this line existed, on ft_unit
 	 * test_rekey_compressed_bp_atomic_or_refused at exponential spacing:
@@ -4817,27 +4796,23 @@ bool ft_flip_txn_reserve_extra(struct ft_flip_txn *t, unsigned int extra)
 	 *    RECORDED.
 	 * A floor from an attempt that bailed is owed to nobody.
 	 */
-	unsigned int cur = t->reserved &&
-			t->mtxn->e.min_alloc > nr ? t->mtxn->e.min_alloc : nr;
+	unsigned int cur = t->reserved && t->resv > nr ? t->resv : nr;
 
 #ifdef FT_DEBUG_RESERVE_RATCHET
 	{
 		/*
-		 * THE RATCHET PROBE.  @cur is taken from @min_alloc, which the
-		 * engine resets only at a COMMIT.  So an op that bails
-		 * PRE-COMMIT and retries adds @extra on top of the PREVIOUS
-		 * attempt's floor, every attempt, without bound.  Print the
-		 * floor as it climbs.  A monotone @cur across attempts of one
-		 * op is the ratchet.  A flat one is not.
+		 * THE RATCHET PROBE.  An op that bails PRE-COMMIT and retries
+		 * must not add @extra on top of the PREVIOUS attempt's floor.
+		 * Print the floor as it climbs.  A monotone @cur across
+		 * attempts of one op is the ratchet.  A flat one is not.
 		 */
 		static unsigned long n_calls;
 		unsigned long c = uatomic_add_return(&n_calls, 1);
 
 		if ((c & 0xfff) == 0)
 			fprintf(stderr,
-				"FT RESERVE-EXTRA call=%lu cur=%u extra=%u -> %u (min_alloc=%u nr=%u)\n",
-				c, cur, extra, cur + extra,
-				t->mtxn->e.min_alloc, nr);
+				"FT RESERVE-EXTRA call=%lu cur=%u extra=%u -> %u (resv=%u nr=%u)\n",
+				c, cur, extra, cur + extra, t->resv, nr);
 	}
 #endif
 	return ft_flip_txn_reserve(t, cur + extra);
@@ -9783,8 +9758,6 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 	if (ft_txn_live(t->mtxn))
 		ft_txn_learn_cost(t->mtxn);
 	st = ft_txn_commit(t->mtxn, reclaim);
-	if (st == URCU_TXN_STATUS_ABORT && t->op)
-		ft_op_commit_aborted(t->op);
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	for (sa_i = 0; sa_i < t->sa_npend; sa_i++) {
 		const struct ft_sa_pend *sp = &t->sa_pend[sa_i];
@@ -13901,7 +13874,7 @@ __attribute__((weak)) unsigned long ft_cow_engine_lane;
 static inline
 int ft_flip_txn_resolve_prio(struct ft_flip_txn *t, void **src, void **out)
 {
-	*out = urcu_txn_read(src, FT_FLIP_PROXY_TAG);
+	*out = ft_txn_read(src, FT_FLIP_PROXY_TAG);
 	return 1;
 }
 
