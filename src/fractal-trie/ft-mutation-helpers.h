@@ -4590,7 +4590,7 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 /*
  * Bounded FT flip-txn BOUND to an op's persistent engine handle, @op.  The
  * caller ran ft_txn_op_init on @op before the op's restart_attempt loop.  It
- * brackets each attempt with urcu_txn_begin()/urcu_txn_end().
+ * brackets each attempt with ft_op_begin()/ft_op_end().
  *
  * The recording facade is this per-attempt wrapper.  The retry aging, the
  * FIFO escalation turn and the learned descriptor size live in @op.  They
@@ -7980,7 +7980,7 @@ struct ft_lock_ctx {
 	/*
 	 * The op's PERSISTENT engine handle, when it has one.  A lock-set
 	 * acquire binds to it so the commit AGES and takes its FIFO turn.  A
-	 * per-attempt handle is domain-less and never begin/end-bracketed.
+	 * per-attempt handle has no op, so no lane, and is never bracketed.
 	 * That makes the acquire a participant the escalation lane cannot
 	 * order.  A peer can then hold a member while a lane-holding writer
 	 * spins for it.  NULL builds a standalone acquire txn, as before.
@@ -8288,9 +8288,9 @@ int ft_member_node_snap(const struct ft_lock_ctx *ctx,
  * IT IS A PARAMETER, not a field left for the caller to patch afterwards.  It
  * used to be initialised to NULL unconditionally.  Three sites out of
  * thirty-two remembered to assign it.  Measured: 6 enrolled acquires against
- * 5,824,454 domain-less ones.  A refused acquire on a domain-less handle cannot
- * age its op (ft_dlm_acquire_set's eagain path).  So the op never reaches the
- * escalation domain's FIFO lane, and a contended anchor starves it.  Making it
+ * 5,824,454 without an op.  A refused acquire without an op cannot age one
+ * (ft_dlm_acquire_set's eagain path).  So the op never reaches the trie's
+ * FIFO lane, and a contended anchor starves it.  Making it
  * an argument stops a new site from re-opening that hole silently.
  */
 static inline
@@ -9892,10 +9892,10 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 		 * reason.  Every caller routes ABORT to a re-descend and
 		 * MEMORY_ERROR out to the app.  Nothing was parked either way.
 		 *
-		 * Age the handle on ABORT only, exactly as a real contention
-		 * abort does inside urcu_txn_commit_flavor.  Without it the op
-		 * never advances txn->retry and never escalates to the FIFO
-		 * lane.  A contended node could then starve it indefinitely.
+		 * Age the op on ABORT only, as an aborted commit does
+		 * (ft_op_commit_aborted).  Without it the op never advances
+		 * op->retry and never escalates to the FIFO lane.  A contended
+		 * node could then starve it indefinitely.
 		 *
 		 * An allocation failure is NOT contention.  Aging for it
 		 * spends the escalation budget on a conflict that never
@@ -12487,7 +12487,7 @@ static __thread struct cds_fair_mutex_node ft_acq_lane_waiter;
  * the per-node contention reproducer: content-commit success 8.7% -> 0.9%,
  * and 8/8 legs killed against 4/8.
  *
- * So put the arbitration back on the SAME lane the engine uses
+ * So put the arbitration back on the SAME lane ft_op_begin() enters
  * (@ctx->op->lane).  The lane is reached through the op's persistent handle,
  * with no descriptor and no grace period owed.
  *
@@ -12613,9 +12613,9 @@ void ft_acq_lane_backoff(const struct cds_ft *ft,
 	if (ft_acq_contended < FT_ACQ_LANE_AGE)
 		{ FT_LANE(too_young); return; }
 	/*
-	 * ☠ NOT IF THIS THREAD IS ALREADY IN THE LANE.  urcu_txn_begin
-	 * escalates into the SAME domain->lock (urcu_txn__enter_fallback),
-	 * and cds_fair_mutex is not reentrant.  So a thread that reached
+	 * ☠ NOT IF THIS THREAD IS ALREADY IN THE LANE.  ft_op_begin()
+	 * enters the SAME lane->lock (ft_op_lane_enter), and
+	 * cds_fair_mutex is not reentrant.  So a thread that reached
 	 * here from inside a fallback episode blocks for ever on a lock it
 	 * is holding.
 	 *
@@ -12628,8 +12628,8 @@ void ft_acq_lane_backoff(const struct cds_ft *ft,
 	 * MEASURED as a reproducible hang of ft_inv at test 87
 	 * (inv_prefix_key_park_vs_holder_churn), three lockordered legs.
 	 * Threads were parked in cds_fair_mutex_park under BOTH
-	 * ft_dlm_acquire_set_at and urcu_txn_begin at once.  That is the
-	 * cycle written out.
+	 * ft_dlm_acquire_set_at and the op's lane entry (then made in
+	 * urcu_txn_begin) at once.  That is the cycle written out.
 	 */
 	if (ft_op_in_lane())
 		{ FT_LANE(in_fallback); return; }

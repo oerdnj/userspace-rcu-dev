@@ -10443,7 +10443,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	 * one handle.  Contention aging is therefore carried manually on the
 	 * persistent @optxn via ft_op_conflict.  After its lane budget of
 	 * conflicts, this writer escalates into the per-trie FIFO fair-mutex
-	 * lane.  Every writer's begin() honors domain->active, so the lane
+	 * lane.  Every writer's ft_op_begin() honors lane->active, so the lane
 	 * drains the contention and the retry terminates (no livelock).
 	 *
 	 * Exclusive trie: the bracket opens nothing and no conflict ever

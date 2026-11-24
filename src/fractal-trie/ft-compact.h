@@ -953,10 +953,10 @@ void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
 	ft_descent_init(&d, ft);
 	/*
 	 * @op has no retry loop behind it: a refused acquire here reaches the
-	 * caller as -EAGAIN.  So @op is carried for DEFERENCE, not aging.  The
-	 * caller's begin() honours domain->active.  A peer starving on one of
-	 * these anchors is queued in front of this pass rather than barged
-	 * past.
+	 * caller as -EAGAIN.  So @op is carried for DEFERENCE, not aging.
+	 * The caller's ft_op_begin() honours lane->active.  A peer starving
+	 * on one of these anchors is queued in front of this pass rather
+	 * than barged past.
 	 *
 	 * Nothing under this descent waits for a grace period.  So holding a
 	 * lane turn across it cannot stall the readers it would then wait on.

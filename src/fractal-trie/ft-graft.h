@@ -2825,7 +2825,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * There are two independent reasons:
 		 *  - ft_op_begin() enters the RCU read side.  A GP under
 		 *    it waits on this very thread.
-		 *  - An aged handle escalates into the fallback lane.
+		 *  - An aged op enters the escalation lane.
 		 *    ft_writer_lock_gp_wait asserts !ft_op_in_lane().  A peer
 		 *    parked on that lane is an ONLINE, non-quiescent reader
 		 *    that holds the GP open.
@@ -2843,7 +2843,8 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 retry_attach:
 		/*
 		 * Open the attempt BEFORE anything it must undo: an aged retry
-		 * escalates here, and escalation blocks on the domain's fair mutex.
+		 * escalates here, and escalation blocks on the lane's fair
+		 * mutex.
 		 */
 		if (ra_txn)
 			ft_op_begin(&optxn);
@@ -5436,7 +5437,7 @@ retry_swap:
 		/*
 		 * Close the escalation bracket BEFORE the dst drain below.
 		 * ft_writer_lock_gp_wait() waits a grace period.  A writer
-		 * parked on the domain's FIFO lane is an ONLINE, non-quiescent
+		 * parked on the trie's FIFO lane is an ONLINE, non-quiescent
 		 * reader that holds that grace period open.  This is why that
 		 * function asserts !ft_op_in_lane().  Closing the attempt also
 		 * closes its read section.
@@ -5671,7 +5672,7 @@ retry_swap:
 		/*
 		 * Close the escalation bracket BEFORE the build-error unwind.
 		 * ft_writer_lock_gp_wait() waits a grace period.  A writer
-		 * parked on the domain's FIFO lane is an ONLINE, non-quiescent
+		 * parked on the trie's FIFO lane is an ONLINE, non-quiescent
 		 * reader that holds that grace period open.  This is why that
 		 * function asserts !ft_op_in_lane().  Closing the attempt also
 		 * closes its read section.

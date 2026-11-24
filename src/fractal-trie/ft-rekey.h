@@ -9409,7 +9409,7 @@ sweep:
  * as before.  So retrying is just calling again.  But calling again is not
  * enough on its own.  Progress under contention comes from AGING a PERSISTENT
  * handle.  ft_op_conflict() advances @optxn->retry.  Once it reaches the
- * fallback budget, the writer takes its FIFO turn on the trie's escalation
+ * lane budget, the writer takes its FIFO turn on the trie's escalation
  * lane and commits without competition.  The caller's external "just call
  * again" loop produced a fresh handle per attempt.  A fresh handle resets
  * that age to zero every time, so the writer never qualifies and spins
@@ -9790,7 +9790,7 @@ int ft_rekey_one_decide(struct cds_ft *ft,
 	 * fact that only FINE mode had a protocol this writer already spoke.
 	 *
 	 * ORDER matches the other writers: FT-wide mutex first, escalation
-	 * domain second (urcu_txn_begin, inside the retry loop below).  So the
+	 * lane second (ft_op_begin, inside the retry loop below).  So the
 	 * two-lock cycle those ops could otherwise form does not arise.  The
 	 * mutex is taken AFTER the caller's ft_move_gate_enter.  So the gate's
 	 * grace period is not waited for while holding the mutex.

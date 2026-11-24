@@ -4210,7 +4210,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 	/*
 	 * The op's persistent engine handle (doc §11) is initialized ONCE.
 	 * So these span every attempt of the loop below:
-	 *  - contention aging (txn->retry);
+	 *  - contention aging (op->retry);
 	 *  - the FIFO fair-mutex escalation turn;
 	 *  - the learned descriptor size.
 	 * Each attempt is bracketed by ft_op_begin()/ft_op_end(): the
@@ -4218,7 +4218,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 	 * must run inside one.  Otherwise a peer writer's call_rcu-deferred
 	 * frees could reclaim nodes under it.  A caller-held section merely
 	 * nests.  On an exclusive trie the bracket opens nothing (NULL
-	 * flavor) and the domain is NULL (never escalates).  The behavior is
+	 * flavor) and the lane is NULL (never escalates).  The behavior is
 	 * identical to the pre-bracket path.
 	 */
 	ft_txn_op_init(ft, &optxn);
@@ -4865,7 +4865,7 @@ insert_done:
 		/*
 		 * Age the pre-commit conflict (ft_op_conflict).  Without
 		 * it, a writer that keeps bailing on the same hot slot never
-		 * advances txn->retry and never escalates.  It can livelock.
+		 * advances op->retry and never escalates.  It can livelock.
 		 * Aging is all it does here.  The bail forfeits the FIFO
 		 * turn, because the re-descend below asks a peer for the
 		 * position it just lost.

@@ -474,10 +474,11 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				struct ft_lock_ctx lctx;
 
 				/*
-				 * JOIN THE ESCALATION DOMAIN for the lock-set this
-				 * detach takes.  The op has no retry loop of
-				 * its own, so it needs no AGING.  It needs
-				 * DEFERENCE.  begin() honours domain->active.
+				 * JOIN THE ESCALATION LANE for the lock-set
+				 * this detach takes.  The op has no retry loop
+				 * of its own, so it needs no AGING.  It needs
+				 * DEFERENCE.  ft_op_begin() honours
+				 * lane->active.
 				 * So a peer starving on one of these anchors
 				 * is queued in front of this detach.  This
 				 * detach does not barge past it.
@@ -485,7 +486,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				 * ★ THE BRACKET IS THIS CALL AND NOTHING MORE.
 				 * ft_detach_keylen waits for three grace periods
 				 * (ft_writer_lock_gp_wait, above and below).  A
-				 * writer parked on the fallback lane is an
+				 * writer parked on the escalation lane is an
 				 * ONLINE, non-quiescent QSBR reader.  Such a
 				 * reader stops the grace period the writer
 				 * would then wait for.  ft_writer_lock_gp_wait
