@@ -2851,7 +2851,7 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	 * of @rm_bracket at each exit.  A re-test is a second chance to
 	 * disagree with the arm actually opened.
 	 *
-	 * WHY THE BODY MAY BE BRACKETED AT ALL.  urcu_txn_begin() enters the RCU
+	 * WHY THE BODY MAY BE BRACKETED AT ALL.  ft_op_begin() enters the RCU
 	 * read side, and ft_op_conflict() ages into the trie's FIFO
 	 * lane -- where ft_writer_lock_gp_wait asserts !ft_op_in_lane().
 	 * Either one is fatal over a grace period, so the body must take none.
@@ -3526,7 +3526,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	 * 585250 declined lock sets over 235141 merges, one op re-descending
 	 * 348 times.
 	 *
-	 * It is bracketed only on a FINE dst.  urcu_txn_begin() enters the RCU
+	 * It is bracketed only on a FINE dst.  ft_op_begin() enters the RCU
 	 * read side, so the bracket must not span a grace period.  The src is
 	 * exclusive here (a live src is refused with BUSY), so the spine copy
 	 * waits for none.

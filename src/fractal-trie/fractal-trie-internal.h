@@ -120,15 +120,15 @@
  * FT is a flavor-agnostic library.  It brackets its RCU read-side sections
  * through the group's RCU flavor, which is bound at runtime.
  *
- * An op-scoped persistent txn handle binds that flavor (ft_txn_op_init ->
- * urcu_txn_init_flavor).  urcu_txn_begin() / urcu_txn_end() then open the
- * section in that flavor directly (doc §11: the FT owns the bracket).
+ * An op binds that flavor (ft_txn_op_init).  ft_op_begin() / ft_op_end()
+ * then open the section in that flavor directly (doc §11: the FT owns the
+ * bracket).  An exclusive trie binds no flavor: it has no reader to defend,
+ * and its frees are synchronous.
  *
- * An exclusive trie binds no flavor: it has no reader to defend, and its
- * frees are synchronous.  Its begin()/end() fall back to the
- * URCU_TXN_RCU_READ_LOCK macros.  These macros are overridden to no-ops
- * here, so that:
- *   - the exclusive bracket opens nothing;
+ * The engine handle binds no flavor either.  So urcu_txn_begin() /
+ * urcu_txn_end() fall back to the URCU_TXN_RCU_READ_LOCK macros.  These
+ * macros are overridden to no-ops here, so that:
+ *   - the engine opens no section of its own;
  *   - no compile-time flavor's rcu_read_lock symbol is bound into the
  *     flavor-agnostic build.
  */
@@ -3127,7 +3127,7 @@ extern unsigned long ft_probe_ranch[2], ft_probe_rewind[2];
  * - cds_ft_rekey_* share the body with src_ft == dst_ft, a LIVE trie.
  *   There those waits DO run.  A read section held across one would be a
  *   writer waiting on its own grace period.
- * urcu_txn_begin() takes the read side, so it can only bracket the first.
+ * ft_op_begin() takes the read side, so it can only bracket the first.
  */
 extern unsigned long ft_probe_mspin[5];
 #define MRG_SPIN_PROBE(i)						\
@@ -3865,7 +3865,7 @@ bool ft_writer_lock_scope_enter(struct cds_ft *ft)
 	 * The bulk gate publishes @bulk_state and then waits ONE grace period.
 	 * So it excludes exactly the point ops that were inside a read-side
 	 * section when they read the gate as clear.  Two facts left a gap:
-	 *   - the per-attempt section urcu_txn_begin takes opens only AFTER
+	 *   - the per-attempt section ft_op_begin takes opens only AFTER
 	 *     this sample, and closes between attempts;
 	 *   - a caller need not hold a section of its own (cds_ft_insert and
 	 *     friends require none).
@@ -3929,7 +3929,7 @@ bool ft_writer_lock_scope_enter(struct cds_ft *ft)
 			 * ★ And the sample races nothing.  A point op that
 			 * read the gate as clear is inside the read section
 			 * taken just above.  That is NOT the one
-			 * urcu_txn_begin takes later (see above).  It is
+			 * ft_op_begin takes later (see above).  It is
 			 * exactly what the gate's publish-then-one-GP waits
 			 * for.
 			 * ☠ The cost is honest and accepted (2026-08-29): while any bulk

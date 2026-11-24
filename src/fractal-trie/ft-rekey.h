@@ -9586,8 +9586,8 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	ft_txn_op_init(ft, &optxn);
 	/*
 	 * PARK THE ESCALATION QUIESCENT.  This op may do that; insert and
-	 * remove may not.  urcu_txn_begin escalates, and therefore blocks,
-	 * before it opens the txn's own read section.  So the only thing that
+	 * remove may not.  ft_op_begin escalates, and therefore blocks,
+	 * before it opens the attempt's read section.  So the only thing that
 	 * could be pinned across that park is an RCU section the CALLER
 	 * holds.  This entry has none:
 	 *  - cds_ft_rekey_graft already forbids being called from a read

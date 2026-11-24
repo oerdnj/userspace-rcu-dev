@@ -3558,19 +3558,14 @@ struct urcu_txn *ft_flip_txn_handle(struct ft_flip_txn *t)
  *  - contention aging (@retry, the FIFO turn);
  *  - the engine's learned descriptor size.
  *
- * Bind the trie's escalation lane to the op.  Bind the group's RCU flavor
- * into the engine handle, so that urcu_txn_begin() / urcu_txn_end() bracket
- * each attempt in the FT's RUNTIME flavor.  The FT owns the read-side
- * bracket; a caller-held section merely nests.  The engine gets NO domain:
- * the lane is FT's (ft_op_begin).
+ * Bind the trie's escalation lane and the group's RCU flavor to the op.
+ * ft_op_begin() and ft_op_end() open and close each attempt's read-side
+ * section in that flavor.  A caller-held section merely nests.  The engine
+ * handle gets no domain and no flavor: the lane and the read side are FT's.
  *
- * An EXCLUSIVE trie has no concurrent writer and no concurrent reader:
- *  - NULL lane: the op never escalates;
- *  - NULL flavor: the bracket falls back to the URCU_TXN_RCU_READ_LOCK
- *    macro, which fractal-trie-internal.h no-ops.
- * So begin()/end() only manage the per-attempt descriptor and
- * deferred-cleanup state.  This behaves exactly like the exclusive path
- * before the bracket existed.
+ * An EXCLUSIVE trie has no concurrent writer and no concurrent reader.  So
+ * it gets a NULL lane, and the op never escalates.  It also gets a NULL
+ * flavor, and the attempt opens no read-side section.
  */
 #ifdef FEATURE_FT_HOLD_TRACE
 static void ft_hold_trace_leak_canary(void);	/* defined with the ledger */
@@ -3582,12 +3577,11 @@ static inline
 void ft_txn_op_init(struct cds_ft *ft, struct ft_op *op)
 {
 	ft_hold_trace_leak_canary();
+	urcu_txn_init(&op->txn, NULL);
 	if (ft->exclusive) {
-		urcu_txn_init_flavor(&op->txn, NULL, NULL);
 		op->lane = NULL;
 		op->flavor = NULL;
 	} else {
-		urcu_txn_init_flavor(&op->txn, NULL, ft->group->flavor);
 		op->lane = &ft->lane;
 		op->flavor = ft->group->flavor;
 	}
@@ -3718,8 +3712,8 @@ void ft_op_lane_exit(struct ft_op *op)
 
 /*
  * Open one attempt of the op's retry loop.  The lane is taken BEFORE the
- * engine opens the attempt's read section, so the park holds no section
- * the op opened.
+ * attempt's read-side section opens, so the park holds no section the op
+ * opened.
  */
 static inline
 void ft_op_begin(struct ft_op *op)
@@ -3742,6 +3736,8 @@ void ft_op_begin(struct ft_op *op)
 		ft_op_lane_publish(op);
 	}
 	urcu_txn_begin(&op->txn);
+	if (op->flavor)
+		op->flavor->read_lock();
 }
 
 /*
@@ -3752,6 +3748,8 @@ static inline
 void ft_op_end(struct ft_op *op)
 {
 	urcu_txn_end(&op->txn);
+	if (op->flavor)
+		op->flavor->read_unlock();
 	if (op->in_lane && !op->retrying)
 		ft_op_lane_exit(op);
 }

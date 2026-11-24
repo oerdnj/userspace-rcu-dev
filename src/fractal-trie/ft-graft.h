@@ -2823,7 +2823,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * @ra_txn is the bracket's condition, evaluated ONCE.  A
 		 * bracket may only span a body that takes NO grace period.
 		 * There are two independent reasons:
-		 *  - urcu_txn_begin() enters the RCU read side.  A GP under
+		 *  - ft_op_begin() enters the RCU read side.  A GP under
 		 *    it waits on this very thread.
 		 *  - An aged handle escalates into the fallback lane.
 		 *    ft_writer_lock_gp_wait asserts !ft_op_in_lane().  A peer

@@ -4213,7 +4213,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 	 *  - contention aging (txn->retry);
 	 *  - the FIFO fair-mutex escalation turn;
 	 *  - the learned descriptor size.
-	 * Each attempt is bracketed by urcu_txn_begin()/urcu_txn_end(): the
+	 * Each attempt is bracketed by ft_op_begin()/ft_op_end(): the
 	 * FT owns its read-side section.  On a concurrent trie the descent
 	 * must run inside one.  Otherwise a peer writer's call_rcu-deferred
 	 * frees could reclaim nodes under it.  A caller-held section merely
