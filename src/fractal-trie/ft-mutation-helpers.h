@@ -24170,44 +24170,6 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		held_earlier = ft_lock_ctx_holds(hold_ctx, meta, &held_snap,
 				&ratified);
 	}
-	/*
-	 * Use a WAITING load, not a raw one.  The offset word below obeys the
-	 * same rule, for the same reason.  &meta->state enters THIS txn's
-	 * write set a few lines down, so its last load must wait out a parked
-	 * owner.
-	 *
-	 * A raw read bakes a peer's parked FT_STATE_PROXY into @live_state.
-	 * That proxy is a descriptor-record POINTER.  The mask below cannot
-	 * remove it: it clears TOMBSTONE and LOCK, and a proxy carries
-	 * neither.  The edge recorded from it is a VALIDATE (old == new).
-	 * So a commit whose install CAS happens to match PUBLISHES that
-	 * pointer back into the live word through settle.  Its owner decided
-	 * and settled long before, so nothing ever clears it.  The node then
-	 * reads as permanently latched, and every later acquire of it fails
-	 * forever.  ft_meta_state_transition's wait loop is the standalone
-	 * counterpart of this load.
-	 */
-	uintptr_t old_state = (uintptr_t) ft_txn_load(txn->mtxn,
-		(void **) &meta->state, FT_STATE_PROXY);
-	/*
-	 * §4.B VALIDATE (Phase 4.3, MW): expect the re-homed child CLEAN-LIVE
-	 * at commit.
-	 *
-	 * A RAW old_state bakes a peer's already-set TOMBSTONE/LOCK into the
-	 * expected-old.  A peer can FREEZE (retire) a child between the
-	 * recompact copy loop's read (ft_node_recompact) and this sweep.
-	 * Such a child would then MATCH at commit, and the commit would
-	 * re-home a DEAD child into the fresh copy.  That is a published
-	 * edge dangling to reclaimed memory (the MW concurrent-recompaction
-	 * UAF).
-	 *
-	 * The mask removes one-way death (TOMBSTONE) AND the reversible lock
-	 * (LOCK), identical to ft_flip_txn_guard_parent.  Such a child then
-	 * MISMATCHES, the commit ABORTS, and the retry runs against the live
-	 * tree.  A genuinely live child carries neither bit.  So live_state
-	 * == old_state, and the mask is a no-op for it.
-	 */
-	uintptr_t live_state = old_state & ~(FT_STATE_TOMBSTONE | FT_STATE_LOCK);
 	bool record_pso = false;
 	uintptr_t old_pso = 0, new_pso = 0;
 
@@ -24330,6 +24292,20 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		 * else will: the caller skips its release sweep once the
 		 * commit consumed the marks.
 		 */
+		/*
+		 * The state word is loaded HERE, in the one arm that records
+		 * it.  The op holds the child through its mark, so no peer
+		 * commit can be parked on the word.  The other callers re-home
+		 * a child they do not hold.  A peer that holds it may be mid-
+		 * commit on this word, so they must not load it at all.
+		 *
+		 * The mask drops TOMBSTONE and the op's own LOCK: the edge
+		 * writes back the clean word, which is the mark's release.
+		 */
+		uintptr_t live_state = (uintptr_t) ft_txn_load(txn->mtxn,
+			(void **) &meta->state, FT_STATE_PROXY) &
+			~(FT_STATE_TOMBSTONE | FT_STATE_LOCK);
+
 		ft_hold_trace_drop(meta);
 		ft_flip_txn_record_state(txn, meta,
 			(void *) live_state, (void *) live_state);
