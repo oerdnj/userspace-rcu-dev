@@ -4203,6 +4203,14 @@ restart_attempt:
 	cst = URCU_TXN_STATUS_OK;
 	node->prev = cell;			/* NULL when the list is off */
 	node->next = NULL;
+	/*
+	 * ...and its back-link.  With the list on, that is the cell's parent.
+	 * The cell is kept across attempts, so a bailed attempt left it
+	 * naming that attempt's fresh node.  That node is freed, and its
+	 * memory may since be a peer's live node.
+	 */
+	if (precell)
+		precell->parent = NULL;
 	if (precell && key_len)
 		cds_ft_item_to_metadata(precell)->incoming_byte =
 			(uint8_t) key[key_len - 1];
@@ -5446,6 +5454,9 @@ restart_replace_attempt:
 	displaced = NULL;
 	node->prev = cell;		/* NULL when the list is off */
 	node->next = NULL;
+	/* ...and its back-link: see the same reset in _cds_ft_insert. */
+	if (precell)
+		precell->parent = NULL;
 	if (precell && key_len)
 		cds_ft_item_to_metadata(precell)->incoming_byte =
 			(uint8_t) key[key_len - 1];
