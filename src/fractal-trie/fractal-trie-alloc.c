@@ -200,7 +200,7 @@ struct cds_ft_metadata *cds_ft_item_to_metadata(void *p)
 	 *
 	 * An arena item is (1 << item_len_order)-aligned and can never carry
 	 * the whole tag.  So the assert only ever fires on that mistake.
-	 * Resolve the slot (ft_resolve_flip_proxy / urcu_txn_load) before
+	 * Resolve the slot (ft_resolve_flip_proxy / ft_txn_read) before
 	 * naming a node.
 	 */
 	assert(((uintptr_t) p & FT_PARENT_TAG_MASK) != FT_PARENT_TAG_MASK);

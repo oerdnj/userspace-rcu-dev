@@ -421,7 +421,7 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 	 *     inside a bulk window with the FT-wide lock held.
 	 *
 	 *   5 A RE-READ UNDER THE LOCK MUST NOT BE READ-YOUR-OWN-WRITES.
-	 *     ft_hlist_chain_plan_ok uses urcu_txn_load_committed.  The
+	 *     ft_hlist_chain_plan_ok uses ft_txn_load_committed.  The
 	 *     previous attempt's re-read used urcu_txn_load.  In a fused commit
 	 *     it read the txn's own pending value, i.e. nothing.
 	 *
@@ -486,7 +486,7 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 	 *   4 append_run missed ... covered at last by the colliding-key merge
 	 *                           test, 0 stale of ~19k concurrent events
 	 *   5 the re-read was RYW .. ft_hlist_chain_plan_ok uses
-	 *                           urcu_txn_load_committed
+	 *                           ft_txn_load_committed
 	 *   6 raw producers ....... the slot mix is ALL hidden-node writes; the
 	 *                           one raw producer on a live chain word is
 	 *                           measured unreachable (see
@@ -518,7 +518,7 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
  * word ZERO times over both suites and all three spacings.  So the
  * conversion is value-neutral.  Under SW, a belief would be a blind write.
  *
- * ☠ urcu_txn_load, not _load_committed: this IS the read-your-own-writes case
+ * ☠ ft_txn_load, not _load_committed: this IS the read-your-own-writes case
  * the engine documents.  A fused commit chains several edges on one chain.
  * The expected-old owed here is the value the slot will hold at install time
  * FROM THIS TXN'S POINT OF VIEW.  When the txn already wrote that word, that
@@ -1445,7 +1445,7 @@ unsigned int ft_hlist_chain_len_at(struct cds_ft_node *head)
  *   - the MW CAS arbitrates nobody;
  *   - the record becomes parkable.
  *
- * ☠ COMMITTED, NOT urcu_txn_load.  The plain load is READ-YOUR-OWN-WRITES.
+ * ☠ COMMITTED, NOT ft_txn_load.  The plain load is READ-YOUR-OWN-WRITES.
  * This is a FUSED commit: the freeze rides ft_detach_node's structural txn.
  * In a fused commit the plain load returns this txn's own pending value.  It
  * never reads the word at all.  That was refutation #5 of the 2026-09-17
@@ -1454,21 +1454,22 @@ unsigned int ft_hlist_chain_len_at(struct cds_ft_node *head)
  * ☠☠ AND THIS CHECK IS NOT BY ITSELF A LICENCE TO PARK.  "A load and check is
  * the same as an MW record" holds ONLY where the holder lock really excludes
  * every writer of the chain.  The check cannot substitute for the exclusion.
- * It can only be exact once the exclusion is.  The engine makes that
- * concrete.  urcu_txn_read spins a bounded URCU_TXN_WAIT_PATIENCE on an
- * UNDECIDED peer descriptor parked on the word.  It then falls back to
- * urcu_txn_resolve, which yields the PRE-COMMIT value.  So a peer whose
- * append is in flight and does not decide inside that window reads here as
- * NULL, this check answers "plan ok", and the install CAS is still the
- * arbiter.
+ * It can only be exact once the exclusion is.  A writer that skipped the
+ * holder would have its in-flight append read as NULL here: its commit has
+ * not flipped, and ft_txn_load_committed resolves its proxy to the
+ * PRE-COMMIT value.  This check would answer "plan ok", and the SW record
+ * would then store blind over that append, losing it.
  *
- * That residue is exactly the exclusion gap.  A peer can only have a proxy
- * parked on this chain if it did NOT take the holder.  ⇒ the SW
- * flip stays gated on completing the lock set (the registry-unowned population
- * at _cds_ft_insert_replace, the positively peer-claimed holders, and the raw
- * producers with no audit arm), NOT on this function.  What it does buy is
- * measured and large.  The appended-duplicate race drops from ~12k-15k per
- * ft_inv leg to the sliver the patience window leaves.
+ * The lock set is what keeps such a writer out.  Its completeness for chain
+ * words is MEASURED, not proven:
+ *   - the chain-hold audit (-DFT_DEBUG_CHAIN_HOLD) reports no unheld chain
+ *     store;
+ *   - the one raw producer on a live chain word is measured unreachable (see
+ *     ft_node_mark_removed_flip's header).
+ *
+ * Under the MCAS engine the install CAS caught such a writer, and this check
+ * cut the appended-duplicate race from ~12k-15k per ft_inv leg to the sliver
+ * its patience window left.
  *
  * ☠ VALIDATE EXACTLY WHAT THE WALK WILL RECORD, which is why the tail is
  * compared against a BARE NULL and not against ft_hlist_unmark(raw): the walk
@@ -1654,28 +1655,22 @@ void ft_hlist_freeze_chain_prepare_at(const struct cds_ft *ft,
 				/*
 				 * ☠☠ ONLY AN ALREADY-MARKED TAIL MAY BE READ
 				 * BACK.  The plan check and this load are TWO
-				 * READS.  The window between them is real.  It
-				 * is exactly the patience window that
-				 * ft_hlist_chain_plan_ok's header describes.
-				 * An UNDECIDED peer proxy reads as the
-				 * pre-commit value there, and as a LIVE
-				 * duplicate here.
+				 * READS.  A writer that skipped the holder
+				 * (see ft_hlist_chain_plan_ok's header) could
+				 * flip between them.  Its append would read
+				 * as the pre-commit value there, and as a
+				 * LIVE duplicate here.
 				 * Taking that value would mark the freshly
 				 * appended duplicate and let the prune orphan
 				 * it: "key LOST after an OK concurrent
-				 * insert", and WORSE than the derived NULL,
-				 * because the CAS would then SUCCEED.  It was
+				 * insert".  Under the MCAS engine it was
 				 * MEASURED at 16 / 15 / 32 events per ft_inv
-				 * leg.  So the window is small and non-empty.
-				 * Those two facts make it a defect rather than
-				 * a theory.
+				 * leg, before the chain words were held.
 				 *
 				 * So take the read ONLY where it can lose
 				 * nothing.  A MARK means the node is already
 				 * frozen, and the skip below is right.
-				 * Anything else keeps the derived NULL and its
-				 * arbitration, which is what aborts the commit
-				 * and sends the caller back to re-derive.
+				 * Anything else keeps the derived NULL.
 				 */
 				/*
 				 * ☠ AND THE MARK ALONE IS NOT THE CONDITION.

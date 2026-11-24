@@ -385,9 +385,8 @@ struct cds_ft_metadata *ft_rekey_cow_skip_meta_ryw(struct cds_ft *ft,
 	} else
 		field = (void **) &en->prev;
 	/*
-	 * Use the record's pending value first.  Else do a WAITING load: this
-	 * word may enter the txn's write set below.  A raw read would launder
-	 * a peer's parked proxy into the peer's uncommitted parent.
+	 * Use the record's pending value first.  Else load the word through
+	 * the txn, since it may enter the txn's write set below.
 	 */
 	r = ft_txn_find(ryw, field);
 	pw = r ? (struct cds_ft_inode_flag *) ft_txn_rec_new(r) :
@@ -543,9 +542,7 @@ int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 				 * kind.  These are
 				 * ft_flip_txn_record_parent_word's two arms,
 				 * with the expected old taken from the
-				 * descriptor.  On the op's FIRST attempt
-				 * urcu_txn_load reads the live word, and a
-				 * chain from it poisons.  The slot offset is
+				 * descriptor.  The slot offset is
 				 * unchanged (the copy is verbatim) and so is
 				 * the incoming byte.  Neither is recorded.
 				 */

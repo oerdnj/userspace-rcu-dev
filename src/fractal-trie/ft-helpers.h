@@ -1110,10 +1110,9 @@ unsigned long ft_nr_keys_get(const struct cds_ft_metadata *m)
 
 /*
  * Reader-side count read: acquire-load nr_keys and resolve a parked proxy to
- * its committed logical value.  urcu_txn_read short-circuits to a plain
- * acquire load whenever nr_keys holds no proxy.  That is the common case, and
- * always the case under writer exclusion.  So the resolve costs nothing
- * outside the commit window.
+ * its logical value.  ft_txn_read is a plain acquire load whenever nr_keys
+ * holds no proxy.  That is the common case, and always the case under writer
+ * exclusion.  So the resolve costs nothing outside the commit window.
  */
 static inline
 unsigned long ft_nr_keys_load(const struct cds_ft_metadata *m)
@@ -1149,14 +1148,14 @@ void ft_nr_keys_store(const struct cds_ft *ft, struct cds_ft_metadata *m,
  * Reader-side read of a node's live-child count.  It resolves a mid-commit
  * proxy on the state word.
  *
- * Once atomic detach is wired, the LIVE->DEAD tombstone rides an MCAS edge on
+ * Once atomic detach is wired, the LIVE->DEAD tombstone rides a txn edge on
  * state.  That edge transiently parks a proxy: a full pointer with bit 0 =
  * FT_STATE_PROXY set.  Without the resolve, the proxy would corrupt the
  * nr_child bits for a concurrent reader.
  *
- * urcu_txn_read short-circuits to a plain acquire load when state holds no
- * proxy, which is always so under writer exclusion.  So it costs nothing
- * outside the commit window.
+ * ft_txn_read is a plain acquire load when state holds no proxy, which is
+ * always so under writer exclusion.  So it costs nothing outside the commit
+ * window.
  *
  * The writer-owned ft_meta_nr_child (direct read) stays for reads of a node
  * that the caller owns or that is quiescent.
@@ -1181,9 +1180,9 @@ unsigned int ft_meta_nr_child_load(const struct cds_ft_metadata *meta)
  * ft_get_parent_slot would then compute ptr(parent) + garbage*8, a WILD
  * address.  It would fault on the dereference, before any commit guard runs.
  *
- * urcu_txn_read resolves the proxy to the real state word first.  It
- * short-circuits to a plain load when no proxy is parked.  That is always so
- * under writer exclusion, so the read is free outside the commit window.
+ * ft_txn_read resolves the proxy to the real state word first.  It is a plain
+ * load when no proxy is parked.  That is always so under writer exclusion, so
+ * the read is free outside the commit window.
  *
  * The direct ft_meta_parent_slot_offset stays for a node that the caller owns
  * or that is quiescent.
@@ -1280,7 +1279,7 @@ struct cds_ft_inode_flag *ft_head_parent_word(struct cds_ft_inode_flag *parent_n
  * Such a write does NOT decide the shape, so the head keeps whatever it was.
  * The answer comes from @old_word, the head's current back-edge value.
  * @old_word is RESOLVED.  The callers that read a transacted word read it
- * through urcu_txn_load.  The plain-store callers resolve a parked proxy
+ * through ft_txn_load.  The plain-store callers resolve a parked proxy
  * first.
  */
 static inline
@@ -4081,7 +4080,7 @@ void ft_pub_rec_add_at(const char *fn, int line,
  * candidate reader a shortcut straight to a retired node.
  *
  * ☞ THE TEST IS "DID THIS TXN RE-HOME @cn", asked of the DESCRIPTOR.
- * urcu_txn_load cannot answer it.  With no record on the slot it falls
+ * ft_txn_load cannot answer it.  With no record on the slot it falls
  * through to a fresh read, which looks the same as "not re-homed".  The
  * divergence of the two derivations is a weaker witness of the same fact.
  *

@@ -1990,11 +1990,9 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	else
 		M_slot = pub;
 	/*
-	 * WAITING load, not a raw one.  @pub_slot is this flip's forward edge,
-	 * so it enters @txn's own write set.  "Untouched until the flip" is
-	 * true of THIS op's stores.  It says nothing about a PEER parking a
-	 * flip proxy there.  That proxy is a descriptor-record POINTER.  As an
-	 * expected-old it trips urcu_txn_add's !urcu_txn_is_proxy self-check.
+	 * A txn load, not a raw one.  @pub_slot is this flip's forward edge,
+	 * and this txn may already hold a pending value for it.  See "LOADS
+	 * INSIDE A TXN" in ft-txn-engine.h.
 	 */
 	D_old = ft_txn_load(txn->mtxn, (void **) pub_slot,
 		FT_FLIP_PROXY_TAG);

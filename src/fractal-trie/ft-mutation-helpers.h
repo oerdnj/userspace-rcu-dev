@@ -12163,12 +12163,11 @@ bool ft_lock_set_order_by_anchor(const struct cds_ft *ft,
  * already gives the takes their exclusion.  A failed guard unwinds them
  * explicitly.
  *
- * ☠ RESOLVE THE PROXY.  urcu_txn_validate compared LOGICAL values.  A raw
- * load here would read a committed-but-unsettled peer as a mismatch.  It
- * would refuse an acquire that is good.  Worse, it would compare a
- * descriptor pointer against a node pointer.  urcu_txn_read resolves the
- * proxy and waits out an undecided owner.  That gives exactly the value the
- * validate would have seen.
+ * ☠ RESOLVE THE PROXY.  A raw load here would read a peer's parked proxy as
+ * a mismatch, and refuse an acquire that is good.  Worse, it would compare a
+ * proxy pointer against a node pointer.  ft_txn_read resolves the proxy
+ * through the selector of its commit: the old value before that commit
+ * flips, the new one after.
  */
 struct ft_acq_guard {
 	void **slot;
@@ -13842,34 +13841,30 @@ __attribute__((weak)) unsigned long ft_cow_engine_lane;
  * resolves (returns 1).  The int return is vestigial: it keeps the call
  * sites' abandon path, now dead, as documentation.  FT proxy tag.
  *
- * The retire is fenced first: ft_meta_lock_acquire set FT_STATE_LOCK in the
- * node's state word before this loop.  So no peer can newly republish @src:
- * its §4.B clean-LIVE guard fails against the LOCK bit.  The only proxy this
- * can meet is a peer child-recompact that parked BEFORE the fence.  That peer
- * is now doomed to abort.
+ * The retire takes its lock set before this loop.  On a FINE trie,
+ * ft_dlm_acquire_set takes the node's lock, which covers every slot of the
+ * node.  Any writer of @src holds that same lock until after its commit, and
+ * the commit settles every slot before it returns.  So no proxy can be parked
+ * on @src here.  A coarse trie and a bulk op (the rekey callers) run under
+ * the FT-wide lock instead.  Under the MCAS engine, a peer that parked before
+ * the fence could still be met, and was doomed to abort.
  *
- * urcu_txn_read reads @src's COMMITTED logical value.  It resolves a proxy to
- * the value it will settle to, which helps a doomed peer to its terminal
- * status.  So the copy builds against a definite child.
+ * ft_txn_read reads @src's COMMITTED logical value.  So the copy builds
+ * against a definite child.
  *
  * The read is COMMITTED, not read-your-own-writes.  This reproduces the old
  * urcu_txn_resolve_prio.  That function read the raw slot and never consulted
  * this attempt's own buffered records.  It is load-bearing.  During the BUILD
  * phase, a bulk op's pending edits live in the descriptor, not in the slot.
- * So a txn-level urcu_txn_load would return the PENDING value.  For example,
+ * So a txn-level ft_txn_load would return the PENDING value.  For example,
  * it returns NULL for a source child the op has buffered a detach for.  The
  * copy would then drop a child it must preserve.  The removal a DEL recompact
  * intends is applied separately, by the by-IDENTITY skip of
  * nullify_node_flag_ptr above.  It is not applied by reading a pending NULL
  * here.
  *
- * Bypassing the txn read set also keeps @src out of this attempt's read set.
- * An entry there would add a spurious commit-time validate.
- *
- * The old priority-eviction (urcu_mcas_outranks) is retired.  Single-driver
- * liveness comes from age-escalation.  The node-level node lock, not a
- * per-slot freeze, keeps @src from going stale against PEERS between here and
- * the commit.
+ * The node lock, not a per-slot freeze, keeps @src from going stale against
+ * PEERS between here and the commit.
  */
 static inline
 int ft_flip_txn_resolve_prio(struct ft_flip_txn *t, void **src, void **out)
@@ -15553,11 +15548,13 @@ uintptr_t ft_flip_txn_record_tombstone(struct ft_flip_txn *t,
 {
 	/*
 	 * READ-YOUR-OWN-WRITES: the expected old is this txn's own PENDING view
-	 * of the state word (urcu_txn_load), not a raw meta->state read.  The
-	 * word is in this record's WRITE set.  So per the engine's read policy
-	 * it must be read through the txn.  A raw committed read is a torn
-	 * read-set the moment another edge in the SAME txn already rewrote the
-	 * word.  The engine POISONS that (commit aborts).
+	 * of the state word (ft_txn_load), not a raw meta->state read.  The
+	 * word is in this record's WRITE set.  Another edge of the SAME txn
+	 * may already have recorded a new value for it.  A raw read would then
+	 * return the stale committed value.  urcu_txn_sw_record_chain()
+	 * asserts against that in a DEBUG_RCU build.  A release build would
+	 * lose the earlier edge, because the new value was computed from the
+	 * stale read.
 	 *
 	 * This happens on a retire that fuses with a recompaction.
 	 * ft_node_recompact already recorded the old node's fenced
@@ -15724,13 +15721,13 @@ uintptr_t ft_flip_txn_record_tombstone(struct ft_flip_txn *t,
  * inherits the arm's existing guard reservation (net-zero).  It also stays on
  * the safe side of the release-then-guard rule.  The reserve's recompact
  * records a lock release on this word EARLIER in the same txn.  So this edge
- * chains onto it rather than poisoning it: {LOCK|s -> s} then {s -> s+1} is
- * release AND increment in one record.
+ * chains onto it: {LOCK|s -> s} then {s -> s+1} is release AND increment in
+ * one record.
  *
- * READ-YOUR-OWN-WRITES: expected-old comes from urcu_txn_load, not a raw read.
+ * READ-YOUR-OWN-WRITES: expected-old comes from ft_txn_load, not a raw read.
  * The reason is spelled out on ft_flip_txn_record_tombstone.  The word is in
  * this txn's own write set whenever a release/tombstone already touched it.  A
- * raw committed read would then be a torn read-set, which the engine poisons.
+ * raw committed read would then be stale against the pending record.
  * A release recorded earlier makes the RYW value ALREADY clean.  So the mask
  * is a no-op there and the chain is exact.
  */
@@ -15812,18 +15809,21 @@ void ft_flip_txn_record_tombstone_locked(struct ft_flip_txn *t,
  * ORDERING RULE, load-bearing.  A guard and a release on ONE word are safe in
  * exactly ONE order:
  *
- *   release THEN guard  = harmless no-op.  urcu_txn_load is read-your-writes
- *       (rcu-txn.h), so the guard reads this record's PENDING value -- the clean
- *       word -- masks nothing, and validates {s -> s} against it; record_chain
- *       finds r->new_ptr == old_ptr and chains without upgrading (rcu-txn-mcas.h).
+ *   release THEN guard  = harmless no-op.  ft_txn_load is read-your-writes,
+ *       so the guard reads this record's PENDING value -- the clean word --
+ *       masks nothing, and records {s -> s} against it.
+ *       urcu_txn_sw_record_chain() finds the pending new == old and chains
+ *       onto it.
  *       Redundant, not wrong.  (This is the order the converted sites are in, so
  *       skipping their guard is an economy and a clarification, NOT a bug fix.)
  *
- *   guard THEN release  = POISON, permanently.  The guard reads the COMMITTED
- *       word (s|LOCK), masks the lock out, and adds {s -> s}.  The release
- *       then arrives with expected old s|LOCK != r->new_ptr == s, so
- *       record_chain sets t->poisoned: every commit of this txn aborts, and each
- *       retry rebuilds the same poisoned shape.  So NEVER plant a §4.B guard on
+ *   guard THEN release  = WRONG.  The guard reads the COMMITTED word (s|LOCK),
+ *       masks the lock out, and records {s -> s}.  The release then arrives
+ *       with expected old s|LOCK, but the pending new is s.
+ *       urcu_txn_sw_record_chain() asserts on that in a DEBUG_RCU build.  In
+ *       a release build the record would keep old s, so a reader resolving
+ *       the parked proxy would see the lock released before the commit
+ *       flips.  So NEVER plant a §4.B guard on
  *       a word BEFORE a recompact records its release on it in the same txn.
  *       No site does today (each op arms its txn, then recompacts, then
  *       publishes), and each conversion must keep it that way.
@@ -20091,14 +20091,10 @@ freeze_done:
 	if (txn) {
 		if (state_meta) {
 			/*
-			 * WAITING load: this word enters the txn's write set on
-			 * the very next line.  A raw read would do two wrong
-			 * things.  It would take a peer's parked proxy as
-			 * the expected-old.  It would also mint the new
-			 * value out of pointer bits (proxy - NR_CHILD_ONE).
-			 * A matching install would then publish a corrupted
-			 * word.  This is the transacted form of the hazard
-			 * that ft_meta_state_transition waits out.
+			 * A txn load, not a raw one.  This word is recorded
+			 * on the very next line, and this txn may already
+			 * hold a pending value for it.  See "LOADS INSIDE A
+			 * TXN" in ft-txn-engine.h.
 			 */
 			uintptr_t old = (uintptr_t) ft_txn_load(txn->mtxn,
 				(void **) &state_meta->state, FT_STATE_PROXY);
@@ -20419,12 +20415,9 @@ void ft_record_child_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 	}
 	/*
 	 * Back-edge expected-old = the child's current back-pointer
-	 * (cell->parent / prev).  It is read as a WAITING load rather than
-	 * raw.  This slot enters @txn's write set on the very next line, so
-	 * its last load must wait out an undecided parker.  A raw read bakes
-	 * a peer's parked flip proxy into the expected-old.  That proxy is a
-	 * descriptor-record POINTER.  This is the engine's
-	 * !urcu_txn_is_proxy self-check.
+	 * (cell->parent / prev).  A txn load, not a raw one.  This slot is
+	 * recorded below, and this txn may already hold a pending value for
+	 * it.  See "LOADS INSIDE A TXN" in ft-txn-engine.h.
 	 */
 	/*
 	 * An EXTERNAL head's back channel goes STRAIGHT into @txn, always-MW.
@@ -23615,15 +23608,8 @@ bool ft_glue_is_fresh(struct cds_ft *ft, struct ft_glue *g,
  * Record a child's PARENT WORD re-parent edge.  Read the expected old THROUGH
  * the txn.
  *
- * The slot enters this txn's WRITE set here, so the engine's read policy
- * demands a WAITING load.  A raw read bakes a peer's parked
- * FT_FLIP_PROXY_TAG, which is a descriptor POINTER, into the expected old.
- * The install CAS can then never match.  So the attempt is a guaranteed
- * abort, and the retry re-reads the same parked word.
- *
- * A release build turns that into a silent poison-and-abort that the retry
- * loops absorb.  That is why it stayed invisible.  --enable-rcu-debug traps
- * it at urcu_txn_add's !urcu_txn_is_proxy assert.
+ * The slot is recorded here, and this txn may already hold a pending value
+ * for it.  See "LOADS INSIDE A TXN" in ft-txn-engine.h.
  *
  * The tag is the one the RECORD carries (FT_FLIP_PROXY_TAG via
  * ft_flip_txn_record_reserved), NOT the state word's FT_STATE_PROXY.
@@ -24163,14 +24149,10 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		 * age-0 fast path refuses to resolve same-slot coincidence.
 		 */
 		/*
-		 * Use a WAITING load, not a raw one.  This slot ends up in
-		 * THIS txn's write set.  The read-policy rule is that such a
-		 * load must wait out an undecided parker.  A raw read would
-		 * bake a peer's parked FT_STATE_PROXY into the expected-old.
-		 * That proxy is a descriptor POINTER.  So the install CAS
-		 * could never match, and the attempt would be a guaranteed
-		 * abort.  Or worse, it would mint a bogus offset from pointer
-		 * bits.  urcu_txn_load settles it first.
+		 * A txn load, not a raw one.  This slot is recorded below,
+		 * and this txn may already hold a pending value for it.  The
+		 * op holds the parent, which owns this word.  See "LOADS
+		 * INSIDE A TXN" in ft-txn-engine.h.
 		 */
 		old_pso = (uintptr_t) ft_txn_load(txn->mtxn,
 			(void **) &meta->parent_slot_offset, FT_STATE_PROXY);
@@ -24195,18 +24177,8 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 	/*
 	 * READ IT THROUGH THE TXN, for the reason the parent_slot_offset load
 	 * above spells out.  The two fields are siblings and the rule is the
-	 * same.  This slot enters THIS txn's write set on the very next line,
-	 * so the engine's read policy requires a WAITING load.  A raw read
-	 * bakes a peer's parked FT_FLIP_PROXY_TAG into the expected old.
-	 * That is a descriptor POINTER, which the install CAS can never
-	 * match.  So the attempt is a guaranteed abort, and the retry
-	 * re-reads the same parked word.
-	 *
-	 * @meta is LIVE here (this is the re-parent of a published child).
-	 * That is exactly the case that CAN meet a peer's park.  Measured:
-	 * --enable-rcu-debug traps it at urcu_txn_add's !urcu_txn_is_proxy
-	 * assert.  This is on the DEFAULT per-node granularity, from
-	 * ft_chain_compress_fused's back-edge fold.
+	 * same.  This slot is recorded on the very next line, and this txn
+	 * may already hold a pending value for it.
 	 */
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	struct cds_ft_metadata *sa_pso_owner = ft_sa_owner_of_parent_word(ft,
@@ -24429,17 +24401,10 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 		 * reader resolves it via ft_resolve_head_prev.
 		 */
 		/*
-		 * Use WAITING loads, not raw ones.  The reason is spelled out
-		 * at ft_reparent_record_meta's &meta->state load.  The slot
-		 * read here is the slot recorded on the very next line.  So
-		 * it enters THIS txn's write set, and its last load must wait
-		 * out a parked owner.  A raw read hands a peer's parked flip
-		 * proxy to urcu_txn_add as the expected-old.  That proxy is a
-		 * descriptor-record POINTER.  It trips the engine's
-		 * !urcu_txn_is_proxy(old_ptr) self-check:
-		 *  - an --enable-rcu-debug build aborts;
-		 *  - a release build POISONS the descriptor instead, and the
-		 *    retry loop absorbs it.
+		 * Use txn loads, not raw ones.  The slot read here is
+		 * recorded on the very next line, and this txn may already
+		 * hold a pending value for it.  See "LOADS INSIDE A TXN" in
+		 * ft-txn-engine.h.
 		 */
 		/*
 		 * Stamp the up-walk edge byte BEFORE the parent edge is

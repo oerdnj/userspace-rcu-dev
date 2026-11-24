@@ -2681,23 +2681,13 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * Plan snapshot of publish_slot's old value.  The slot still
 		 * holds the collapsed chain's reference (parent_cn's
 		 * grandparent flag, or @iter_node_flag) resolved just above:
-		 * nothing has been stored yet.  The commit CAS rejects a peer
-		 * that raced it (see ft_pub_rec_add).
+		 * nothing has been stored yet.  This op holds
+		 * @publish_parent's word, so no peer changes it before the
+		 * commit.
 		 *
-		 * This is a WAITING load, not a raw one.  @publish_slot is
-		 * recorded as an edge of THIS txn a few lines down.  So it
-		 * enters the txn's own write set, and the read-policy rule is
-		 * to wait out an undecided parker.
-		 *
-		 * "The commit CAS rejects a peer that raced it" holds for a
-		 * stale PLAIN value and not for a parked flip proxy.  A proxy
-		 * is a descriptor-record POINTER.  Handing it to the engine
-		 * as an expected-old trips urcu_txn_add's !urcu_txn_is_proxy
-		 * check under --enable-rcu-debug.  A release build POISONS
-		 * the descriptor and the retry loop absorbs it, so the arm is
-		 * green and wrong.  Only a coarse spacing exposes it.  Under
-		 * per-node this op holds @publish_parent's own word, so no
-		 * peer can park here.
+		 * A txn load, not a raw one.  This slot is recorded below,
+		 * and this txn may already hold a pending value for it.  See
+		 * "LOADS INSIDE A TXN" in ft-txn-engine.h.
 		 */
 		struct cds_ft_inode_flag *pub_expected_old =
 			ft_txn_load(txn->mtxn, (void **) publish_slot,
@@ -3999,8 +3989,8 @@ int ft_detach_node(struct cds_ft *ft,
 		 * can disagree.  A plan built from two different counts is
 		 * incoherent, even when each load is resolved on its own.
 		 *
-		 * Off the commit window, urcu_txn_read short-circuits to a
-		 * plain load, so single-writer is unchanged.
+		 * With no proxy parked, ft_txn_read is a plain load.  So a
+		 * trie with a single writer pays nothing for it.
 		 */
 		nr_child = ft_meta_nr_child_load(metadata);
 
@@ -6560,22 +6550,13 @@ int ft_detach_node(struct cds_ft *ft,
 				 * disagreements per ft_inv leg.  The txn
 				 * registry owned the holder at 100% of them.
 				 *
-				 * We hold it HERE, so ask the word.  A stale
-				 * plan is refused before any record is
-				 * filed.  That is the SAME decision the
-				 * commit's install CAS makes today.  It is
-				 * taken earlier, and mostly without needing
-				 * the CAS to make it.
-				 *
-				 * ☠ NOT "instead of" the CAS: see
-				 * ft_hlist_chain_plan_ok's header.  An
-				 * UNDECIDED peer proxy that outlasts
-				 * urcu_txn_read's patience window still
-				 * reads as NULL here.  So the install CAS
-				 * remains the backstop until the lock set is
-				 * complete.  This shrinks the window the CAS
-				 * arbitrates.  It does not on its own make
-				 * the record parkable.
+				 * We hold it HERE, so ask the word before any
+				 * record is filed: a stale plan is refused
+				 * there.  Nothing checks the record later,
+				 * because an SW record stores blind.  So this
+				 * check is exact because every writer of the
+				 * chain takes its holder.  See
+				 * ft_hlist_chain_plan_ok's header.
 				 *
 				 * ☠ RETRIABLE, AND IT TERMINATES.  The
 				 * caller re-derives and finds the longer

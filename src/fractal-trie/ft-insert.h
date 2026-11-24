@@ -5861,21 +5861,18 @@ restart_replace_attempt:
 						 * leg, the largest of them.
 						 *
 						 * The holder is held HERE.
-						 * So ask the word, instead
-						 * of letting the install
-						 * CAS arbitrate it.  It is
-						 * the same decision, taken
-						 * before any record is
-						 * filed.
-						 * ☠ This SHRINKS the window
-						 * the CAS arbitrates.  It
-						 * does not replace the CAS.
-						 * An UNDECIDED peer proxy
-						 * that outlasts the
-						 * patience window of
-						 * urcu_txn_read still reads
-						 * as NULL.  See the header
-						 * of ft_hlist_chain_plan_ok.
+						 * So ask the word before
+						 * any record is filed: a
+						 * stale plan is refused
+						 * there.  Nothing checks
+						 * the record later, because
+						 * an SW record stores
+						 * blind.  So this check is
+						 * exact because every
+						 * writer of the chain takes
+						 * its holder.  See the
+						 * header of
+						 * ft_hlist_chain_plan_ok.
 						 *
 						 * ☠ Nothing is live-stored
 						 * yet on this arm:
@@ -6264,21 +6261,18 @@ restart_replace_attempt:
 						 * leg, the largest of them.
 						 *
 						 * The holder is held HERE.
-						 * So ask the word, instead
-						 * of letting the install
-						 * CAS arbitrate it.  It is
-						 * the same decision, taken
-						 * before any record is
-						 * filed.
-						 * ☠ This SHRINKS the window
-						 * the CAS arbitrates.  It
-						 * does not replace the CAS.
-						 * An UNDECIDED peer proxy
-						 * that outlasts the
-						 * patience window of
-						 * urcu_txn_read still reads
-						 * as NULL.  See the header
-						 * of ft_hlist_chain_plan_ok.
+						 * So ask the word before
+						 * any record is filed: a
+						 * stale plan is refused
+						 * there.  Nothing checks
+						 * the record later, because
+						 * an SW record stores
+						 * blind.  So this check is
+						 * exact because every
+						 * writer of the chain takes
+						 * its holder.  See the
+						 * header of
+						 * ft_hlist_chain_plan_ok.
 						 *
 						 * ☠ Nothing is live-stored
 						 * yet on this arm:
@@ -6770,21 +6764,18 @@ restart_replace_attempt:
 						 * leg, the largest of them.
 						 *
 						 * The holder is held HERE.
-						 * So ask the word, instead
-						 * of letting the install
-						 * CAS arbitrate it.  It is
-						 * the same decision, taken
-						 * before any record is
-						 * filed.
-						 * ☠ This SHRINKS the window
-						 * the CAS arbitrates.  It
-						 * does not replace the CAS.
-						 * An UNDECIDED peer proxy
-						 * that outlasts the
-						 * patience window of
-						 * urcu_txn_read still reads
-						 * as NULL.  See the header
-						 * of ft_hlist_chain_plan_ok.
+						 * So ask the word before
+						 * any record is filed: a
+						 * stale plan is refused
+						 * there.  Nothing checks
+						 * the record later, because
+						 * an SW record stores
+						 * blind.  So this check is
+						 * exact because every
+						 * writer of the chain takes
+						 * its holder.  See the
+						 * header of
+						 * ft_hlist_chain_plan_ok.
 						 *
 						 * ☠ Nothing is live-stored
 						 * yet on this arm:
@@ -7118,21 +7109,18 @@ restart_replace_attempt:
 						 * leg, the largest of them.
 						 *
 						 * The holder is held HERE.
-						 * So ask the word, instead
-						 * of letting the install
-						 * CAS arbitrate it.  It is
-						 * the same decision, taken
-						 * before any record is
-						 * filed.
-						 * ☠ This SHRINKS the window
-						 * the CAS arbitrates.  It
-						 * does not replace the CAS.
-						 * An UNDECIDED peer proxy
-						 * that outlasts the
-						 * patience window of
-						 * urcu_txn_read still reads
-						 * as NULL.  See the header
-						 * of ft_hlist_chain_plan_ok.
+						 * So ask the word before
+						 * any record is filed: a
+						 * stale plan is refused
+						 * there.  Nothing checks
+						 * the record later, because
+						 * an SW record stores
+						 * blind.  So this check is
+						 * exact because every
+						 * writer of the chain takes
+						 * its holder.  See the
+						 * header of
+						 * ft_hlist_chain_plan_ok.
 						 *
 						 * ☠ Nothing is live-stored
 						 * yet on this arm:
