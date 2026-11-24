@@ -16088,16 +16088,13 @@ void ft_flip_txn_record_release_lock(struct ft_flip_txn *t,
 }
 
 /*
- * ☠ WHAT A CELL LOCK SET COSTS THE TXN'S RESERVATION.
+ * WHAT A CELL LOCK SET COSTS THE TXN'S RESERVATION.
  *
- * Riding the txn is what makes the release unmissable, and it is not free.
- * Each taken lock adds ONE state-word record ({LOCK|s -> s}).  A plan is at
- * most {cell, pred, succ}, so THREE.  The record path ends in
- * `assert(!ret); /* reserved up front -> never fails *\/`, and -DNDEBUG DELETES
- * that assert.  So an unreserved record is not a crash.  It is a SILENTLY
- * DROPPED release, i.e. a permanently held lock.  The first widening attempt
- * died of that same failure.  Reserve for it explicitly rather than relying
- * on a site happening to have slack.
+ * Each taken lock used to add one state-word record, its release
+ * {LOCK|s -> s}.  The release now runs after the commit (@rel_after), so a
+ * pure release records nothing.  The reservation is kept as it was.  Before
+ * it shrinks, each site that adds it needs checking, and so does the edge
+ * array that FT_ORD_CELL_SWAP_REC_MAX_EDGES sizes.
  */
 #define FT_CELL_LOCKSET_MAX_RECORDS	6
 
