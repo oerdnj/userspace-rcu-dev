@@ -382,6 +382,18 @@ struct urcu_txn_sw_txn {
  * settles before the other records -- still corrupt, and are still invisible
  * here.  A clean run is evidence, not proof.
  */
+/*
+ * Return true if @v, loaded from a slot recorded under @tag, is a parked
+ * proxy rather than a live value: it carries all of @tag's bits.  The tag
+ * contract (see urcu_txn_sw_record) is that no live value of that slot
+ * does.  Strip the tag to reach the struct urcu_txn_sw_proxy.
+ */
+static inline
+bool urcu_txn_sw_is_proxy(const void *v, uintptr_t tag)
+{
+	return tag != 0 && ((uintptr_t) v & tag) == tag;
+}
+
 #if defined(URCU_TXN_SW_EXCL_VALIDATE) || defined(URCU_TXN_SW_DEBUG_DISJOINT)
 # include <stdio.h>			/* the validators' reports */
 #endif
@@ -396,16 +408,6 @@ struct urcu_txn_sw_txn {
 		abort();						\
 	} while (0)
 
-/*
- * Does @v carry all of @tag's bits -- i.e. is it a parked proxy rather than a
- * live value?  The engine's tag contract (see urcu_txn_sw_record) is that no
- * live value an embedder stores in a transacted slot may do so.
- */
-static inline
-int urcu_txn_sw__is_proxy(const void *v, uintptr_t tag)
-{
-	return tag != 0 && ((uintptr_t) v & tag) == tag;
-}
 
 static inline
 void urcu_txn_sw__excl_claim(struct urcu_txn_sw_txn *t)
@@ -429,7 +431,7 @@ void urcu_txn_sw__excl_slot_free(void **slot, uintptr_t tag, const char *what)
 {
 	void *v = uatomic_load(slot, CMM_RELAXED);
 
-	if (urcu_txn_sw__is_proxy(v, tag))
+	if (urcu_txn_sw_is_proxy(v, tag))
 		urcu_txn_sw__excl_abort("slot=%p already holds a parked proxy (%p) at %s: another writer is mid-transaction on it\n",
 			(void *) slot, v, what);
 }

@@ -30,7 +30,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 31
+#define NR_TESTS 33
 
 /* Per-record tag: bit 0 of the proxy pointer (latches are 16B-aligned). */
 #define TEST_TAG	1UL
@@ -141,10 +141,14 @@ int main(void)
 		urcu_txn_sw_install(t);
 		ok(is_proxy(slot) && resolve(slot) == (void *) 0x100,
 			"explicit install parks a proxy resolving to old");
+		ok(urcu_txn_sw_is_proxy(slot, TEST_TAG),
+			"urcu_txn_sw_is_proxy sees the parked proxy");
 		st = urcu_txn_sw_commit(t);
 		ok(st == URCU_TXN_STATUS_OK,
 			"explicitly-installed single edge commits OK");
 		ok(slot == (void *) 0x200, "explicitly-installed slot settles to new");
+		ok(!urcu_txn_sw_is_proxy(slot, TEST_TAG),
+			"urcu_txn_sw_is_proxy sees no proxy once settled");
 	}
 
 	/*
