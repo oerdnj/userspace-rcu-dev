@@ -714,6 +714,31 @@ void urcu_txn_sw__free_records(struct urcu_txn_sw_txn *t)
 }
 
 /*
+ * Drop every record of @t without committing it.  @t is then empty, and
+ * records again from scratch.  An out-of-memory state stays, so the
+ * commit still reports MEMORY_ERROR.
+ *
+ * Call it before install() or after the commit, never in between: parked
+ * proxies point into the record array.  The engine frees the array it
+ * owns.  Caller storage (urcu_txn_sw_init_inline()) is kept for the next
+ * record until a commit, which consumes it.
+ */
+static inline
+void urcu_txn_sw_discard(struct urcu_txn_sw_txn *t)
+{
+	urcu_posix_assert(t->state != URCU_TXN_SW_INSTALLED || !t->latches);
+	urcu_txn_sw__excl_owner(t, "discard()");
+	if (!t->latches_inline)
+		urcu_txn_sw__free_records(t);
+	if (!t->latches)
+		t->cap = 0;
+	t->nr = 0;
+	t->bloom_live = false;
+	if (t->state == URCU_TXN_SW_INSTALLED)
+		t->state = URCU_TXN_SW_PREPARE;
+}
+
+/*
  * call_rcu callback: free a committed transaction's persistent group block and
  * the record array it carries, once the grace period has retired any proxy a
  * reader may still have held.
@@ -837,6 +862,21 @@ struct urcu_txn_sw_latch *urcu_txn_sw__find_ryw(struct urcu_txn_sw_txn *t,
 		return NULL;			/* definitely absent */
 #endif
 	return urcu_txn_sw__find(t, slot);
+}
+
+/*
+ * Return the record @t holds for @slot, or NULL.  Its proxy holds the
+ * old value in ptr[0] and the new value in ptr[1].  The next record() or
+ * reserve() on @t may move the record array, so use the result before
+ * recording again.  A committed or discarded @t has no records.
+ */
+static inline
+const struct urcu_txn_sw_latch *urcu_txn_sw_find(struct urcu_txn_sw_txn *t,
+		void **slot)
+{
+	if (!t->latches)
+		return NULL;
+	return urcu_txn_sw__find_ryw(t, slot);
 }
 
 /*

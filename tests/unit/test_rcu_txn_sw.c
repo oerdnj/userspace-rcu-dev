@@ -5,8 +5,8 @@
 /*
  * Unit test for urcu_txn_sw_txn: the multi-edge transaction layer of the
  * single-updater engine, focusing on the commit() shortcuts -- the single-edge fast path
- * (no proxy at all) and auto-install -- the explicit-install caveat, and the
- * record-array realloc-grow path.
+ * (no proxy at all) and auto-install -- the explicit-install caveat, the
+ * record-array realloc-grow path, and the find() and discard() accessors.
  *
  * commit() owns reclaim: it frees the txn at once on the single-edge / empty
  * paths and defers it through call_rcu() once proxies are parked.  The test
@@ -30,7 +30,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 20
+#define NR_TESTS 31
 
 /* Per-record tag: bit 0 of the proxy pointer (latches are 16B-aligned). */
 #define TEST_TAG	1UL
@@ -242,6 +242,112 @@ int main(void)
 			"exclusive (synchronous-reclaim) multi-edge commit returns OK");
 		ok(s1 == (void *) 0x41 && s2 == (void *) 0x51,
 			"exclusive multi-edge slots settled to new, block freed in place");
+	}
+
+	/*
+	 * 8. find: a recorded slot returns its record, with old and new in
+	 * its proxy.  A slot not recorded returns NULL, and so does every
+	 * slot once the commit consumed the records.
+	 */
+	{
+		void *s1 = (void *) 0x10, *s2 = (void *) 0x20, *s3 = (void *) 0x30;
+		const struct urcu_txn_sw_latch *l;
+		struct urcu_txn_sw_txn _t, *t = &_t;
+
+		urcu_txn_sw_init(t);
+		ok(!urcu_txn_sw_find(t, &s1), "find on an empty txn is NULL");
+		urcu_txn_sw_record(t, &s1, (void *) 0x10, (void *) 0x11, TEST_TAG);
+		urcu_txn_sw_record(t, &s2, (void *) 0x20, (void *) 0x21, TEST_TAG);
+		l = urcu_txn_sw_find(t, &s2);
+		ok(l && l->proxy.ptr[0] == (void *) 0x20 &&
+			l->proxy.ptr[1] == (void *) 0x21,
+			"find returns the record of a recorded slot");
+		ok(!urcu_txn_sw_find(t, &s3), "find on a slot not recorded is NULL");
+		urcu_txn_sw_commit_flavor(t, sync_call_rcu);
+		ok(!urcu_txn_sw_find(t, &s1), "find after the commit is NULL");
+	}
+
+	/*
+	 * 9. find past URCU_TXN_SW_BLOOM_MIN records, where the RYW filter is
+	 * armed: every recorded slot is found, and a slot not recorded is not.
+	 */
+	{
+		enum { NR_EDGES = 2 * URCU_TXN_SW_BLOOM_MIN };
+		void *slots[NR_EDGES + 1];
+		struct urcu_txn_sw_txn _t, *t = &_t;
+		bool all_found = true;
+		unsigned int i;
+
+		urcu_txn_sw_init(t);
+		for (i = 0; i < NR_EDGES; i++) {
+			slots[i] = (void *) (((unsigned long) (i + 1)) << 8);
+			urcu_txn_sw_record(t, &slots[i], slots[i],
+				(void *) ((unsigned long) slots[i] | 0x10), TEST_TAG);
+		}
+		for (i = 0; i < NR_EDGES; i++) {
+			const struct urcu_txn_sw_latch *l =
+				urcu_txn_sw_find(t, &slots[i]);
+
+			if (!l || l->proxy.ptr[1] !=
+					(void *) ((unsigned long) slots[i] | 0x10))
+				all_found = false;
+		}
+		ok(all_found, "find returns every record of a long txn");
+		ok(!urcu_txn_sw_find(t, &slots[NR_EDGES]),
+			"find on a slot not recorded is NULL in a long txn");
+		urcu_txn_sw_commit_flavor(t, sync_call_rcu);
+	}
+
+	/*
+	 * 10. discard: the slots keep their values and the txn has no
+	 * records.  It then records and commits like a new one, both after a
+	 * discard and after a commit followed by a discard.
+	 */
+	{
+		void *s1 = (void *) 0x10, *s2 = (void *) 0x20;
+		struct urcu_txn_sw_txn _t, *t = &_t;
+		enum urcu_txn_status st;
+
+		urcu_txn_sw_init(t);
+		urcu_txn_sw_record(t, &s1, (void *) 0x10, (void *) 0x11, TEST_TAG);
+		urcu_txn_sw_record(t, &s2, (void *) 0x20, (void *) 0x21, TEST_TAG);
+		urcu_txn_sw_discard(t);
+		ok(s1 == (void *) 0x10 && s2 == (void *) 0x20 &&
+			!urcu_txn_sw_find(t, &s1),
+			"discard leaves the slots and drops the records");
+		urcu_txn_sw_record(t, &s1, (void *) 0x10, (void *) 0x12, TEST_TAG);
+		urcu_txn_sw_record(t, &s2, (void *) 0x20, (void *) 0x22, TEST_TAG);
+		st = urcu_txn_sw_commit_flavor(t, sync_call_rcu);
+		ok(st == URCU_TXN_STATUS_OK && s1 == (void *) 0x12 &&
+			s2 == (void *) 0x22, "a discarded txn records and commits");
+		urcu_txn_sw_discard(t);
+		urcu_txn_sw_record(t, &s1, (void *) 0x12, (void *) 0x13, TEST_TAG);
+		urcu_txn_sw_record(t, &s2, (void *) 0x22, (void *) 0x23, TEST_TAG);
+		st = urcu_txn_sw_commit_flavor(t, sync_call_rcu);
+		ok(st == URCU_TXN_STATUS_OK && s1 == (void *) 0x13 &&
+			s2 == (void *) 0x23,
+			"a committed txn records and commits again after a discard");
+	}
+
+	/*
+	 * 11. discard keeps caller storage: an inline txn records into the
+	 * same buffer again, and its lone edge commits directly.
+	 */
+	{
+		void *slot = (void *) 0x100;
+		struct urcu_txn_sw_latch buf[1];
+		struct urcu_txn_sw_txn _t, *t = &_t;
+		enum urcu_txn_status st;
+
+		urcu_txn_sw_init_inline(t, buf, 1);
+		urcu_txn_sw_record(t, &slot, (void *) 0x100, (void *) 0x200, TEST_TAG);
+		urcu_txn_sw_discard(t);
+		ok(t->latches == buf && slot == (void *) 0x100,
+			"inline discard keeps the caller's buffer");
+		urcu_txn_sw_record(t, &slot, (void *) 0x100, (void *) 0x300, TEST_TAG);
+		st = urcu_txn_sw_commit_flavor(t, sync_call_rcu);
+		ok(st == URCU_TXN_STATUS_OK && slot == (void *) 0x300,
+			"inline txn records and commits after a discard");
 	}
 
 	rcu_barrier();			/* drain deferred txn reclaim callbacks */
