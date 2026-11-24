@@ -102,10 +102,26 @@ void *ft_txn_read(void **slot, uintptr_t tag)
 /*
  * FT's txn handle.  It wraps the engine's handle, so that an engine swap
  * changes the member and not every function that passes a handle.
+ *
+ * It also counts what an attempt costs: the loads it made through the
+ * handle, plus the edges it recorded.  @cost keeps the highest cost of
+ * the attempts that ended so far.  An op reads it to size the number of
+ * attempts it may lose before it takes the lane (ft_op_lane_at).
  */
 struct ft_txn {
 	struct urcu_txn e;		/* the engine's handle */
+	unsigned int nload;		/* loads by the current attempt */
+	unsigned int cost;		/* highest cost of an ended attempt */
 };
+
+/* Initialize @h, with no attempt and no cost yet. */
+FT_TXN_INLINE
+void ft_txn_init(struct ft_txn *h)
+{
+	urcu_txn_init(&h->e, NULL);
+	h->nload = 0;
+	h->cost = 0;
+}
 
 /*
  * THE TXN'S OWN RECORDS.  FT reads what a txn recorded and never edits it.
@@ -210,6 +226,20 @@ void ft_txn_discard(struct ft_txn *h)
 }
 
 /*
+ * The current attempt of @h ends: keep its cost if it is the highest so
+ * far.  Call it when the attempt is lost, and before a commit of a live
+ * record set.
+ */
+FT_TXN_INLINE
+void ft_txn_learn_cost(struct ft_txn *h)
+{
+	unsigned int c = h->nload + ft_txn_nr_records(h);
+
+	if (c > h->cost)
+		h->cost = c;
+}
+
+/*
  * LOADS INSIDE A TXN.  ft_txn_load() returns @slot as the txn behind @h will
  * leave it.  That is its own pending value when it recorded @slot, else the
  * slot's committed value.  ft_txn_load_committed() skips the pending value.
@@ -298,6 +328,7 @@ void *ft_txn_load_at(struct ft_txn *h, void **slot, uintptr_t tag,
 		bool committed, const char *file, int line)
 {
 	ft_fp_note(h, slot, tag, file, line);
+	h->nload++;
 	return committed ? urcu_txn_load_committed(&h->e, slot, tag) :
 		urcu_txn_load(&h->e, slot, tag);
 }
@@ -309,12 +340,14 @@ void *ft_txn_load_at(struct ft_txn *h, void **slot, uintptr_t tag,
 FT_TXN_INLINE
 void *ft_txn_load(struct ft_txn *h, void **slot, uintptr_t tag)
 {
+	h->nload++;
 	return urcu_txn_load(&h->e, slot, tag);
 }
 
 FT_TXN_INLINE
 void *ft_txn_load_committed(struct ft_txn *h, void **slot, uintptr_t tag)
 {
+	h->nload++;
 	return urcu_txn_load_committed(&h->e, slot, tag);
 }
 #endif

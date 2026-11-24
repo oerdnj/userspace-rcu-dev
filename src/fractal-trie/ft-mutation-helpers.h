@@ -3577,7 +3577,7 @@ static inline
 void ft_txn_op_init(struct cds_ft *ft, struct ft_op *op)
 {
 	ft_hold_trace_leak_canary();
-	urcu_txn_init(&op->txn.e, NULL);
+	ft_txn_init(&op->txn);
 	if (ft->exclusive) {
 		op->lane = NULL;
 		op->flavor = NULL;
@@ -3635,15 +3635,11 @@ __attribute__((weak)) unsigned long ft_op_lane_nr_begin, ft_op_lane_nr_want,
  */
 static __thread const struct cds_ft_metadata *ft_acq_refused_word;
 
-/*
- * The op's cost.  The MCAS engine learns it (loads + records, high-water)
- * as its handle commits and conflicts.  FT reads it here.  An engine
- * without that count needs FT to keep its own.
- */
+/* The op's cost: its handle's highest attempt cost (struct ft_txn). */
 static inline
 unsigned long ft_op_cost(const struct ft_op *op)
 {
-	return urcu_txn_last_cost(&op->txn.e);
+	return op->txn.cost;
 }
 
 /* Attempts this op may lose before it earns the lane. */
@@ -3736,6 +3732,7 @@ void ft_op_begin(struct ft_op *op)
 		ft_op_lane_publish(op);
 	}
 	urcu_txn_begin(&op->txn.e);
+	op->txn.nload = 0;	/* a new attempt counts its own loads */
 	if (op->flavor)
 		op->flavor->read_lock();
 }
@@ -3756,12 +3753,14 @@ void ft_op_end(struct ft_op *op)
 
 /*
  * The attempt lost before its commit: age the op.  The turn is forfeited at
- * ft_op_end(), since @retrying stays clear.  The engine handle is aged too,
- * for the engine's own policy and for the cost ft_op_cost() reads.
+ * ft_op_end(), since @retrying stays clear.  The attempt's cost counts
+ * toward ft_op_cost().  The engine handle is aged too, for the engine's
+ * own policy.
  */
 static inline
 void ft_op_conflict(struct ft_op *op)
 {
+	ft_txn_learn_cost(&op->txn);
 	urcu_txn_conflict(&op->txn.e);
 	op->retry++;
 }
@@ -3792,10 +3791,12 @@ void ft_op_set_park_quiescent(struct ft_op *op, int on)
 static inline
 void ft_flip_txn_conflict(struct ft_flip_txn *t)
 {
-	if (t->op)
+	if (t->op) {
 		ft_op_conflict(t->op);
-	else
+	} else {
+		ft_txn_learn_cost(t->mtxn);
 		urcu_txn_conflict(&t->mtxn->e);
+	}
 }
 
 /*
@@ -4208,9 +4209,9 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 #endif
 	t->mtxn = &t->own;
 	t->op = NULL;
-	urcu_txn_init(&t->mtxn->e, NULL);	/* flavor-agnostic: the caller brackets the
-					 * RCU read side; no escalation domain
-					 * under POC exclusion */
+	ft_txn_init(t->mtxn);	/* flavor-agnostic: the caller brackets the
+				 * RCU read side; no escalation domain
+				 * under POC exclusion */
 	/* Skip the age-0 optimistic install and its fixed-size RYW Bloom
 	 * filter.  A growable FT commit (merge/graft spine folds) can
 	 * accumulate a large, dense write set that saturates the Bloom.  A
@@ -9976,6 +9977,9 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 			ft_hold_trace_drop(t->locks[drop_i].meta);
 	}
 	FT_MK_NOTE(t, ft);
+	/* The attempt ends here, if it has a record set to commit. */
+	if (ft_txn_live(t->mtxn))
+		ft_txn_learn_cost(t->mtxn);
 	st = urcu_txn_commit_flavor(&t->mtxn->e, reclaim);
 	if (st == URCU_TXN_STATUS_ABORT && t->op)
 		ft_op_commit_aborted(t->op);
