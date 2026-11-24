@@ -208,11 +208,31 @@ bool ft_txn_rec_sw(const struct ft_txn_rec *r)
 	return ((const struct urcu_txn_record *) r)->kind == URCU_TXN_KIND_SW;
 }
 
+/* The slot a record writes, and that slot's proxy tag. */
+FT_TXN_INLINE
+void **ft_txn_rec_slot(const struct ft_txn_rec *r)
+{
+	return ((const struct urcu_txn_record *) r)->slot;
+}
+
+FT_TXN_INLINE
+uintptr_t ft_txn_rec_tag(const struct ft_txn_rec *r)
+{
+	return ((const struct urcu_txn_record *) r)->proxy_tag;
+}
+
 /* How many edges the txn behind @h has recorded. */
 FT_TXN_INLINE
 unsigned int ft_txn_nr_records(const struct ft_txn *h)
 {
 	return ft_txn_live(h) ? h->e.desc->nr : 0;
+}
+
+/* Record @i of the txn behind @h, for i < ft_txn_nr_records(@h). */
+FT_TXN_INLINE
+const struct ft_txn_rec *ft_txn_rec_at(const struct ft_txn *h, unsigned int i)
+{
+	return (const struct ft_txn_rec *) &h->e.desc->recs[i];
 }
 
 /*
@@ -252,6 +272,69 @@ void ft_txn_discard(struct ft_txn *h)
 		h->e.desc = NULL;
 	}
 }
+
+/*
+ * The record and commit entry points call the debug instruments of
+ * ft-txn-rec-dbg.h.  Only fractal-trie.c includes that header, and only it
+ * records or commits.  The allocator's unit sees the rest of this file.
+ */
+#ifdef _FT_TXN_REC_DBG_H
+/* Fill the debug instruments' view @v of record @r of @h. */
+FT_TXN_INLINE
+void ft_txn_rec_dbg_view(const struct ft_txn *h, const struct ft_txn_rec *r,
+		struct ft_rec_dbg *v)
+{
+	v->slot = ft_txn_rec_slot(r);
+	v->old_ptr = ft_txn_rec_old(r);
+	v->new_ptr = ft_txn_rec_new(r);
+	v->tag = ft_txn_rec_tag(r);
+	v->txn = h;
+}
+
+/*
+ * Record the edge {*slot: old -> new} under @tag.  A second record on the
+ * same slot merges onto the first: it keeps the first old value and takes
+ * the new one.  Return false when out of memory.  The failure is sticky,
+ * and the commit reports it.
+ */
+FT_TXN_INLINE
+bool ft_txn_record(struct ft_txn *h, void **slot, void *old_ptr,
+		void *new_ptr, uintptr_t tag)
+{
+	bool merged = FT_REC_DBG && ft_txn_recorded(h, slot);
+
+	if (urcu_txn_store_sw(&h->e, slot, old_ptr, new_ptr, tag) < 0)
+		return false;
+	if (FT_REC_DBG) {
+		struct ft_rec_dbg v;
+
+		ft_txn_rec_dbg_view(h, ft_txn_find(h, slot), &v);
+		ft_rec_dbg_recorded(&v, merged);
+	}
+	return true;
+}
+
+/*
+ * Commit the records of @h, deferring reclaim through @reclaim.  Return
+ * OK, MEMORY_ERROR when a record could not be made, or ABORT.
+ */
+FT_TXN_INLINE
+enum urcu_txn_status ft_txn_commit(struct ft_txn *h,
+		void (*reclaim)(struct rcu_head *, void (*)(struct rcu_head *)))
+{
+	if (FT_REC_DBG) {
+		unsigned int i, nr = ft_txn_nr_records(h);
+
+		for (i = 0; i < nr; i++) {
+			struct ft_rec_dbg v;
+
+			ft_txn_rec_dbg_view(h, ft_txn_rec_at(h, i), &v);
+			ft_rec_dbg_will_commit(&v);
+		}
+	}
+	return urcu_txn_commit_flavor(&h->e, reclaim);
+}
+#endif	/* _FT_TXN_REC_DBG_H */
 
 /*
  * The current attempt of @h ends: keep its cost if it is the highest so

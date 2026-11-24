@@ -1621,43 +1621,20 @@ static inline void ft_dt_note_clear(const void *w, const void *pc, bool report,
 	ft_dt_ent_unlock(e);
 }
 
-static void ft_dt_engine_clear(const struct urcu_txn_record *r, void *v);
+static unsigned long ft_dt_commit_stores;
 
 /*
- * The record a plain store was already noted for, BEFORE it landed, so the
- * post-store hook that follows does not count it twice.  Per thread: the note
- * and the store run on the committing thread, back to back.
+ * The commit is about to store @r->new_ptr (ft_txn_commit).  It runs
+ * before the commit, on the committing thread.
  */
-static __thread const struct urcu_txn_record *ft_dt_prenoted;
-
-static unsigned long ft_dt_prenote_n, ft_dt_postnote_n;
-
-static void ft_dt_will_write(const struct urcu_txn_record *r, void *v)
-{
-	uatomic_inc(&ft_dt_prenote_n);
-	ft_dt_prenoted = r;
-	ft_dt_engine_clear(r, v);
-}
-
-/* The engine's half: every store it makes, including the settles. */
-static inline void ft_dt_wrote(const struct urcu_txn_record *r, void *v)
-{
-	if (ft_dt_prenoted == r) {
-		ft_dt_prenoted = NULL;	/* noted before the store */
-		return;
-	}
-	uatomic_inc(&ft_dt_postnote_n);
-	ft_dt_engine_clear(r, v);	/* a CAS store: noted after it landed */
-}
-
-static void ft_dt_engine_clear(const struct urcu_txn_record *r, void *v)
+static void ft_dt_will_write(const struct ft_rec_dbg *r)
 {
 	const struct cds_ft_metadata *m;
+	void *v = r->new_ptr;
 
-	if (r->proxy_tag != FT_STATE_PROXY)
+	uatomic_inc(&ft_dt_commit_stores);
+	if (r->tag != FT_STATE_PROXY)
 		return;				/* not a state word */
-	if (urcu_txn_is_proxy(v, r->proxy_tag))
-		return;				/* a parked proxy says nothing yet */
 	/*
 	 * ☠ THE ENGINE CAN ONLY END OWNERSHIP, NEVER ESTABLISH IT.  A settle
 	 * that writes LOCK|s back is an ABORT-RESTORE of a take the op already
@@ -1696,8 +1673,8 @@ static void ft_dt_engine_clear(const struct urcu_txn_record *r, void *v)
 	if (uatomic_read(&ft_dt_slot(m)->word) == m &&
 			uatomic_read(&ft_dt_slot(m)->tid))
 		FT_TP(lock_ev, 0, (int) FT_LL_ENGINE_CLEAR, (const void *) m,
-			(unsigned long) (uintptr_t) r->desc,
-			(unsigned long) (uintptr_t) v, (const void *) r->desc,
+			(unsigned long) (uintptr_t) r->txn,
+			(unsigned long) (uintptr_t) v, (const void *) r->txn,
 			(const void *) r->slot, ft_ll_violation_tid(),
 			(uint64_t) 0);
 	/*
@@ -1707,9 +1684,8 @@ static void ft_dt_engine_clear(const struct urcu_txn_record *r, void *v)
 	 * word a DIFFERENT tid took, that is a steal through a record.  The
 	 * plain-release check cannot see it: its report is off for the engine.
 	 *
-	 * This hook runs AFTER the store.  So a peer may legitimately have
-	 * re-taken the word already and filed itself as owner.  The count is
-	 * still NOT filtered on the live word; the comment below says why.
+	 * The count is NOT filtered on the live word; the comment below says
+	 * why.
 	 */
 	{
 		struct ft_dt_ent *e = ft_dt_slot(m);
@@ -1749,8 +1725,7 @@ static void ft_dt_engine_clear(const struct urcu_txn_record *r, void *v)
 			ft_dt_ent_unlock(e);
 		}
 	}
-	ft_dt_note_clear(m, (const void *) r->desc, /*report=*/ false,
-		/*engine=*/ 1);
+	ft_dt_note_clear(m, r->txn, /*report=*/ false, /*engine=*/ 1);
 	{
 		struct ft_dt_ent *e = ft_dt_slot(m);
 
@@ -1805,18 +1780,16 @@ static unsigned long ft_sws_checked, ft_sws_stale, ft_sws_proxy,
  */
 static __thread int ft_sws_doomed;
 
-static void ft_sw_stale_check(const struct urcu_txn_record *r)
+static void ft_sw_stale_check(const struct ft_rec_dbg *r)
 {
 	void *cur, *bt[FT_SWS_DEPTH];
 	unsigned long key = 0;
 	unsigned int i;
 	int nbt, isproxy = 0;
 
-	if (r->kind != URCU_TXN_KIND_SW)
-		return;
 	uatomic_inc(&ft_sws_checked);
 	cur = CMM_LOAD_SHARED(*r->slot);
-	if (urcu_txn_is_proxy(cur, r->proxy_tag)) {
+	if (ft_txn_is_proxy(cur, r->tag)) {
 		/* A peer parked on a word this op records SW: no exclusion. */
 		uatomic_inc(&ft_sws_proxy);
 		isproxy = 1;
@@ -1838,7 +1811,7 @@ static void ft_sw_stale_check(const struct urcu_txn_record *r)
 	 * record writes back its own old.  A TOMBSTONE difference still
 	 * counts: writing it back would resurrect a retired node.
 	 */
-	if (r->proxy_tag == FT_STATE_PROXY && r->new_ptr == r->old_ptr &&
+	if (r->tag == FT_STATE_PROXY && r->new_ptr == r->old_ptr &&
 			((uintptr_t) cur & ~(uintptr_t) FT_STATE_LOCK) ==
 				(uintptr_t) r->old_ptr &&
 			((uintptr_t) cur & FT_STATE_LOCK)) {
@@ -1861,7 +1834,7 @@ static void ft_sw_stale_check(const struct urcu_txn_record *r)
 	}
 	if (ft_sws_doomed) {
 		uatomic_inc(&ft_sws_doomed_stale);
-		if (urcu_txn_is_proxy(cur, r->proxy_tag)) {
+		if (ft_txn_is_proxy(cur, r->tag)) {
 			uatomic_inc(&ft_sws_doomed_proxy);
 			uatomic_add(&ft_sws_proxy, -1);
 		}
@@ -1880,17 +1853,16 @@ static void ft_sw_stale_check(const struct urcu_txn_record *r)
 				isproxy ? " (a peer's parked proxy)" : "",
 				r->new_ptr);
 			if (isproxy) {
-				/* Name the peer: its record and its commit's state. */
-				struct urcu_txn_record *pr =
-					urcu_txn_untag(cur, r->proxy_tag);
+				/* Name the peer: its proxy and its commit's state. */
+				const struct ft_txn_parked *pp =
+					ft_txn_parked_of(cur, r->tag);
 
 				fprintf(stderr, "FT SW STALE-OLD AT DETECTION: the "
-					"peer's record: slot %p old %p new %p kind %d, "
-					"descriptor %p status %lu\n",
-					(void *) pr->slot, pr->old_ptr, pr->new_ptr,
-					(int) pr->kind, (void *) pr->desc,
-					pr->desc ? (unsigned long) uatomic_load(
-						&pr->desc->status, CMM_RELAXED) : 99UL);
+					"peer's proxy: old %p new %p, committed %d\n",
+					ft_txn_parked_value(pp, false),
+					ft_txn_parked_value(pp, true),
+					(int) ft_txn_decision_committed(
+						ft_txn_parked_decision(pp)));
 			}
 			nbt = backtrace(bt, FT_SWS_DEPTH);
 			backtrace_symbols_fd(bt, nbt, 2);
@@ -1947,7 +1919,7 @@ static __attribute__((destructor)) void ft_sw_stale_report(void)
 	}
 }
 
-static void ft_dt_rec_check(const struct urcu_txn_record *r)
+static void ft_dt_rec_check(const struct ft_rec_dbg *r)
 {
 	const struct cds_ft_metadata *m;
 	struct ft_dt_ent *e;
@@ -1961,7 +1933,7 @@ static void ft_dt_rec_check(const struct urcu_txn_record *r)
 	 * below never sees it (no LOCK in old).  Neither does the
 	 * engine-settle check.
 	 */
-	if (r->proxy_tag == FT_STATE_PROXY && r->kind == URCU_TXN_KIND_SW &&
+	if (r->tag == FT_STATE_PROXY &&
 			!((uintptr_t) r->old_ptr & FT_STATE_LOCK) &&
 			!((uintptr_t) r->new_ptr & FT_STATE_LOCK)) {
 		m = (const struct cds_ft_metadata *) ((const char *)
@@ -1988,7 +1960,7 @@ static void ft_dt_rec_check(const struct urcu_txn_record *r)
 		}
 		return;
 	}
-	if (r->proxy_tag != FT_STATE_PROXY ||
+	if (r->tag != FT_STATE_PROXY ||
 			!((uintptr_t) r->old_ptr & FT_STATE_LOCK) ||
 			((uintptr_t) r->new_ptr & FT_STATE_LOCK))
 		return;		/* not a release of the fence */
@@ -2081,10 +2053,9 @@ static __attribute__((destructor)) void ft_dt_report(void)
 	fprintf(stderr, "FT STOLEN LOCK: %lu takes, %lu released by their owner, %lu released with the owner already gone, %lu STOLEN (cleared by a thread that did not take them)\n",
 		uatomic_read(&ft_dt_sets), uatomic_read(&ft_dt_matched),
 		uatomic_read(&ft_dt_unowned), uatomic_read(&ft_dt_double));
-	fprintf(stderr, "FT ENGINE STEAL: %lu engine settles cleared a fence another thread took (engine stores noted: %lu BEFORE the store, %lu after a CAS)\n",
+	fprintf(stderr, "FT ENGINE STEAL: %lu engine settles cleared a fence another thread took (commit stores checked: %lu)\n",
 		uatomic_read(&ft_dt_engine_steal),
-		uatomic_read(&ft_dt_prenote_n),
-		uatomic_read(&ft_dt_postnote_n));
+		uatomic_read(&ft_dt_commit_stores));
 	if (uatomic_read(&ft_dt_underflow))
 		fprintf(stderr, "FT LOCK UNDERFLOW: %lu releases drove a word's take/release balance NEGATIVE\n",
 			uatomic_read(&ft_dt_underflow));
@@ -2192,7 +2163,7 @@ static __attribute__((constructor)) void ft_dt_selftest_engine(void)
 {
 	struct cds_ft_metadata *m = &ft_dt_selftest_meta;
 	struct ft_dt_ent *e = ft_dt_slot(m);
-	struct urcu_txn_record rec = { 0 };
+	struct ft_rec_dbg rec = { 0 };
 	unsigned long st0 = uatomic_read(&ft_dt_engine_steal);
 	unsigned long uf0 = uatomic_read(&ft_dt_underflow);
 	unsigned long st1, uf1;
@@ -2203,10 +2174,9 @@ static __attribute__((constructor)) void ft_dt_selftest_engine(void)
 	rec.slot = (void **) &m->state;
 	rec.old_ptr = (void *) (FT_STATE_LOCK | 8);
 	rec.new_ptr = (void *) (uintptr_t) 8;
-	rec.proxy_tag = FT_STATE_PROXY;
+	rec.tag = FT_STATE_PROXY;
 	ft_dt_in_selftest = 1;
-	ft_dt_will_write(&rec, rec.new_ptr);
-	ft_dt_prenoted = NULL;
+	ft_dt_will_write(&rec);
 	st1 = uatomic_read(&ft_dt_engine_steal);
 	ft_dt_note_clear(m, (const void *) &ft_dt_selftest_engine, true, 0);
 	uf1 = uatomic_read(&ft_dt_underflow);
@@ -2260,7 +2230,7 @@ void ft_ll_mark_freed(const struct cds_ft_metadata *m)
 
 #ifdef FT_DEBUG_SLOT_HIST
 /*
- * -DFT_DEBUG_SLOT_HIST (see ft-txn-rec-dbg.h): every engine store, filed in a
+ * -DFT_DEBUG_SLOT_HIST (see ft-txn-rec-dbg.h): every commit store, filed in a
  * ring hashed by SLOT address.  Racy by design, like the lock-leak ring:
  *  - a slot is claimed by one atomic add;
  *  - the stores into it are plain;
@@ -2272,11 +2242,9 @@ void ft_ll_mark_freed(const struct cds_ft_metadata *m)
 struct ft_sh_ev {
 	void **slot;
 	void *val, *old, *nw;
-	const void *desc;
+	const void *txn;
 	uint64_t ts;
 	uint32_t tid;
-	uint16_t nr;
-	uint8_t kind, status;
 };
 # define FT_SH_NSLOT	16384
 # define FT_SH_HIST	32
@@ -2299,21 +2267,16 @@ static inline struct ft_sh_slot *ft_sh_slot_of(void *const *slot)
 	return &ft_sh_map[((uintptr_t) slot >> 3) & (FT_SH_NSLOT - 1)];
 }
 
-static void ft_sh_note(const struct urcu_txn_record *r, void *v)
+static void ft_sh_note(const struct ft_rec_dbg *r, void *v)
 {
 	struct ft_sh_slot *sl;
 	unsigned long i;
 	struct ft_sh_ev *e;
 
 	/*
-	 * A same-value MW record is a VALIDATE: its CAS installs only over the
-	 * value it names.  It is skipped.  Otherwise a hot word's validates
-	 * scroll every real transition out of its ring (measured: the list
-	 * head's).  A same-value SW record is KEPT: a park is a blind store,
-	 * so it can write its value back over a peer's.
+	 * A same-value record is KEPT: an SW store is blind, so it can write
+	 * its value back over a peer's.
 	 */
-	if (r->old_ptr == r->new_ptr && r->kind == URCU_TXN_KIND_MW)
-		return;
 	sl = ft_sh_slot_of(r->slot);
 	i = uatomic_add_return(&sl->head, 1) - 1;
 	e = &sl->ev[i % FT_SH_HIST];
@@ -2324,10 +2287,7 @@ static void ft_sh_note(const struct urcu_txn_record *r, void *v)
 	e->val = v;
 	e->old = r->old_ptr;
 	e->nw = r->new_ptr;
-	e->desc = r->desc;
-	e->nr = r->desc ? (uint16_t) r->desc->nr : 0;
-	e->status = r->desc ? (uint8_t) CMM_LOAD_SHARED(r->desc->status) : 9;
-	e->kind = (uint8_t) r->kind;
+	e->txn = r->txn;
 	e->tid = ft_sh_tid;
 	e->ts = ft_sh_now();
 }
@@ -2347,20 +2307,19 @@ static void ft_sh_replay(const char *name, void *const *slot)
 
 		if (e->slot != slot)
 			continue;
-		fprintf(stderr, "  #%lu ts=%llu tid=%u wrote %p [%s] rec{old %p new %p} %s desc %p nr %u status %u\n",
+		fprintf(stderr, "  #%lu ts=%llu tid=%u wrote %p [%s] rec{old %p new %p} txn %p\n",
 			i, (unsigned long long) e->ts, e->tid, e->val, ph,
-			e->old, e->nw, e->kind ? "MW" : "SW", e->desc,
-			e->nr, e->status);
+			e->old, e->nw, e->txn);
 	}
 }
 
 /*
- * URCU_TXN_PARK_CLOBBER_NOTE: the engine is about to blindly park over a value
- * its record did not expect.  Its backtrace names the PARKER.  This hook
- * names the WRITER.  It prints the word's engine-store history.  When the
- * lock-leak ring is built too, it also prints the word's take/release
- * history.  A cleared LOCK shows up there: it is a plain CAS, invisible to
- * the engine's ring.
+ * ft_sh_clobber: a commit is about to store blindly over a value its record
+ * did not expect (ft_rec_dbg_will_commit).  Its backtrace names the
+ * COMMITTER.  This names the WRITER: it prints the word's commit-store
+ * history.  When the lock-leak ring is built too, it also prints the
+ * word's take/release history.  A cleared LOCK shows up there: it is a
+ * plain CAS, invisible to the commit-store ring.
  */
 #ifdef FT_DEBUG_LOCK_LEAK
 /* Defined with the lock-leak ring, further down this file. */
@@ -2379,14 +2338,25 @@ static __attribute__((destructor)) void ft_fc_report(void)
 }
 #endif
 
-static void ft_sh_clobber(const struct urcu_txn_record *r, void *prev)
+static void ft_sh_clobber(const struct ft_rec_dbg *r, void *prev)
 {
 	static unsigned long printed;
-	bool loud = uatomic_add_return(&printed, 1) <= 4;
+	bool loud;
+
+	/*
+	 * A release-shaped {s -> s} record over the op's own LOCK|s is by
+	 * design (see ft_sw_stale_check): the live word differs by LOCK
+	 * alone, and the store is the release.
+	 */
+	if (r->tag == FT_STATE_PROXY && r->new_ptr == r->old_ptr &&
+			((uintptr_t) prev & ~(uintptr_t) FT_STATE_LOCK) ==
+				(uintptr_t) r->old_ptr)
+		return;
+	loud = uatomic_add_return(&printed, 1) <= 4;
 
 	if (loud) {
-		fprintf(stderr, "FT SLOT HIST CLOBBER: record %p slot %p expected %p, found %p (writing %p)\n",
-			(const void *) r, (void *) r->slot, r->old_ptr, prev,
+		fprintf(stderr, "FT SLOT HIST CLOBBER: txn %p slot %p expected %p, found %p (writing %p)\n",
+			r->txn, (void *) r->slot, r->old_ptr, prev,
 			r->new_ptr);
 		ft_sh_replay("clobbered slot", r->slot);
 	}
@@ -9510,15 +9480,23 @@ void ft_guard_unheld_abort(const char *what, const void *slot,
  */
 static unsigned long ft_hf_commits, ft_hf_seen, ft_hf_hidden, ft_hf_max,
 	ft_hf_regs;
-/* Creating-pc table, filled by the engine's record stamp (ft-txn-rec-dbg.h). */
+/* Creating-pc table, filled as each record is created (ft-txn-rec-dbg.h). */
 #define FT_HF_PC_SLOTS	8192
-static struct ft_hf_pc { const void *rec, *pc, *pc2, *pc3; }
-	ft_hf_pc_tab[FT_HF_PC_SLOTS];
-static void ft_hf_pc_note(const struct urcu_txn_record *r, const void *pc)
+static struct ft_hf_pc {
+	const void *txn;
+	void **slot;
+	const void *pc, *pc2, *pc3;
+} ft_hf_pc_tab[FT_HF_PC_SLOTS];
+static inline struct ft_hf_pc *ft_hf_pc_ent(const void *txn, void **slot)
 {
-	struct ft_hf_pc *e = &ft_hf_pc_tab[(((uintptr_t) r) >> 4) &
+	return &ft_hf_pc_tab[(((uintptr_t) slot ^ (uintptr_t) txn) >> 4) &
 		(FT_HF_PC_SLOTS - 1)];
-	void *bt[6];
+}
+static void ft_hf_pc_note(const struct ft_rec_dbg *r)
+{
+	struct ft_hf_pc *e = ft_hf_pc_ent(r->txn, r->slot);
+	const void *pc = NULL;
+	void *bt[4];
 
 	/*
 	 * Only a record that WRITES INTO NOTHING can be a fill of a hidden
@@ -9526,20 +9504,20 @@ static void ft_hf_pc_note(const struct urcu_txn_record *r, const void *pc)
 	 * per run.  Calling backtrace() on each record would measure the
 	 * instrument.
 	 */
-	if (!pc && !r->old_ptr && backtrace(bt, 6) >= 5) {
-		pc = bt[3];
-		e->pc2 = bt[4];
-		e->pc3 = bt[5];
+	if (!r->old_ptr && backtrace(bt, 4) >= 4) {
+		pc = bt[1];
+		e->pc2 = bt[2];
+		e->pc3 = bt[3];
 	}
-	e->rec = r;
+	e->txn = r->txn;
+	e->slot = r->slot;
 	e->pc = pc;
 }
-static const void *ft_hf_pc_of(const struct urcu_txn_record *r)
+static const struct ft_hf_pc *ft_hf_pc_of(const void *txn, void **slot)
 {
-	const struct ft_hf_pc *e = &ft_hf_pc_tab[(((uintptr_t) r) >> 4) &
-		(FT_HF_PC_SLOTS - 1)];
+	const struct ft_hf_pc *e = ft_hf_pc_ent(txn, slot);
 
-	return e->rec == r ? e->pc : NULL;
+	return e->txn == txn && e->slot == slot ? e : NULL;
 }
 /* Per-producer tally, printed as file offsets (ASLR moves absolutes). */
 #define FT_HF_SITES	16
@@ -9564,51 +9542,48 @@ static void ft_hf_site_note(const void *pc)
 }
 static void ft_hidden_fill_at_commit(struct ft_flip_txn *t)
 {
-	struct urcu_txn_desc *d = t && t->mtxn ? t->mtxn->e.desc : NULL;
+	const struct ft_txn *h = t ? t->mtxn : NULL;
 	unsigned long n = 0;
-	unsigned int i, j;
+	unsigned int i, j, nr;
 
-	if (!d || d == URCU_TXN_ENOMEM)
+	if (!ft_txn_live(h))
 		return;
+	nr = ft_txn_nr_records(h);
 	uatomic_inc(&ft_hf_commits);
-	for (i = 0; i < d->nr; i++) {
+	for (i = 0; i < nr; i++) {
+		const struct ft_txn_rec *r = ft_txn_rec_at(h, i);
+		void **slot = ft_txn_rec_slot(r);
+
 		uatomic_inc(&ft_hf_seen);
 		for (j = 0; j < t->nr_hidden; j++) {
 			uintptr_t mask = ~(((uintptr_t) 1 <<
 				t->hidden_order[j]) - 1);
+			const struct ft_hf_pc *e;
 
-			if ((((uintptr_t) d->recs[i].slot) & mask) ==
-					(((uintptr_t) t->hidden[j]) & mask)) {
-				ft_hf_site_note(ft_hf_pc_of(&d->recs[i]));
-				if (uatomic_read(&ft_hf_hidden) + n < 4) {
-					const struct ft_hf_pc *e =
-						&ft_hf_pc_tab[(((uintptr_t)
-							&d->recs[i]) >> 4) &
-						(FT_HF_PC_SLOTS - 1)];
-					Dl_info di2;
-					const char *fb = dladdr((void *)
-						ft_hf_pc_note, &di2) ?
-						(const char *) di2.dli_fbase :
-						NULL;
+			if ((((uintptr_t) slot) & mask) !=
+					(((uintptr_t) t->hidden[j]) & mask))
+				continue;
+			e = ft_hf_pc_of(h, slot);
+			ft_hf_site_note(e ? e->pc : NULL);
+			if (e && uatomic_read(&ft_hf_hidden) + n < 4) {
+				Dl_info di2;
+				const char *fb = dladdr((void *)
+					ft_hf_pc_note, &di2) ?
+					(const char *) di2.dli_fbase : NULL;
 
-					fprintf(stderr, "FT HIDDEN FILL: base+0x%lx old %p new %p %s chain +0x%lx +0x%lx +0x%lx\n",
-						(unsigned long) (((uintptr_t)
-							d->recs[i].slot) -
-						 (((uintptr_t) t->hidden[j]) &
-						  mask)),
-						d->recs[i].old_ptr,
-						d->recs[i].new_ptr,
-						d->recs[i].kind ? "MW" : "SW",
-						(unsigned long) ((const char *)
-							e->pc - fb),
-						(unsigned long) ((const char *)
-							e->pc2 - fb),
-						(unsigned long) ((const char *)
-							e->pc3 - fb));
-				}
-				n++;
-				break;
+				fprintf(stderr, "FT HIDDEN FILL: base+0x%lx old %p new %p chain +0x%lx +0x%lx +0x%lx\n",
+					(unsigned long) (((uintptr_t) slot) -
+					 (((uintptr_t) t->hidden[j]) & mask)),
+					ft_txn_rec_old(r), ft_txn_rec_new(r),
+					(unsigned long) ((const char *)
+						e->pc - fb),
+					(unsigned long) ((const char *)
+						e->pc2 - fb),
+					(unsigned long) ((const char *)
+						e->pc3 - fb));
 			}
+			n++;
+			break;
 		}
 	}
 	uatomic_add(&ft_hf_hidden, n);
@@ -9793,7 +9768,7 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 	/* The attempt ends here, if it has a record set to commit. */
 	if (ft_txn_live(t->mtxn))
 		ft_txn_learn_cost(t->mtxn);
-	st = urcu_txn_commit_flavor(&t->mtxn->e, reclaim);
+	st = ft_txn_commit(t->mtxn, reclaim);
 	if (st == URCU_TXN_STATUS_ABORT && t->op)
 		ft_op_commit_aborted(t->op);
 #ifdef FT_DEBUG_STRUCT_ANCHOR
@@ -10042,7 +10017,7 @@ void ft_flip_txn_park_excluded(struct ft_flip_txn *t, void **slot,
 	if (ft_flip_txn_record_is_noop(t, slot, old_ptr, new_ptr))
 		return;
 	FT_LL_REC(t, slot, old_ptr, new_ptr, true);
-	ret = urcu_txn_store_sw(&t->mtxn->e, slot, old_ptr, new_ptr, tag);
+	ret = ft_txn_record(t->mtxn, slot, old_ptr, new_ptr, tag) ? 0 : -ENOMEM;
 	assert(!ret);
 	(void) ret;
 }
@@ -10496,8 +10471,8 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 		}
 #endif
 		FT_LL_REC(t, slot, old_ptr, new_ptr, true);
-		ret = urcu_txn_store_sw(&t->mtxn->e, slot, old_ptr, new_ptr,
-				tag);
+		ret = ft_txn_record(t->mtxn, slot, old_ptr, new_ptr, tag) ?
+			0 : -ENOMEM;
 	} else {
 		ft_flip_txn_struct_mw_abort("STRUCT", t, owner, slot,
 			old_ptr, new_ptr, __builtin_return_address(0));
@@ -10618,8 +10593,8 @@ void __ft_flip_txn_record_tag_excluded(struct ft_flip_txn *t, void **slot,
 			!(t->ft && slot == (void **) &t->ft->root)) {
 		FT_TK_COUNT_REC(t, FT_TK_SW);
 		FT_LL_REC(t, slot, old_ptr, new_ptr, true);
-		ret = urcu_txn_store_sw(&t->mtxn->e, slot, old_ptr, new_ptr,
-				tag);
+		ret = ft_txn_record(t->mtxn, slot, old_ptr, new_ptr, tag) ?
+			0 : -ENOMEM;
 	} else {
 		/*
 		 * Every caller reaches this lane only on a trie that excludes
@@ -10835,8 +10810,8 @@ void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
 			int ret;
 
 			FT_LL_REC(t, slot, old_ptr, new_ptr, true);
-			ret = urcu_txn_store_sw(&t->mtxn->e, slot, old_ptr,
-				new_ptr, FT_FLIP_PROXY_TAG);
+			ret = ft_txn_record(t->mtxn, slot, old_ptr, new_ptr,
+				FT_FLIP_PROXY_TAG) ? 0 : -ENOMEM;
 			assert(!ret);
 			(void) ret;
 			return;

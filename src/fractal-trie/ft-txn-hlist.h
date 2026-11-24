@@ -493,7 +493,7 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 	 *                           ft_node_mark_removed_flip's header)
 	 */
 	FT_TK_COUNT_CHAIN_SW();
-	return urcu_txn_store_sw(&txn->e, slot, old_ptr, new_ptr, tag);
+	return ft_txn_record(txn, slot, old_ptr, new_ptr, tag) ? 0 : -ENOMEM;
 }
 
 #define ft_hlist_store_chain(ft, txn, slot, old_ptr, new_ptr, tag)	\
@@ -560,7 +560,7 @@ int ft_hlist_store_sw_at(const char *fn, int line, const struct cds_ft *ft,
 	FT_TK_COUNT_CHAIN_SW();
 	FT_CH_COARSE(fn, line);
 	FT_CHAIN_CANARY_STAMP(fn, line, slot);
-	return urcu_txn_store_sw(&txn->e, slot, old_ptr, new_ptr, tag);
+	return ft_txn_record(txn, slot, old_ptr, new_ptr, tag) ? 0 : -ENOMEM;
 }
 
 #define ft_hlist_store_sw(ft, txn, slot, old_ptr, new_ptr, tag)		\
