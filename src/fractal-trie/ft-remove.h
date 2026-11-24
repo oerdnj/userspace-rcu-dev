@@ -4799,6 +4799,27 @@ int ft_detach_node(struct cds_ft *ft,
 				walk_nf = next;
 			}
 			/*
+			 * ☠ A DESTROY WALK MUST END AT THE TARGET.  It follows
+			 * each link's child as read under that link's lock, so
+			 * it walks the tree as it is NOW.  A peer's in-place
+			 * delete can leave a link with one child again: a
+			 * sibling key's.  The walk then ends at the sibling's
+			 * head.  It would retire the sibling's path, while the
+			 * leaf this remove freezes hangs under a node it never
+			 * locked.  The walk below refuses the same arrival.
+			 * MEASURED: inv_prefix_shape_zoo, 1-4 per run, each one
+			 * a walk one link shorter than the climb counted.
+			 * Nothing is recorded yet.  The held links release at
+			 * @end.
+			 */
+			if (free_detached_subtree && walk_nf &&
+					ft_node_external(walk_nf) &&
+					ft_node_ptr_raw(walk_nf) !=
+					ft_node_ptr_raw(entry_target)) {
+				ret = -EAGAIN;
+				goto end;
+			}
+			/*
 			 * As in the replace-ptr free-walk below.  A
 			 * skip-compressed external leaf at the chain end keeps
 			 * its path bytes in a separate skip-target compressed
