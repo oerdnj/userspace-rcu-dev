@@ -602,10 +602,11 @@ void ft_op_retry_tick(const struct cds_ft *ft, struct ft_op_retry *r, int last_r
 	/*
 	 * ☠ abort() RUNS NO DESTRUCTOR.  So it silently voids every exit-time
 	 * dump in the tree.  ft_tk_dump_at_exit is among them: it holds the
-	 * which-record-lost report (-DFT_WINNER_DBG).  That is the report you
+	 * per-site txn census (-DFT_DEBUG_TXN_KIND).  That is a report you
 	 * WANT at a retry cap.  The cap says that an op cannot converge.  The
-	 * dump says which record kept losing.  Arming both and getting nothing
-	 * reads as "the instrument found nothing".  That is the wrong zero
+	 * dump says what its txns recorded and returned.  Arming both and
+	 * getting nothing reads as "the instrument found nothing".  That is the
+	 * wrong zero
 	 * [[feedback_an_instrument_can_be_armed_firing_and_blind]].
 	 * -DFT_RETRY_CAP_EXIT trades the core for the destructors.
 	 */

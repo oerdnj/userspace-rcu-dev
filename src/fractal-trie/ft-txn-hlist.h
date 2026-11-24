@@ -462,7 +462,6 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 	 * @fn/@line are the CALLER's, so every chain-word store gets its own
 	 * audit row.  That is the whole point, since the question is per SITE.
 	 */
-	FT_AB_ARM(FT_AB_CELL_HANDLE, FT_AB_OWN_NA);
 	FT_CH_COARSE(fn, line);
 	FT_CHAIN_CANARY_STAMP(fn, line, slot);
 	/*
@@ -559,7 +558,6 @@ int ft_hlist_store_sw_at(const char *fn, int line, const struct cds_ft *ft,
 		void **slot, void *old_ptr, void *new_ptr, uintptr_t tag)
 {
 	FT_TK_COUNT_CHAIN_SW();
-	FT_AB_ARM(FT_AB_CELL_HANDLE, FT_AB_OWN_NA);
 	FT_CH_COARSE(fn, line);
 	FT_CHAIN_CANARY_STAMP(fn, line, slot);
 	return urcu_txn_store_sw(&txn->e, slot, old_ptr, new_ptr, tag);

@@ -1171,42 +1171,6 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
  *     is acquired (abort-and-regrow);
  *   - -ENOMEM.
  */
-#ifdef FT_DEBUG_LIVE_VALIDATE
-/*
- * Liveness of the split's child lock: acquires, those with a child member,
- * refusals, and the longest run of consecutive refusals on one thread.
- */
-static unsigned long ft_split_acq_calls, ft_split_acq_child,
-	ft_split_acq_refused, ft_split_acq_reread, ft_split_acq_max_streak;
-static __thread unsigned long ft_split_acq_streak;
-static void ft_split_acq_report(void) __attribute__((destructor));
-static void ft_split_acq_report(void)
-{
-	fprintf(stderr, "FT_SPLIT_ACQ calls=%lu child=%lu refused=%lu "
-		"child_reread_refused=%lu max_streak=%lu%s\n",
-		ft_split_acq_calls, ft_split_acq_child, ft_split_acq_refused,
-		ft_split_acq_reread, ft_split_acq_max_streak,
-#ifdef FT_RED_SPLIT_NO_CHILD_LOCK
-		" [RED: no child lock]"
-#else
-		""
-#endif
-		);
-}
-static void ft_split_acq_note(bool child, int outcome)
-{
-	uatomic_inc(&ft_split_acq_calls);
-	if (child)
-		uatomic_inc(&ft_split_acq_child);
-	if (!outcome) {
-		ft_split_acq_streak = 0;
-		return;
-	}
-	uatomic_inc(outcome == 2 ? &ft_split_acq_reread : &ft_split_acq_refused);
-	if (++ft_split_acq_streak > CMM_LOAD_SHARED(ft_split_acq_max_streak))
-		CMM_STORE_SHARED(ft_split_acq_max_streak, ft_split_acq_streak);
-}
-#endif
 
 static inline
 int ft_insert_dlm_acquire_split(struct cds_ft *ft,
@@ -1270,10 +1234,6 @@ int ft_insert_dlm_acquire_split(struct cds_ft *ft,
 	 */
 	ft_lock_ctx_init(&lctx, d, NULL, ic ? ic->op : NULL);
 	dret = ft_dlm_acquire_set(ft, &lctx, set, 3);
-#ifdef FT_DEBUG_LIVE_VALIDATE
-	if (dret)
-		ft_split_acq_note(set[2].nf != NULL, 1);
-#endif
 	if (dret)
 		return dret == -ENOMEM ? -ENOMEM : -EAGAIN;
 	/*
@@ -1288,14 +1248,8 @@ int ft_insert_dlm_acquire_split(struct cds_ft *ft,
 		for (i = 0; i < 3; i++)
 			if (set[i].nf && !set[i].held.shared)
 				ft_meta_lock_release(set[i].held.lock);
-#ifdef FT_DEBUG_LIVE_VALIDATE
-		ft_split_acq_note(set[2].nf != NULL, 2);
-#endif
 		return -EAGAIN;
 	}
-#ifdef FT_DEBUG_LIVE_VALIDATE
-	ft_split_acq_note(set[2].nf != NULL, 0);
-#endif
 
 	*held = set[0].held;
 	/*
@@ -8175,9 +8129,9 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			 * inv_concurrent_same_key_replace_nolist, 49966 of
 			 * 49974 aborts were attributed to the VALIDATE class
 			 * (100.0%).  Replace livelocked at this arm's ABORT
-			 * exit.  (-DFT_WINNER_DBG names the losing record's
-			 * class.  The retry cap now exit()s so its
-			 * destructor dump survives.)
+			 * exit.  (-DFT_WINNER_DBG, since removed, named the
+			 * losing record's class.  The retry cap now exit()s
+			 * so its destructor dump survives.)
 			 *
 			 * The predicate is the one
 			 * ft_flip_txn_lock_or_guard_parent_at already applies
@@ -8322,9 +8276,9 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			 * inv_concurrent_same_key_replace_nolist, 49966 of
 			 * 49974 aborts were attributed to the VALIDATE class
 			 * (100.0%).  Replace livelocked at this arm's ABORT
-			 * exit.  (-DFT_WINNER_DBG names the losing record's
-			 * class.  The retry cap now exit()s so its
-			 * destructor dump survives.)
+			 * exit.  (-DFT_WINNER_DBG, since removed, named the
+			 * losing record's class.  The retry cap now exit()s
+			 * so its destructor dump survives.)
 			 *
 			 * The predicate is the one
 			 * ft_flip_txn_lock_or_guard_parent_at already applies

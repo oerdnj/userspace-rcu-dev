@@ -6688,8 +6688,6 @@ int ft_detach_node(struct cds_ft *ft,
 					} else {
 						rcu_assign_pointer(*pub->head_parent_field,
 							pub->head_parent_new);
-						FT_WIN_NOTE_RAW(pub->head_parent_field,
-							pub->head_parent_new, 1);
 					}
 				}
 				/*

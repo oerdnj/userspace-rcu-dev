@@ -9472,191 +9472,6 @@ void ft_guard_unheld_abort(const char *what, const void *slot,
 				__builtin_return_address(0));		\
 	} while (0)
 
-#ifdef FT_DEBUG_MW_KEPT
-# ifndef FT_ABORT_ATTRIB
-#  error "-DFT_DEBUG_MW_KEPT needs -DFT_DEBUG_TXN_KIND and -DURCU_TXN_REC_DBG"
-# endif
-/*
- * THE CAS THAT REMAIN: every record that COMMITS as MW, by its FT class and by
- * the writer mode of the txn's trie.  These are what the SW engine
- * (<urcu/rcu-txn-sw.h>, no CAS) cannot carry.  They are counted at the commit.
- * By then every per-record gate and door 1 have decided the kind.  So a class
- * counter taken at record time (MW_ALWAYS) cannot mislead it.
- *
- *   fine-op     a fine trie, the op's own locks
- *   fine-wlock  a fine trie under the FT-wide writer lock (bulk windows)
- *   trie-wide   coarse or exclusive (door 1): expected to be all SW
- */
-enum { FT_MK_FINE_OP, FT_MK_FINE_WLOCK, FT_MK_TRIE_WIDE, FT_MK_NR };
-static unsigned long ft_mk_mw[FT_MK_NR][FT_AB_CLS_NR + 1];
-static unsigned long ft_mk_sw[FT_MK_NR], ft_mk_txn[FT_MK_NR];
-
-static inline
-void ft_mk_note(const struct ft_flip_txn *t, const struct cds_ft *ft)
-{
-	struct urcu_txn_desc *d = t->mtxn ? t->mtxn->e.desc : NULL;
-	unsigned int i, mode;
-
-	if (!d || d == URCU_TXN_ENOMEM || !d->nr)
-		return;
-	mode = (ft && ft->lock_fine && !ft->exclusive &&
-			ft_wlock_held == ft) ? FT_MK_FINE_WLOCK :
-		t->trie_wide_sw ? FT_MK_TRIE_WIDE : FT_MK_FINE_OP;
-	uatomic_inc(&ft_mk_txn[mode]);
-	for (i = 0; i < d->nr; i++) {
-		const struct urcu_txn_record *r = &d->recs[i];
-		unsigned int c;
-
-		if (r->kind != URCU_TXN_KIND_MW) {
-			uatomic_inc(&ft_mk_sw[mode]);
-			continue;
-		}
-		c = (r->dbg_embedder & FT_AB_MIXED) ? FT_AB_CLS_NR :
-			ft_ab_code_cls(r->dbg_embedder);
-		if (c > FT_AB_CLS_NR)
-			c = FT_AB_UNSET;
-		uatomic_inc(&ft_mk_mw[mode][c]);
-	}
-}
-
-static void ft_mk_report(void) __attribute__((destructor));
-static void ft_mk_report(void)
-{
-	static const char * const mn[FT_MK_NR] = {
-		"fine-op", "fine-wlock", "trie-wide" };
-	unsigned int m, c;
-
-	fprintf(stderr, "=== FT_DEBUG_MW_KEPT: records committed as MW (CAS) ===\n");
-	for (m = 0; m < FT_MK_NR; m++) {
-		unsigned long tot = 0;
-
-		for (c = 0; c <= FT_AB_CLS_NR; c++)
-			tot += ft_mk_mw[m][c];
-		fprintf(stderr, "  %-10s txns %10lu  SW %12lu  MW %12lu\n",
-			mn[m], ft_mk_txn[m], ft_mk_sw[m], tot);
-		for (c = 0; c <= FT_AB_CLS_NR; c++)
-			if (ft_mk_mw[m][c])
-				fprintf(stderr, "      %-18s %12lu\n",
-					c == FT_AB_CLS_NR ? "MIXED" :
-					ft_ab_cls_name(c), ft_mk_mw[m][c]);
-	}
-}
-# define FT_MK_NOTE(t, ft)	ft_mk_note((t), (ft))
-
-/*
- * WHO records them: a backtrace sampled where a record is decided MW.  The
- * sample takes the first 32 per thread and class, then 1 in 512.  Frames are
- * printed as module+offset, for addr2line -f -i against the module.  A class
- * says what a word is.  The producer says what to change.
- */
-#include <execinfo.h>
-#include <dlfcn.h>
-# define FT_MK_STACKS	512
-# define FT_MK_DEPTH	12
-struct ft_mk_stack {
-	unsigned int cls;
-	int depth;
-	unsigned long n;
-	void *pc[FT_MK_DEPTH];
-};
-static struct ft_mk_stack ft_mk_stacks[FT_MK_STACKS];
-static unsigned int ft_mk_nstacks;
-static unsigned long ft_mk_overflow;
-static pthread_mutex_t ft_mk_mutex = PTHREAD_MUTEX_INITIALIZER;
-static __thread unsigned long ft_mk_tcount[FT_AB_CLS_NR + 1];
-/*
- * Every record DECIDED MW, committed or not.  The SW engine cannot take an MW
- * record at all, not even into a txn that is later discarded.  So the
- * engine-agnostic flip txn needs this count at zero, not only the committed
- * one above.
- */
-static unsigned long ft_mk_rec_mw[FT_AB_CLS_NR + 1];
-
-static __attribute__((noinline))
-void ft_mk_sample(unsigned int cls)
-{
-	void *pc[FT_MK_DEPTH + 1];
-	int depth;
-	unsigned int i;
-
-	if (cls > FT_AB_CLS_NR)
-		cls = FT_AB_UNSET;
-	uatomic_inc(&ft_mk_rec_mw[cls]);
-	if (ft_mk_tcount[cls]++ >= 32 && (ft_mk_tcount[cls] & 511))
-		return;
-	depth = backtrace(pc, FT_MK_DEPTH + 1) - 1;
-	if (depth < 0)
-		depth = 0;
-	pthread_mutex_lock(&ft_mk_mutex);
-	for (i = 0; i < ft_mk_nstacks; i++) {
-		struct ft_mk_stack *st = &ft_mk_stacks[i];
-
-		if (st->cls == cls && st->depth == depth &&
-				!memcmp(st->pc, pc + 1, depth * sizeof(void *))) {
-			st->n++;
-			goto out;
-		}
-	}
-	if (ft_mk_nstacks < FT_MK_STACKS) {
-		struct ft_mk_stack *st = &ft_mk_stacks[ft_mk_nstacks++];
-
-		st->cls = cls;
-		st->depth = depth;
-		st->n = 1;
-		memcpy(st->pc, pc + 1, depth * sizeof(void *));
-	} else {
-		ft_mk_overflow++;
-	}
-out:
-	pthread_mutex_unlock(&ft_mk_mutex);
-}
-
-static void ft_mk_stack_report(void) __attribute__((destructor));
-static void ft_mk_stack_report(void)
-{
-	unsigned int i, j;
-
-	{
-		unsigned int c;
-
-		fprintf(stderr, "  records DECIDED MW at record time "
-			"(committed or not):\n");
-		for (c = 0; c <= FT_AB_CLS_NR; c++)
-			if (ft_mk_rec_mw[c])
-				fprintf(stderr, "      %-18s %12lu\n",
-					c == FT_AB_CLS_NR ? "MIXED" :
-					ft_ab_cls_name(c), ft_mk_rec_mw[c]);
-	}
-	fprintf(stderr, "  MW record stacks: %u (overflow %lu)\n",
-		ft_mk_nstacks, ft_mk_overflow);
-	for (i = 0; i < ft_mk_nstacks; i++) {
-		const struct ft_mk_stack *st = &ft_mk_stacks[i];
-
-		fprintf(stderr, "FT_MK_STACK n=%lu %s :", st->n,
-			st->cls == FT_AB_CLS_NR ? "MIXED" :
-			ft_ab_cls_name(st->cls));
-		for (j = 0; j < (unsigned int) st->depth; j++) {
-			Dl_info di;
-
-			if (dladdr(st->pc[j], &di) && di.dli_fname)
-				fprintf(stderr, " %s+%#lx",
-					strrchr(di.dli_fname, '/') ?
-					strrchr(di.dli_fname, '/') + 1 :
-					di.dli_fname,
-					(unsigned long) ((char *) st->pc[j] -
-						(char *) di.dli_fbase));
-			else
-				fprintf(stderr, " %p", st->pc[j]);
-		}
-		fprintf(stderr, "\n");
-	}
-}
-# define FT_MK_SAMPLE(cls)	ft_mk_sample(cls)
-#else
-# define FT_MK_NOTE(t, ft)	do { } while (0)
-# define FT_MK_SAMPLE(cls)	do { } while (0)
-#endif
-
 /*
  * Commit an FT flip-txn (ft_flip_txn_create*).  Commit @mtxn, then free the
  * handle.  The op recorded its edge set straight into @mtxn as it built.  @t is
@@ -9914,7 +9729,6 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 		ft_flip_txn_destroy(t);
 		return miss_st;
 	}
-	FT_AB_LOST_RESET();
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	bool sa_held[CAA_ARRAY_SIZE(t->sa_pend)];
 	uintptr_t sa_tstate[CAA_ARRAY_SIZE(t->sa_tpend)];
@@ -9976,7 +9790,6 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 		for (drop_i = 0; drop_i < t->nr_locks; drop_i++)
 			ft_hold_trace_drop(t->locks[drop_i].meta);
 	}
-	FT_MK_NOTE(t, ft);
 	/* The attempt ends here, if it has a record set to commit. */
 	if (ft_txn_live(t->mtxn))
 		ft_txn_learn_cost(t->mtxn);
@@ -10103,20 +9916,6 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 			(st == URCU_TXN_STATUS_MEMORY_ERROR ? FT_TK_MEMERR :
 				FT_TK_ABORT));
 	/*
-	 * WHICH RECORD LOST.  The engine stashed it on the way out of the commit
-	 * just above.  Read it HERE, where the txn's creation site is still in
-	 * hand.  The class can then be counted per site rather than globally.
-	 *
-	 * RESET before the commit, never after.  An ABORT that reached none of
-	 * the hooks would otherwise inherit the previous commit's loser and
-	 * read as attribution.  There is no such path today.  That is a claim
-	 * this asserts rather than assumes.
-	 */
-	if (caa_unlikely(st == URCU_TXN_STATUS_ABORT)) {
-		FT_AB_COUNT_LOST(t);
-		FT_AB_CLAIM_REPORT(t);
-	}
-	/*
 	 * node locks: a committed txn transitioned each registered node
 	 * through the terminal its op recorded:
 	 *   - {LOCK|s -> TOMBSTONE|s} (retire), or
@@ -10242,7 +10041,6 @@ void ft_flip_txn_park_excluded(struct ft_flip_txn *t, void **slot,
 
 	if (ft_flip_txn_record_is_noop(t, slot, old_ptr, new_ptr))
 		return;
-	FT_AB_ARM(FT_AB_SW, FT_AB_OWN_NA);
 	FT_LL_REC(t, slot, old_ptr, new_ptr, true);
 	ret = urcu_txn_store_sw(&t->mtxn->e, slot, old_ptr, new_ptr, tag);
 	assert(!ret);
@@ -10629,7 +10427,6 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 			abort();
 		}
 		FT_TK_COUNT_REC(t, FT_TK_SW);
-		FT_AB_ARM(FT_AB_SW, FT_AB_OWN_NA);
 #ifdef FT_DEBUG_TXN_KIND
 		/*
 		 * ☞ DOES THE TRIE-WIDE ARM ACTUALLY HAVE ITS EXCLUSION?
@@ -10760,7 +10557,6 @@ void __ft_flip_txn_record_tag_excluded(struct ft_flip_txn *t, void **slot,
 	ft_sa_rec_count(FT_TK_TXN_SITE(t), __builtin_return_address(0),
 		FT_SA_CALLER_PC(), FT_SA_RV_LANE, false);
 #endif
-	FT_AB_ARM(FT_AB_SW, FT_AB_OWN_NA);
 	/*
 	 * ☞ DOOR 1 COVERS THESE LANES TOO (Mathieu, doc §12.1): "in an
 	 * application-provided exclusion, we should be able to entirely remove
@@ -11038,7 +10834,6 @@ void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
 			 */
 			int ret;
 
-			FT_AB_ARM(FT_AB_SW, FT_AB_OWN_NA);
 			FT_LL_REC(t, slot, old_ptr, new_ptr, true);
 			ret = urcu_txn_store_sw(&t->mtxn->e, slot, old_ptr,
 				new_ptr, FT_FLIP_PROXY_TAG);
@@ -15198,7 +14993,6 @@ void ft_ord_cell_flip_one(struct ft_ord_cell_edge *edge)
 		(const void *) edge->old_target,
 		(const void *) edge->new_target);
 	rcu_assign_pointer(*edge->slot, edge->new_target);
-	FT_WIN_NOTE_RAW(edge->slot, edge->new_target, 0);
 }
 
 /*
@@ -22181,14 +21975,11 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 		 */
 		/*
 		 * A DECLARED FOLD: another walk of this txn may already carry a
-		 * delta on this ancestor, and this one chains onto it (see
-		 * FT_SS_FOLD_BEGIN).
+		 * delta on this ancestor, and this one chains onto it.
 		 */
-		FT_SS_FOLD_BEGIN();
 		ft_flip_txn_record_tag_excluded(t, (void **) &m->nr_keys,
 			(void *) old_raw, (void *) new_raw,
 			FT_NR_KEYS_PROXY_TAG);
-		FT_SS_FOLD_END();
 		cur = ft_parent_node(m->parent_word);
 	}
 }
@@ -24345,9 +24136,6 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
  * same-value write, safe before the commit.
  */
 static
-#ifdef FT_DEBUG_LIVE_VALIDATE
-__attribute__((noinline))	/* the re-home call site is the report's key */
-#endif
 void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_metadata *meta,
 		struct cds_ft_inode_flag *parent_nf,
@@ -24602,20 +24390,6 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 			&& !ft_flip_txn_owns(txn, meta)
 			&& !ft_flip_txn_excludes_all(txn, ft)
 			) {
-#ifdef FT_DEBUG_LIVE_VALIDATE
-		int lv_self = -1, lv_held = -1;
-# ifdef FT_DEBUG_STRUCT_ANCHOR
-		struct cds_ft_metadata *lv_a;
-
-		if (ft->lock_fine && !ft->exclusive &&
-				ft_sa_struct_anchor(ft, meta, &lv_a)) {
-			lv_self = lv_a == meta;
-			lv_held = ft_sa_witness(txn, hold_ctx, lv_a);
-		}
-# endif
-		ft_lv_note((void **) &meta->state, __builtin_return_address(0),
-			lv_self, lv_held);
-#endif
 		FT_GUARD_STOP("re-parent guard", &meta->state);
 	}
 	/*
@@ -26536,15 +26310,12 @@ void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
 			/*
 			 * A DECLARED FOLD.  An earlier step of this txn can
 			 * have re-homed the same child already (the COW sweep,
-			 * the detach).  This edge re-aims that record (see
-			 * FT_SS_FOLD_BEGIN).
+			 * the detach).  This edge re-aims that record.
 			 */
-			FT_SS_FOLD_BEGIN();
 			ft_reparent_record(ft, g->txn, g->deferred[i].child,
 				g->deferred[i].parent, g->deferred[i].slot,
 				g->deferred[i].held_lock, /*hold_ctx=*/ NULL,
 				/*check_child=*/ true);
-			FT_SS_FOLD_END();
 			continue;
 		}
 		ft_set_parent(ft, g->deferred[i].child, g->deferred[i].parent,
@@ -26792,15 +26563,12 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 			/*
 			 * A DECLARED FOLD.  An earlier step of this txn can
 			 * have re-homed the same child already (the COW sweep,
-			 * the detach).  This edge re-aims that record (see
-			 * FT_SS_FOLD_BEGIN).
+			 * the detach).  This edge re-aims that record.
 			 */
-			FT_SS_FOLD_BEGIN();
 			ft_reparent_record(ft, g->txn, g->deferred[i].child,
 				g->deferred[i].parent, g->deferred[i].slot,
 				g->deferred[i].held_lock, /*hold_ctx=*/ NULL,
 				/*check_child=*/ true);
-			FT_SS_FOLD_END();
 			continue;
 		}
 		ft_glue_record_back_edge(ft, g->txn, g->deferred[i].child,
@@ -26884,14 +26652,6 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	if (g->txn && g->txn->pending_pub_folded &&
 			g->publish_slot == g->txn->pending_pub_slot)
 		goto publish_done;
-	/*
-	 * ☠ THE PAIRING, not the pointer.  This publish names @publish_parent as
-	 * the OWNER of @publish_slot.  The record-time owner check asks only
-	 * whether the op HOLDS that node.  It never asks whether that node
-	 * OWNS the word.  ft_slot_in_node is the pairing test its own header
-	 * was written for.  It is asked here only to be COUNTED.
-	 */
-	FT_AB_COUNT_PUB_PAIR(ft_slot_in_node(g->publish_parent, g->publish_slot));
 	/*
 	 * @dual_owner_held false.  This function makes no statement of its
 	 * own exclusion over the SKIP_X dual's grandparent, and a shared
