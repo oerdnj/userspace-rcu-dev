@@ -11189,8 +11189,9 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			 * The DERIVATION both arms below freeze against, taken
 			 * once.  ft_hlist_freeze_chain_prepare treats it as a
 			 * BOUND.  So a duplicate appended since is not this
-			 * op's to retire.  It tears the derived tail's NULL
-			 * instead.
+			 * op's to retire.  Each freeze below first checks the
+			 * plan under the holder's lock
+			 * (ft_hlist_chain_plan_ok), and a stale one retries.
 			 */
 			unsigned int nr_frozen = ft_hlist_chain_len(chain_head);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
@@ -11542,8 +11543,9 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		 *
 		 * @nr_frozen is the DERIVATION.  ft_hlist_freeze_chain_prepare
 		 * treats it as a BOUND, not a hint.  A duplicate appended since
-		 * is not this op's to retire.  Tearing the derived tail's NULL
-		 * aborts the commit, so the retry re-derives the longer chain.
+		 * is not this op's to retire.  ft_detach_node's freeze arms
+		 * check the plan under the holder's lock, so a stale one
+		 * retries and re-derives the longer chain.
 		 */
 		unsigned int nr_frozen = ft_hlist_chain_len(chain_head);
 

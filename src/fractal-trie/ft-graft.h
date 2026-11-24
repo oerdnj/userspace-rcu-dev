@@ -1560,8 +1560,11 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 			 */
 			/*
 			 * VALIDATE (§4.B): guard the LIVE grandparent this
-			 * relocation republishes into.  A concurrent freeze
-			 * of it aborts the commit.
+			 * relocation republishes into.  Only a coarse trie
+			 * calls it.  It records nothing: the FT-wide lock
+			 * excludes every other writer.  It calls abort() (FT
+			 * GUARD UNHELD) if this txn itself retired that
+			 * grandparent.
 			 *
 			 * LOCK_FINE (§9.3, step 6): the recompact acquired
 			 * this SAME word (its P) earlier in this same
@@ -1593,12 +1596,14 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 			 * &ft->root.  A peer's root-level graft parks a
 			 * proxy in that word.
 			 *
-			 * A raw load then records that descriptor POINTER as
-			 * the expected-old.  urcu_txn_settle stores it back
-			 * blind on a matching commit.  Nothing ever clears
-			 * it there, because its owning transaction decided
-			 * and settled long before.  So every later acquire
-			 * of that word bails forever.
+			 * Under the MCAS engine, a raw load then recorded
+			 * that descriptor POINTER as the expected-old.
+			 * urcu_txn_settle stored it back blind on a matching
+			 * commit.  Nothing ever cleared it there, because its
+			 * owning transaction decided and settled long before.
+			 * So every later acquire of that word bailed forever.
+			 * The txn load also returns this txn's own pending
+			 * value, which a raw load would miss.
 			 *
 			 * This was reached by a KEYED graft racing a ROOT
 			 * graft into one destination:
@@ -4332,9 +4337,10 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * to re-root into @swap_ft.
 		 *
 		 * It becomes the forward publish's expected-old
-		 * (ft_glue_set_publish_old).  So if a peer swaps the graft
-		 * point out from under this attempt, the commit ABORTS.  It
-		 * does not ratify a world this op never saw.
+		 * (ft_glue_set_publish_old).  graft_swap holds @dst_ft's
+		 * FT-wide lock from the descent to the commit, so no peer can
+		 * swap the graft point in between.  (Under the MCAS engine
+		 * such a swap made the commit abort.)
 		 *
 		 * Raw, not @d.nf: the descent RESOLVES a skip-compressed
 		 * occupant, and the expected-old is compared against the slot.

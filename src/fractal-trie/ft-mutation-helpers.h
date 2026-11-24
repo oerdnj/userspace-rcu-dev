@@ -276,9 +276,11 @@ struct ft_descent {
 	 * rewind > 0: a peer chain-merge moved the encoded position up.  The
 	 * captured publish slot @nfp is then at the wrong level.
 	 *
-	 * A mutating caller must re-descend against the now-current tree.  A
-	 * caller that ignores the flag still navigates a LIVE node (no torn
-	 * read), and its txn commit aborts any incoherent publish.
+	 * A mutating caller must re-descend against the now-current tree.  The
+	 * insert, graft, merge and rekey descents all do.  A caller that
+	 * ignored the flag would still navigate a LIVE node (no torn read).
+	 * But its commit would not catch an incoherent publish: the
+	 * single-writer engine stores every record blind.
 	 *
 	 * Set only, never cleared mid-descent.  The first mutator that
 	 * observes it bails.
@@ -4660,9 +4662,10 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 /*
  * THE ACQUIRE LANE, and why it is a SEPARATE CONSTRUCTOR, not a content txn
  * used differently.  The lock take {clean -> LOCK|s} IS the point that
- * decides between two ops racing for a node.  An MW record installs with a
- * CAS-old, so the loser's commit aborts.  An SW park cannot fail, so an SW
- * take would hand BOTH ops the node.  So this txn names no trie and can
+ * decides between two ops racing for a node.  The take is FT's own cmpxchg
+ * (ft_dlm_lock_now), so the loser's take fails and it retries.  A recorded
+ * take could not arbitrate: the single-writer engine stores every record
+ * blind, so it would hand BOTH ops the node.  So this txn names no trie and can
  * never be armed.  ft_dlm_lock's assert(!t->structural_sw) then catches a
  * miscategorised site loudly.  Without it such a site would silently produce
  * two lock owners.
@@ -6970,19 +6973,13 @@ int ft_meta_lock_acquire(struct cds_ft_metadata *meta,
  * FT_STATE_LOCK, RELEASE side: drop ONLY the reversible lock bit and preserve
  * every other field.  The node stays LIVE.  This runs in two cases:
  *   - the copy was abandoned (pre-commit bail);
- *   - its commit aborted.  The engine then settled the state record back to
- *     its old value, LOCK included.
+ *   - its commit did not land.  ft_flip_txn_commit returned ABORT because a
+ *     lock-set member was not acquired, and nothing was parked.
  *
- * The word may transiently hold a peer's parked proxy.  That proxy is one of:
- *   - a doomed guard mid-install.  It validates clean-LIVE and the fence is
- *     still set;
- *   - a peer write that will mismatch the fence-pinned value.
- * So wait for the owner to settle, then CAS.
- *
- * The owner's settle bounds the wait, and only the owner can settle.  Helping
- * a foreign txn drives it terminal but cannot make its word plain.  So a
- * helping read would not shorten the wait.  This is part of why the
- * engine-side "F2 3/3" was dropped.
+ * This op holds the word, and every writer of a state word takes its lock
+ * first.  So no peer commit can have a proxy parked on it.  The loop still
+ * waits out a parked proxy before its CAS, as a defence.  (Under the MCAS
+ * engine the word could hold a doomed guard or a peer write mid-install.)
  *
  * A writer thread dying mid-install would wedge this loop.  But a writer dying
  * mid-mutation is already fatal to the trie under the library's contract.
@@ -7825,8 +7822,9 @@ bool ft_flip_txn_excludes_all(const struct ft_flip_txn *t,
  * takes the LOCK bit without being excluded by @meta's lock.  A park would
  * erase that bit.
  *
- * A miss makes the record MW.  The live value is its expected old, so a peer
- * holding the word fails the install and the op re-derives.
+ * A miss sends the record to ft_flip_txn_record_tag_excluded.  That lane
+ * records only on a trie that excludes writers, and calls abort() otherwise
+ * (FT LANE MW).
  */
 static inline
 bool ft_flip_txn_owns_state_word(const struct ft_flip_txn *t,
@@ -11855,9 +11853,9 @@ void ft_flip_txn_record_pub_rec(struct ft_flip_txn *t,
  *
  *   1. TAKE the lock protecting the node  {clean -> LOCK|s}          -- MW.
  *      THE ARBITRATION POINT.  Two ops racing for the node are decided here
- *      and nowhere else.  An MW record installs with a CAS-old, so the
- *      loser's commit aborts.  An SW park cannot fail, so an SW take would
- *      hand BOTH ops the node.  This is why ft_dlm_lock asserts
+ *      and nowhere else.  The take is FT's own cmpxchg (ft_dlm_lock_now),
+ *      so the loser's take fails.  A recorded take would be stored blind,
+ *      and would hand BOTH ops the node.  This is why ft_dlm_lock asserts
  *      !structural_sw.
  *   2. SET THE TOMBSTONE  {LOCK|s -> TOMBSTONE|s}                    -- SW.
  *      Legitimate BECAUSE step 1 already won the word.  Re-validating here
@@ -11987,9 +11985,9 @@ void ft_flip_txn_record_state_kind(struct ft_flip_txn *t,
  * @snap, exactly as the incremental scheme does today.  The terminal is a
  * release {LOCK|snap -> snap} or a retire {-> TOMBSTONE|snap}.
  *
- * This is deadlock-free.  A dirty or held member, or a re-homed guarded
- * back-edge, aborts the commit.  The commit never blocks.  On failure
- * NOTHING is acquired (all-or-none -> abort-and-regrow).
+ * This is deadlock-free.  The take fails on a dirty or held member, or on a
+ * re-homed guarded back-edge.  It never blocks.  On failure NOTHING is
+ * acquired (all-or-none -> abort-and-regrow).
  */
 
 
@@ -14189,12 +14187,15 @@ uintptr_t ft_edge_tag(const struct ft_ord_cell_edge *edge)
  * that.  It leaves ONE WORD CARRYING TWO WRITER DISCIPLINES:
  *
  *   SW commit  uatomic_store(slot, new, CMM_RELEASE)   -- validates NOTHING
- *   MW commit  uatomic_cmpxchg(slot, old, new)
+ *   MW commit  uatomic_cmpxchg(slot, old, new)          (MCAS)
  *
- * and settle "stores old_ptr (abort) or new_ptr (commit) BLIND"
- * (urcu_txn_add's header).  Writer X HOLDS the anchor: it parks SW and stores
- * unconditionally.  Writer Y does NOT hold it: it CASes.  They run
- * concurrently PRECISELY BECAUSE Y never took the lock X holds.
+ * Under the MCAS engine, settle "stores old_ptr (abort) or new_ptr (commit)
+ * BLIND" (urcu_txn_add's header).  Writer X HOLDS the anchor: it parks SW
+ * and stores unconditionally.  Writer Y does NOT hold it: it CASes.  They
+ * run concurrently PRECISELY BECAUSE Y never took the lock X holds.  The
+ * single-writer engine has no MW record, so writer Y no longer exists: a
+ * cell word recorded without its lock calls abort() (FT CELL UNHELD in
+ * ft_cell_edge_owner).
  *
  *   writer X (holds the anchor)       writer Y (does not hold it)
  *                                     CAS succeeds
@@ -15097,8 +15098,8 @@ unsigned int ft_ord_sentinel_edges(struct cds_ft *ft,
  * are stable through the commit.  "@dst_ft is empty" is then still true at the
  * linearization point, not merely true when it was sampled.  The caller
  * records the FENCED tombstone (ft_flip_txn_record_tombstone_locked,
- * expected-old @snap|LOCK).  So any state change that did slip under the fence
- * aborts the commit instead of being ratified.  ft_root_list_swap_publish's
+ * expected-old @snap|LOCK).  The fence is what keeps a state change out: the
+ * single-writer engine stores the tombstone blind.  ft_root_list_swap_publish's
  * infallible commit has always assumed that exclusion; the fence restores it.
  *
  * @external_nodes is checked but NOT covered by the fence: no retire validates
@@ -18217,11 +18218,13 @@ void ft_flip_txn_hold_or_lock_parent_at(const char *fn, int line,
  *  2. the parker's old_ptr/new_ptr were derived before the mark existed;
  *  3. urcu_txn_park writes its proxy with a blind uatomic_store;
  *  4. the settle republishes a successor with the tombstone erased.
- * Under MW the install CAS rejects that.  An SW park cannot fail.
+ * Under the MCAS engine, an MW record's install CAS rejected that.  The
+ * single-writer engine stores every record blind.
  *
- * The lone SW edge is different again, and is fine.  rcu-txn-mcas.h commits
- * it as a single plain release store with no proxy window at all.  So this
- * CAS either precedes or follows it, and its own expected-old arbitrates.
+ * The lone edge is different again, and is fine.  The single-writer engine
+ * commits it as a single plain release store with no proxy window at all.
+ * So this CAS either precedes or follows it, and its own expected-old
+ * arbitrates.
  *
  * ☞ Measured unreachable, which is why the flip is not blocked on it today.
  * -DFT_DEBUG_CHAIN_CANARY scores this producer at raw = 0 in ft_inv and
@@ -18912,15 +18915,19 @@ void ft_flip_txn_guard_installed_child(struct cds_ft *ft, struct ft_flip_txn *t,
 	 * beside that record.  The guard is always-MW by design.  The record
 	 * it lands beside is SW on an armed txn.
 	 *
-	 * One slot, two kinds:
-	 *  - --enable-rcu-debug aborts at urcu_txn_record_chain's
+	 * Under the MCAS engine that put one slot under two kinds:
+	 *  - --enable-rcu-debug aborted at urcu_txn_record_chain's
 	 *    `r->kind == kind`.
-	 *  - A release build takes the MW-domination fail-safe, which turns
-	 *    the park into a CAS whose expected-old cannot match.  The
-	 *    commit aborts, the op re-descends, and the next attempt is
+	 *  - A release build took the MW-domination fail-safe, which turned
+	 *    the park into a CAS whose expected-old could not match.  The
+	 *    commit aborted, the op re-descended, and the next attempt was
 	 *    identical.
+	 * The single-writer engine has no kinds.  A guard that masks the lock
+	 * out would chain onto the record with a mismatched old, which
+	 * urcu_txn_sw_record_chain() asserts in a DEBUG_RCU build.
 	 *
-	 * Measured: ft_unit test_rekey_collapse_one_slot_two_kinds at
+	 * Measured under the MCAS engine: ft_unit
+	 * test_rekey_collapse_one_slot_two_kinds at
 	 * CDS_FT_LOCK_SPACING_ROOT_ONLY spun 50,001 attempts on one move
 	 * (-DFT_DEBUG_REKEY_RETRY_CAP), with a final ret of -EAGAIN.  It
 	 * aborted on that engine assert under --enable-rcu-debug.  The SW
@@ -20033,10 +20040,15 @@ int ft_remove_one_commit(struct cds_ft *ft,
 		 * insert can have appended a duplicate since that unheld
 		 * derivation.  Re-loading would mark the duplicate into the
 		 * tombstone and prune the branch around it: an OK insert
-		 * whose key never resolves again.  Against NULL, the append
-		 * fails this MW edge's install CAS: ABORT.  The caller routes
-		 * that to a re-derivation that promotes the successor
-		 * instead.  See ft_hlist_freeze_sole_prepare.
+		 * whose key never resolves again.
+		 *
+		 * Not held, the edge joins @edges[] with no owner.  Both
+		 * replays record it only on a trie that excludes writers.
+		 * Otherwise they call abort(): ft_ord_cell_flip_into through
+		 * ft_flip_txn_record_unheld_edge (FT EDGE UNHELD), and
+		 * ft_ord_cell_record_into_ft through
+		 * ft_flip_txn_record_tag_excluded (FT LANE MW).  So on a fine
+		 * shared trie only the held arm below runs.
 		 *
 		 * ☞ HELD, THE CHECK MOVES UNDER THE LOCK AND THE EDGE PARKS.
 		 * The chain is protected by its HOLDER's lock.  The holder is
@@ -20046,8 +20058,8 @@ int ft_remove_one_commit(struct cds_ft *ft,
 		 * append can land from here to the commit.  An append that
 		 * landed between the unheld derivation and the take is caught
 		 * by re-reading @next under the lock.  Anything but NULL
-		 * retries, exactly as the MW install's ABORT did.  The edge
-		 * is then an SW record owned by the holder.
+		 * retries.  The edge is then an SW record owned by the
+		 * holder.
 		 *
 		 * MEASURED before (FT_DEBUG_MW_KEPT, ft_inv MW): the largest
 		 * producer of committed CAS left on fine tries (39%).
@@ -20108,10 +20120,12 @@ freeze_done:
 			 * this, and the remove did not.  A raw @old carries
 			 * FT_STATE_TOMBSTONE when a peer has already retired
 			 * this node.  The expected-old then MATCHES a dead
-			 * holder, and the decrement commits on it.  Masking
-			 * the bit out makes the install CAS mismatch instead.
-			 * That aborts the commit and sends the op back to
-			 * re-derive against the live copy.
+			 * holder, and the decrement commits on it.  Under the
+			 * single-writer engine nothing compares that value.
+			 * The mask now only keeps the record's old equal to the
+			 * live word: on the held arm no peer can set the
+			 * tombstone, and the not-held arm records only on a
+			 * trie that excludes writers (see below).
 			 *
 			 * The recompacting delete never needed it: ft_dlm_lock
 			 * refuses PROXY|TOMBSTONE|LOCK outright.  The §4.B
@@ -20170,9 +20184,11 @@ freeze_done:
 			 * edge (FT_FLIP_PROXY_TAG) carries a meaningful
 			 * owner.
 			 *
-			 * Not held: the ordinary in-place delete, whose
-			 * holder is self-guarded by this very CAS.  It stays
-			 * MW, as before.
+			 * Not held: the record goes through
+			 * ft_flip_txn_record_tag_excluded.  That lane records
+			 * only on a trie that excludes writers (coarse,
+			 * exclusive, or under the FT-wide lock), and calls
+			 * abort() otherwise (FT LANE MW).
 			 * ☞ RECORDED HERE, NOT THROUGH @edges[].  Both edge
 			 * replays record a non-structural tag MW under the
 			 * CELL class.  This state word shares bit 0 with a
@@ -22309,9 +22325,11 @@ struct ft_glue_free_item {
 	 * fuses to the single {LOCK|s -> TOMBSTONE|s}.  Coarsening splits the
 	 * two: @node takes the TOMBSTONE while the anchor takes a RELEASE.
 	 *
-	 * Recording the fenced terminal against the NODE alone names a LOCK
-	 * the node does not carry.  The install mismatches, the commit aborts,
-	 * and the merge reports OK on top of it.
+	 * Recording the fenced terminal against the NODE alone would name a
+	 * LOCK the node does not carry.  The single-writer engine would store
+	 * the tombstone blind and never release the anchor's lock.  (Under the
+	 * MCAS engine the install mismatched, the commit aborted, and the merge
+	 * reported OK on top of it.)
 	 *
 	 * @holder_shared: the op ALREADY held that word.  So this entry owes
 	 * no release: the acquire that first took the word recorded one.
@@ -26993,10 +27011,10 @@ enum urcu_txn_status ft_glue_txn_commit_replace(struct cds_ft *ft,
 		}
 	}
 	/*
-	 * Return the commit status.  Under the FT-wide lock the replace is
-	 * failure-free, and the caller ignores the status.  With the lock
-	 * dropped (FT-wide-lock drop), a peer relocating the contended dst
-	 * parent aborts the commit.  cds_ft_graft_swap re-descends on it.
+	 * Return the commit status.  cds_ft_graft_swap holds the FT-wide lock
+	 * here, so the replace is failure-free and the caller ignores the
+	 * status.  It drops that lock only at a grace-period seam between two
+	 * commits (ft_writer_lock_gp_wait).
 	 */
 	cst = ft_glue_txn_commit_edges(ft, g, cedges, n);
 	/* Arm only when the edges took effect (see ft_glue_txn_commit). */

@@ -764,17 +764,19 @@ int ft_op_in_lane(void)
  */
 struct ft_ord_cell {
 	/*
-	 * ☞ THE ONE FAMILY WHOSE MW IS ARGUED, NOT ASSERTED (register note 6):
-	 * @lnode's two links have NO owning node lock at per-node OR exponential
-	 * spacing, because a splice rewrites the cells of the NEIGHBOURING KEYS,
-	 * whose holders this op never acquires.  MW by design, at every spacing;
-	 * only a root-only lock-set or the FT-wide bulk gate would cover them.
+	 * ☞ @lnode's two links are locked by the CELL that owns the word, not
+	 * by a trie node (ft_cell_word_lock): the owning cell's own lock, or
+	 * the sentinel's begin or end lock.  A splice takes the neighbouring
+	 * cells' locks (ft_cell_lockset_take).  A cell word recorded without
+	 * its lock calls abort() (FT CELL UNHELD in ft_cell_edge_owner).
 	 * The deletion MARK on a retired cell's next is load-bearing.  A peer
-	 * splice that captured that dead cell as pred/succ fails on this mark.
+	 * splice that captured that dead cell as pred/succ re-checks the mark
+	 * under the cell locks, and retries.
 	 * ☠ Feed expected-olds through the txn handle, not through
-	 * ft_ord_cell_resolve_ord.  An optimistic read of a slot this txn also
-	 * WRITES is a doomed install under contention.  It causes aborts, not
-	 * corruption.
+	 * ft_ord_cell_resolve_ord.  This txn may already write the slot, and
+	 * only the handle returns that pending value.  The single-writer
+	 * engine checks no expected-old: readers would see a stale one until
+	 * the commit.
 	 *
 	 * @parent, by contrast, HAS a single owner: the holder P.  It is MW
 	 * only by debt.  It is also still written raw on ft_set_parent's path.

@@ -412,13 +412,11 @@ void ft_park_live_parent_edge(struct cds_ft *ft,
 	 */
 	/*
 	 * ☠ THE EXPECTED-OLD IS READ THROUGH THE TXN, NEVER RAW.  @field is a
-	 * TRANSACTED word: a concurrent op can have a transient proxy parked
-	 * in it.  A raw `*field` then hands that descriptor POINTER to the
-	 * engine as the expected-old.  A debug build traps on it in
-	 * urcu_txn_add ("Debug builds still trap, to name the raw read").
-	 * Any other build silently records a value no reader ever sees.
-	 * ft_record_child_back_edge reads the same class of word the same
-	 * way.
+	 * TRANSACTED word, and this txn may already hold a pending value for
+	 * it.  A raw read would miss that value.  (Under the MCAS engine a
+	 * raw read could also hand a peer's parked proxy to urcu_txn_add as
+	 * the expected-old.)  ft_record_child_back_edge reads the same class
+	 * of word the same way.
 	 */
 	/*
 	 * @slot settles the head's shape (ft_head_parent_word_slot):
@@ -982,7 +980,8 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 	/*
 	 * @expected_old: the plan-snapshot value of *slot (the old subtree
 	 * this divergence replaces).  The caller captures it BEFORE its
-	 * build, so that the commit CAS rejects a peer that raced the slot.
+	 * build.  The single-writer engine stores it blind, so the caller
+	 * must hold the slot's owner and re-check the slot under that lock.
 	 * See ft_pub_rec_add.
 	 */
 
@@ -1925,8 +1924,8 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 * re-homed parent P2 while @parent_slot still indexes the old parent
 	 * P1.  ft_set_parent would then invert (P2, @parent_slot) and fault
 	 * ft_slot_to_byte with an out-of-range rank against P2's bitmap.
-	 * One snapshot keeps the pair consistent.  A re-home that lands
-	 * AFTER it is caught by the commit CAS.
+	 * One snapshot keeps the pair consistent.  It is taken under the
+	 * lock set, so no re-home can land after it.
 	 */
 	if (ft_resolve_parent_slot(cn_meta, ft, &cur_parent) != parent_slot) {
 		ft_free_unpublished_split_cluster(ft, created, nr_created);
@@ -2508,9 +2507,9 @@ int ft_attach_node(struct cds_ft *ft,
 	 *    too routes to retry.
 	 * Bail to the from-root restart_attempt rather than build against a
 	 * stale slot.  Nothing is armed or built yet (nr_created_nodes == 0),
-	 * so check_error is a clean unwind.  The commit's forward-CAS + parent
-	 * guard would surface the same conflict as ABORT.  Failing fast here
-	 * just skips a doomed build.  No-op under retained exclusion.
+	 * so check_error is a clean unwind.  This check is unheld, so it only
+	 * fails fast.  The publish re-checks the slot under its owner's lock.
+	 * No-op under retained exclusion.
 	 */
 	if ((old_node_flag_ptr && ft_node_ptr_raw(*old_node_flag_ptr) && !external_nodes) ||
 			(attach_node_flag_ptr && ft_node_ptr_raw(*attach_node_flag_ptr) !=
@@ -5166,9 +5165,10 @@ unsigned int ft_insert_replace_leaf_sedges(struct cds_ft *ft,
 			 * would POISON the descriptor and its own retry loop
 			 * would absorb it.  So the arm reads green and is
 			 * wrong.  Resolved, each value is the word before or
-			 * after that peer's commit, never a descriptor.  A
-			 * STALE-but-valid one simply fails this MW edge's
-			 * install CAS.  That is an ABORT, and the retry loop
+			 * after that peer's commit, never a descriptor.  An
+			 * edge whose owner the op does not hold goes through
+			 * ft_flip_txn_record_unheld_edge: a STALE one dooms
+			 * the txn (@acquire_miss) and the retry loop
 			 * re-derives from it.  cds_ft_remove's cell capture
 			 * and ft_graft's publish slot follow the same
 			 * discipline.

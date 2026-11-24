@@ -1983,8 +1983,8 @@ bool ft_rekey_fold_shape_ok(struct cds_ft *ft,
  *     single-child premise ON the marked snapshot;
  *   - ft_detach_freeze_orphans records the fenced {LOCK|s -> TOMBSTONE|s}
  *     terminal from that snapshot.
- * So a peer that GREW one of the nodes between the plan and the commit tears
- * the expected-old, and this commit aborts clean.
+ * The snapshot is taken under each node's lock, which the op holds until
+ * after the commit.  So no peer can grow one of the nodes in between.
  *
  * @steps is the length the gate's own climb measured.  The walk must produce
  * exactly that length and end on @top.  A re-derivation that disagrees means

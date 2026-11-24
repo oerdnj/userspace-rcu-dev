@@ -1474,10 +1474,10 @@ unsigned int ft_hlist_chain_len_at(struct cds_ft_node *head)
  *
  * ☠ VALIDATE EXACTLY WHAT THE WALK WILL RECORD, which is why the tail is
  * compared against a BARE NULL and not against ft_hlist_unmark(raw): the walk
- * records {NULL -> MARK(NULL)} there, so an already-marked tail fails that CAS
- * today.  Answering false here reproduces that outcome through the caller's
- * retry instead of through an abort -- same decision, made before any
- * structural work rather than after it.
+ * records {NULL -> MARK(NULL)} there.  Under the MCAS engine an already-marked
+ * tail failed that CAS.  Under the single-writer engine nothing would check
+ * it, so answering false here is the only refusal, made before any
+ * structural work.
  *
  * A SHORTER chain matters too.  The freeze walk stops at NULL (`i < len &&
  * head`).  So a chain that lost members since the count would silently
@@ -1566,9 +1566,13 @@ bool ft_hlist_chain_plan_ok(const struct cds_ft *ft, struct ft_txn *txn,
  * one for its derived NULL.  The derivation is made with NOTHING HELD.  So a
  * same-key cds_ft_insert can APPEND a duplicate before this commit.  Under
  * LOCK_FINE such an insert is concurrent with a remove in contract.
- * Stopping at @len records the derived tail against NULL, so that append
- * fails this commit's install CAS and the whole detach ABORTS, and the
- * caller re-derives and finds the longer chain.
+ * Stopping at @len records the derived tail against NULL.  Under the MCAS
+ * engine that append then failed the install CAS and the whole detach
+ * aborted.  The single-writer engine stores the record blind, so the caller
+ * must refuse a stale plan itself, under the holder's lock, with
+ * ft_hlist_chain_plan_ok.  The bulk fold in
+ * ft_detach_node_replace_compressed_parent does not check: it runs under
+ * the FT-wide writer lock.
  *
  * RE-LOADING THE TAIL INSTEAD WOULD LOSE THE KEY.  A fresh load would find the
  * appended node.  It would mark it into the tombstone with the rest and
@@ -1628,15 +1632,15 @@ void ft_hlist_freeze_chain_prepare_at(const struct cds_ft *ft,
 			 * ft_hlist_chain_len counts it as the end of the chain,
 			 * because ft_hlist_resolve unmarks.  On that tail this
 			 * records {NULL -> MARK(NULL)} against a word already
-			 * holding MARK(NULL).  Under MW that CAS merely fails
-			 * and the op retries -- which is why it has been
-			 * invisible.  ☠ Under
-			 * SW the record PARKS and its abort writes @old_ptr back
-			 * BLIND, UNMARKING a node a peer froze.  This was
-			 * MEASURED once the appended-duplicate race was closed.
-			 * It is the entire residual tail-disagreement
-			 * population: 11,425 / 10,772 / 12,722 per ft_inv leg
-			 * at the three spacings.
+			 * holding MARK(NULL).  Under the MCAS engine an MW
+			 * record's CAS merely failed there, and an SW
+			 * record's abort wrote @old_ptr back BLIND,
+			 * UNMARKING a node a peer froze.  This was MEASURED
+			 * once the appended-duplicate race was closed.  It
+			 * was the entire residual tail-disagreement
+			 * population: 11,425 / 10,772 / 12,722 per ft_inv
+			 * leg at the three spacings.  The skip below avoids
+			 * recording it.
 			 *
 			 * ft_hlist_chain_plan_ok has just proved unmark(word) is
 			 * NULL.  So this load can only answer NULL or

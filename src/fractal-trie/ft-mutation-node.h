@@ -2458,19 +2458,18 @@ int ft_node_recompact(enum ft_recompact mode,
 			if (old_node_flag) {
 				/*
 				 * Live retire: RESOLVE this source slot to a
-				 * definite child by aging priority (help a peer
-				 * child-recompact forward, evict a lower-priority
-				 * one) instead of copying its parked flip proxy --
-				 * an embedded copy would dangle into the peer's
-				 * reclaimed descriptor after its grace period (a
-				 * permanent wild edge, and the reparent sweep would
-				 * skip the proxy child, orphaning its back-pointer)
-				 * -- and instead of bailing, which livelocks under
-				 * a stream of peer latches.  The slot is frozen as a
-				 * COPY_SLOT in the reparent sweep below (read-set
-				 * src == resolved catches a later republish).  DEL
-				 * skips the to-remove slot by IDENTITY: a resolved-
-				 * value compare would miss a peer recompacting the
+				 * definite child (ft_flip_txn_resolve_prio).
+				 * Never copy a parked flip proxy: the copy
+				 * would dangle into reclaimed memory after its
+				 * grace period, and the reparent sweep would
+				 * skip the proxy child.  The op holds this
+				 * node's lock, so no peer proxy can be parked
+				 * here.  (Under
+				 * the MCAS engine the resolve helped a peer
+				 * forward by aging priority, and the read set
+				 * caught a later republish.)  DEL skips the
+				 * to-remove slot by IDENTITY: a resolved-value
+				 * compare would miss a peer recompacting the
 				 * target out from under us.
 				 */
 				struct cds_ft_inode_flag **src_slot;
@@ -2670,9 +2669,9 @@ int ft_node_recompact(enum ft_recompact mode,
 			if (old_node_flag) {
 				/*
 				 * Live retire: resolve this source slot to a
-				 * definite child by aging priority + freeze it as a
-				 * COPY_SLOT below; DEL skips the to-remove slot by
-				 * identity.  See the popcount loop for the rationale.
+				 * definite child.  DEL skips the to-remove
+				 * slot by identity.  See the popcount loop for
+				 * the rationale.
 				 */
 				struct cds_ft_inode_flag **src_slot;
 				void *resolved;
@@ -3878,10 +3877,9 @@ skip_copy:
 	 * P is compressed) are EDITED, not retired.  So their locks resolve
 	 * through the other terminal: {LOCK|s -> s}, dropped atomically with
 	 * the publish that flips their slots.  Expected old is each member's
-	 * MARK snapshot.  So a peer state change on a locked node between the
-	 * mark and the commit aborts this recompact.  It does not commit a
-	 * plan derived from a world that moved.  The retire half carries the
-	 * same contract.
+	 * MARK snapshot.  The op holds each member's lock from the mark to the
+	 * commit, so no peer state change can land in between.  The retire
+	 * half carries the same contract.
 	 *
 	 * Registering them hands the unlock to @retire_txn exactly like the
 	 * retire half:
