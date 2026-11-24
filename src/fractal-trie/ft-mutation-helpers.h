@@ -904,14 +904,8 @@ extern unsigned long cds_ft_probe_promote_guarded;
  *  - the dry-run claim beside it (ft_flip_txn_claim_per_op).
  * So the assert covers exactly the txns whose promise is per-word.
  *
- * ⇒ IT THEREFORE HAS NO COVERAGE UNTIL THE FIRST SITE ARMS.  The counter
- * beside it gives it coverage NOW (FT_TK_OWN_HELD / FT_TK_OWN_MISS,
- * ft-txn-kind-stats.h).  The counter runs the SAME predicate on every
- * SW-capable record, whatever the mode.  Read it as follows:
- *  - a site whose records are 100% owner-held under FINE is a site the arm
- *    can convert;
- *  - a site below that has named the exclusion gap it must close first.
- * ([[feedback_an_assert_config_that_never_fires_is_not_coverage]])
+ * An unarmed record that the op does not hold never reaches the assert.  The
+ * recorder aborts on it instead (ft_flip_txn_struct_mw_abort).
  *
  * @owner NULL means "no node owns this word".
  *  - For a TRIE ROOT that is the true answer.  The always-MW
@@ -1033,8 +1027,8 @@ bool ft_owner_ctx_holds(const struct ft_lock_ctx *ctx,
 #endif
 
 /*
- * THE TWO WAYS A SITE HAS NO OWNER TO NAME.  Both are NULL.  So both count
- * OWN_MISS and both refuse a per-op SW park.  But they are different findings.
+ * THE TWO WAYS A SITE HAS NO OWNER TO NAME.  Both are NULL.  So both refuse
+ * a per-op SW park.  But they are different findings.
  * Separate names make each one a GREPPABLE INVENTORY.  A bare NULL would read
  * as an oversight.
  *
@@ -4149,8 +4143,8 @@ void ft_flip_txn_set_structural_sw(struct ft_flip_txn *t, bool v);
  * ☠ THE PARK IS UNFAILABLE.  A WRONGLY armed txn does not abort: it silently
  * erases whatever a peer left in the slot.  So every widening of this
  * predicate owes a positive control: the mode it opened must actually have
- * RUN under the -DFT_DEBUG_TXN_KIND counters.  That means armSW > 0, with
- * MW_STRUCT moving to SW at the sites that mode drives.  A green suite
+ * RUN under the -DFT_DEBUG_TXN_KIND counters.  That means armSW > 0, and SW
+ * records at the sites that mode drives.  A green suite
  * proves nothing about a mode the suite never entered.  The default strategy
  * is FINE.
  *
@@ -8243,8 +8237,7 @@ int ft_ch_ctx_source(const struct ft_lock_ctx *ctx,
  * The hold-trace ledger is deliberately NOT consulted.  It is gated by
  * FEATURE_FT_HOLD_TRACE.  An assert whose reach depends on a second, unrelated
  * knob quietly loses coverage in the config nobody checks.
- * ft_flip_txn_record_tag states that rule beside FT_OWNER_ASSERT_OWNED.  The
- * ledger stays in the counter's OWN_LEDGER lane.
+ * ft_flip_txn_record_tag states that rule beside FT_OWNER_ASSERT_OWNED.
  */
 static inline
 bool ft_owner_retire_witnessed(const struct ft_lock_ctx *ctx,
@@ -10580,30 +10573,6 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 	 */
 	FT_ROOT_ASSERT_NOT_ROOT(t, slot);
 	/*
-	 * ☠ NOT the DLM lock TAKE.  It reaches this same helper, but it is the
-	 * ARBITRATION POINT and must stay MW forever.  So it is not part of
-	 * the conversion surface.  Counting it would put the whole acquire
-	 * lane in OWN_MISS, and that would read as a gap that can never close.
-	 * A take is also the one record that CANNOT be owner-held by
-	 * construction: it is what makes the op the owner.
-	 */
-#ifdef FT_DEBUG_TXN_KIND
-	/*
-	 * ☞ PROBE: did the txn's ARM or TAKE state change between the OWN split
-	 * and the kind decision below?  Both live in this one function with no
-	 * early exit.  So the six OWN_* columns must sum to MW_STRUCT.  They
-	 * fall 32,429 short per ft_inv leg.  Reading the code cannot explain it,
-	 * so ask the only thing reading cannot rule out.
-	 */
-	{
-		bool dbg_armed0 = t->structural_sw;
-		bool dbg_take0 = FT_TK_TXN_IS_TAKE(t);
-
-		t->dbg_armed_at_own = dbg_armed0;
-		t->dbg_take_at_own = dbg_take0;
-	}
-#endif
-	/*
 	 * A WORD THE OP HOLDS TAKES NO CAS, armed or not.  Every writer of a
 	 * word holds that word's lock.  (The lock take itself is outside the
 	 * txn.)  So an MW install on a HELD word arbitrates against nobody.
@@ -10629,23 +10598,6 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 	 */
 	held_sw = !t->structural_sw && t->ft && t->ft->lock_fine &&
 		(ft_flip_txn_owns(t, owner) || t->trie_wide_sw);
-	if (!FT_TK_TXN_IS_TAKE(t) && !held_sw) {
-		/*
-		 * COUNTED ONLY WHERE THE QUESTION IS OPEN.  Then OWN_HELD +
-		 * OWN_MISS == MW_STRUCT exactly.  This is the surface, split
-		 * by whether arming it would be legal.
-		 *
-		 * An ALREADY-ARMED txn is excluded.  Its arm was decided on a
-		 * wider argument: a COARSE or exclusive trie excludes every
-		 * peer.  Its ops register no per-node lock for most of what
-		 * they park.  So its records would land in OWN_MISS and read
-		 * as a gap in ops that have no gap.  The mode with that arm
-		 * is Phase A's, already done.  These two count the mode Phase
-		 * B has yet to convert.
-		 */
-		if (!t->structural_sw)
-			FT_TK_COUNT_OWN(t, owner);
-	}
 	/*
 	 * ASKED OF EVERY SW-CAPABLE RECORD, not only of the ones that actually
 	 * park, and NOT behind the take gate above.  That gate is spelled in a
@@ -10889,7 +10841,6 @@ void __ft_flip_txn_record_tag_excluded(struct ft_flip_txn *t, void **slot,
 	ft_sa_rec_count(FT_TK_TXN_SITE(t), __builtin_return_address(0),
 		FT_SA_CALLER_PC(), FT_SA_RV_LANE, false);
 #endif
-	FT_TK_COUNT_REC(t, FT_TK_MW_ALWAYS);
 	FT_AB_ARM(FT_AB_SW, FT_AB_OWN_NA);
 	/*
 	 * ☞ DOOR 1 COVERS THESE LANES TOO (Mathieu, doc §12.1): "in an
@@ -10915,8 +10866,8 @@ void __ft_flip_txn_record_tag_excluded(struct ft_flip_txn *t, void **slot,
 	 * slots.  Door 1 already rests on that argument, both directions, at
 	 * ft_txn_content_sw_ok.
 	 *
-	 * ☠ AND THE LOCK TAKE IS NOT HERE.  It is MW_LOCK, a separate kind and
-	 * a separate recorder: it IS the arbitration point and can never park.
+	 * ☠ AND THE LOCK TAKE IS NOT HERE.  It has a recorder of its own: it IS
+	 * the arbitration point and can never park.
 	 * A coarse trie takes no DLM lock at all; an exclusive FINE trie does,
 	 * and keeps its CAS.
 	 *
@@ -10950,6 +10901,7 @@ void __ft_flip_txn_record_tag_excluded(struct ft_flip_txn *t, void **slot,
 	if (!FT_LANE_MW_PLANT && old_ptr != new_ptr &&
 			t->trie_wide_sw &&
 			!(t->ft && slot == (void **) &t->ft->root)) {
+		FT_TK_COUNT_REC(t, FT_TK_SW);
 		FT_LL_REC(t, slot, old_ptr, new_ptr, true);
 		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	} else {
@@ -15967,16 +15919,6 @@ uintptr_t ft_flip_txn_record_tombstone(struct ft_flip_txn *t,
 	}
 #endif
 
-	/*
-	 * ☞ TELL THE CENSUS THIS IS A RETIRE.  The record's owner IS the node
-	 * being killed, so ft_flip_txn_owns can never answer yes.  The word
-	 * ends unclaimable and nothing registers it.  ft_flip_txn_owns' own
-	 * header names this as its documented counterexample.  Counted in
-	 * OWN_MISS, it reads as a Phase B obligation that can never be
-	 * discharged.  The DLM-take carve-out exists to prevent the same
-	 * distortion.  So it gets its own lane instead of being skipped
-	 * silently.
-	 */
 #if defined(FT_DEBUG_TXN_KIND) && defined(FEATURE_FT_HOLD_TRACE)
 	/*
 	 * ☞ IS THE LOCK HELD WHEN WE TOMBSTONE?  That is the whole question for
@@ -16030,10 +15972,8 @@ uintptr_t ft_flip_txn_record_tombstone(struct ft_flip_txn *t,
 			uatomic_inc(&ft_tk_ret_unlocked_fine);
 	}
 #endif
-	FT_TK_TXN_SET_RETIRE(t, true);
 	ft_flip_txn_record_state(t, meta,
 			(void *) old, (void *) (old | FT_STATE_TOMBSTONE));
-	FT_TK_TXN_SET_RETIRE(t, false);
 	/*
 	 * ☠ THE WORD ENDS DEAD, WHICHEVER SITE RECORDED THE EARLIER EDGE.  This
 	 * retire CHAINS onto a release already recorded on @meta in this same
@@ -17376,7 +17316,7 @@ void ft_flip_txn_record_retire_anchored_arms(struct ft_flip_txn *t,
  * The retire above hands @node's LOCK to the commit, so the ledger must forget
  * it.  But it must do so only after the retire has planted its records.  Each
  * record asks, when it is planted, whether the op OWNS the word
- * (ft_flip_txn_owns, and the OWN_LEDGER counter beside it).  Dropping first
+ * (ft_flip_txn_owns).  Dropping first
  * answers "no", although this branch has already established the true
  * answer.  The whole class then reads as an exclusion gap instead of the
  * registry gap it is.  Measured: 2,200,222 of 14,907,298 anchored retires

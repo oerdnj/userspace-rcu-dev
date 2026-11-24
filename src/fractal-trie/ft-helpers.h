@@ -4031,8 +4031,8 @@ void ft_pub_rec_add_at(const char *fn, int line,
 	 *   - the slot is a ROOT slot.  It has no owning node at all, and
 	 *     takes the always-MW route through @root instead.
 	 * A producer that leaves @owner unset only declines to convert (see
-	 * struct ft_pub_rec).  So a missing owner is safe and merely counts
-	 * OWN_MISS.  EVERY producer did that before this parameter existed.
+	 * struct ft_pub_rec).  So a missing owner is safe.  EVERY producer
+	 * did that before this parameter existed.
 	 */
 	rec->owner[rec->n] = owner;
 	/*

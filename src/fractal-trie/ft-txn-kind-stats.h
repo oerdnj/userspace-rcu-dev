@@ -6,58 +6,21 @@
 #define _FT_TXN_KIND_STATS_H
 
 /*
- * ft-txn-kind-stats: count WHICH RECORD KIND each flip-txn plants, and what
- * its commit returns.  The counts are per TXN CREATION SITE.  Built only under
+ * ft-txn-kind-stats: count the records each flip-txn plants, and what its
+ * commit returns.  The counts are per TXN CREATION SITE.  Built only under
  * -DFT_DEBUG_TXN_KIND.  Otherwise it is byte-neutral: the struct fields, the
  * increments and this whole unit compile out.
  *
- * WHAT IT IS FOR.  The engine takes SW-kind and MW-kind records in one commit
- * (doc/design/mw-writer-lock-escalation-model.md).  An MW record is a validated
- * CAS.  It arbitrates, and it can ABORT the whole commit.  An SW record is a
- * plain locked park.  It cannot fail.  It is legal exactly where the op
- * EXCLUDES every peer writer of that slot.
+ * Every record is SW.  A record that the op neither owns nor excludes aborts
+ * the process (ft_flip_txn_struct_mw_abort), so there is no MW class to count.
+ * The table gives, per site:
+ *   - the txns created, and those armed SW at creation;
+ *   - the SW records;
+ *   - the commit outcomes (enum ft_tk_end_class).
  *
- * Most FT ops record all-MW today.  They do not have to: they never opted in.
- * All-MW is stricter and always sound.  Converting those CONSERVATIVE MW
- * records to SW buys FAIRNESS and LATENCY, never correctness.  So the only
- * honest acceptance criterion is a measured ABORT / RETRY number.  This is
- * that instrument.  Read it BEFORE and AFTER a conversion:
- *
- *   BEFORE  MW_STRUCT is the conversion SURFACE: structural edges that took the
- *           MW branch only because their txn never armed @structural_sw.
- *   AFTER   MW_STRUCT must have MOVED to SW at the converted sites, and the
- *           site's ABORT count must have dropped.  A conversion that leaves
- *           MW_STRUCT where it was did not run
- *           ([[feedback_verify_the_mechanism_ran_before_believing_a_zero]]).
- *
- * IT ALSO CLASSIFIES THE 70 CREATION SITES EMPIRICALLY.  The acquire lane must
- * stay all-MW forever.  The lock take {clean -> LOCK|s} IS the arbitration
- * point, and an SW take hands BOTH racing ops the node.  So an acquire txn is
- * one whose site records MW_LOCK and VALIDATE and nothing else.  A content txn
- * records structural edges.  The table says which is which by measurement.  A
- * source-level split can check itself against the table.
- *
- * THE CLASSES, and what each one is allowed to become:
- *
- *   SW          a structural edge parked SW (the txn armed @structural_sw and
- *               the slot is not the &ft->root exemption).  Already converted.
- *   MW_STRUCT   a structural edge recorded MW because the txn is not armed.
- *               THE CONVERSION SURFACE.
- *   MW_ALWAYS   ft_flip_txn_record_tag_excluded: the slots no node lock
- *               covers -- ordered-cell interleave, duplicate-chain splices,
- *               rank-count propagation.  It parks SW where the trie excludes
- *               writers and aborts otherwise.  The class keeps its old name.
- *   MW_LOCK     the DLM lock take.  MUST stay MW; ft_dlm_lock asserts it.
- *   VALIDATE    a read-set guard (back-edge / anchor state).  Not a store; it
- *               can abort a commit, which is why it is worth seeing beside the
- *               abort column.
- *
- * Some cell / hlist stores bypass these helpers and record straight onto the
- * engine handle (ft-txn-hlist.h, ft_txn_list_insert_between_prepare).  They
- * hold no back-pointer to their flip-txn, so they are counted GLOBALLY rather
- * than per site.  They are MW on purpose and out of the conversion's scope.
- * The global count exists so that "MW records still standing after the
- * conversion" has no unexplained remainder.
+ * The duplicate-chain stores record straight onto the engine handle
+ * (ft-txn-hlist.h).  They hold no back-pointer to their flip-txn, so they are
+ * counted GLOBALLY rather than per site.
  *
  * COUNTERS ARE PER THREAD, summed at the dump.  A shared counter on the hot
  * path would be a contended cacheline, and it would disturb the fairness this
@@ -78,152 +41,9 @@
 
 enum ft_tk_rec_class {
 	FT_TK_SW = 0,
-	FT_TK_MW_STRUCT,
-	FT_TK_MW_ALWAYS,
-	FT_TK_MW_LOCK,
-	FT_TK_VALIDATE,
-	/*
-	 * THE PHASE B READINESS PAIR.  It is NOT a kind.  The two SPLIT
-	 * MW_STRUCT, which is the conversion surface.  The split is on whether
-	 * the op's lock registry HOLDS the word's owner (ft_flip_txn_owns).
-	 * OWN_HELD + OWN_MISS == MW_STRUCT is an invariant of the table, and
-	 * a useful self-check on it.
-	 *
-	 * WHY A COUNTER AND NOT ONLY THE ASSERT.  The assert
-	 * (FT_OWNER_ASSERT_OWNED) is armed only for a txn that armed PER-OP.
-	 * So it has no coverage until the first Phase B site arms.  An assert
-	 * with no coverage is not coverage.  These two run the same predicate
-	 * on every SW-capable record in EVERY mode.  So a FINE unarmed run
-	 * says, per site, whether the arm would be legal.  It says so BEFORE
-	 * the arm is written:
-	 *
-	 *   OWN_MISS == 0   the site's structural records are all owner-held;
-	 *                   the per-op arm is the only thing missing.
-	 *   OWN_MISS > 0    the site names a word its lock-set does not own.
-	 *                   That is the exclusion gap to close, and its size
-	 *                   is the number here -- not an argument to be had.
-	 *
-	 * ☠ A MISS IS NOT AUTOMATICALLY A DEFECT TODAY.  Unarmed, the record
-	 * is MW, and MW is always sound.  Also, a site may hold the word
-	 * through a frame the txn registry cannot see.  ft_flip_txn_owns says
-	 * why that is still worth reporting.  A miss is a Phase B
-	 * PRECONDITION, read per site, never a bug count.
-	 */
-	FT_TK_OWN_HELD,
-	/*
-	 * The registry does NOT name the word's owner but this THREAD holds it
-	 * (ft_hold_trace_holds).  This is a REGISTRY gap, not an exclusion gap.
-	 * The op really does exclude every peer from that word.  It only filed
-	 * the hold where a record helper cannot see it.  Counting the two gaps
-	 * apart makes OWN_MISS readable as a Phase B obligation instead of a
-	 * mix of the two.
-	 *
-	 * ☠ ZERO WITHOUT -DFEATURE_FT_HOLD_TRACE.  There the query is a
-	 * constant false and every such record falls into OWN_MISS.  That is
-	 * exactly the older two-way split.  A zero column in that build is NOT
-	 * evidence.
-	 */
-	FT_TK_OWN_LEDGER,
-	FT_TK_OWN_MISS,
-	/*
-	 * ☠ A RETIRE CAN NEVER BE OWNER-HELD IN THE REGISTRY.  Counting it in
-	 * OWN_MISS would report a lane that cannot close as open work.  The DLM
-	 * TAKE carve-out above exists to stop exactly that, and this is the
-	 * same shape.
-	 *
-	 * ft_flip_txn_record_tombstone records {old -> old|TOMBSTONE} on the
-	 * RETIRED NODE'S OWN state word.  So the record's owner IS the node
-	 * being killed.  The header of ft_flip_txn_owns already names this as
-	 * the documented counterexample.  Where the anchor IS the retired node,
-	 * the site
-	 * "records the fused terminal and REGISTERS NOTHING, because a
-	 * tombstoned word is unclaimable forever and the caller's release sweep
-	 * is therefore correct on BOTH outcomes with no per-commit bookkeeping."
-	 * Registering it would buy nothing: nobody can take the word again.
-	 *
-	 * MEASURED: this lane was the ENTIRE remaining OWN_MISS after the
-	 * doomed-commit split.  That is 222,210 records per ft_inv leg.  All of
-	 * them reach ft_flip_txn_record_tombstone from the graft's three glue
-	 * txns.  The comments of those txns call them "fused free-list
-	 * tombstones (§4.B)".
-	 *
-	 * ☠☠ AND THIS IS A CLASSIFICATION, NOT A CLEARANCE.  It says the
-	 * REGISTRY cannot answer for a retire.  That is why the lane does not
-	 * belong in a Phase B obligation count.
-	 *
-	 * ☠ IT IS ALSO NOT THE CELL LIST'S KIND OF PERMANENCE.  An earlier
-	 * version of this comment drew that analogy.  It is wrong in a way that
-	 * matters.  The ordered cell list is a word carrying NO lock, so every
-	 * writer must agree and MW is forever.  metadata.state CARRIES the
-	 * lock: FT_STATE_TOMBSTONE is bit 1 and FT_STATE_LOCK is bit 19 of the
-	 * same word.  So the lock-bearing exception of urcu_txn_store_sw()
-	 * applies.  The lock bit is taken MW.  While it is HELD, the holder may
-	 * update the other bits of the word SW, across any number of txns.
-	 * That includes the release.
-	 *
-	 * ⇒ A RETIRE MAY PARK, whenever the op HOLDS the word.  MW after the
-	 * take is correct but wasteful, so converting is PERFORMANCE.  The real
-	 * question for this lane is not "may it park" but "is it held".  The
-	 * bucket that would be a BUG is a retire recorded while nobody holds
-	 * the word.  Such a retire races the sites that do park SW on it.
-	 *
-	 * MEASURED at the tombstone (ft_inv, per-node / exponential):
-	 *   - held by US: 0 / 0;
-	 *   - held by a PEER: 0 / 0;
-	 *   - unlocked-under-FINE, the only bucket owed an answer: 0 / 0.
-	 * Every retire runs in one of three places:
-	 *   - on an exclusive trie (812,314 / 895,568);
-	 *   - inside the FT-wide writer scope (201,899 / 206,953);
-	 *   - on a coarse one (29,674 / 27,454).
-	 * So there is no unprotected retire in either suite's reach.  Equally,
-	 * none of them rides a HELD per-node lock.  So the lock-bearing
-	 * exception is not what would license converting them.  Door 1's
-	 * trie-wide exclusion is.
-	 */
-	FT_TK_OWN_RETIRE,
-	/*
-	 * ☠ THE POPULATION THE OWN SPLIT USED TO DROP.  Dropping it is why the
-	 * invariant this table states did NOT hold.  That invariant is
-	 * "OWN_HELD + OWN_MISS == MW_STRUCT is an invariant of the table, and a
-	 * useful self-check on it".  The sum was ~350k short per ft_inv leg, on
-	 * every leg, for as long as the arm gate has existed.  A self-check
-	 * that does not close is not a self-check.  So count what was dropped
-	 * instead of narrating it.
-	 *
-	 * An ALREADY-ARMED txn is excluded from the three-way split.  The
-	 * reason given is that "a COARSE or exclusive trie excludes every
-	 * peer".  That is true of the TRIE-WIDE arm and false of the PER-OP
-	 * one.  @sw_per_op exists to tell the two arms apart:
-	 *   - the trie-wide arm rests on the FT-wide mutex or an exclusive
-	 *     trie;
-	 *   - the per-op arm rests on THIS op's own lock registry.
-	 * "Only the second can be wrong for a given record".  So the two are
-	 * counted apart:
-	 *
-	 *   ARMED_WIDE   no question to ask; the exclusion is trie-wide.
-	 *   ARMED_PEROP  the PER-RECORD gate was asked and REFUSED the park --
-	 *                it kept the record MW because the op does not own the
-	 *                owner.  Safe (MW always is), and NOT a defect: it is the
-	 *                gate working.  But it is the conversion's own residue on
-	 *                an already-converted op, so it belongs in the table
-	 *                rather than outside it.
-	 *
-	 * ☠ AND BOTH READ ZERO TODAY.  This is worth stating because they did
-	 * not when they were added.  The 300-800k/leg that looked like "per-op
-	 * gate refusals" were TRIE-WIDE txns misread as per-op.  No constructor
-	 * initialised @sw_per_op, so an armed txn read the previous op's byte.
-	 * With that fixed, there are no genuine per-op refusals in either
-	 * suite.  So a NON-ZERO here is news.  The first thing to ask of it is
-	 * whether the flag it keys on is sound.
-	 */
-	FT_TK_OWN_ARMED_WIDE,
-	FT_TK_OWN_ARMED_PEROP,
 	FT_TK_REC_NR,
 };
 
-/* See the drift probe in __ft_flip_txn_record_tag_ctx. */
-extern unsigned long ft_tk_drift_armed, ft_tk_drift_take;
-unsigned long ft_tk_drift_armed, ft_tk_drift_take;
 /* See the door-1/3 exclusion probe at the SW park in __ft_flip_txn_record_tag_ctx. */
 extern unsigned long ft_tk_d13_body, ft_tk_d13_excl, ft_tk_d13_coarse,
 	ft_tk_d13_wlock, ft_tk_d13_none;
@@ -279,21 +99,7 @@ struct ft_tk_tls {
 	unsigned long end[FT_TK_MAX_SITES][FT_TK_END_NR];
 	unsigned long created[FT_TK_MAX_SITES];
 	unsigned long armed[FT_TK_MAX_SITES];
-	unsigned long cell_mw;	/* not site-attributed, see the header comment */
-	unsigned long cell_sw;	/* the chain edges converted OFF MW; same caveat */
-	/*
-	 * ☠ AND THE DUPLICATE CHAIN COUNTS APART FROM THE ORDERED CELL LIST.
-	 * Both reach the engine handle directly.  There is no record helper,
-	 * so no site attribution.  Both used to land in @cell_mw.  But they
-	 * are different words with OPPOSITE futures:
-	 *   - ft_ord_cell.lnode is [DESIGN] MW forever.  A splice rewrites the
-	 *     cells of NEIGHBOURING keys, and the op never acquires their
-	 *     holders.
-	 *   - cds_ft_node.next/.prev is SW under the nearest ancestor lock.
-	 * With one shared bucket, any "MW is correct here" earned by the cell
-	 * list read as though it covered the chain.  Neither could be SIZED.
-	 * The header of ft_hlist_store_mw_at asked for this split.
-	 */
+	/* the duplicate-chain stores, not site-attributed: see the header */
 	unsigned long chain_sw;
 #ifdef FT_ABORT_ATTRIB
 	/*
@@ -439,18 +245,11 @@ static inline
 void ft_tk_count_rec(struct ft_tk_site *site, enum ft_tk_rec_class c)
 {
 	/*
-	 * ☞ A CLASS OUT OF RANGE IS NOT A COUNTING ERROR, IT IS A SPRAY.  @c is
-	 * a compile-time constant at every call site but one: the ternary on
-	 * @sw_per_op.  GCC compiles that ternary as
-	 * `base + (unsigned char)flag` rather than a branch.  So a flag byte
-	 * that is neither 0 nor 1 indexes PAST this row, into whatever .bss
-	 * follows it.  That is how an uninitialised bool made this census
-	 * silently lose ~35k records a leg.  It ALSO corrupted its neighbours'
-	 * counters.  Meanwhile every static check ("one producer", "no state
-	 * drift") came back clean.
-	 *
-	 * The bound costs a predicted compare in a debug build.  It turns that
-	 * whole failure mode into an immediate, located abort.
+	 * ☞ A CLASS OUT OF RANGE IS NOT A COUNTING ERROR, IT IS A SPRAY.  It would
+	 * index past this row, into whatever .bss follows it.  An uninitialised
+	 * bool once did that here, and corrupted the neighbouring counters.  The
+	 * bound costs a predicted compare in a debug build.  It turns that failure
+	 * into an immediate, located abort.
 	 */
 	if (caa_unlikely((unsigned int) c >= (unsigned int) FT_TK_REC_NR)) {
 		fprintf(stderr, "FT_TK BOUNDS: class=%d site=%s:%d ra=%p\n",
@@ -480,25 +279,6 @@ void ft_tk_count_armed(struct ft_tk_site *site)
 	ft_tk_tls_get()->armed[site ? ft_tk_site_id(site) : FT_TK_OVERFLOW_ID]++;
 }
 
-static inline
-void ft_tk_count_cell_mw(void)
-{
-	ft_tk_tls_get()->cell_mw++;
-}
-
-/*
- * The SW twin.  A chain edge used to be MW without exception, so one counter
- * was enough.  Once a site converts, a single bucket would report the
- * conversion as a DROP in cell_mw and nothing else.  That looks the same as
- * the site no longer running.  Count both and the pair moves visibly.
- */
-static inline
-void ft_tk_count_cell_sw(void)
-{
-	ft_tk_tls_get()->cell_sw++;
-}
-
-/* The duplicate chain's own counter -- see @chain_sw. */
 static inline
 void ft_tk_count_chain_sw(void)
 {
@@ -1436,9 +1216,6 @@ int ft_tk_row_cmp(const void *a, const void *b)
 	const struct ft_tk_row *ra = (const struct ft_tk_row *) a;
 	const struct ft_tk_row *rb = (const struct ft_tk_row *) b;
 
-	/* The conversion surface first: that is what the table is read for. */
-	if (ra->rec[FT_TK_MW_STRUCT] != rb->rec[FT_TK_MW_STRUCT])
-		return ra->rec[FT_TK_MW_STRUCT] > rb->rec[FT_TK_MW_STRUCT] ? -1 : 1;
 	if (ra->end[FT_TK_ABORT] != rb->end[FT_TK_ABORT])
 		return ra->end[FT_TK_ABORT] > rb->end[FT_TK_ABORT] ? -1 : 1;
 	return strcmp(ra->site->file, rb->site->file);
@@ -1449,7 +1226,7 @@ void ft_tk_dump(void)
 {
 	struct ft_tk_row *rows;
 	struct ft_tk_tls *tls;
-	unsigned long cell_mw = 0, cell_sw = 0, chain_sw = 0;
+	unsigned long chain_sw = 0;
 #ifdef FT_ABORT_ATTRIB
 	unsigned long ab[FT_AB_CLS_NR], ab_own[FT_AB_CLS_NR][FT_AB_OWN_NR];
 	unsigned long ab_alarm_site[FT_TK_MAX_SITES][2];
@@ -1495,8 +1272,6 @@ void ft_tk_dump(void)
 		int c;
 
 		threads++;
-		cell_mw += tls->cell_mw;
-		cell_sw += tls->cell_sw;
 		chain_sw += tls->chain_sw;
 #ifdef FT_ABORT_ATTRIB
 		{
@@ -1568,12 +1343,9 @@ void ft_tk_dump(void)
 	fprintf(stderr,
 "\n=== FT_DEBUG_TXN_KIND: record kind + commit outcome, per txn creation site ===\n"
 "    threads=%d sites=%d\n"
-"%-44s %9s %7s %10s %10s %10s %10s %8s %10s %10s %9s %10s %10s %10s %10s %9s %8s %7s %8s\n",
+"%-44s %9s %7s %10s %10s %9s %8s %7s %8s\n",
 		threads, nr,
-		"site", "created", "armSW",
-		"SW", "MW_STRUCT", "MW_ALWAYS", "MW_LOCK", "VALID",
-		"OWN_HELD", "OWN_LEDGER", "OWN_MISS", "OWN_RETIRE",
-		"ARM_WIDE", "ARM_OP",
+		"site", "created", "armSW", "SW",
 		"OK", "ABORT", "MEMERR", "MISS", "BAILED");
 	for (i = 0; i < nr; i++) {
 		int c;
@@ -1585,15 +1357,9 @@ void ft_tk_dump(void)
 		else
 			snprintf(name, sizeof(name), "%s", rows[i].site->file);
 		fprintf(stderr,
-"%-44s %9lu %7lu %10lu %10lu %10lu %10lu %8lu %10lu %10lu %9lu %10lu %10lu %10lu %10lu %9lu %8lu %7lu %8lu\n",
+"%-44s %9lu %7lu %10lu %10lu %9lu %8lu %7lu %8lu\n",
 			name, rows[i].created, rows[i].armed,
-			rows[i].rec[FT_TK_SW], rows[i].rec[FT_TK_MW_STRUCT],
-			rows[i].rec[FT_TK_MW_ALWAYS], rows[i].rec[FT_TK_MW_LOCK],
-			rows[i].rec[FT_TK_VALIDATE],
-			rows[i].rec[FT_TK_OWN_HELD], rows[i].rec[FT_TK_OWN_LEDGER],
-			rows[i].rec[FT_TK_OWN_MISS], rows[i].rec[FT_TK_OWN_RETIRE],
-			rows[i].rec[FT_TK_OWN_ARMED_WIDE],
-			rows[i].rec[FT_TK_OWN_ARMED_PEROP],
+			rows[i].rec[FT_TK_SW],
 			rows[i].end[FT_TK_OK], rows[i].end[FT_TK_ABORT],
 			rows[i].end[FT_TK_MEMERR], rows[i].end[FT_TK_MISS],
 			rows[i].end[FT_TK_BAILED]);
@@ -1605,22 +1371,14 @@ void ft_tk_dump(void)
 		tot.armed += rows[i].armed;
 	}
 	fprintf(stderr,
-"%-44s %9lu %7lu %10lu %10lu %10lu %10lu %8lu %10lu %10lu %9lu %10lu %10lu %10lu %10lu %9lu %8lu %7lu %8lu\n",
+"%-44s %9lu %7lu %10lu %10lu %9lu %8lu %7lu %8lu\n",
 		"TOTAL", tot.created, tot.armed,
-		tot.rec[FT_TK_SW], tot.rec[FT_TK_MW_STRUCT],
-		tot.rec[FT_TK_MW_ALWAYS], tot.rec[FT_TK_MW_LOCK],
-		tot.rec[FT_TK_VALIDATE],
-		tot.rec[FT_TK_OWN_HELD], tot.rec[FT_TK_OWN_LEDGER],
-		tot.rec[FT_TK_OWN_MISS], tot.rec[FT_TK_OWN_RETIRE],
-		tot.rec[FT_TK_OWN_ARMED_WIDE], tot.rec[FT_TK_OWN_ARMED_PEROP],
+		tot.rec[FT_TK_SW],
 		tot.end[FT_TK_OK], tot.end[FT_TK_ABORT],
 		tot.end[FT_TK_MEMERR], tot.end[FT_TK_MISS],
 		tot.end[FT_TK_BAILED]);
 	fprintf(stderr,
-"    ORDERED-CELL list stores (ft_ord_cell.lnode, [DESIGN] MW; straight on the engine handle, not site-attributed): MW=%lu SW=%lu\n",
-		cell_mw, cell_sw);
-	fprintf(stderr,
-"    DUPLICATE-CHAIN stores (cds_ft_node.next/.prev; same caveat):                                                  SW=%lu\n",
+"    DUPLICATE-CHAIN stores (cds_ft_node.next/.prev; straight on the engine handle, not site-attributed): SW=%lu\n",
 		chain_sw);
 
 #ifdef FT_ABORT_ATTRIB
@@ -1677,8 +1435,8 @@ void ft_tk_dump(void)
 					"state word only: a non-holder wrote another field of the same packed word (by design)" :
 					"(none -- the exclusion held everywhere it was claimed)"));
 		/*
-		 * ☠ BY SITE ID, not by row index.  The rows were sorted by
-		 * MW_STRUCT above, so row i is no longer site i.
+		 * ☠ BY SITE ID, not by row index.  The rows were sorted
+		 * above, so row i is no longer site i.
 		 */
 		for (i = 0; (ab_alarm[0] || ab_alarm[1]) && i < nr; i++) {
 			int id = rows[i].site->id;
@@ -1756,40 +1514,7 @@ void ft_tk_dump(void)
 #endif
 	}
 #endif
-	fprintf(stderr,
-"    MW_STRUCT is the conversion surface; MW_ALWAYS + MW_LOCK stay MW by design.\n"
-"    The cell/hlist line is SPLIT: the ordinal CELL list is MW forever, the duplicate CHAIN is [debt] and converting -- read the SW column, not a fall in MW.\n"
-"    OWN_HELD/OWN_LEDGER/OWN_MISS split MW_STRUCT (the surface) by whether the op holds the word's owner; they sum to it:\n"
-"      OWN_HELD   the txn registry names it.  OWN_LEDGER  only this thread's hold ledger does (a REGISTRY gap;\n"
-"      needs -DFEATURE_FT_HOLD_TRACE or it reads 0).  OWN_MISS  neither: a real exclusion gap.\n"
-"    a site with OWN_MISS == 0 is ready for the Phase B per-op arm; OWN_MISS is the size of its exclusion gap.\n"
-"      OWN_RETIRE  the record's owner IS the node it tombstones -- unregisterable by construction, not an obligation.\n"
-"      ARM_WIDE / ARM_OP  MW_STRUCT on an ALREADY-ARMED txn: trie-wide (no question) vs per-op (the per-record\n"
-"      gate was asked and REFUSED the park).\n");
 	{
-		unsigned long own_sum = tot.rec[FT_TK_OWN_HELD] +
-			tot.rec[FT_TK_OWN_LEDGER] + tot.rec[FT_TK_OWN_MISS] +
-			tot.rec[FT_TK_OWN_RETIRE] +
-			tot.rec[FT_TK_OWN_ARMED_WIDE] +
-			tot.rec[FT_TK_OWN_ARMED_PEROP];
-
-		/*
-		 * ☠ THE SELF-CHECK CHECKS.  It used to be a sentence claiming
-		 * that the columns sum to MW_STRUCT.  They did not, by ~350k
-		 * a leg.  Nobody noticed, because nothing subtracted them.
-		 * Print the delta so that an unattributed record branch
-		 * announces itself.
-		 */
-		fprintf(stderr,
-"    SELF-CHECK  the six OWN_* columns vs MW_STRUCT: %lu vs %lu, delta %ld%s\n\n",
-			own_sum, tot.rec[FT_TK_MW_STRUCT],
-			(long) tot.rec[FT_TK_MW_STRUCT] - (long) own_sum,
-			own_sum == tot.rec[FT_TK_MW_STRUCT] ? "" :
-				"  ☠ a record branch counts into MW_STRUCT and into no OWN column");
-		fprintf(stderr,
-"    SELF-CHECK  state drift between the OWN split and the kind decision: armed=%lu take=%lu\n",
-			uatomic_read(&ft_tk_drift_armed),
-			uatomic_read(&ft_tk_drift_take));
 		fprintf(stderr,
 "    DOOR 1/3 SW parks, is the trie-wide exclusion REALLY in force?\n"
 "      sw_body(door 3)=%lu  exclusive=%lu  coarse=%lu  FT-wide-lock=%lu  ☠ NONE(must be 0)=%lu\n",
@@ -1834,9 +1559,6 @@ void ft_tk_dump_at_exit(void)
 #define FT_TK_TXN_FIELDS						\
 	struct ft_tk_site *dbg_site;					\
 	bool dbg_lock_take;						\
-	bool dbg_retire;						\
-	bool dbg_armed_at_own;						\
-	bool dbg_take_at_own;						\
 	bool dbg_ended;
 
 /*
@@ -1852,7 +1574,6 @@ void ft_tk_dump_at_exit(void)
 	do {								\
 		(t)->dbg_site = (site);					\
 		(t)->dbg_lock_take = false;				\
-		(t)->dbg_retire = false;				\
 		(t)->dbg_ended = false;					\
 		ft_tk_count_created(site);				\
 	} while (0)
@@ -1860,148 +1581,8 @@ void ft_tk_dump_at_exit(void)
 #define FT_TK_TXN_SITE(t)		((t)->dbg_site)
 #define FT_TK_TXN_IS_TAKE(t)		((t)->dbg_lock_take)
 #define FT_TK_TXN_SET_TAKE(t, v)	do { (t)->dbg_lock_take = (v); } while (0)
-#define FT_TK_TXN_IS_RETIRE(t)		((t)->dbg_retire)
-#define FT_TK_TXN_SET_RETIRE(t, v)	do { (t)->dbg_retire = (v); } while (0)
 #define FT_TK_COUNT_REC(t, c)		ft_tk_count_rec((t)->dbg_site, (c))
-/*
- * ☞ WHERE THE MISSES COME FROM, which the census cannot say.
- *
- * The census table is keyed by the TXN CREATION site.  So it sizes a site's
- * exclusion gap but never names the record that has it.  ft-insert.h:1183
- * shows 1.78M OWN_MISS out of 60.3M.  Converting it means knowing WHICH of
- * those 60M records miss.  -DFT_DEBUG_STRUCT_ANCHOR captures the right thing
- * but emits a CAPPED per-event trace.  -DFT_ABORT_ATTRIB keys by word class
- * and is about aborts.  Neither aggregates.
- *
- * ☠ AND THE ALTERNATIVE WAS A SIGNATURE, WHICH IS WHY THIS USES THE PC.
- * Keying by record site properly means threading fn/line through
- * __ft_flip_txn_record_tag_ctx and every caller.  That is the plumbing the
- * head-word arm is already blocked on.  Two return addresses cost nothing and
- * change no signature.  They are exactly what §0 already symbolizes offline
- * with `addr2line -i`.
- *
- * ☠☠ AND THE SECOND KEY IS THE TXN SITE, NOT A SECOND FRAME.  One return
- * address collapses distinct producers together once the recorder inlines.
- * So the first spelling reached for __builtin_return_address(1).  That is
- * UNDEFINED when that frame does not exist, and under -O2 it does not:
- * SIGSEGV at ft_inv test 45.  Pairing the record PC with the txn's CREATION
- * site is the same (txn creation site, call site) keying that §0 describes.
- * It distinguishes the producers just as well and walks no frames at all.
- *
- * Lossy on overflow, and it SAYS SO rather than silently truncating.  A table
- * that fills and keeps counting into the last row is how a class reads as one
- * hot site.
- */
-#include <dlfcn.h>
-#include <link.h>
-
-#define FT_TK_MISS_PC_MAX	64
-struct ft_tk_miss_pc_ent {
-	const struct ft_tk_site *site;	/* the txn's creation site */
-	const void *pc;			/* the record's own call site */
-	unsigned long n;
-	/*
-	 * ☠ OF WHICH, HOW MANY ARE ALREADY DOOMED.  A record whose txn
-	 * carries @acquire_miss will never commit: lock_or_guard refused the
-	 * acquire and the commit ABORTS all-or-none.  So counting it as an
-	 * exclusion gap measures CONTENTION, not a word this op writes
-	 * unexcluded.  The two need different work and must not be pooled.
-	 * It is the same mistake as folding OWN_LEDGER into OWN_MISS, one
-	 * level down.
-	 */
-	unsigned long n_amiss;
-};
-extern struct ft_tk_miss_pc_ent ft_tk_miss_pcs[FT_TK_MISS_PC_MAX];
-extern unsigned int ft_tk_miss_pc_n;
-extern unsigned long ft_tk_miss_pc_overflow;
-struct ft_tk_miss_pc_ent ft_tk_miss_pcs[FT_TK_MISS_PC_MAX];
-unsigned int ft_tk_miss_pc_n;
-unsigned long ft_tk_miss_pc_overflow;
-
-static inline
-void ft_tk_miss_pc(const struct ft_tk_site *site, const void *pc, bool amiss)
-{
-	unsigned int i;
-
-	for (i = 0; i < ft_tk_miss_pc_n; i++)
-		if (ft_tk_miss_pcs[i].site == site &&
-				ft_tk_miss_pcs[i].pc == pc) {
-			uatomic_inc(&ft_tk_miss_pcs[i].n);
-			if (amiss)
-				uatomic_inc(&ft_tk_miss_pcs[i].n_amiss);
-			return;
-		}
-	if (ft_tk_miss_pc_n >= FT_TK_MISS_PC_MAX) {
-		uatomic_inc(&ft_tk_miss_pc_overflow);
-		return;
-	}
-	i = ft_tk_miss_pc_n++;
-	ft_tk_miss_pcs[i].site = site;
-	ft_tk_miss_pcs[i].pc = pc;
-	uatomic_inc(&ft_tk_miss_pcs[i].n);
-	if (amiss)
-		uatomic_inc(&ft_tk_miss_pcs[i].n_amiss);
-}
-
-static void ft_tk_miss_pc_report(void) __attribute__((destructor));
-static void ft_tk_miss_pc_report(void)
-{
-	unsigned int i;
-
-	if (!ft_tk_miss_pc_n)
-		return;
-	fprintf(stderr, "\nFT OWN_MISS by RECORD SITE (txn site + record pc; "
-		"symbolize with addr2line -i -e <lib>)  rows=%u/%d overflow=%lu\n",
-		ft_tk_miss_pc_n, FT_TK_MISS_PC_MAX,
-		uatomic_read(&ft_tk_miss_pc_overflow));
-	for (i = 0; i < ft_tk_miss_pc_n; i++)
-	{
-		Dl_info info;
-		struct link_map *lm = NULL;
-		char off[160];
-		const void *pc = ft_tk_miss_pcs[i].pc;
-
-		if (pc && dladdr1((void *) pc, &info, (void **) &lm,
-				RTLD_DI_LINKMAP) && lm)
-			snprintf(off, sizeof(off), "%s+0x%lx",
-				info.dli_fname ? info.dli_fname : "?",
-				(unsigned long) ((uintptr_t) pc - lm->l_addr));
-		else
-			snprintf(off, sizeof(off), "%p", pc);
-		fprintf(stderr, "  MISSPC %s:%d %s %lu amiss=%lu\n",
-			ft_tk_miss_pcs[i].site &&
-				ft_tk_miss_pcs[i].site->file ?
-				ft_tk_miss_pcs[i].site->file : "(none)",
-			ft_tk_miss_pcs[i].site ?
-				ft_tk_miss_pcs[i].site->line : 0,
-			off,
-			uatomic_read(&ft_tk_miss_pcs[i].n),
-			uatomic_read(&ft_tk_miss_pcs[i].n_amiss));
-	}
-}
-
-/*
- * THE UNION IS THE HELD SET, and the three-way split says which witness saw it.
- * Asked registry-first because that is the cheap one and the one a shipped
- * (non-test) build can also answer.
- */
-#define FT_TK_COUNT_OWN(t, owner)					\
-	do {								\
-		enum ft_tk_rec_class c__ =					\
-			FT_TK_TXN_IS_RETIRE(t) ? FT_TK_OWN_RETIRE :	\
-			(ft_flip_txn_owns((t), (owner)) ? FT_TK_OWN_HELD : \
-			(ft_hold_trace_holds((owner)) ? FT_TK_OWN_LEDGER : \
-				FT_TK_OWN_MISS));			\
-									\
-		ft_tk_count_rec((t)->dbg_site, c__);			\
-		if (c__ == FT_TK_OWN_MISS)				\
-			ft_tk_miss_pc((t)->dbg_site,			\
-				__builtin_return_address(0),		\
-				(t)->acquire_miss);			\
-	} while (0)
 #define FT_TK_COUNT_ARMED(t)		ft_tk_count_armed((t)->dbg_site)
-#define FT_TK_COUNT_CELL_MW()		ft_tk_count_cell_mw()
-#define FT_TK_COUNT_CELL_SW()		ft_tk_count_cell_sw()
 #define FT_TK_COUNT_CHAIN_SW()		ft_tk_count_chain_sw()
 #ifdef FT_ABORT_ATTRIB
 #define FT_AB_LOST_RESET()		do { ft_ab_lost_valid = 0; } while (0)
@@ -2063,14 +1644,9 @@ struct ft_tk_site;	/* incomplete: the NULL the constructors take */
 #define FT_TK_TXN_INIT(t, site)		do { } while (0)
 #define FT_TK_TXN_IS_TAKE(t)		0
 #define FT_TK_TXN_SET_TAKE(t, v)	do { } while (0)
-#define FT_TK_TXN_IS_RETIRE(t)		0
-#define FT_TK_TXN_SET_RETIRE(t, v)	do { } while (0)
 #define FT_TK_COUNT_REC(t, c)		do { } while (0)
-#define FT_TK_COUNT_OWN(t, held)	do { } while (0)
 #define FT_TK_COUNT_END(t, c)		do { } while (0)
 #define FT_TK_COUNT_ARMED(t)		do { } while (0)
-#define FT_TK_COUNT_CELL_MW()		do { } while (0)
-#define FT_TK_COUNT_CELL_SW()		do { } while (0)
 #define FT_TK_COUNT_CHAIN_SW()		do { } while (0)
 #define FT_AB_LOST_RESET()		do { } while (0)
 #define FT_AB_COUNT_LOST(t)		do { } while (0)
