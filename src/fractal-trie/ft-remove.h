@@ -6323,6 +6323,23 @@ int ft_detach_node(struct cds_ft *ft,
 					ret = -EAGAIN;
 					goto end;
 				}
+				/*
+				 * The slot the plan deletes must still hold what
+				 * the plan read there.  The plan was read with
+				 * nothing held.  A peer holding the holder may
+				 * have committed a split in between: a new node
+				 * now sits in the slot, and the leaf moved under
+				 * it.  The plan then names a chain that node
+				 * holds, not this one.  The slot is in the
+				 * holder, whose lock we hold, so a plain load is
+				 * exact.
+				 */
+				urcu_assert_debug(ft_slot_in_node(iter_node_flag,
+					detach_node_flag_ptr));
+				if (*detach_node_flag_ptr != plan_old_child) {
+					ret = -EAGAIN;
+					goto end;
+				}
 #if defined(FEATURE_FT_SKIP_COMPRESSED) && !defined(FT_DEBUG_INPLACE_DELETE_RESIDUE)
 				/*
 				 * THE IN-PLACE TWIN OF THE RECOMPACTION
