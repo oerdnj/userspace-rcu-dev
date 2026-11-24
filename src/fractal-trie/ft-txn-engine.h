@@ -100,6 +100,14 @@ void *ft_txn_read(void **slot, uintptr_t tag)
 }
 
 /*
+ * FT's txn handle.  It wraps the engine's handle, so that an engine swap
+ * changes the member and not every function that passes a handle.
+ */
+struct ft_txn {
+	struct urcu_txn e;		/* the engine's handle */
+};
+
+/*
  * THE TXN'S OWN RECORDS.  FT reads what a txn recorded and never edits it.
  * A struct ft_txn_rec is one recorded edge, read through the accessors
  * below.  Lookups take the HANDLE, not the engine's record array.  A record
@@ -110,23 +118,23 @@ struct ft_txn_rec;
 
 /* Does the txn behind @h hold a record set (not empty, not out of memory)? */
 FT_TXN_INLINE
-bool ft_txn_live(const struct urcu_txn *h)
+bool ft_txn_live(const struct ft_txn *h)
 {
-	return h && h->desc && h->desc != URCU_TXN_ENOMEM;
+	return h && h->e.desc && h->e.desc != URCU_TXN_ENOMEM;
 }
 
 /* The txn's record on @slot, or NULL.  @h may be NULL. */
 FT_TXN_INLINE
-const struct ft_txn_rec *ft_txn_find(struct urcu_txn *h, void **slot)
+const struct ft_txn_rec *ft_txn_find(struct ft_txn *h, void **slot)
 {
 	if (!ft_txn_live(h))
 		return NULL;
-	return (const struct ft_txn_rec *) urcu_txn_find(h->desc, slot);
+	return (const struct ft_txn_rec *) urcu_txn_find(h->e.desc, slot);
 }
 
 /* Has the txn behind @h recorded an edge on @slot? */
 FT_TXN_INLINE
-bool ft_txn_recorded(struct urcu_txn *h, void **slot)
+bool ft_txn_recorded(struct ft_txn *h, void **slot)
 {
 	return ft_txn_find(h, slot) != NULL;
 }
@@ -158,9 +166,9 @@ bool ft_txn_rec_sw(const struct ft_txn_rec *r)
 
 /* How many edges the txn behind @h has recorded. */
 FT_TXN_INLINE
-unsigned int ft_txn_nr_records(const struct urcu_txn *h)
+unsigned int ft_txn_nr_records(const struct ft_txn *h)
 {
-	return ft_txn_live(h) ? h->desc->nr : 0;
+	return ft_txn_live(h) ? h->e.desc->nr : 0;
 }
 
 /*
@@ -175,13 +183,13 @@ enum ft_txn_state {
 };
 
 FT_TXN_INLINE
-enum ft_txn_state ft_txn_state(const struct urcu_txn *h)
+enum ft_txn_state ft_txn_state(const struct ft_txn *h)
 {
 	unsigned long st;
 
 	if (!ft_txn_live(h))
 		return FT_TXN_EMPTY;
-	st = urcu_txn_desc_status(h->desc);
+	st = urcu_txn_desc_status(h->e.desc);
 	if (st == URCU_TXN_DESC_UNDECIDED)
 		return FT_TXN_UNDECIDED;
 	return st == URCU_TXN_DESC_SUCCEEDED ? FT_TXN_COMMITTED :
@@ -193,11 +201,11 @@ enum ft_txn_state ft_txn_state(const struct urcu_txn *h)
  * stays, so the failure still surfaces at the commit.
  */
 FT_TXN_INLINE
-void ft_txn_discard(struct urcu_txn *h)
+void ft_txn_discard(struct ft_txn *h)
 {
 	if (ft_txn_live(h)) {
-		urcu_txn_destroy(h->desc);
-		h->desc = NULL;
+		urcu_txn_destroy(h->e.desc);
+		h->e.desc = NULL;
 	}
 }
 
@@ -231,7 +239,7 @@ static unsigned long ft_fp_loads, ft_fp_parked, ft_fp_dropped;
 static unsigned long ft_fp_ps_snapshot, ft_fp_ps_ryw;
 
 static inline
-void ft_fp_note(struct urcu_txn *h, void **slot, uintptr_t tag,
+void ft_fp_note(struct ft_txn *h, void **slot, uintptr_t tag,
 		const char *file, int line)
 {
 	void *raw = uatomic_load(slot, CMM_RELAXED);
@@ -286,12 +294,12 @@ static void ft_fp_report(void)
 }
 
 FT_TXN_INLINE
-void *ft_txn_load_at(struct urcu_txn *h, void **slot, uintptr_t tag,
+void *ft_txn_load_at(struct ft_txn *h, void **slot, uintptr_t tag,
 		bool committed, const char *file, int line)
 {
 	ft_fp_note(h, slot, tag, file, line);
-	return committed ? urcu_txn_load_committed(h, slot, tag) :
-		urcu_txn_load(h, slot, tag);
+	return committed ? urcu_txn_load_committed(&h->e, slot, tag) :
+		urcu_txn_load(&h->e, slot, tag);
 }
 # define ft_txn_load(h, slot, tag)					\
 	ft_txn_load_at((h), (slot), (tag), false, __FILE__, __LINE__)
@@ -299,15 +307,15 @@ void *ft_txn_load_at(struct urcu_txn *h, void **slot, uintptr_t tag,
 	ft_txn_load_at((h), (slot), (tag), true, __FILE__, __LINE__)
 #else
 FT_TXN_INLINE
-void *ft_txn_load(struct urcu_txn *h, void **slot, uintptr_t tag)
+void *ft_txn_load(struct ft_txn *h, void **slot, uintptr_t tag)
 {
-	return urcu_txn_load(h, slot, tag);
+	return urcu_txn_load(&h->e, slot, tag);
 }
 
 FT_TXN_INLINE
-void *ft_txn_load_committed(struct urcu_txn *h, void **slot, uintptr_t tag)
+void *ft_txn_load_committed(struct ft_txn *h, void **slot, uintptr_t tag)
 {
-	return urcu_txn_load_committed(h, slot, tag);
+	return urcu_txn_load_committed(&h->e, slot, tag);
 }
 #endif
 

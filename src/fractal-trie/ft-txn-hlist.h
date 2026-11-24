@@ -163,7 +163,7 @@
  */
 static inline
 int ft_hlist_store_sw_at(const char *fn, int line, const struct cds_ft *ft,
-		struct urcu_txn *txn, void **slot, void *old_ptr, void *new_ptr,
+		struct ft_txn *txn, void **slot, void *old_ptr, void *new_ptr,
 		uintptr_t tag);
 
 /*
@@ -380,7 +380,7 @@ const struct ft_canary_ent *ft_chain_canary_of(void **slot)
 
 static inline
 int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
-		struct urcu_txn *txn,
+		struct ft_txn *txn,
 		void **slot, void *old_ptr, void *new_ptr, uintptr_t tag)
 {
 	/*
@@ -494,7 +494,7 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 	 *                           ft_node_mark_removed_flip's header)
 	 */
 	FT_TK_COUNT_CHAIN_SW();
-	return urcu_txn_store_sw(txn, slot, old_ptr, new_ptr, tag);
+	return urcu_txn_store_sw(&txn->e, slot, old_ptr, new_ptr, tag);
 }
 
 #define ft_hlist_store_chain(ft, txn, slot, old_ptr, new_ptr, tag)	\
@@ -555,14 +555,14 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
  */
 static inline
 int ft_hlist_store_sw_at(const char *fn, int line, const struct cds_ft *ft,
-		struct urcu_txn *txn,
+		struct ft_txn *txn,
 		void **slot, void *old_ptr, void *new_ptr, uintptr_t tag)
 {
 	FT_TK_COUNT_CHAIN_SW();
 	FT_AB_ARM(FT_AB_CELL_HANDLE, FT_AB_OWN_NA);
 	FT_CH_COARSE(fn, line);
 	FT_CHAIN_CANARY_STAMP(fn, line, slot);
-	return urcu_txn_store_sw(txn, slot, old_ptr, new_ptr, tag);
+	return urcu_txn_store_sw(&txn->e, slot, old_ptr, new_ptr, tag);
 }
 
 #define ft_hlist_store_sw(ft, txn, slot, old_ptr, new_ptr, tag)		\
@@ -676,7 +676,7 @@ static void ft_mark_refuse_report(void)
  * retained for exactly this.
  */
 static inline
-int ft_hlist_insert_after_prepare(const struct cds_ft *ft, struct urcu_txn *txn,
+int ft_hlist_insert_after_prepare(const struct cds_ft *ft, struct ft_txn *txn,
 		struct cds_ft_node *newp,
 		struct cds_ft_node *pos)
 {
@@ -758,7 +758,7 @@ int ft_hlist_insert_after_prepare(const struct cds_ft *ft, struct urcu_txn *txn,
  * The reservation is two records per splice.
  */
 static inline
-void ft_hlist_append_run_prepare(const struct cds_ft *ft, struct urcu_txn *txn,
+void ft_hlist_append_run_prepare(const struct cds_ft *ft, struct ft_txn *txn,
 		struct cds_ft_node *tail,
 		struct cds_ft_node *run_head)
 {
@@ -795,7 +795,7 @@ void ft_hlist_append_run_prepare(const struct cds_ft *ft, struct urcu_txn *txn,
  * Return 0, or -ENOENT when @elem is already logically deleted.
  */
 static inline
-int ft_hlist_del_prepare(const struct cds_ft *ft, struct urcu_txn *txn, struct cds_ft_node *elem)
+int ft_hlist_del_prepare(const struct cds_ft *ft, struct ft_txn *txn, struct cds_ft_node *elem)
 {
 	struct cds_ft_node *next = (struct cds_ft_node *)
 			ft_txn_load(txn, (void **) &elem->next, FT_HLIST_TAG);
@@ -863,7 +863,7 @@ int ft_hlist_del_prepare(const struct cds_ft *ft, struct urcu_txn *txn, struct c
  * Always returns 0.  The int is retained for caller-shape parity.
  */
 static inline
-int ft_hlist_replace_prepare(const struct cds_ft *ft, struct urcu_txn *txn,
+int ft_hlist_replace_prepare(const struct cds_ft *ft, struct ft_txn *txn,
 		struct cds_ft_node *old, struct cds_ft_node *newp)
 {
 	struct cds_ft_node *next = (struct cds_ft_node *)
@@ -905,7 +905,7 @@ int ft_hlist_replace_prepare(const struct cds_ft *ft, struct urcu_txn *txn,
  * FT_HLIST_FREEZE_MAX_EDGES on top of the host op's footprint.
  */
 static inline
-void ft_hlist_freeze_prepare(const struct cds_ft *ft, struct urcu_txn *txn, struct cds_ft_node *node)
+void ft_hlist_freeze_prepare(const struct cds_ft *ft, struct ft_txn *txn, struct cds_ft_node *node)
 {
 	void *en = ft_txn_load(txn, (void **) &node->next, FT_HLIST_TAG);
 	int ret;
@@ -938,7 +938,7 @@ void ft_hlist_freeze_prepare(const struct cds_ft *ft, struct urcu_txn *txn, stru
  * the successor and PROMOTES it.
  */
 static inline
-void ft_hlist_freeze_sole_prepare(const struct cds_ft *ft, struct urcu_txn *txn, struct cds_ft_node *node)
+void ft_hlist_freeze_sole_prepare(const struct cds_ft *ft, struct ft_txn *txn, struct cds_ft_node *node)
 {
 	int ret;
 
@@ -1089,7 +1089,7 @@ __thread const char *ft_hlist_why_fn;
 __thread int ft_hlist_why_line;
 /*
  * THE REGISTRY WITNESS' SOURCE.  A freeze helper is handed the ENGINE handle
- * (struct urcu_txn *).  The lock registry lives one level up, in the
+ * (struct ft_txn *).  The lock registry lives one level up, in the
  * ft_flip_txn that owns it.  So the wrapper cannot be recovered from the
  * handle.  Every caller of a *_prepare form reaches it through
  * ft_flip_txn_handle().  So stamp the wrapper THERE, in the one place that
@@ -1103,7 +1103,7 @@ extern __thread struct ft_flip_txn *ft_hlist_why_ftxn;
 __thread struct ft_flip_txn *ft_hlist_why_ftxn;
 static inline bool ft_flip_txn_owns(const struct ft_flip_txn *t,
 		const struct cds_ft_metadata *owner);
-static inline struct urcu_txn *ft_flip_txn_handle(struct ft_flip_txn *t);
+static inline struct ft_txn *ft_flip_txn_handle(struct ft_flip_txn *t);
 static bool ft_hold_trace_holds(const struct cds_ft_metadata *lock);
 /*
  * ☞ COUNT THE BAIL, DO NOT JUST PREVENT THE EVENT.  ft_hlist_chain_plan_ok
@@ -1229,7 +1229,7 @@ static void ft_hlist_why_report(void)
 }
 
 static inline
-void ft_hlist_why_tail(struct cds_ft *ft, struct urcu_txn *txn,
+void ft_hlist_why_tail(struct cds_ft *ft, struct ft_txn *txn,
 		struct cds_ft_node *head)
 {
 	void *live = (void *) CMM_LOAD_SHARED(head->next);
@@ -1489,7 +1489,7 @@ unsigned int ft_hlist_chain_len_at(struct cds_ft_node *head)
  * stale, not wrong -- and must not have made any reader-visible change yet.
  */
 static inline
-bool ft_hlist_chain_plan_ok(const struct cds_ft *ft, struct urcu_txn *txn,
+bool ft_hlist_chain_plan_ok(const struct cds_ft *ft, struct ft_txn *txn,
 		struct cds_ft_node *head, unsigned int len)
 {
 	unsigned int i;
@@ -1583,7 +1583,7 @@ bool ft_hlist_chain_plan_ok(const struct cds_ft *ft, struct urcu_txn *txn,
  */
 static inline
 void ft_hlist_freeze_chain_prepare_at(const struct cds_ft *ft,
-		struct urcu_txn *txn, struct cds_ft_node *head,
+		struct ft_txn *txn, struct cds_ft_node *head,
 		unsigned int len, bool plan_checked)
 {
 	unsigned int i;

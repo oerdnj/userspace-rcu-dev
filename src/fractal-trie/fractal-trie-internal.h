@@ -168,7 +168,7 @@ struct ft_lane {
  * (<urcu/rcu-txn-sw.h>) has no lane.
  */
 struct ft_op {
-	struct urcu_txn txn;		/* the engine handle (no domain) */
+	struct ft_txn txn;		/* its engine handle has no domain */
 	struct ft_lane *lane;		/* NULL: never escalates (exclusive trie) */
 	const struct rcu_flavor_struct *flavor;	/* for the quiescent park */
 	unsigned long retry;		/* attempts lost so far */
@@ -1193,7 +1193,7 @@ struct ft_pub_rec {
 	 * NULL keeps the raw derivation.  A direct-store publish has no txn to
 	 * consult, and no pending edges to miss.
 	 */
-	struct urcu_txn *mtxn;
+	struct ft_txn *mtxn;
 };
 
 /*

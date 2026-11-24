@@ -3196,7 +3196,7 @@ struct cds_ft_inode_flag **ft_get_parent_slot(const struct cds_ft_metadata *meta
  */
 static inline
 struct cds_ft_inode_flag **ft_txn_parent_slot_at(const struct cds_ft_metadata *meta,
-		struct cds_ft *ft, struct urcu_txn *mtxn,
+		struct cds_ft *ft, struct ft_txn *mtxn,
 		struct cds_ft_inode_flag **parent_out)
 {
 	struct cds_ft_inode_flag *parent;

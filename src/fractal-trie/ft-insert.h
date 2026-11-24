@@ -5139,7 +5139,7 @@ struct ft_ord_cell *ft_insert_replace_head_cell(struct cds_ft_node *head)
 
 static
 unsigned int ft_insert_replace_leaf_sedges(struct cds_ft *ft,
-		struct urcu_txn *mtxn, struct cds_ft_inode_flag *pnf,
+		struct ft_txn *mtxn, struct cds_ft_inode_flag *pnf,
 		struct cds_ft_inode_flag **nfp, struct cds_ft_inode_flag *nf,
 		struct cds_ft_node *node, struct ft_ord_cell_edge *sedges,
 		bool gp_held)

@@ -1066,7 +1066,7 @@ bool ft_owner_ctx_holds(const struct ft_lock_ctx *ctx,
  * FT bridge to the concurrent MCAS transaction engine (<urcu/rcu-txn.h>).
  *
  * During its build, an op records its frozen edge set {slot, old, new}
- * DIRECTLY into the engine transaction (@mtxn, a `struct urcu_txn *`).  It
+ * DIRECTLY into the engine transaction (@mtxn, a `struct ft_txn *`).  It
  * records through:
  *  - ft_flip_txn_record_reserved / ft_flip_txn_record_tag;
  *  - the ordered-list *_prepare helpers.
@@ -2871,10 +2871,10 @@ static struct ft_miss_site {
 } ft_miss_sites[FT_MISS_SITES];
 static unsigned long ft_miss_overflow;
 
-static inline unsigned int ft_miss_nr(const struct urcu_txn *mtxn)
+static inline unsigned int ft_miss_nr(const struct ft_txn *mtxn)
 {
-	return (mtxn && mtxn->desc && mtxn->desc != URCU_TXN_ENOMEM) ?
-		mtxn->desc->nr : 0;
+	return (mtxn && mtxn->e.desc && mtxn->e.desc != URCU_TXN_ENOMEM) ?
+		mtxn->e.desc->nr : 0;
 }
 
 static void ft_miss_account(const char *fn, int line, unsigned int wasted)
@@ -2933,14 +2933,14 @@ static __attribute__((destructor)) void ft_miss_report(void)
 #endif
 
 struct ft_flip_txn {
-	struct urcu_txn *mtxn;	/* the concurrent commit engine handle:
+	struct ft_txn *mtxn;	/* the concurrent commit engine handle:
 					 * &own (standalone txn), or the op's
 					 * PERSISTENT handle (create_bounded_on)
 					 * whose retry aging / FIFO turn / learned
 					 * size span the op's restart_attempt loop
 					 * (doc/design/mcas-multiwriter-readiness.md
 					 * §11) */
-	struct urcu_txn own;	/* backing handle for standalone txns */
+	struct ft_txn own;	/* backing handle for standalone txns */
 	struct ft_op *op;	/* the op whose handle @mtxn is, or NULL */
 	bool reserved;			/* @mtxn pre-reserved (bounded) => infallible commit */
 	bool list_locked;		/* holds class-1 words (ft_list_locked_txns) */
@@ -3535,7 +3535,7 @@ void ft_ll_terminal(struct ft_flip_txn *t, int kind, int status)
  * that record directly into the transaction.
  */
 static inline
-struct urcu_txn *ft_flip_txn_handle(struct ft_flip_txn *t)
+struct ft_txn *ft_flip_txn_handle(struct ft_flip_txn *t)
 {
 #ifdef FT_DEBUG_HLIST_TAIL_WHY
 	/*
@@ -3577,7 +3577,7 @@ static inline
 void ft_txn_op_init(struct cds_ft *ft, struct ft_op *op)
 {
 	ft_hold_trace_leak_canary();
-	urcu_txn_init(&op->txn, NULL);
+	urcu_txn_init(&op->txn.e, NULL);
 	if (ft->exclusive) {
 		op->lane = NULL;
 		op->flavor = NULL;
@@ -3643,7 +3643,7 @@ static __thread const struct cds_ft_metadata *ft_acq_refused_word;
 static inline
 unsigned long ft_op_cost(const struct ft_op *op)
 {
-	return urcu_txn_last_cost(&op->txn);
+	return urcu_txn_last_cost(&op->txn.e);
 }
 
 /* Attempts this op may lose before it earns the lane. */
@@ -3735,7 +3735,7 @@ void ft_op_begin(struct ft_op *op)
 			ft_op_earned_lane(op)) {
 		ft_op_lane_publish(op);
 	}
-	urcu_txn_begin(&op->txn);
+	urcu_txn_begin(&op->txn.e);
 	if (op->flavor)
 		op->flavor->read_lock();
 }
@@ -3747,7 +3747,7 @@ void ft_op_begin(struct ft_op *op)
 static inline
 void ft_op_end(struct ft_op *op)
 {
-	urcu_txn_end(&op->txn);
+	urcu_txn_end(&op->txn.e);
 	if (op->flavor)
 		op->flavor->read_unlock();
 	if (op->in_lane && !op->retrying)
@@ -3762,7 +3762,7 @@ void ft_op_end(struct ft_op *op)
 static inline
 void ft_op_conflict(struct ft_op *op)
 {
-	urcu_txn_conflict(&op->txn);
+	urcu_txn_conflict(&op->txn.e);
 	op->retry++;
 }
 
@@ -3795,7 +3795,7 @@ void ft_flip_txn_conflict(struct ft_flip_txn *t)
 	if (t->op)
 		ft_op_conflict(t->op);
 	else
-		urcu_txn_conflict(t->mtxn);
+		urcu_txn_conflict(&t->mtxn->e);
 }
 
 /*
@@ -4208,7 +4208,7 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 #endif
 	t->mtxn = &t->own;
 	t->op = NULL;
-	urcu_txn_init(t->mtxn, NULL);	/* flavor-agnostic: the caller brackets the
+	urcu_txn_init(&t->mtxn->e, NULL);	/* flavor-agnostic: the caller brackets the
 					 * RCU read side; no escalation domain
 					 * under POC exclusion */
 	/* Skip the age-0 optimistic install and its fixed-size RYW Bloom
@@ -4218,7 +4218,7 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	 * a spurious escalate-ABORT (see the note in
 	 * ft_flip_txn_create_bounded).  The exact age-1+ reconcile has no
 	 * Bloom. */
-	urcu_txn_expect_conflict(t->mtxn);
+	urcu_txn_expect_conflict(&t->mtxn->e);
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
 	t->list_locked = false;
 	t->glue_anchors = 0;
@@ -4509,7 +4509,7 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 #endif
 	t->mtxn = &op->txn;
 	t->op = op;
-	urcu_txn_expect_conflict(t->mtxn);
+	urcu_txn_expect_conflict(&t->mtxn->e);
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
 	t->list_locked = false;
 	t->glue_anchors = 0;
@@ -4627,7 +4627,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 #endif
 	t->mtxn = &op->txn;
 	t->op = op;
-	if (urcu_txn_reserve(t->mtxn, cap) < 0) {
+	if (urcu_txn_reserve(&t->mtxn->e, cap) < 0) {
 		ft_flip_txn_free(t);
 		return NULL;
 	}
@@ -4773,7 +4773,7 @@ struct ft_flip_txn *ft_flip_txn_acquire_bounded_at(FT_TK_SITE_PARAM
 static inline
 bool ft_flip_txn_reserve(struct ft_flip_txn *t, unsigned int cap)
 {
-	if (urcu_txn_reserve(t->mtxn, cap) < 0)
+	if (urcu_txn_reserve(&t->mtxn->e, cap) < 0)
 		return false;
 	t->reserved = true;
 	t->committed = false;
@@ -4847,7 +4847,7 @@ bool ft_flip_txn_reserve_extra(struct ft_flip_txn *t, unsigned int extra)
 	 * A floor from an attempt that bailed is owed to nobody.
 	 */
 	unsigned int cur = t->reserved &&
-			t->mtxn->min_alloc > nr ? t->mtxn->min_alloc : nr;
+			t->mtxn->e.min_alloc > nr ? t->mtxn->e.min_alloc : nr;
 
 #ifdef FT_DEBUG_RESERVE_RATCHET
 	{
@@ -4866,7 +4866,7 @@ bool ft_flip_txn_reserve_extra(struct ft_flip_txn *t, unsigned int extra)
 			fprintf(stderr,
 				"FT RESERVE-EXTRA call=%lu cur=%u extra=%u -> %u (min_alloc=%u nr=%u)\n",
 				c, cur, extra, cur + extra,
-				t->mtxn->min_alloc, nr);
+				t->mtxn->e.min_alloc, nr);
 	}
 #endif
 	return ft_flip_txn_reserve(t, cur + extra);
@@ -7635,7 +7635,7 @@ enum ft_lock_terminal_state ft_lock_terminal_query(const struct ft_flip_txn *t,
 /*
  * WILL A SUCCESSFUL COMMIT OF @t TAKE OUR FENCE OFF @lock?  Asked BEFORE the
  * commit, because a commit consumes the flip-txn wrapper and reading
- * ->mtxn->desc afterwards is a use-after-free.
+ * ->mtxn->e.desc afterwards is a use-after-free.
  *
  * This is how a post-commit release learns what it may touch.  The op files a
  * record.  The record says what the terminal will DO to the word.  Together
@@ -9493,7 +9493,7 @@ static unsigned long ft_mk_sw[FT_MK_NR], ft_mk_txn[FT_MK_NR];
 static inline
 void ft_mk_note(const struct ft_flip_txn *t, const struct cds_ft *ft)
 {
-	struct urcu_txn_desc *d = t->mtxn ? t->mtxn->desc : NULL;
+	struct urcu_txn_desc *d = t->mtxn ? t->mtxn->e.desc : NULL;
 	unsigned int i, mode;
 
 	if (!d || d == URCU_TXN_ENOMEM || !d->nr)
@@ -9748,7 +9748,7 @@ static void ft_hf_site_note(const void *pc)
 }
 static void ft_hidden_fill_at_commit(struct ft_flip_txn *t)
 {
-	struct urcu_txn_desc *d = t && t->mtxn ? t->mtxn->desc : NULL;
+	struct urcu_txn_desc *d = t && t->mtxn ? t->mtxn->e.desc : NULL;
 	unsigned long n = 0;
 	unsigned int i, j;
 
@@ -9976,7 +9976,7 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 			ft_hold_trace_drop(t->locks[drop_i].meta);
 	}
 	FT_MK_NOTE(t, ft);
-	st = urcu_txn_commit_flavor(t->mtxn, reclaim);
+	st = urcu_txn_commit_flavor(&t->mtxn->e, reclaim);
 	if (st == URCU_TXN_STATUS_ABORT && t->op)
 		ft_op_commit_aborted(t->op);
 #ifdef FT_DEBUG_STRUCT_ANCHOR
@@ -10240,7 +10240,7 @@ void ft_flip_txn_park_excluded(struct ft_flip_txn *t, void **slot,
 		return;
 	FT_AB_ARM(FT_AB_SW, FT_AB_OWN_NA);
 	FT_LL_REC(t, slot, old_ptr, new_ptr, true);
-	ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
+	ret = urcu_txn_store_sw(&t->mtxn->e, slot, old_ptr, new_ptr, tag);
 	assert(!ret);
 	(void) ret;
 }
@@ -10695,7 +10695,8 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 		}
 #endif
 		FT_LL_REC(t, slot, old_ptr, new_ptr, true);
-		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
+		ret = urcu_txn_store_sw(&t->mtxn->e, slot, old_ptr, new_ptr,
+				tag);
 	} else {
 		ft_flip_txn_struct_mw_abort("STRUCT", t, owner, slot,
 			old_ptr, new_ptr, __builtin_return_address(0));
@@ -10817,7 +10818,8 @@ void __ft_flip_txn_record_tag_excluded(struct ft_flip_txn *t, void **slot,
 			!(t->ft && slot == (void **) &t->ft->root)) {
 		FT_TK_COUNT_REC(t, FT_TK_SW);
 		FT_LL_REC(t, slot, old_ptr, new_ptr, true);
-		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
+		ret = urcu_txn_store_sw(&t->mtxn->e, slot, old_ptr, new_ptr,
+				tag);
 	} else {
 		/*
 		 * Every caller reaches this lane only on a trie that excludes
@@ -11034,7 +11036,7 @@ void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
 
 			FT_AB_ARM(FT_AB_SW, FT_AB_OWN_NA);
 			FT_LL_REC(t, slot, old_ptr, new_ptr, true);
-			ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr,
+			ret = urcu_txn_store_sw(&t->mtxn->e, slot, old_ptr,
 				new_ptr, FT_FLIP_PROXY_TAG);
 			assert(!ret);
 			(void) ret;
@@ -15068,7 +15070,7 @@ int ft_txn_list_insert_between_prepare(struct cds_ft *ft,
 		struct urcu_txn_list_node *pos,
 		struct urcu_txn_list_node *succ_expected)
 {
-	struct urcu_txn *txn = ft_flip_txn_handle(t);
+	struct ft_txn *txn = ft_flip_txn_handle(t);
 	void *pn;
 
 	if (caa_unlikely(!pos || !succ_expected))
@@ -18007,7 +18009,7 @@ static void ft_dual_ask_report(void)
 bool ft_skip_dual_gp_held(struct cds_ft *ft,
 		const struct ft_lock_ctx *ctx,
 		struct cds_ft_inode_flag *parent_nf,
-		struct urcu_txn *mtxn)
+		struct ft_txn *mtxn)
 {
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	struct cds_ft_compressed_node *cn;
@@ -18164,7 +18166,7 @@ bool ft_lock_skip_dual_gp(struct cds_ft *ft,
 		const struct ft_lock_ctx *ctx,
 		struct ft_flip_txn *txn,
 		struct cds_ft_inode_flag *parent_nf,
-		struct urcu_txn *mtxn)
+		struct ft_txn *mtxn)
 {
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	struct cds_ft_compressed_node *cn;
@@ -21846,7 +21848,7 @@ void ft_set_parent_raw(struct cds_ft *ft, struct cds_ft_inode_flag *child,
  */
 static
 struct cds_ft_metadata *ft_count_walk_survivor_meta(struct cds_ft *ft,
-		struct urcu_txn *ryw, void *new_raw)
+		struct ft_txn *ryw, void *new_raw)
 {
 	struct cds_ft_inode_flag *nf = (struct cds_ft_inode_flag *) new_raw;
 
@@ -21882,7 +21884,7 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 		struct cds_ft_inode_flag *stable_base, long delta)
 {
 	struct cds_ft_inode_flag *cur = stable_base;
-	struct urcu_txn *ryw = NULL;
+	struct ft_txn *ryw = NULL;
 	/*
 	 * The survivor bodies this walk has already charged.  Bounded by the
 	 * walk itself: one level of the chain adds at most one body.
@@ -27748,7 +27750,7 @@ void ft_glue_record_splices(struct cds_ft *ft, struct ft_glue *g,
 		 *   under the caller exclusion their contract requires.
 		 */
 		{
-			struct urcu_txn *h = ft_flip_txn_handle(txn);
+			struct ft_txn *h = ft_flip_txn_handle(txn);
 			void *prev_old = ft_txn_load(h, (void **) &src_head->prev,
 					FT_HLIST_PREV_TAG);
 			int ret;

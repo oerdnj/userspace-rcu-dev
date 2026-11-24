@@ -311,7 +311,7 @@ bool ft_rekey_cow_fresh_has(const struct ft_rekey_cow_fresh *fresh,
  * out of memory).
  */
 static inline
-struct urcu_txn *ft_rekey_cow_ryw(const struct ft_flip_txn *txn, bool ryw)
+struct ft_txn *ft_rekey_cow_ryw(const struct ft_flip_txn *txn, bool ryw)
 {
 	if (!ryw || !ft_txn_live(txn->mtxn))
 		return NULL;
@@ -320,7 +320,7 @@ struct urcu_txn *ft_rekey_cow_ryw(const struct ft_flip_txn *txn, bool ryw)
 
 static inline
 bool ft_rekey_cow_slot_value(struct ft_flip_txn *txn,
-		struct urcu_txn *ryw,
+		struct ft_txn *ryw,
 		struct cds_ft_inode_flag **src_slot,
 		struct cds_ft_inode_flag **iter_ret)
 {
@@ -362,7 +362,7 @@ bool ft_rekey_cow_slot_value(struct ft_flip_txn *txn,
  */
 static
 struct cds_ft_metadata *ft_rekey_cow_skip_meta_ryw(struct cds_ft *ft,
-		struct ft_flip_txn *txn, struct urcu_txn *ryw,
+		struct ft_flip_txn *txn, struct ft_txn *ryw,
 		struct cds_ft_inode_flag *skip)
 {
 	struct cds_ft_inode_flag *child = ft_skip_child_ptr(skip);
@@ -443,7 +443,7 @@ struct cds_ft_metadata *ft_rekey_cow_glue_fresh_meta(struct cds_ft *ft,
 /* The node's key count as this commit will leave it (see @ryw above). */
 static inline
 unsigned long ft_rekey_cow_nr_keys(const struct cds_ft_metadata *m,
-		struct urcu_txn *ryw)
+		struct ft_txn *ryw)
 {
 	if (ryw) {
 		const struct ft_txn_rec *r = ft_txn_find(ryw,
@@ -469,7 +469,7 @@ unsigned long ft_rekey_cow_nr_keys(const struct cds_ft_metadata *m,
 static
 int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 		const struct ft_lock_ctx *ctx, struct ft_lock_ctx *cctx,
-		struct ft_flip_txn *txn, struct urcu_txn *ryw,
+		struct ft_flip_txn *txn, struct ft_txn *ryw,
 		struct cds_ft_inode_flag *iter, struct cds_ft_inode_flag *new_flag,
 		struct cds_ft_inode_flag **slot, struct cds_ft_inode_flag **src_slot,
 		unsigned int child_depth, const struct ft_rekey_cow_fresh *fresh,
