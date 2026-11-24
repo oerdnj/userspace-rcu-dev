@@ -240,117 +240,6 @@ unsigned long ft_tk_ret_held_us, ft_tk_ret_held_other,
 	ft_tk_ret_unlocked_fine, ft_tk_ret_unlocked_coarse,
 	ft_tk_ret_unlocked_excl, ft_tk_ret_unlocked_wlock;
 
-/*
- * MW_ALWAYS IS NOT ONE POPULATION, and the G4 decision reads it as if it were.
- * The column mixes two families of slots:
- *   - slots that can NEVER convert (a trie root has no node to lock);
- *   - slots that are unheld only because THIS op's lock-set does not reach
- *     them (a SKIP_X dual in a grandparent).
- * The per-edge @owner_held of af22756b moved the second family INTO this
- * column from MW_STRUCT.  That is why the post-Phase-B re-measure shows
- * MW_ALWAYS nearly doubling while the conversion surface falls 65%.  Part of
- * that rise is BOOKKEEPING, and no argument settles which part.  This enum
- * splits it.
- *
- * ONE CLASS PER RECORD BRANCH, declared by the branch itself.  There is no
- * default.  In the instrumented build, the class is a required argument of
- * ft_flip_txn_record_tag_excluded.  So a new caller of it cannot be added
- * without saying which population it joins.  @owner_held uses the same
- * compiler-enforced discipline.  The classes are:
- *
- *   ROOT         &ft->root.  A root lives in no node, so there is no lock word
- *                to make a park legal -- ft_flip_txn_record_root.  NEVER
- *                converts, whatever G4 decides.
- *   HEAD_BACK    an external head's back channel (cell->parent / en->prev).
- *                Neither an external node nor its cell carries a state word --
- *                but that is the wrong question, and this entry used to answer
- *                it: "that predicate's permanent false arm.  NEVER converts".
- *                ☠ REFUTED IN THE TREE.  The word has a NAMED single owner --
- *                the chain HOLDER, which is exactly what ft_back_edge_owner
- *                returns -- and ft_promote_head ALREADY PARKS IT SW with that
- *                holder as @owner.  So HEAD_BACK is a LOCK-SET REACH class
- *                like PARENT_WORD, not a never-converts class like ROOT: its
- *                MW is debt.  What the missing state word rules out is making
- *                the EXTERNAL the owner, not conversion.  Read a count here
- *                as "producers that did not reach the holder", and see THE
- *                TRANSACTED-SLOT REGISTER in fractal-trie-internal.h.
- *   DUAL         a STRUCTURAL trie edge whose owner the op does not hold: the
- *                SKIP_X dual landing in a grandparent the op never acquired.
- *                THE RECLASSIFIED POPULATION -- it was MW_STRUCT (or, before
- *                af22756b, an unsound SW park) and it is convertible in
- *                principle, by WIDENING THE LOCK-SET, not by arming.
- *                ☠ AND THIS COLUMN NO LONGER MEASURES THAT DEFINITION.  It is
- *                the `else` of ft_ord_cell_flip_into's dispatch, so it also
- *                receives: a FORWARD edge recorded with @owner_held false
- *                (ft_node_recompact's RELOCATE), an &ft->root edge that
- *                carried no .root flag (the replace op's sedges), and -- since
- *                the insert and remove lanes began ACQUIRING the dual's
- *                grandparent -- duals whose owner the op DOES hold.  So a
- *                count here is an upper bound on "unheld SKIP_X duals", and
- *                the G4 / Phase-E readings taken from it are stale in both
- *                directions.  Split the branch before trusting the number.
- *   CELL         a non-structural-tag edge replayed through ft_ord_cell_flip_into:
- *                the key-ordered CELL LIST (ft_ord_cell.lnode links and the
- *                deletion mark, MW by design) -- NOT the duplicate chain, a
- *                different list stored on the engine handle.  (The not-held
- *                nr_child-- of ft_remove_one_commit, whose FT_STATE_PROXY tag
- *                is the same bit 0, used to land here; it is NR_CHILD_DEC.)
- *                THE G4 LANE.  Convertible only if cells grow a state word and
- *                join lock-sets -- the separately-planned workstream.
- *   RANK         nr_keys propagated up the ancestor chain.  A rank-stats trie
- *                is coerced COARSE (ft-lifecycle.h), so every writer holds the
- *                FT-wide writer lock: convertible to SW under that condition
- *                only (the register's note 9).  MW today is debt.
- *   PARENT_WORD  a child's parent_word written by the recompaction re-parent
- *                sweep, whose acquire takes {C,P,(GP)} and never C's children.
- *                Same shape as DUAL: a lock-set reach question.
- *   PSO          the same child's parent_slot_offset, third word of the same
- *                node.  §8.3's layout split is what retires it.
- *   STATE        the recompaction re-parent sweep's own child state word,
- *                recorded {live -> live}.  A VALIDATE in everything but the
- *                engine's bookkeeping, and it must stay MW: a park validates
- *                nothing.  MARKING those children instead was implemented in
- *                full and does not live (a contended child fails the acquire,
- *                and escalation cannot rescue it).
- *   GUARD        the §4.B guard on a node a forward edge INSTALLS as a VALUE,
- *                which no lock can ever cover (the acquire takes {C,P,(GP)},
- *                never C's children).  Same shape as STATE, different source,
- *                and separated here because one number for both is what this
- *                decomposition exists to stop.
- *
- * ☞ CELL here counts only the cell edges that ride a flip-txn's edge replay.
- * The ones recorded straight on the engine handle are the separate cell/hlist
- * line -- see the header comment.  Both are the same lane for G4.
- */
-enum ft_tk_mwa_class {
-	FT_TK_MWA_ROOT = 0,
-	FT_TK_MWA_HEAD_BACK,
-	FT_TK_MWA_DUAL,		/* residual: none of the three below */
-	FT_TK_MWA_DUAL_ROOT,
-	FT_TK_MWA_DUAL_NAMED,
-	FT_TK_MWA_DUAL_UNNAMED,
-	FT_TK_MWA_CELL,
-	FT_TK_MWA_RANK,
-	FT_TK_MWA_PARENT_WORD,
-	FT_TK_MWA_PSO,
-	FT_TK_MWA_STATE,
-	FT_TK_MWA_GUARD,
-	FT_TK_MWA_NR_CHILD_DEC,	/* the in-place delete's not-held nr_child-- */
-	FT_TK_MWA_NR,
-};
-
-#ifdef FT_ABORT_ATTRIB
-/*
- * ft-txn-rec-dbg.h reserves its tail for these thirteen.  It is parsed BEFORE
- * this header, because it defines hooks the engine's inlines need.  So it
- * cannot use the enum itself.  Fail the BUILD if the two ever disagree, rather
- * than silently folding a fourteenth population into the last row.
- */
-urcu_static_assert(FT_AB_CLS_NR - FT_AB_MWA_BASE == FT_TK_MWA_NR,
-	"ft-txn-rec-dbg.h reserves a different number of always-MW classes",
-	ft_ab_mwa_class_count);
-#endif
-
 enum ft_tk_end_class {
 	FT_TK_OK = 0,		/* urcu_txn_commit_flavor -> OK */
 	FT_TK_ABORT,		/* a peer won an MW record or a guard */
@@ -406,7 +295,6 @@ struct ft_tk_tls {
 	 * The header of ft_hlist_store_mw_at asked for this split.
 	 */
 	unsigned long chain_sw;
-	unsigned long mwa[FT_TK_MWA_NR];
 #ifdef FT_ABORT_ATTRIB
 	/*
 	 * WHICH CLASS OF RECORD LOST, per txn creation site.  It is per site
@@ -617,26 +505,9 @@ void ft_tk_count_chain_sw(void)
 	ft_tk_tls_get()->chain_sw++;
 }
 
-/*
- * Which always-MW POPULATION this record joins.  Global rather than per site:
- * the class is a property of the record BRANCH (its producer), and every branch
- * is reached from many txn sites.
- */
-static inline
-void ft_tk_count_mwa(enum ft_tk_mwa_class c)
-{
-	ft_tk_tls_get()->mwa[c]++;
-}
-
 #ifdef FT_ABORT_ATTRIB
 static const char * const ft_ab_names[FT_AB_CLS_NR] = {
 	"UNATTRIB", "SW", "MW_STRUCT", "MW_LOCK", "VALIDATE", "CELL_HANDLE",
-	/* enum ft_tk_mwa_class order, exactly -- the static assert above only
-	 * checks the COUNT, so a name out of order would mislabel silently. */
-	"mwa:ROOT", "mwa:HEAD_BACK", "mwa:DUAL", "mwa:DUAL_ROOT",
-	"mwa:DUAL_NAMED", "mwa:DUAL_UNNAMED", "mwa:CELL",
-	"mwa:RANK", "mwa:PARENT_WORD", "mwa:PSO", "mwa:STATE", "mwa:GUARD",
-	"mwa:NR_CHILD_DEC",
 };
 
 static
@@ -975,7 +846,6 @@ void ft_win_lookup(const struct urcu_txn_record *r)
 enum ft_lv_cause {
 	FT_LV_SEEN_NONE = 0,	/* no observed value */
 	FT_LV_PROXY_LOCKTAKE,	/* a peer's parked lock take (MW_LOCK) */
-	FT_LV_PROXY_STATE,	/* a peer's parked STATE record (validate / MW retire) */
 	FT_LV_PROXY_SW,		/* a holder's SW park */
 	FT_LV_PROXY_OTHER,
 	FT_LV_LOCK_MEMBER,	/* LOCK set, the child is a MEMBER some op claims */
@@ -986,7 +856,7 @@ enum ft_lv_cause {
 	FT_LV_NR,
 };
 static const char * const ft_lv_cause_name[FT_LV_NR] = {
-	"seen_none", "proxy_locktake", "proxy_state", "proxy_sw",
+	"seen_none", "proxy_locktake", "proxy_sw",
 	"proxy_other", "LOCK_member", "LOCK_anchor", "TOMB", "nr_child",
 	"other",
 };
@@ -1094,9 +964,7 @@ static void ft_lv_lost(const struct urcu_txn_record *r)
 			CMM_LOAD_SHARED(wr->dbg_embedder));
 
 		c = wcls == FT_AB_MW_LOCK ? FT_LV_PROXY_LOCKTAKE :
-			wcls == FT_AB_SW ? FT_LV_PROXY_SW :
-			wcls == FT_AB_MWA_BASE + FT_TK_MWA_STATE ?
-				FT_LV_PROXY_STATE : FT_LV_PROXY_OTHER;
+			wcls == FT_AB_SW ? FT_LV_PROXY_SW : FT_LV_PROXY_OTHER;
 	} else {
 		uintptr_t sv = (uintptr_t) seen;
 		uintptr_t diff = sv ^ (uintptr_t) r->old_ptr;
@@ -1296,8 +1164,8 @@ void ft_ab_note_lost(const struct urcu_txn_desc *t,
 static unsigned long ft_ss_tab[FT_SS_HAD][FT_AB_CLS_NR][2][2][2][2][2];
 static unsigned long ft_ss_total, ft_ss_declared;
 /*
- * The LOCK bit's transition on each side of the pair, for the words that
- * carry one (every class but RANK):
+ * The LOCK bit's transition on each side of the pair.  A rank count carries
+ * no lock bit, but a large count can set the same bit and land here too:
  *
  *   0  no lock bit
  *   1  RELEASE (L -> ~L)
@@ -1359,9 +1227,8 @@ void ft_ss_note(const struct urcu_txn_record *r, void *old_ptr,
 		gc = FT_AB_UNSET;
 	uatomic_inc(&ft_ss_tab[hc][gc][hk][gk][hv][gv][ch]);
 	uatomic_inc(&ft_ss_total);
-	if (gc != FT_AB_MWA_BASE + FT_TK_MWA_RANK)
-		uatomic_inc(&ft_ss_lock[ft_ss_lock_shape(r->old_ptr, r->new_ptr)]
-			[ft_ss_lock_shape(old_ptr, new_ptr)]);
+	uatomic_inc(&ft_ss_lock[ft_ss_lock_shape(r->old_ptr, r->new_ptr)]
+		[ft_ss_lock_shape(old_ptr, new_ptr)]);
 	if (ft_ss_tcount++ >= 64 && (ft_ss_tcount & 255))
 		return;
 	key = (((((hc * FT_AB_CLS_NR + gc) * 2 + hk) * 2 + gk) * 2 + hv) * 2
@@ -1430,7 +1297,7 @@ void ft_ss_report(void)
 		static const char * const ls[4] = {
 			"nolock", "RELEASE", "under-lock", "TAKE" };
 
-		fprintf(stderr, "  LOCK-bit shape, had x got (non-RANK):\n");
+		fprintf(stderr, "  LOCK-bit shape, had x got:\n");
 		for (hc = 0; hc < 4; hc++)
 			for (gc = 0; gc < 4; gc++)
 				if (ft_ss_lock[hc][gc])
@@ -1583,8 +1450,6 @@ void ft_tk_dump(void)
 	struct ft_tk_row *rows;
 	struct ft_tk_tls *tls;
 	unsigned long cell_mw = 0, cell_sw = 0, chain_sw = 0;
-	unsigned long mwa[FT_TK_MWA_NR];
-	unsigned long mwa_tot = 0;
 #ifdef FT_ABORT_ATTRIB
 	unsigned long ab[FT_AB_CLS_NR], ab_own[FT_AB_CLS_NR][FT_AB_OWN_NR];
 	unsigned long ab_alarm_site[FT_TK_MAX_SITES][2];
@@ -1610,7 +1475,6 @@ void ft_tk_dump(void)
 	nr = ft_tk_nr_sites;
 	if (ft_tk_sites[FT_TK_OVERFLOW_ID])
 		nr = FT_TK_MAX_SITES;
-	memset(mwa, 0, sizeof(mwa));
 #ifdef FT_ABORT_ATTRIB
 	memset(ab, 0, sizeof(ab));
 	memset(ab_own, 0, sizeof(ab_own));
@@ -1634,8 +1498,6 @@ void ft_tk_dump(void)
 		cell_mw += tls->cell_mw;
 		cell_sw += tls->cell_sw;
 		chain_sw += tls->chain_sw;
-		for (i = 0; i < FT_TK_MWA_NR; i++)
-			mwa[i] += tls->mwa[i];
 #ifdef FT_ABORT_ATTRIB
 		{
 			int c2, o2;
@@ -1761,60 +1623,11 @@ void ft_tk_dump(void)
 "    DUPLICATE-CHAIN stores (cds_ft_node.next/.prev; same caveat):                                                  SW=%lu\n",
 		chain_sw);
 
-	/*
-	 * MW_ALWAYS, SPLIT BY THE BRANCH THAT RECORDED IT.  The classes sum
-	 * to the MW_ALWAYS total above.  That equality is the table's
-	 * self-check.  It is printed rather than asserted.  A mismatch means
-	 * that a record branch was added without a class.  That is a fact
-	 * about the table, not a reason to kill the run.
-	 */
-	{
-		static const char * const mwa_name[FT_TK_MWA_NR] = {
-			"ROOT", "HEAD_BACK", "DUAL", "DUAL_ROOT",
-			"DUAL_NAMED", "DUAL_UNNAMED", "CELL",
-			"RANK", "PARENT_WORD", "PSO", "STATE",
-			"GUARD", "NR_CHILD_DEC",
-		};
-		static const char * const mwa_what[FT_TK_MWA_NR] = {
-			"&ft->root -- no node to lock, NEVER converts",
-			"external head back channel -- holder-owned; MW is lock-set reach, NOT never-converts",
-			"dispatch else, unclassified -- should read 0 now that the three below split it",
-			"the slot IS &ft->root -- no node owns it, [DESIGN], never converts",
-			"owner NAMED but not held -- THE CONVERSION SURFACE: a producer that could vouch if it acquired",
-			"owner UNNAMED (NULL) -- FT_OWNER_UNPLUMBED or genuinely ownerless: plumbing, not a lock",
-			"ordered-cell / dup-chain edge -- THE G4 LANE",
-			"nr_keys up unlocked ancestors -- Phase E (root-only spacing)",
-			"child parent_word, child not held (reparent sweep) -- lock-set reach",
-			"child parent_slot_offset -- §8.3 layout split retires it",
-			"the reparent sweep's own child state {live->live} -- a validate; must stay MW",
-			"§4.B guard on an INSTALLED value node -- a validate; must stay MW",
-			"in-place delete's nr_child--, holder not in the registry -- was counted in CELL (shared bit 0)",
-		};
-
-		for (i = 0; i < FT_TK_MWA_NR; i++)
-			mwa_tot += mwa[i];
-		fprintf(stderr,
-"\n    MW_ALWAYS split by RECORD BRANCH (the G4 input -- one number was four populations):\n");
-		for (i = 0; i < FT_TK_MWA_NR; i++)
-			fprintf(stderr,
-"      %-12s %14lu  %5.1f%%  %s\n",
-				mwa_name[i], mwa[i],
-				mwa_tot ? 100.0 * (double) mwa[i] /
-					(double) mwa_tot : 0.0,
-				mwa_what[i]);
-		fprintf(stderr,
-"      %-12s %14lu  (MW_ALWAYS column %lu%s)\n",
-			"sum", mwa_tot, tot.rec[FT_TK_MW_ALWAYS],
-			mwa_tot == tot.rec[FT_TK_MW_ALWAYS] ? "" :
-				" -- ☠ MISMATCH: an always-MW branch records no class");
-	}
-
 #ifdef FT_ABORT_ATTRIB
 	/*
 	 * WHICH RECORD LOST, over every aborted commit.  The rows sum to the
-	 * ABORT column above.  This is the same self-check as in the
-	 * MW_ALWAYS table.  Here it also proves that the engine hooks cover
-	 * every abort EXIT.  There are three, and the lone-MW-edge one builds
+	 * ABORT column above.  This self-check also proves that the engine
+	 * hooks cover every abort EXIT.  There are three, and the lone-MW-edge one builds
 	 * no descriptor at all.
 	 */
 	{
@@ -1846,10 +1659,9 @@ void ft_tk_dump(void)
 		 * a holder of the owning node's lock.  So an owner-held
 		 * record losing one is an exclusion that did not exclude.
 		 * The packed STATE word has lock-free writers BY DESIGN: the
-		 * re-parent sweep's guard and the §4.B validates (the
-		 * MW_ALWAYS populations above).  So losing one says only that
-		 * a non-holder wrote another field of the same word.  Pooling
-		 * them would manufacture a defect.
+		 * re-parent sweep's guard and the §4.B validates.  So losing
+		 * one says only that a non-holder wrote another field of the
+		 * same word.  Pooling them would manufacture a defect.
 		 */
 		fprintf(stderr,
 "    glue publish PAIRING (ft_slot_in_node(publish_parent, publish_slot)):"
@@ -2191,17 +2003,6 @@ static void ft_tk_miss_pc_report(void)
 #define FT_TK_COUNT_CELL_MW()		ft_tk_count_cell_mw()
 #define FT_TK_COUNT_CELL_SW()		ft_tk_count_cell_sw()
 #define FT_TK_COUNT_CHAIN_SW()		ft_tk_count_chain_sw()
-/*
- * THE CLASS ARGUMENT EXISTS ONLY IN THE INSTRUMENTED BUILD, for the same
- * reason as the site parameter (see FT_TK_SITE_PARAM).  An extra
- * always-constant argument is free at runtime.  But it still moves the
- * compiler's inlining decisions.  This instrument must not perturb the paths
- * it measures.  It is written as a TRAILING pair so that a call site reads:
- * ft_flip_txn_record_tag_excluded(t, slot, o, n, tag FT_TK_MWA(FT_TK_MWA_ROOT)).
- */
-#define FT_TK_MWA_PARAM			, enum ft_tk_mwa_class dbg_mwa
-#define FT_TK_MWA(c)			, (c)
-#define FT_TK_COUNT_MWA(c)		ft_tk_count_mwa(c)
 #ifdef FT_ABORT_ATTRIB
 #define FT_AB_LOST_RESET()		do { ft_ab_lost_valid = 0; } while (0)
 #define FT_AB_COUNT_LOST(t)		ft_ab_count_lost((t)->dbg_site)
@@ -2271,9 +2072,6 @@ struct ft_tk_site;	/* incomplete: the NULL the constructors take */
 #define FT_TK_COUNT_CELL_MW()		do { } while (0)
 #define FT_TK_COUNT_CELL_SW()		do { } while (0)
 #define FT_TK_COUNT_CHAIN_SW()		do { } while (0)
-#define FT_TK_MWA_PARAM
-#define FT_TK_MWA(c)
-#define FT_TK_COUNT_MWA(c)		do { } while (0)
 #define FT_AB_LOST_RESET()		do { } while (0)
 #define FT_AB_COUNT_LOST(t)		do { } while (0)
 #define FT_AB_CLAIM_REPORT(t)		do { } while (0)

@@ -69,19 +69,7 @@ enum ft_ab_cls {
 	FT_AB_MW_LOCK,		/* the DLM lock take -- losing IS its job */
 	FT_AB_VALIDATE,		/* a read-set guard */
 	FT_AB_CELL_HANDLE,	/* an ordered-cell / hlist store recorded straight on the handle */
-	/*
-	 * + enum ft_tk_mwa_class: the always-MW populations.  The count is
-	 * SPELLED OUT.  This header precedes ft-txn-kind-stats.h, so it cannot
-	 * read FT_TK_MWA_NR.  The static assert there keeps the two in step.
-	 * ☠ It had drifted.  The DUAL column was split three ways (DUAL_ROOT /
-	 * DUAL_NAMED / DUAL_UNNAMED), but this reservation stayed at nine.  So
-	 * EVERY -DFT_ABORT_ATTRIB build failed that assert.  The
-	 * abort-attribution config had no coverage at all, and -DFT_WINNER_DBG
-	 * with it.  A count that must be updated by hand needs the assert to be
-	 * REACHED.  A config nobody builds never reaches it.
-	 */
-	FT_AB_MWA_BASE,
-	FT_AB_CLS_NR = FT_AB_MWA_BASE + 13,
+	FT_AB_CLS_NR,
 };
 
 /* Which witness saw the hold, for the classes where a lock could cover it. */

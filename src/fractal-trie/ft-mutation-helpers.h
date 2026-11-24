@@ -8932,8 +8932,8 @@ enum ft_sa_rv {
 	FT_SA_RV_O_HELD_COARSE,
 	FT_SA_RV_O_UNCOVERED,	/* SELF_ONLY / UNDATED / NOLOCKS / UNHELD */
 	FT_SA_RV_O_CHILD_ONLY,	/* uncovered, but the op holds the CHILD's anchor */
-	FT_SA_RV_MWA_BASE,	/* + always-MW class (declared, no owner) */
-	FT_SA_RV_NR = FT_SA_RV_MWA_BASE + FT_TK_MWA_NR,
+	FT_SA_RV_LANE,	/* a record of ft_flip_txn_record_tag_excluded */
+	FT_SA_RV_NR,
 };
 
 #define FT_SA_REC_ENTRIES	2048
@@ -9033,7 +9033,7 @@ static void ft_sa_off(void *pc, char *buf, size_t len)
 static __attribute__((destructor))
 void ft_sa_rec_report(void)
 {
-	static const char *hdr[FT_SA_RV_MWA_BASE] = {
+	static const char *hdr[FT_SA_RV_NR] = {
 		"total", "sw", "WLOCK", "coarse", "miss", "NOOWNER", "HELD",
 		"held_coarse", "SELF_ONLY", "retire_wit", "undated_held",
 		"UNDATED", "NOLOCKS", "UNHELD", "c_LATE", "c_NEVER_OK",
@@ -9043,7 +9043,7 @@ void ft_sa_rec_report(void)
 		"P_SELF_ANCHORED", "p_parent_shares", "P_PARENT_DIFFERS",
 		"P_WORD_LOCKED", "o_asked", "O_NOOWNER", "o_wlock", "o_coarse",
 		"o_miss", "o_held", "o_held_coarse", "O_UNCOVERED",
-		"O_CHILD_ONLY" };
+		"O_CHILD_ONLY", "lane" };
 	int i, j;
 	struct ft_sa_rec_tls *m;
 	bool any = false;
@@ -9057,9 +9057,6 @@ void ft_sa_rec_report(void)
 		for (m = ft_sa_rec_head; m; m = m->next)
 			for (j = 0; j < FT_SA_RV_NR; j++)
 				sum[j] += m->c[i][j];
-		if (!sum[FT_SA_RV_TOTAL] && !sum[FT_SA_RV_MWA_BASE] &&
-				!any)
-			;
 		if (!any) {
 			fprintf(stderr, "\n=== FT_SA_REC: record-time lock-set "
 				"coverage vs the STRUCTURAL anchor, per (txn "
@@ -9073,18 +9070,14 @@ void ft_sa_rec_report(void)
 				"?",
 			ft_sa_rec_keys[i].site ? ft_sa_rec_keys[i].site->line :
 				0, o0, o1);
-		for (j = 0; j < FT_SA_RV_MWA_BASE; j++)
+		for (j = 0; j < FT_SA_RV_NR; j++)
 			if (sum[j])
 				fprintf(stderr, " %s=%lu", hdr[j], sum[j]);
-		for (j = FT_SA_RV_MWA_BASE; j < FT_SA_RV_NR; j++)
-			if (sum[j])
-				fprintf(stderr, " mwa%d=%lu",
-					j - FT_SA_RV_MWA_BASE, sum[j]);
 		fprintf(stderr, "\n");
 	}
 	if (any)
-		fprintf(stderr, "FT_SA_REC overflow=%lu (mwaN: enum "
-			"ft_tk_mwa_class index)\n", ft_sa_rec_overflow);
+		fprintf(stderr, "FT_SA_REC overflow=%lu\n",
+			ft_sa_rec_overflow);
 }
 
 /*
@@ -10861,145 +10854,12 @@ void ft_flip_txn_record_tag(struct ft_flip_txn *t,
  * exclusive, or under the FT-wide lock).  A root, a same-value validate and a
  * record on a fine, shared trie abort.
  */
-/*
- * ☞ HOW MUCH OF THE ALWAYS-MW SURFACE IS ALREADY ARMED SW BY DOOR 1?
- *
- * Mathieu, on the app-provided exclusion mode: "we should be able to entirely
- * remove the remaining MW updates which were not possible to transition to SW
- * (except those MW updates which genuinely are meant to be kept MW)."
- *
- * The lanes below call this recorder UNCONDITIONALLY.  On a COARSE or
- * EXCLUSIVE trie, door 1 has already armed the rest of the txn SW.  There the
- * FT-wide mutex means no peer writer of ANY slot exists.  So on such a trie
- * these records are CASes that arbitrate against nobody.
- *
- * Measure before converting (doc §12.1): per class, how many records sit on a
- * trie ft_txn_content_sw_ok already says yes to.
- *
- * ☠ AND COUNT THE CROSS-TRIE SHAPE SEPARATELY.  A graft/graft_swap txn NAMES
- * one trie and writes another's root.  So "the named trie excludes everyone"
- * does not cover that slot.  That is the per-slot uniformity trap the CHAIN
- * flip fell into (§11.9).
- */
-/*
- * ☠ DEBUG INSTRUMENTATION, AND IT MUST BE GATED.  These counters and their
- * destructor shipped ungated.  So ANY application linking the release library
- * paid an atomic increment per recorded slot.  It then got
- * "FT MWA DOOR1 converted=..." on its stderr at exit.  This was measured on a
- * plain -O2 -DNDEBUG build.  A library does not print its own debug counters
- * to an application's stderr.  Its twin below was gated from the start; this
- * half simply never was.
- *
- * Nothing here is load-bearing.  The convert arm's branch does not read any of
- * these words.  Neither does its choice of urcu_txn_store_sw vs _mw.  Compiled
- * out, they cost nothing and report nothing.  -DFT_DEBUG_MWA_DOOR1 is how you
- * measure.  The door-1 numbers in doc §12.1 were taken on that tree.
- */
-#ifdef FT_DEBUG_MWA_DOOR1
-static unsigned long ft_mwa_door1_conv;
-static unsigned long ft_mwa_door1_kept[2];	/* [0] fine trie, [1] a VALIDATE */
-/*
- * ☠ THE TWO WITNESSES THAT MUST READ ZERO.  They exist because the predicate
- * is latched off the txn's NAMED trie.  So it answers for a slot only while
- * every slot these lanes record belongs to that trie.
- *
- * @foreign: three recorders take a trie ARGUMENT separately from @t->ft:
- *   - ft_flip_txn_record_count_parent;
- *   - ft_ord_cell_flip_into;
- *   - ft_ord_cell_record_into_ft.
- * A cross-trie op could in principle pass one trie while the txn names the
- * other.  Then coarse would license a park on a FINE trie's word.  That is the
- * per-slot two-kinds violation.
- *
- * @root_slot: root pinning is by the PRODUCER's @root flag, not by the slot.
- * So a producer that forgot the flag used to cost a harmless MW on a root.  It
- * would now cost a PARK on one.  The converting arm therefore also tests the
- * slot itself, and counts when that test is what saved it.
- */
-static unsigned long ft_mwa_door1_foreign;
-static unsigned long ft_mwa_door1_root_slot;
-
-static void ft_mwa_door1_conv_report(void) __attribute__((destructor));
-static void ft_mwa_door1_conv_report(void)
-{
-	if (!(uatomic_read(&ft_mwa_door1_conv) | uatomic_read(&ft_mwa_door1_kept[0])
-			| uatomic_read(&ft_mwa_door1_kept[1])))
-		return;
-	fprintf(stderr, "FT MWA DOOR1  converted=%lu | kept MW: fine_trie=%lu VALIDATE=%lu | ☠ foreign_ft=%lu root_slot_saved=%lu\n",
-		uatomic_read(&ft_mwa_door1_conv),
-		uatomic_read(&ft_mwa_door1_kept[0]),
-		uatomic_read(&ft_mwa_door1_kept[1]),
-		uatomic_read(&ft_mwa_door1_foreign),
-		uatomic_read(&ft_mwa_door1_root_slot));
-}
-#define FT_MWA_DOOR1_CONV()	uatomic_inc(&ft_mwa_door1_conv)
-#define FT_MWA_DOOR1_KEPT(t, val)					\
-	uatomic_inc(&ft_mwa_door1_kept[(val) ? 1 : 0])
-#define FT_MWA_DOOR1_ROOT_SLOT()	uatomic_inc(&ft_mwa_door1_root_slot)
-
-/*
- * Called by every recorder that carries a trie argument of its own: does it
- * agree with the trie the txn named?  See @foreign above.
- */
-static inline
-void ft_mwa_door1_note_ft(const struct cds_ft *ft, const struct ft_flip_txn *t)
-{
-	if (ft && t && t->ft && ft != t->ft)
-		uatomic_inc(&ft_mwa_door1_foreign);
-}
-#else
-# define FT_MWA_DOOR1_CONV()		do { } while (0)
-# define FT_MWA_DOOR1_KEPT(t, val)	do { (void) (t); (void) (val); } while (0)
-# define FT_MWA_DOOR1_ROOT_SLOT()	do { } while (0)
-static inline
-void ft_mwa_door1_note_ft(const struct cds_ft *ft, const struct ft_flip_txn *t)
-{
-	(void) ft;
-	(void) t;
-}
-#endif	/* FT_DEBUG_MWA_DOOR1 */
-
-#ifdef FT_DEBUG_MWA_DOOR1
-static unsigned long ft_mwa_door1[FT_TK_MWA_NR][2];
-
-static void ft_mwa_door1_report(void) __attribute__((destructor));
-static void ft_mwa_door1_report(void)
-{
-	unsigned int i;
-	unsigned long y = 0, n = 0;
-
-	for (i = 0; i < FT_TK_MWA_NR; i++) {
-		y += uatomic_read(&ft_mwa_door1[i][1]);
-		n += uatomic_read(&ft_mwa_door1[i][0]);
-	}
-	if (!(y | n))
-		return;
-	fprintf(stderr, "\nFT MWA DOOR1  convertible(trie is coarse/exclusive)=%lu  fine=%lu\n",
-		y, n);
-	for (i = 0; i < FT_TK_MWA_NR; i++)
-		if (uatomic_read(&ft_mwa_door1[i][1]) |
-				uatomic_read(&ft_mwa_door1[i][0]))
-			fprintf(stderr, "FT MWA DOOR1  class %2u  convertible=%-12lu fine=%lu\n",
-				i, uatomic_read(&ft_mwa_door1[i][1]),
-				uatomic_read(&ft_mwa_door1[i][0]));
-}
-
-static inline
-void ft_mwa_door1_ask(const struct ft_flip_txn *t, enum ft_tk_mwa_class c)
-{
-	uatomic_inc(&ft_mwa_door1[c][ft_txn_content_sw_ok(t->ft) ? 1 : 0]);
-}
-# define FT_MWA_DOOR1_ASK(t, c)		ft_mwa_door1_ask((t), (c))
-#else
-# define FT_MWA_DOOR1_ASK(t, c)		do { (void) (t); } while (0)
-#endif
-
 static inline
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 __attribute__((noinline))
 #endif
 void __ft_flip_txn_record_tag_excluded(struct ft_flip_txn *t, void **slot,
-		void *old_ptr, void *new_ptr, uintptr_t tag FT_TK_MWA_PARAM)
+		void *old_ptr, void *new_ptr, uintptr_t tag)
 {
 	int ret;
 
@@ -11027,13 +10887,10 @@ void __ft_flip_txn_record_tag_excluded(struct ft_flip_txn *t, void **slot,
 		return;
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	ft_sa_rec_count(FT_TK_TXN_SITE(t), __builtin_return_address(0),
-		FT_SA_CALLER_PC(),
-		(enum ft_sa_rv) (FT_SA_RV_MWA_BASE + dbg_mwa), false);
+		FT_SA_CALLER_PC(), FT_SA_RV_LANE, false);
 #endif
 	FT_TK_COUNT_REC(t, FT_TK_MW_ALWAYS);
-	FT_TK_COUNT_MWA(dbg_mwa);
-	FT_MWA_DOOR1_ASK(t, dbg_mwa);
-	FT_AB_ARM(FT_AB_MWA_BASE + dbg_mwa, FT_AB_OWN_NA);
+	FT_AB_ARM(FT_AB_SW, FT_AB_OWN_NA);
 	/*
 	 * ☞ DOOR 1 COVERS THESE LANES TOO (Mathieu, doc §12.1): "in an
 	 * application-provided exclusion, we should be able to entirely remove
@@ -11093,7 +10950,6 @@ void __ft_flip_txn_record_tag_excluded(struct ft_flip_txn *t, void **slot,
 	if (!FT_LANE_MW_PLANT && old_ptr != new_ptr &&
 			t->trie_wide_sw &&
 			!(t->ft && slot == (void **) &t->ft->root)) {
-		FT_MWA_DOOR1_CONV();
 		FT_LL_REC(t, slot, old_ptr, new_ptr, true);
 		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	} else {
@@ -11111,10 +10967,9 @@ void __ft_flip_txn_record_tag_excluded(struct ft_flip_txn *t, void **slot,
 
 static inline
 void ft_flip_txn_record_tag_excluded(struct ft_flip_txn *t, void **slot,
-		void *old_ptr, void *new_ptr, uintptr_t tag FT_TK_MWA_PARAM)
+		void *old_ptr, void *new_ptr, uintptr_t tag)
 {
-	__ft_flip_txn_record_tag_excluded(t, slot, old_ptr, new_ptr, tag
-		FT_TK_MWA(dbg_mwa));
+	__ft_flip_txn_record_tag_excluded(t, slot, old_ptr, new_ptr, tag);
 }
 
 /*
@@ -11448,11 +11303,10 @@ struct cds_ft_metadata *ft_back_edge_owner(void *parent_word)
  * is absent, so read `peer` as an UPPER bound anywhere else.
  */
 /*
- * WHICH SITE produced a back-edge record.  This mirrors the FT_TK_MWA idiom
- * that C.1(b) used to decompose MW_ALWAYS: "a CLASS naming the population its
- * caller joins, required in the instrumented build, absent from every other
- * one".  One number for the whole lane is what a decomposition exists to
- * stop.  The lane's 57.8% "op holds nothing" needs a site breakdown before
+ * WHICH SITE produced a back-edge record.  Each caller names the population
+ * it joins.  The class is required in the instrumented build and absent from
+ * every other one.  One number for the whole lane is what a decomposition
+ * exists to stop.  The lane's 57.8% "op holds nothing" needs a site breakdown before
  * anyone can say whether it is one path or eleven.
  */
 #ifdef FT_DEBUG_BACK_EDGE_OWNER
@@ -11967,7 +11821,7 @@ void ft_flip_txn_record_head_back_edge_owned(struct ft_flip_txn *t, void **slot,
 		return;
 	}
 	ft_flip_txn_record_tag_excluded(t, slot, old_ptr, new_ptr,
-		FT_FLIP_PROXY_TAG FT_TK_MWA(FT_TK_MWA_HEAD_BACK));
+		FT_FLIP_PROXY_TAG);
 }
 
 /* The unowned spelling: an always-MW head back edge, as before. */
@@ -12463,8 +12317,7 @@ void ft_flip_txn_record_state_kind_ctx(struct ft_flip_txn *t,
 			old_ptr, new_ptr, FT_STATE_PROXY);
 	else
 		ft_flip_txn_record_tag_excluded(t, (void **) &meta->state,
-			old_ptr, new_ptr, FT_STATE_PROXY
-			FT_TK_MWA(FT_TK_MWA_STATE));
+			old_ptr, new_ptr, FT_STATE_PROXY);
 	/*
 	 * The record now carries a SAMPLE of this word.  Its settle will
 	 * write that sample back.  What can go wrong happens in the gap
@@ -18159,10 +18012,8 @@ void ft_flip_txn_lock_or_guard_parent_at(const char *fn, int line,
  * arbitration point; ft_dlm_lock asserts it), &ft->root (a root lives in no
  * node, so there is no lock word that could make a park legal), the
  * duplicate-chain splices and ordered-cell interleave, and rank-count
- * propagation.  The SKIP_X dual is none of those: it is FT_TK_MWA_DUAL, which
- * ft-txn-kind-stats.h's header names as the family "unheld only because THIS
- * op's lock-set does not reach them", and calls the column's rise
- * "BOOKKEEPING".
+ * propagation.  The SKIP_X dual is none of those.  It was unheld only
+ * because THIS op's lock-set did not reach it.
  *
  * ☞ So what this helper removes is the reason for that debt.  ft_detach_node's
  * own note said what the conversion needed: "the ANSWER must be publish-time:
@@ -19288,7 +19139,6 @@ enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
 		struct ft_flip_txn *t,
 		struct ft_ord_cell_edge *edges, unsigned int n)
 {
-	ft_mwa_door1_note_ft(ft, t);
 	unsigned int i;
 
 	for (i = 0; i < n; i++) {
@@ -19500,7 +19350,6 @@ static inline
 void ft_ord_cell_record_into_ft(struct cds_ft *ft, struct ft_flip_txn *t,
 		const struct ft_ord_cell_edge *edges, unsigned int n)
 {
-	ft_mwa_door1_note_ft(ft, t);
 	unsigned int i;
 
 	for (i = 0; i < n; i++) {
@@ -19553,8 +19402,7 @@ void ft_ord_cell_record_into_ft(struct cds_ft *ft, struct ft_flip_txn *t,
 				ft_flip_txn_record_tag_excluded(t,
 					(void **) edges[i].slot,
 					(void *) edges[i].old_target,
-					(void *) edges[i].new_target, tag
-					FT_TK_MWA(FT_TK_MWA_CELL));
+					(void *) edges[i].new_target, tag);
 		}
 	}
 }
@@ -20757,8 +20605,7 @@ freeze_done:
 					(void **) &state_meta->state,
 					(void *) live,
 					(void *) (live - FT_STATE_NR_CHILD_ONE),
-					FT_STATE_PROXY
-					FT_TK_MWA(FT_TK_MWA_NR_CHILD_DEC));
+					FT_STATE_PROXY);
 			}
 		}
 		/*
@@ -22489,8 +22336,7 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 		FT_SS_FOLD_BEGIN();
 		ft_flip_txn_record_tag_excluded(t, (void **) &m->nr_keys,
 			(void *) old_raw, (void *) new_raw,
-			FT_NR_KEYS_PROXY_TAG
-			FT_TK_MWA(FT_TK_MWA_RANK));
+			FT_NR_KEYS_PROXY_TAG);
 		FT_SS_FOLD_END();
 		cur = ft_parent_node(m->parent_word);
 	}
