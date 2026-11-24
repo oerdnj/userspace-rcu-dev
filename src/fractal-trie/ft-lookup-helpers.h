@@ -79,7 +79,7 @@ struct ft_ord_cell *ft_ord_cell_ptr(const void *prev)
  * then names the fresh copy from the decide on.  That back edge is
  * cell->parent with the list on, and the prev itself with the list off.  It
  * stays parked until the settle.  So the re-homer PUBLISHES the fresh copy
- * LOCKED, and releases it in the late pass (ft_flip_txn_lock_born).  This rule
+ * LOCKED, and releases it after the commit (ft_flip_txn_lock_born).  This rule
  * then holds for the fresh copy too: whoever acquires it finds every adopted
  * back edge already settled.
  */

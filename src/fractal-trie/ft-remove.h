@@ -1111,8 +1111,8 @@ void ft_detach_freeze_one(struct ft_flip_txn *txn,
 		 *
 		 * @covered answers ft_flip_txn_owns without taking on a
 		 * release (the caller's sweep keeps that), so the terminal
-		 * parks SW.  It settles outside the registry's late pass.
-		 * That is harmless for a tombstone: the word is unlockable
+		 * parks SW.  It settles with the commit, not after it like a
+		 * release.  That is harmless for a tombstone: the word is unlockable
 		 * from the moment it lands.  A full @covered drops the entry
 		 * and the record stays MW.
 		 */

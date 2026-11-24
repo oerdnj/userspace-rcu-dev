@@ -7812,8 +7812,8 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 		/*
 		 * PROBE: does the holder lock ever come back FREE while a word it
 		 * protects still carries the releasing commit's proxy?  The
-		 * engine settles every record tagged like the lock word in ONE
-		 * late pass, in plant order, and FT_HLIST_TAG == FT_STATE_PROXY.
+		 * release runs after that commit returns, when every record is
+		 * settled.  So this would count no proxy.
 		 */
 		{
 			static unsigned long ft_ls_checked, ft_ls_proxy,

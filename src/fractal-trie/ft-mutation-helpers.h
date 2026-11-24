@@ -51,13 +51,6 @@ void (*cds_ft_dbg_interleave_hook)(int point);
 /* The delete tier's leaf hoist: planned (PRE the acquire), holding (POST). */
 #define FT_IL_LEAF_HOIST_PRE	1
 #define FT_IL_LEAF_HOIST_POST	2
-/*
- * A commit's settle.  The point is after every other record and BEFORE the
- * registered lock words the commit hands back (ft_flip_txn_late_last).  This
- * is the committed-but-unsettled window.  In it, a lock this commit guarded
- * can be taken again while its tombstones still read as proxies.
- */
-#define FT_IL_SETTLE_LOCKS_LAST	3
 
 /*
  * THE ANCESTOR LEDGER -- DEBUG-ONLY SINCE THE WIDENING WENT.
@@ -7411,23 +7404,14 @@ static void ft_rel_after_report(void)
 # define FT_REL_AFTER_COUNT(i)	do { } while (0)
 #endif
 
-/*
- * Stage @meta's release after the txn.  False only under the
- * -DFT_DEBUG_RELEASE_IN_TXN control, whose caller then records the release
- * terminal as before.
- */
+/* Stage @meta's release after the txn. */
 static inline
-bool ft_flip_txn_release_after_add(struct ft_flip_txn *t,
+void ft_flip_txn_release_after_add(struct ft_flip_txn *t,
 		struct cds_ft_metadata *meta)
 {
-#ifdef FT_DEBUG_RELEASE_IN_TXN
-	(void) t;
-	(void) meta;
-	return false;
-#else
 	if (ft_flip_txn_releases_after(t, meta)) {
 		FT_REL_AFTER_COUNT(1);
-		return true;
+		return;
 	}
 	if (caa_unlikely(t->nr_rel_after == t->cap_rel_after)) {
 		unsigned int cap = t->cap_rel_after * 2;
@@ -7450,8 +7434,6 @@ bool ft_flip_txn_release_after_add(struct ft_flip_txn *t,
 	}
 	t->rel_after[t->nr_rel_after++] = meta;
 	FT_REL_AFTER_COUNT(0);
-	return true;
-#endif
 }
 
 /* A word registered on the caller's own account: it IS the node (see @member). */
@@ -9454,43 +9436,6 @@ static void ft_ch_sa_score(struct ft_ch_site *s, const struct cds_ft *ft,
 #endif /* FT_DEBUG_STRUCT_ANCHOR */
 
 /*
- * The engine's late-last predicate for an FT commit: is @slot the state word of
- * a lock THIS txn registered?  The settle of those words hands a lock back.
- * So they settle after every other record.  That includes the same-tagged
- * duplicate-chain links the lock protects.
- */
-#ifdef FT_DEBUG_RELEASE_IN_TXN
-static bool ft_flip_txn_late_last(void *arg, void **slot)
-{
-	const struct ft_flip_txn *t = (const struct ft_flip_txn *) arg;
-	unsigned int i;
-
-	for (i = 0; i < t->nr_locks; i++)
-		if ((void **) &t->locks[i].meta->state == slot) {
-#ifdef FT_DEBUG_INTERLEAVE
-			/*
-			 * The engine asks once per record in each late pass, just
-			 * before that record's store.  The first TRUE answer for a
-			 * slot already answered TRUE is the start of the last pass.
-			 */
-			static __thread const void *il_arg;
-			static __thread void **il_first;
-
-			if (il_arg != arg) {
-				il_arg = arg;
-				il_first = slot;
-			} else if (il_first == slot) {
-				il_arg = NULL;
-				FT_INTERLEAVE(FT_IL_SETTLE_LOCKS_LAST);
-			}
-#endif
-			return true;
-		}
-	return false;
-}
-#endif
-
-/*
  * A §4.B guard is an MW {live -> live} validate of a word the op does not
  * hold.  Ownership is taken, never observed: in the lock-before-write model
  * the op holds the word, or its trie excludes every writer.  Each guard below
@@ -9906,44 +9851,15 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 
 	/*
 	 * THE FT'S OWNERSHIP WORDS ARE ITS STATE WORDS.  A node's lock lives in
-	 * meta->state (FT_STATE_PROXY).  This commit's release of that lock
-	 * must become visible only after every structural word the lock
-	 * protects is plain.  Otherwise a peer acquires on the strength of the
-	 * release while our SW parks are still parked.  Our own settle then
-	 * overwrites what the peer publishes.
+	 * meta->state.  Its release must become visible only after every
+	 * structural word the lock protects is plain.  Otherwise a peer
+	 * acquires on the strength of the release while our SW parks are still
+	 * parked, and our own settle overwrites what the peer publishes.  So
+	 * this commit carries no release.  The releases run after it returns
+	 * (@rel_after), when every record is settled.
 	 */
 #ifdef FT_DEBUG_HIDDEN_FILL
 	ft_hidden_fill_at_commit(t);
-#endif
-	/*
-	 * ☞ ONLY FOR THE RECORDED-RELEASE CONTROL.  The late-last settle below
-	 * orders a lock word's RELEASE after the words it protects.  Releases
-	 * now happen after the commit returns (@rel_after).  Every record is
-	 * settled by then, so the order is given by construction and the
-	 * settle needs no late pass.  -DFT_DEBUG_RELEASE_IN_TXN records the
-	 * releases again, and keeps the late pass.
-	 */
-#ifdef FT_DEBUG_RELEASE_IN_TXN
-	urcu_txn_desc_set_late_tag(t->mtxn->desc, FT_STATE_PROXY);
-	/*
-	 * ☠ AND FT_STATE_PROXY IS NOT ONLY THE STATE WORDS' TAG.  The duplicate
-	 * chain's links are tagged FT_HLIST_TAG == URCU_TXN_TAG == 1 too.  So
-	 * the late pass alone settled two things in PLANT order: a registered
-	 * lock's release, and the chain links that lock protects.  The release
-	 * came first.
-	 *
-	 * MEASURED on inv_concurrent_insert_replace_nolist.  A same-key
-	 * cds_ft_replace did this:
-	 *   1. It took the chain holder while @old_node->next still held the
-	 *      releasing commit's proxy (26 of 400 filtered runs).
-	 *   2. It passed its raw ft_node_is_removed() test.
-	 *   3. It loaded MARK(NULL) through its txn.
-	 *   4. It recorded &((node *) 0x2)->prev.
-	 * That is the SIGSEGV in urcu_txn_install_mw_depth.  It hit ~2% of runs
-	 * before the delete tier took its holder lock and ~3.4% after.  Settle
-	 * the REGISTERED lock words last.
-	 */
-	urcu_txn_desc_set_late_last(t->mtxn->desc, ft_flip_txn_late_last, t);
 #endif
 	if (caa_unlikely(t->acquire_miss)) {
 #ifdef FT_DEBUG_RESERVE_RATCHET
@@ -10650,7 +10566,7 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 	 * recorded an edge on another parked that edge SW.  An SW park CANNOT
 	 * FAIL: no CAS, no expected-old.  That is a blind write to a word the
 	 * op never excluded.  The two-pass settle cannot protect it either.
-	 * @late_tag can only hold back a release the commit CARRIES.  There is
+	 * @late_tag could only hold back a release the commit CARRIED.  There was
 	 * no lock for that node in this descriptor.  MEASURED at
 	 * ft_insert_publish_or_park with nr_locks == 1 on an unrelated owner.
 	 *
@@ -12246,11 +12162,10 @@ void ft_flip_txn_record_state_kind_ctx(struct ft_flip_txn *t,
 	 * refuses it as before.
 	 */
 	if ((o & FT_STATE_LOCK) && !(n & FT_STATE_LOCK)) {
-		if (ft_flip_txn_release_after_add(t, meta)) {
-			n |= FT_STATE_LOCK;
-			if (n == o)
-				return;		/* a pure release: nothing to record */
-		}
+		ft_flip_txn_release_after_add(t, meta);
+		n |= FT_STATE_LOCK;
+		if (n == o)
+			return;		/* a pure release: nothing to record */
 	} else if (!(o & FT_STATE_LOCK) && ft_flip_txn_releases_after(t, meta)) {
 		uintptr_t pend = (uintptr_t) ft_txn_load(t->mtxn,
 				(void **) &meta->state, FT_STATE_PROXY);
@@ -14292,11 +14207,10 @@ bool ft_trace_miswire_observe(struct cds_ft *ft,
  *   - for a skip form, the child's back edge.
  * A compressed split moves ALL of them in ONE flip.  So an observation that
  * straddles that commit sees a mixture of old and new words, and can conclude
- * anything.  Its own tombstone exemption cannot cover this.  The state word
- * carrying the tombstone is LATE-TAGGED
- * (urcu_txn_desc_set_late_tag(..., FT_STATE_PROXY)).  And urcu_txn_settle
- * writes late words in a SECOND pass.  So the structural words read here
- * already say NEW while the bit that would forgive them is still unsettled.
+ * anything.  Its own tombstone exemption cannot cover this.  The settle
+ * writes the commit's words one at a time.  So the structural words read here
+ * can already say NEW while the state word that carries the tombstone is
+ * still unsettled.
  * The exemption is blind to exactly its own failure window.
  *
  * ☞ MEASURED (2026-09-02, each arm in its own memcg):
@@ -16184,10 +16098,6 @@ void ft_flip_txn_record_release_lock(struct ft_flip_txn *t,
  * DROPPED release, i.e. a permanently held lock.  The first widening attempt
  * died of that same failure.  Reserve for it explicitly rather than relying
  * on a site happening to have slack.
- *
- * (The records settle LAST whatever order they were added in.  The FT tags
- * them FT_STATE_PROXY, and urcu_txn_desc_set_late_tag defers every such record
- * to the late pass.)
  */
 #define FT_CELL_LOCKSET_MAX_RECORDS	6
 
@@ -17057,9 +16967,9 @@ void ft_flip_txn_record_anchor_release_held(struct ft_flip_txn *t,
  * inv_concurrent_same_key_removes: a promote copied the proxy into a fresh
  * cell.  That was a proxy of ANOTHER slot's record, which no settle rewrites.
  *
- * Holding the fresh parent's lock until the late pass makes "a plain load
- * under the lock is fine" true for those words again.  Registered lock words
- * settle LAST (ft_flip_txn_late_last), after every back edge.
+ * Holding the fresh parent's lock until after the commit makes "a plain load
+ * under the lock is fine" true for those words again.  The release runs once
+ * the commit has settled every back edge.
  *
  * The node is built locked with a plain store, because it is hidden.  It is
  * then registered as @born: its only terminal is this txn's commit.  Its

@@ -3900,8 +3900,8 @@ skip_copy:
 	 * edges settle only after this commit's decide, so the fresh copy
 	 * must not be lockable before then.  Its lock word is its OWN exactly
 	 * when C's was (same position, same depth).  Under a coarser spacing
-	 * it is the ancestor anchor C already shares, held above until the
-	 * late pass.
+	 * it is the ancestor anchor C already shares, held above until after
+	 * the commit.
 	 */
 	if (fenced && new_node_flag && c_held.lock == metadata) {
 		ft_flip_txn_lock_born(retire_txn, new_metadata);
