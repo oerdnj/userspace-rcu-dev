@@ -50,6 +50,11 @@ static void ft_dt_rec_check(const struct ft_rec_dbg *r);
  */
 static void ft_sw_stale_check(const struct ft_rec_dbg *r);
 /*
+ * The same audit at the commit, just before the store: a word can still
+ * change after the record was created.
+ */
+static void ft_sw_commit_check(const struct ft_rec_dbg *r);
+/*
  * The detector's store half: the commit is about to store @r->new_ptr.  The
  * owner it reads is still the one that store displaces.
  */
@@ -107,6 +112,7 @@ void ft_rec_dbg_will_commit(const struct ft_rec_dbg *r)
 	ft_sh_note(r, r->new_ptr);
 #endif
 #if FT_DT_ARMED
+	ft_sw_commit_check(r);
 	ft_dt_will_write(r);
 #endif
 	(void) r;

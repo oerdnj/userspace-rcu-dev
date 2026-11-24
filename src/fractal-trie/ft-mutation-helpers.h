@@ -1900,6 +1900,77 @@ static void ft_sw_stale_check(const struct ft_rec_dbg *r)
 	uatomic_inc(&ft_sws_overflow);
 }
 
+/*
+ * THE STALE-PLAN AUDIT AT COMMIT.  ft_sw_stale_check compares a record's
+ * expected-old with the live word when the record is CREATED.  Compare them
+ * again just before the commit stores the record (ft_rec_dbg_will_commit).
+ * The op holds the lock of each word it records, so the word must not
+ * change in between.  The single-writer engine stores blind, so nothing
+ * else would see a change.  A release-shaped record is not stale, as at
+ * creation.  When another thread took its lock, it is only counted.
+ *
+ * The counts are printed at exit.  FT_SW_STALE_ABORT=1 in the environment
+ * prints the first stale record and the committer's backtrace, then aborts.
+ */
+static unsigned long ft_swc_checked, ft_swc_stale, ft_swc_proxy,
+	ft_swc_release_shaped, ft_swc_release_foreign;
+
+static void ft_sw_commit_check(const struct ft_rec_dbg *r)
+{
+	void *cur, *bt[FT_SWS_DEPTH];
+	int nbt, isproxy;
+
+	uatomic_inc(&ft_swc_checked);
+	cur = CMM_LOAD_SHARED(*r->slot);
+	if (cur == r->old_ptr)
+		return;
+	isproxy = ft_txn_is_proxy(cur, r->tag);
+	if (!isproxy && r->tag == FT_STATE_PROXY && r->new_ptr == r->old_ptr &&
+			((uintptr_t) cur & ~(uintptr_t) FT_STATE_LOCK) ==
+				(uintptr_t) r->old_ptr &&
+			((uintptr_t) cur & FT_STATE_LOCK)) {
+		const struct cds_ft_metadata *m =
+			(const struct cds_ft_metadata *)
+			((const char *) (const void *) r->slot -
+			 offsetof(struct cds_ft_metadata, state));
+		struct ft_dt_ent *e = ft_dt_slot(m);
+		unsigned int owner = 0;
+
+		ft_dt_ent_lock(e);
+		if (uatomic_read(&e->word) == m)
+			owner = uatomic_read(&e->tid);
+		ft_dt_ent_unlock(e);
+		if (owner && owner != ft_ll_violation_tid())
+			uatomic_inc(&ft_swc_release_foreign);
+		uatomic_inc(&ft_swc_release_shaped);
+		return;
+	}
+	uatomic_inc(&ft_swc_stale);
+	if (isproxy)
+		uatomic_inc(&ft_swc_proxy);
+	if (getenv("FT_SW_STALE_ABORT")) {
+		fprintf(stderr, "FT SW STALE-AT-COMMIT: slot %p "
+			"expected-old %p live %p%s new %p tag %#lx\n",
+			(void *) r->slot,
+			r->old_ptr, cur,
+			isproxy ? " (a peer's parked proxy)" : "",
+			r->new_ptr, (unsigned long) r->tag);
+		nbt = backtrace(bt, FT_SWS_DEPTH);
+		backtrace_symbols_fd(bt, nbt, 2);
+		abort();
+	}
+}
+
+static __attribute__((destructor)) void ft_sw_commit_report(void)
+{
+	fprintf(stderr, "FT SW STALE-AT-COMMIT: %lu of %lu records with an "
+		"expected-old != the live word at commit (%lu with a peer "
+		"proxy); %lu release-shaped over LOCK|s, %lu of them over a "
+		"fence ANOTHER thread took\n",
+		ft_swc_stale, ft_swc_checked, ft_swc_proxy,
+		ft_swc_release_shaped, ft_swc_release_foreign);
+}
+
 static __attribute__((destructor)) void ft_sw_stale_report(void)
 {
 	unsigned int i;
