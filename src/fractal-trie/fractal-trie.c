@@ -328,7 +328,7 @@ extern long cds_ft_fault_commit_countdown;
  * stay opaque to API users.  A duplicate-chain walk is not a fast path, so
  * the cost of the call does not matter.
  */
-urcu_static_assert(CDS_FT_NODE_TXN_PROXY_TAG == URCU_TXN_TAG,
+urcu_static_assert(CDS_FT_NODE_TXN_PROXY_TAG == FT_TXN_TAG,
 		"FT public duplicate-next proxy tag must equal the engine proxy tag",
 		ft_node_next_proxy_tag_matches_engine);
 struct cds_ft_node *cds_ft_node_next_resolve(void *raw)

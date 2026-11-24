@@ -97,47 +97,27 @@
 #include <unistd.h>
 #include <urcu/list.h>
 /*
- * FT parks a concurrent MCAS proxy under its own pointer tag: type 7, low
- * nibble 0xF (see FT_FLIP_PROXY_TAG in ft-helpers.h).  The proxy is a
- * struct urcu_txn_record pointer.  It is 16-byte aligned, so its low 4 bits
- * are free.
+ * FT parks a structural edge's proxy under its own pointer tag: type 7, low
+ * nibble 0xF (see FT_FLIP_PROXY_TAG in ft-helpers.h).  The proxy points to a
+ * latch's struct urcu_txn_sw_proxy.  Latches are 16-byte aligned, so its low
+ * 4 bits are free.
  *
- * FT does not use the engine's default tag, bit 0.  Here bit 0 alone marks an
+ * FT does not use bit 0 alone for these edges.  Here bit 0 alone marks an
  * internal node, so a bit-0 proxy would alias one.  No real node, NULL or
- * skip pointer can carry a 0xF low nibble.
+ * skip pointer can carry a 0xF low nibble.  Each record carries its own tag
+ * (see ft_txn_record), and the read hot paths recognise the 0xF one with
+ * ft_node_flip_proxy().
  *
- * The tag is now carried per record:
- *   - FT passes FT_FLIP_PROXY_TAG to every urcu_txn_store()/load_validate()
- *     (see ft_flip_txn_commit).
- *   - The engine stores it in urcu_txn_record.proxy_tag.
- *   - The engine forms the parked proxy as (record | proxy_tag).
- *   - The read hot paths recognise it with ft_node_flip_proxy().  This is
- *     the same low-nibble test they already run.
- *
- * No per-TU macro override of the engine is needed.
- */
-/*
  * FT is a flavor-agnostic library.  It brackets its RCU read-side sections
- * through the group's RCU flavor, which is bound at runtime.
- *
- * An op binds that flavor (ft_txn_op_init).  ft_op_begin() / ft_op_end()
- * then open the section in that flavor directly (doc §11: the FT owns the
- * bracket).  An exclusive trie binds no flavor: it has no reader to defend,
- * and its frees are synchronous.
- *
- * The engine handle binds no flavor either.  So urcu_txn_begin() /
- * urcu_txn_end() fall back to the URCU_TXN_RCU_READ_LOCK macros.  These
- * macros are overridden to no-ops here, so that:
- *   - the engine opens no section of its own;
- *   - no compile-time flavor's rcu_read_lock symbol is bound into the
- *     flavor-agnostic build.
+ * through the group's RCU flavor, which is bound at runtime.  An op binds
+ * that flavor (ft_txn_op_init), and ft_op_begin() / ft_op_end() open the
+ * section in it.  An exclusive trie binds no flavor: it has no reader to
+ * defend, and its frees are synchronous.  The engine opens no section of
+ * its own.
  */
-#define URCU_TXN_RCU_READ_LOCK()	do { } while (0)
-#define URCU_TXN_RCU_READ_UNLOCK()	do { } while (0)
 #include <urcu/fair-mutex.h>	/* MW coarse lock-mode FT-wide writer lock */
-#include <urcu/rcu-txn.h>
-#include <urcu/rcu-txn-list.h>	/* the ordered-cell list's link format */
 #include <urcu/rcu-txn-sw.h>	/* the commit engine */
+#include <urcu/rcu-txn-sw-list.h>	/* ordered-cell list links */
 #include "ft-txn-engine.h"	/* FT's view of the parked-slot format */
 
 /*
@@ -810,10 +790,10 @@ struct ft_ord_cell {
 	 * With the public node embedded, the single-cell
 	 * splice/unsplice/replace use the list's composable _prepare ops,
 	 * folded into the FT structural flip-txn.  The cell edges carry the
-	 * concurrent list's engine proxy tag (URCU_TXN_TAG, bit 0).  Readers
+	 * concurrent list's engine proxy tag (FT_TXN_TAG, bit 0).  Readers
 	 * resolve them with ft_txn_list_resolve (ft_ord_cell_resolve_ord).
 	 */
-	struct urcu_txn_list_node lnode;
+	struct urcu_txn_sw_list_node lnode;
 	struct cds_ft_node *node;
 	struct cds_ft_inode_flag *parent;
 };
@@ -916,13 +896,13 @@ struct cds_ft_inode_flag *ft_parent_prefix_strip(struct cds_ft_inode_flag *paren
 
 /* Recover the cell owning an embedded ordered-list link node, and vice versa. */
 static inline
-struct ft_ord_cell *ft_ord_cell_of(const struct urcu_txn_list_node *lnode)
+struct ft_ord_cell *ft_ord_cell_of(const struct urcu_txn_sw_list_node *lnode)
 {
 	return caa_container_of(lnode, struct ft_ord_cell, lnode);
 }
 
 static inline
-struct urcu_txn_list_node *ft_ord_cell_lnode(struct ft_ord_cell *cell)
+struct urcu_txn_sw_list_node *ft_ord_cell_lnode(struct ft_ord_cell *cell)
 {
 	return &cell->lnode;
 }
@@ -2975,7 +2955,7 @@ struct cds_ft {
 	 * them naturally.  Read the endpoints via ft_ord_first / ft_ord_last
 	 * (NULL when empty).
 	 */
-	struct urcu_txn_list_head ord_sentinel;
+	struct urcu_txn_sw_list_head ord_sentinel;
 	/*
 	 * ☞ THE THREE WORDS NO NODE OWNS, GIVEN OWNERS.
 	 *
@@ -4518,17 +4498,17 @@ void ft_seam_check_root(struct cds_ft *h, const void *site);
 static __attribute__((noinline, unused))
 void ft_seam_check_list(struct cds_ft *h, const void *site)
 {
-	struct urcu_txn_list_node *s, *first, *last, *fp, *ln;
+	struct urcu_txn_sw_list_node *s, *first, *last, *fp, *ln;
 
 	if (!h || !h->ordered_list)
 		return;
 	s = &h->ord_sentinel.node;
-	first = urcu_txn_list_unmark(ft_txn_list_next_rcu(s));
-	last = urcu_txn_list_unmark(ft_txn_list_prev_rcu(s));
+	first = ft_list_unmark(ft_txn_list_next_rcu(s));
+	last = ft_list_unmark(ft_txn_list_prev_rcu(s));
 	if (first == s && last == s)
 		return;				/* empty: self-looped */
-	fp = first ? urcu_txn_list_unmark(ft_txn_list_prev_rcu(first)) : NULL;
-	ln = last ? urcu_txn_list_unmark(ft_txn_list_next_rcu(last)) : NULL;
+	fp = first ? ft_list_unmark(ft_txn_list_prev_rcu(first)) : NULL;
+	ln = last ? ft_list_unmark(ft_txn_list_next_rcu(last)) : NULL;
 	if (caa_likely(first && last && fp == s && ln == s))
 		return;
 	fprintf(stderr, "FT SEAM RULE: trie %p dropped its writer lock for a grace "

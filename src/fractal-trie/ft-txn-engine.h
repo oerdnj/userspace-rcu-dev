@@ -95,29 +95,62 @@ void *ft_txn_read(void **slot, uintptr_t tag)
 }
 
 /*
- * The ordered-cell list uses the format of <urcu/rcu-txn-list.h>: a link
- * is parked under URCU_TXN_TAG (bit 0), and a deleted node carries
- * URCU_TXN_LIST_MARK (bit 1).  Resolve a link loaded from such a slot
- * through the engine, and strip the mark.  urcu_txn_list_resolve() does
- * the same through the MCAS engine only.
+ * Bit 0 of a pointer word marks a parked proxy.  The ordered-cell list
+ * links and the duplicate chain (FT_HLIST_TAG) use it.  It is the bit
+ * <urcu/rcu-txn-sw-list.h> uses for its own links.
+ */
+#define FT_TXN_TAG	1UL
+urcu_static_assert(FT_TXN_TAG == URCU_TXN_SW_LIST_PROXY_TAG,
+	"FT_TXN_TAG is the SW list's proxy tag", ft_txn_tag_is_list_tag);
+
+/*
+ * The ordered-cell list uses the links of <urcu/rcu-txn-sw-list.h>, plus
+ * a logical-deletion mark: bit 1 of a deleted node's next link.
+ */
+#define FT_LIST_MARK	2UL
+
+static inline
+void *ft_list_set_mark(struct urcu_txn_sw_list_node *n)
+{
+	return (void *) ((uintptr_t) n | FT_LIST_MARK);
+}
+
+static inline
+int ft_list_is_marked(void *v)
+{
+	return (int) ((uintptr_t) v & FT_LIST_MARK);
+}
+
+static inline
+struct urcu_txn_sw_list_node *ft_list_unmark(void *v)
+{
+	return (struct urcu_txn_sw_list_node *)
+			((uintptr_t) v & ~(uintptr_t) FT_LIST_MARK);
+}
+
+/*
+ * Resolve a link loaded from an ordered-cell list slot: resolve a parked
+ * proxy through the engine, and strip the mark.
  */
 static inline
-struct urcu_txn_list_node *ft_txn_list_resolve(void *raw)
+struct urcu_txn_sw_list_node *ft_txn_list_resolve(void *raw)
 {
-	if (caa_unlikely((uintptr_t) raw & (URCU_TXN_TAG | URCU_TXN_LIST_MARK)))
-		return urcu_txn_list_unmark(ft_txn_resolve(raw, URCU_TXN_TAG));
-	return (struct urcu_txn_list_node *) raw;
+	if (caa_unlikely((uintptr_t) raw & (FT_TXN_TAG | FT_LIST_MARK)))
+		return ft_list_unmark(ft_txn_resolve(raw, FT_TXN_TAG));
+	return (struct urcu_txn_sw_list_node *) raw;
 }
 
 /* The resolved next and previous links of @node, in a read-side section. */
 static inline
-struct urcu_txn_list_node *ft_txn_list_next_rcu(struct urcu_txn_list_node *node)
+struct urcu_txn_sw_list_node *ft_txn_list_next_rcu(
+		struct urcu_txn_sw_list_node *node)
 {
 	return ft_txn_list_resolve((void *) rcu_dereference(node->next));
 }
 
 static inline
-struct urcu_txn_list_node *ft_txn_list_prev_rcu(struct urcu_txn_list_node *node)
+struct urcu_txn_sw_list_node *ft_txn_list_prev_rcu(
+		struct urcu_txn_sw_list_node *node)
 {
 	return ft_txn_list_resolve((void *) rcu_dereference(node->prev));
 }

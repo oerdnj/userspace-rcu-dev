@@ -3268,7 +3268,7 @@ unsigned int ft_rekey_fresh_cell_substitute(struct cds_ft *ft,
 	for (i = 0; i < n; i++) {
 		struct ft_ord_cell_edge e = edges[i];
 
-		if (ft_edge_tag(&e) == URCU_TXN_TAG) {
+		if (ft_edge_tag(&e) == FT_TXN_TAG) {
 			if (e.slot == (struct ft_ord_cell **)
 					&old_cell->lnode.prev) {
 				prev = e.new_target;
@@ -3295,7 +3295,7 @@ unsigned int ft_rekey_fresh_cell_substitute(struct cds_ft *ft,
 	new_cell->lnode.prev = ft_ord_cell_lnode(prev);
 	new_cell->lnode.next = ft_ord_cell_lnode(next);
 	if (!prev_linked) {
-		edges[out].tag = URCU_TXN_TAG;	/* ordered-cell edge */
+		edges[out].tag = FT_TXN_TAG;	/* ordered-cell edge */
 		edges[out].slot = (struct ft_ord_cell **) &prev->lnode.next;
 		edges[out].owner_cell = prev;
 		edges[out].old_target = old_cell;
@@ -3303,19 +3303,19 @@ unsigned int ft_rekey_fresh_cell_substitute(struct cds_ft *ft,
 		out++;
 	}
 	if (!next_linked) {
-		edges[out].tag = URCU_TXN_TAG;	/* ordered-cell edge */
+		edges[out].tag = FT_TXN_TAG;	/* ordered-cell edge */
 		edges[out].slot = (struct ft_ord_cell **) &next->lnode.prev;
 		edges[out].owner_cell = next;
 		edges[out].old_target = old_cell;
 		edges[out].new_target = new_cell;
 		out++;
 	}
-	edges[out].tag = URCU_TXN_TAG;	/* the deletion mark */
+	edges[out].tag = FT_TXN_TAG;	/* the deletion mark */
 	edges[out].slot = (struct ft_ord_cell **) &old_cell->lnode.next;
 	edges[out].owner_cell = old_cell;
 	edges[out].old_target = old_next;
 	edges[out].new_target = (struct ft_ord_cell *)
-		urcu_txn_list_set_mark(ft_ord_cell_lnode(old_next));
+		ft_list_set_mark(ft_ord_cell_lnode(old_next));
 	out++;
 	return out;
 }
@@ -8550,12 +8550,12 @@ detach_bail:
 			cn = 0;
 			if (!ft_flip_txn_excludes_all(txn, ft))
 			{
-				cedges[0].tag = URCU_TXN_TAG;
+				cedges[0].tag = FT_TXN_TAG;
 				cedges[0].slot = (struct ft_ord_cell **)
 					&rfc->lnode.prev;
 				cedges[0].old_target = src_pred;
 				cedges[0].new_target = src_pred;
-				cedges[1].tag = URCU_TXN_TAG;
+				cedges[1].tag = FT_TXN_TAG;
 				cedges[1].slot = (struct ft_ord_cell **)
 					&rlc->lnode.next;
 				cedges[1].old_target = src_succ;

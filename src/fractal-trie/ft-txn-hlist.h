@@ -81,8 +81,6 @@
 
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
-#include <urcu/rcu-txn-mcas.h>
-#include <urcu/rcu-txn.h>
 #include <urcu-pointer.h>
 
 #include <urcu/fractal-trie.h>	/* struct cds_ft_node, CDS_FT_NODE_REMOVED_FLAG */
@@ -91,11 +89,11 @@
  * Engine proxy tag for every interior chain slot (a node next/prev).  The
  * interior chain holds only duplicate leaves.  It never holds the structural
  * children that carry FT_FLIP_PROXY_TAG.  So the plain bit-0 engine tag is
- * enough.  In one TU it coexists with the ordered-cell list's URCU_TXN_TAG
+ * enough.  In one TU it coexists with the ordered-cell list's FT_TXN_TAG
  * (the slots never overlap) and with the trie's FT_FLIP_PROXY_TAG structural
  * edges.
  */
-#define FT_HLIST_TAG	URCU_TXN_TAG
+#define FT_HLIST_TAG	FT_TXN_TAG
 
 /* Logical-deletion mark: the public cds_ft_node removal tombstone (bit 1). */
 #define FT_HLIST_MARK	CDS_FT_NODE_REMOVED_FLAG
@@ -108,7 +106,7 @@
  * ft_skip_to_compressed and ft_get_parent_rcu.  That helper resolves the FT
  * flip-proxy tag (low nibble 0xF) and nothing else.  In list mode a HEAD's
  * prev is an ordinal cell pointer tagged FT_ORD_CELL_TAG.  That tag is BIT 0,
- * the same bit as URCU_TXN_TAG.
+ * the same bit as FT_TXN_TAG.
  *
  * So a reader hopping a duplicate chain would read a prev record with the
  * hlist tag as a cell.  A member's prev is its predecessor, a raw external
@@ -455,7 +453,7 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 	 * ordinal CELL list (ft_ord_cell.lnode) does not come through this
 	 * function.
 	 *
-	 * ☠ AND THE TAG CANNOT DO THIS JOB.  FT_HLIST_TAG *IS* URCU_TXN_TAG
+	 * ☠ AND THE TAG CANNOT DO THIS JOB.  FT_HLIST_TAG *IS* FT_TXN_TAG
 	 * (1), the ordered-cell tag.  So a tag test classes a chain word as a
 	 * cell.  The PRODUCER is what names the class.
 	 *

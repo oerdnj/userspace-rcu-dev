@@ -1276,7 +1276,7 @@ unsigned int ft_ord_survivor_link(struct ft_ord_cell *cell,
 		cell->lnode.next = ft_ord_cell_lnode(next);
 		return n;
 	}
-	edges[n].tag = URCU_TXN_TAG;		/* ordered-cell edge */
+	edges[n].tag = FT_TXN_TAG;		/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &cell->lnode.next;
 	edges[n].old_target = ft_ord_cell_resolve_ord(&cell->lnode.next);
 	edges[n].new_target = next;
@@ -1292,7 +1292,7 @@ unsigned int ft_ord_survivor_back(struct ft_ord_cell *cell,
 		cell->lnode.prev = ft_ord_cell_lnode(prev);
 		return n;
 	}
-	edges[n].tag = URCU_TXN_TAG;		/* ordered-cell edge */
+	edges[n].tag = FT_TXN_TAG;		/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &cell->lnode.prev;
 	edges[n].old_target = ft_ord_cell_resolve_ord(&cell->lnode.prev);
 	edges[n].new_target = prev;
@@ -1472,7 +1472,7 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 			if (!prev_is_dst) {
 				n = ft_ord_survivor_link(prev, cell, edges, n,
 						record_all);
-				edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
+				edges[n].tag = FT_TXN_TAG;	/* ordered-cell edge */
 				edges[n].slot = (struct ft_ord_cell **) &cell->lnode.prev;
 				edges[n].old_target =
 					ft_ord_cell_resolve_ord(&cell->lnode.prev);
@@ -1495,7 +1495,7 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 				 * flip its forward edge to the survivor.  When prev is the
 				 * sentinel this IS the old "new list minimum: flip head".
 				 */
-				edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
+				edges[n].tag = FT_TXN_TAG;	/* ordered-cell edge */
 				edges[n].slot = (struct ft_ord_cell **) &prev->lnode.next;
 				edges[n].old_target =
 					ft_ord_cell_resolve_ord(&prev->lnode.next);
@@ -1522,7 +1522,7 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 	 */
 	if (!prev_is_dst || tail_link != dst_succ) {
 		n = ft_ord_survivor_link(prev, tail_link, edges, n, record_all);
-		edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
+		edges[n].tag = FT_TXN_TAG;	/* ordered-cell edge */
 		edges[n].slot = (struct ft_ord_cell **) &tail_link->lnode.prev;
 		edges[n].old_target =
 			ft_ord_cell_resolve_ord(&tail_link->lnode.prev);
@@ -3868,7 +3868,7 @@ merge_spine_retry:
 				dst_root_fenced, subtree->root,
 				NULL, ft_ord_first(subtree),
 				NULL, ft_ord_last(subtree), subtree, true);
-			urcu_txn_list_init(&subtree->ord_sentinel);
+			urcu_txn_sw_list_init(&subtree->ord_sentinel);
 		} else {
 			/*
 			 * No ordered list: dst's root is the only

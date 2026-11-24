@@ -469,7 +469,7 @@ enum urcu_txn_status ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 
 	if (cell) {
 		struct ft_ord_cell *pred, *pred2, *succ0;
-		struct urcu_txn_list_node *pred_lnode;
+		struct urcu_txn_sw_list_node *pred_lnode;
 
 		/*
 		 * Locate the predecessor.  From-HEAD seeds at the fresh head

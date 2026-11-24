@@ -880,7 +880,7 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	 * unconditionally, because it is cheap.  Every created trie flows
 	 * through here, including the transient detach / merge tries.
 	 */
-	urcu_txn_list_init(&ft->ord_sentinel);
+	urcu_txn_sw_list_init(&ft->ord_sentinel);
 	/*
 	 * The three ownerless words' lock anchors.  A zeroed @state is CLEAN,
 	 * which is what ft_meta_lock_acquire expects to CAS from.  Nothing

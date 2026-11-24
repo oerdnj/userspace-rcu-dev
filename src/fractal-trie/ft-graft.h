@@ -4287,7 +4287,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			if (dh)
 				ft_ord_cell_run_install(swap_ft, dh, dt);
 			else
-				urcu_txn_list_init(&swap_ft->ord_sentinel);
+				urcu_txn_sw_list_init(&swap_ft->ord_sentinel);
 			ft_ord_finalize_circular(swap_ft);
 		}
 
@@ -5534,14 +5534,14 @@ retry_swap:
 				 */
 				gs_d_first->lnode.prev = &swap_ft->ord_sentinel.node;
 				gs_d_last->lnode.next = &swap_ft->ord_sentinel.node;
-				edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
+				edges[n].tag = FT_TXN_TAG;	/* ordered-cell edge */
 				edges[n].slot = (struct ft_ord_cell **)
 					&swap_ft->ord_sentinel.node.next;
 				edges[n].sentinel_ft = swap_ft;
 				edges[n].old_target = ft_ord_sentinel_cell(swap_ft);
 				edges[n].new_target = gs_d_first;
 				n++;
-				edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
+				edges[n].tag = FT_TXN_TAG;	/* ordered-cell edge */
 				edges[n].slot = (struct ft_ord_cell **)
 					&swap_ft->ord_sentinel.node.prev;
 				edges[n].sentinel_ft = swap_ft;

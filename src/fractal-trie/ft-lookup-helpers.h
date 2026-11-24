@@ -158,7 +158,7 @@ struct cds_ft_inode_flag *ft_resolve_head_prev(const struct cds_ft *ft, void *pr
  * directional edges flip atomically for a bidirectional ordered reader.
  *
  * The ordered-cell list rides <urcu/rcu-txn-list.h>.  So its edges carry the
- * concurrent list's ENGINE proxy tag (URCU_TXN_TAG, bit 0), NOT FT's type-7
+ * concurrent list's ENGINE proxy tag (FT_TXN_TAG, bit 0), NOT FT's type-7
  * structural tag.  A logically-deleted node carries the list deletion MARK
  * (bit 1).  ft_txn_list_resolve strips both and resolves the proxy.
  * Raw cells are >= 8-byte aligned (bits 0-1 clear), so the resolve is
@@ -166,9 +166,10 @@ struct cds_ft_inode_flag *ft_resolve_head_prev(const struct cds_ft *ft, void *pr
  * on the write side).
  */
 static inline_lookup
-struct ft_ord_cell *ft_ord_cell_resolve_ord(struct urcu_txn_list_node *const *slot)
+struct ft_ord_cell *ft_ord_cell_resolve_ord(
+		struct urcu_txn_sw_list_node *const *slot)
 {
-	struct urcu_txn_list_node *p = rcu_dereference(*slot);
+	struct urcu_txn_sw_list_node *p = rcu_dereference(*slot);
 
 	p = ft_txn_list_resolve((void *) p);
 	/*
