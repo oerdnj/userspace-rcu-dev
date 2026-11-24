@@ -1650,10 +1650,11 @@ struct ft_pub_rec {
  *              parked a 0xF-tagged proxy on a word that every other
  *              producer and resolver tags FT_STATE_PROXY (0x1).  That
  *              includes its own caller's expected-old load two lines up.
- *              urcu_txn_is_proxy(v, 0x1) ACCEPTS 0xF.  urcu_txn_untag then
- *              yields desc|0xE, a misaligned record pointer that the
- *              resolve path dereferences.  The engine's debug net covers
- *              the RECORD path only.
+ *              urcu_txn_is_proxy(v, 0x1) ACCEPTED 0xF, and
+ *              urcu_txn_sw_is_proxy(v, 0x1) still does.  urcu_txn_untag
+ *              then yielded desc|0xE, a misaligned record pointer that
+ *              the resolve path dereferenced.  The MCAS engine's debug
+ *              net covered the RECORD path only.
  *              ☠ AND ITS REACH WAS NARROWER THAN IT LOOKED, which is the
  *              part worth keeping.  The delete arm returns -EFBIG unless
  *              ft_in_place_ok(), i.e. -DFEATURE_FT_INSERT_IN_PLACE on an
@@ -1851,8 +1852,11 @@ struct cds_ft_metadata {
 	 * is debt, not design.  It is stored as (count << 1).  Bit 0 is
 	 * FT_NR_KEYS_PROXY_TAG.
 	 * ☠ One txn may walk one ancestor TWICE (-1 then +1).  The expected old
-	 * must come from the DESCRIPTOR first.  Otherwise the second walk
-	 * poisons the commit, and the op livelocks with no contention at all.
+	 * must come from the txn's own record first.  Otherwise the second
+	 * walk uses a stale expected old.  A DEBUG_RCU build asserts on it.
+	 * A release build would lose the first walk's change.  Under the MCAS
+	 * engine it poisoned the commit, and the op livelocked with no
+	 * contention at all.
 	 */
 	unsigned long nr_keys;
 
@@ -2865,7 +2869,7 @@ struct cds_ft {
 	 * - a circular wait;
 	 * - a fresh MCAS descriptor allocated per retry (unbounded slab
 	 *   growth).
-	 * Both were observed.  A mutex is a mutex.
+	 * Both were observed, under the MCAS engine.  A mutex is a mutex.
 	 *
 	 * GRACE-PERIOD RULE (the invariant rcu-txn.h:1126 also relies on): a
 	 * holder must NEVER wait on a grace period while holding this lock.

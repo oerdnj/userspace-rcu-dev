@@ -247,9 +247,9 @@ void ft_rekey_marks_to_txn(struct ft_flip_txn *txn,
  *  3. a child this txn already RE-HOMED (its parent word carries a record)
  *     or already HOLDS (an earlier step's fence).  Chain onto that step's
  *     record, with its kind and its PENDING value as the expected old.  (A
- *     load on the first attempt reads the live word, not the record, and
- *     the chain would poison.)  Take no mark of our own and owe no second
- *     terminal.
+ *     load on the first attempt reads the live word, not the record.  The
+ *     chain's old would then not match, and a DEBUG_RCU build asserts.)
+ *     Take no mark of our own and owe no second terminal.
  *  4. anything else: the ordinary path.  Mark it, then SW records.  An
  *     external child whose back-channel this txn already recorded (a head
  *     the detach promoted into the frame's slot) chains the same way, by its
@@ -5181,7 +5181,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				 *  - ft_flip_txn_record_anchor_release_held is
 				 *    placed by coverage, not by order;
 				 *  - a §4.B guard planted before a release
-				 *    would poison the txn;
+				 *    would break the ordering rule on
+				 *    ft_flip_txn_record_release_lock;
 				 *  - a retire this op decides later chains
 				 *    onto the release's clean pending value.
 				 */
@@ -5621,7 +5622,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * already right. Only the aggregate was wrong, so nothing but
 		 * cds_ft_verify and the rank/select queries could see it.  It
 		 * could not be reached at all until the count walk stopped
-		 * poisoning the descriptor
+		 * poisoning the MCAS descriptor
 		 * (ft_flip_txn_record_count_parent's read-your-own-writes).
 		 *
 		 * ☑ THIS FIXES THE VALUE. THE WALK'S BASE was its own defect
@@ -8501,9 +8502,11 @@ detach_bail:
 		 * pair was derived earlier than these src reads.  A peer move
 		 * can have shifted the neighbourhood in between.  MEASURED at
 		 * 1.5-2% of commits before the move counter pinned the window
-		 * shut.  ft_flip_txn_create's expect_conflict makes the engine
-		 * RECONCILE rather than corrupt (it poisons -> clean abort).
-		 * But relying on that is relying on a fallback.  Bail
+		 * shut.  Under the MCAS engine, ft_flip_txn_create's
+		 * expect_conflict made the engine RECONCILE rather than
+		 * corrupt (it poisoned -> clean abort).  The single-writer
+		 * engine has no such fallback.  A release build would chain the
+		 * two records and keep only the second one's new value.  Bail
 		 * explicitly instead, so the distinctness the engine requires
 		 * holds BY CONSTRUCTION.  Clean -EAGAIN: the txn has recorded
 		 * structural edges but published nothing.  So the bail below

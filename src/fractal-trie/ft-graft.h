@@ -857,9 +857,10 @@ old_dir_built:
 	 * needs them is the detach's external-promote.  Without them it
 	 * publishes into @cn->child and refreshes @cn's SKIP_X dual.  That is
 	 * the very word the forward publish below repoints.  The result is
-	 * two records on one slot whose expected-olds disagree.  This poisons
-	 * the descriptor and re-plans for ever (ft-remove.h's promote arm
-	 * carries the measurement).
+	 * two records on one slot whose expected-olds disagree.  A DEBUG_RCU
+	 * build asserts on that in urcu_txn_sw_record_chain().  Under the MCAS
+	 * engine it poisoned the descriptor, and the op re-planned for ever
+	 * (ft-remove.h's promote arm carries the measurement).
 	 *
 	 * Name it AFTER the branch is final, never at the defer above.  The
 	 * second ft_node_set_nth may reallocate the branch.  A slot captured
@@ -1576,7 +1577,7 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 			 * The ordering is safe by construction.  The release
 			 * was recorded first.  If the guard were kept, it
 			 * would chain as a read-your-writes no-op.  It would
-			 * never be the poisoning guard-then-release order
+			 * never be the forbidden guard-then-release order
 			 * (rule at ft_flip_txn_record_release_lock).
 			 * Non-lock_fine keeps the guard.
 			 */
@@ -1599,7 +1600,7 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 			 * and settled long before.  So every later acquire
 			 * of that word bails forever.
 			 *
-			 * This is reached by a KEYED graft racing a ROOT
+			 * This was reached by a KEYED graft racing a ROOT
 			 * graft into one destination:
 			 * inv_empty_dst_root_graft_peer, ~1 run in 40 under
 			 * -DDEBUG_RCU.
@@ -1892,7 +1893,7 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 		 * ft_flip_txn_record_tombstone here would DOUBLE-record the
 		 * same word with a conflicting expected-old (plain
 		 * current-state vs the mark snapshot).  That is the
-		 * double-tombstone poison: a lost key and a double free.
+		 * double-tombstone hazard: a lost key and a double free.
 		 *
 		 * Insert relies solely on the recompact's retire (ft-insert.h,
 		 * free_old_node, no commit-time tombstone).  The graft matches

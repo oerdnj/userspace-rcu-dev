@@ -450,8 +450,10 @@ static __thread unsigned long ft_dbg_lock_refuse_switches;
  *                                       livelock wearing a proxy.
  *   a CHURN of descriptors               ordinary contention this op is losing.
  *
- * Captured at the refusal, reported at the cap.  @poisoned is carried too.  A
- * poisoned descriptor can never commit, so it can never settle by committing.
+ * Captured at the refusal, reported at the cap.  @poisoned is carried too.  It
+ * is the MCAS engine's poison flag: a poisoned descriptor could never commit,
+ * so it could never settle by committing.  The single-writer engine has no
+ * such flag, and nothing sets @poisoned now.
  */
 static __thread const void *ft_dbg_proxy_desc;
 static __thread unsigned long ft_dbg_proxy_status;

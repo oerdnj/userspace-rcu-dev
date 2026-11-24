@@ -15397,12 +15397,12 @@ void ft_state_edge(struct ft_ord_cell_edge *edge, uintptr_t *state_slot,
 	 * ft_edge_tag defaults an untagged edge to FT_FLIP_PROXY_TAG (0xF).
 	 * Every other producer and every resolver tags a STATE word
 	 * FT_STATE_PROXY (0x1).  So a STATE word got a 0xF-tagged proxy parked
-	 * on it.  urcu_txn_is_proxy(v, 0x1) accepts 0xF ((0xF & 0x1) == 0x1).
-	 * urcu_txn_untag then yields desc|0xE: a misaligned record pointer
-	 * that the resolve path dereferences.  The tag, like the kind, is a
-	 * property of the SLOT.  It must be the same in every txn and every
-	 * reader that touches it.  ☞ THE TRANSACTED-SLOT REGISTER in
-	 * fractal-trie-internal.h.
+	 * on it.  urcu_txn_is_proxy(v, 0x1) accepted 0xF ((0xF & 0x1) == 0x1),
+	 * and urcu_txn_sw_is_proxy() still does.  urcu_txn_untag then yielded
+	 * desc|0xE: a misaligned record pointer that the resolve path
+	 * dereferenced.  The tag, like the kind, is a property of the SLOT.
+	 * It must be the same in every txn and every reader that touches it.
+	 * ☞ THE TRANSACTED-SLOT REGISTER in fractal-trie-internal.h.
 	 */
 	edge->slot = (struct ft_ord_cell **) state_slot;
 	edge->old_target = (struct ft_ord_cell *) old_state;
@@ -16632,9 +16632,10 @@ int ft_cell_lockset_take(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
  *   - recorded first, the op's later edges expect the committed value while
  *     pending has already moved;
  *   - recorded last, the earlier edges have moved pending off the snapshot.
- * Either way every commit aborts and the retry rebuilds the same shape.  This
- * is a livelock with no diagnostic (measured: single-writer, so not
- * contention).
+ * Under the MCAS engine, either way every commit aborted and the retry
+ * rebuilt the same shape.  That was a livelock with no diagnostic
+ * (measured: single-writer, so not contention).  A DEBUG_RCU build now
+ * asserts on the mismatch in urcu_txn_sw_record_chain().
  *
  * The retire twin already does the RYW load.  Its justification carries over
  * exactly: no peer can have moved this word, BECAUSE WE HOLD IT LOCKED.
@@ -16843,14 +16844,14 @@ void ft_flip_txn_lock_born_spine(struct cds_ft *ft, struct ft_flip_txn *t,
  * word, and the fused {LOCK|s -> TOMBSTONE|s} transition above expresses that
  * in a single record.  Recording that fused form across two words would
  * tombstone a LIVE ancestor.  It would also carry the ancestor's word as the
- * node's expected old.  Those values are unrelated, so the commit could only
- * ever abort.  The two halves are recorded at DIFFERENT times, hence two
- * functions.
+ * node's expected old.  Those values are unrelated.  (Under the MCAS engine
+ * the commit could only ever abort.)  The two halves are recorded at
+ * DIFFERENT times, hence two functions.
  *
  * THE RELEASE half is recorded when the op REGISTERS the lock, not at the
  * commit.  The surviving ancestor can also be the publish target's own word.
- * A §4.B guard planted on a word BEFORE its release POISONS the txn
- * permanently (the ordering rule on ft_flip_txn_record_release_lock).
+ * A §4.B guard planted on a word BEFORE its release breaks the ordering
+ * rule on ft_flip_txn_record_release_lock.  A DEBUG_RCU build asserts.
  * Recording the release first makes the later guard the harmless no-op that
  * rule describes.  This is a no-op when the lock IS the retired node's word:
  * the fused terminal covers it, unchanged.
@@ -16859,10 +16860,11 @@ void ft_flip_txn_lock_born_spine(struct cds_ft *ft, struct ft_flip_txn *t,
  * lets a member anchor on a node the SAME op retires.  This member wants the
  * anchor to survive, and that one kills it.  A node's fate belongs to the
  * op's PLAN, not to the order its members were acquired.  Recording both
- * poisons the txn either way round.  {LOCK|s -> s} and {LOCK|s -> TOMBSTONE|s}
- * carry the same expected old.  So whichever lands second mismatches the
- * first's pending new, and record_chain sets t->poisoned, permanently (the
- * ordering rule on ft_flip_txn_record_release_lock).  So the release YIELDS.
+ * is wrong in either order.  {LOCK|s -> s} and {LOCK|s -> TOMBSTONE|s} carry
+ * the same expected old.  So whichever lands second mismatches the first's
+ * pending new (the ordering rule on ft_flip_txn_record_release_lock).
+ * urcu_txn_sw_record_chain() asserts on that in a DEBUG_RCU build.  So the
+ * release YIELDS.
  * If this txn's own pending view of the word already shows TOMBSTONE, the op
  * has retired the anchor and that record is the terminal.  The other order
  * needs nothing here: the later retire chains onto the release's clean
@@ -17446,14 +17448,14 @@ void ft_flip_txn_lock_or_guard_parent_ex(const char *fn, int line,
 			 * is owed here.  A guard after a release on one word
 			 * is the harmless no-op of the ordering rule.  It
 			 * reads the record's own pending clean value and
-			 * validates {s -> s}.  It is never the poison order.
+			 * validates {s -> s}.  It is never the forbidden order.
 			 *
 			 * The exception is the word the op holds.  The
 			 * guard expects clean-LIVE, which masks out the
 			 * FT_STATE_LOCK this op set.  The word has not
 			 * carried that value since the mark landed.  And
 			 * the member that took the word records its terminal
-			 * later in the commit.  That is the poison order
+			 * later in the commit.  That is the order
 			 * the ordering rule above forbids.
 			 *
 			 * Per-node granularity cannot reach this case.  The
@@ -17902,12 +17904,13 @@ bool ft_lock_chain_holder(struct cds_ft *ft,
  *     RYW meta=…358 state=c pending_new=(nil) tombstoned=0 <- the record's
  *
  * The guard then asserts clean-LIVE on a word this very commit tombstones.
- * The expectation contradicts the pending new, so urcu_txn_record_chain
- * poisons the descriptor.  The commit aborts with no losing record.  The
- * caller's retry reads that as retriable and spins forever, leaking a txn
- * per attempt.  (Order matters.  The "composes ORDER-FREE" note at
- * ft_flip_txn_guard_parent only holds for guard-then-retire.
- * Retire-then-guard poisons.)
+ * The expectation contradicts the pending new.  Under the MCAS engine,
+ * urcu_txn_record_chain poisoned the descriptor.  The commit aborted with
+ * no losing record.  The caller's retry read that as retriable and spun
+ * forever, leaking a txn per attempt.  urcu_txn_sw_record_chain() asserts
+ * on it in a DEBUG_RCU build.  (Order matters.  The "composes ORDER-FREE"
+ * note at ft_flip_txn_guard_parent only holds for guard-then-retire.
+ * Retire-then-guard is the broken order.)
  *
  * ☞ And the deeper rule it breaks (Mathieu).  During a rekey, readers run
  * two descents, so they can identify the change.  But both the before state
@@ -18124,12 +18127,13 @@ void ft_flip_txn_hold_or_lock_parent_at(const char *fn, int line,
 		 * retires.  Coarsening puts it on an ancestor.  Root-only
 		 * puts every member on one word.  Then {LOCK|s -> s} and
 		 * {LOCK|s -> TOMBSTONE|s} carry the same expected old.
-		 * Whichever lands second mismatches the first's pending new,
-		 * and record_chain poisons the descriptor.  The poison is
-		 * permanent: every commit aborts and the retry rebuilds the
-		 * identical shape.  This is a livelock with no contention,
-		 * and that is exactly how it presents (measured
-		 * single-threaded at the rekey's retry cap).
+		 * Whichever lands second mismatches the first's pending new.
+		 * urcu_txn_sw_record_chain() asserts on that in a DEBUG_RCU
+		 * build.  Under the MCAS engine record_chain poisoned the
+		 * descriptor, permanently: every commit aborted and the retry
+		 * rebuilt the identical shape.  That was a livelock with no
+		 * contention (measured single-threaded at the rekey's retry
+		 * cap).
 		 *
 		 * The RYW form yields:
 		 *  - a pending TOMBSTONE means the op retires this anchor
@@ -20277,7 +20281,7 @@ freeze_done:
  * flip as the forward publish.  This replaces a bare ft_set_parent before it.
  * The child's parent field transitions old -> @new_parent atomically with the
  * structural publish.  This closes the re-parent-before-publish window and
- * makes the back-edge an MCAS descriptor edge.
+ * makes the back-edge a txn edge.
  *
  * Resolves the field per child kind exactly as ft_set_parent /
  * ft_park_live_parent_edge do:
@@ -21874,22 +21878,24 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 		 *
 		 * Deriving the expected-old from that word makes the second
 		 * walk claim an old that the first walk has already
-		 * superseded.  urcu_txn_record_chain answers a same-slot
-		 * value mismatch by POISONING the descriptor.  The commit
-		 * then ABORTS having published nothing.  The caller
-		 * re-descends onto the identical shape, and it does so
-		 * FOREVER.  The op is single-threaded, so no peer can ever
-		 * change what it re-reads.
+		 * superseded.  urcu_txn_sw_record_chain() asserts on that in
+		 * a DEBUG_RCU build.  A release build would chain it and lose
+		 * the first walk's change.  Under the MCAS engine,
+		 * urcu_txn_record_chain answered it by POISONING the
+		 * descriptor.  The commit then ABORTED having published
+		 * nothing.  The caller re-descended onto the identical shape,
+		 * and did so FOREVER.  The op is single-threaded, so no peer
+		 * could ever change what it re-read.
 		 *
-		 * MEASURED before this: on a rank-stats trie
+		 * MEASURED before this, under MCAS: on a rank-stats trie
 		 * cds_ft_rekey_merge() never returned (3.7M attempts in 20 s,
 		 * ~20 MB/s of arena per retry).  The ancestor the two walks
 		 * met on is the ROOT.  Every same-trie move shares the root,
 		 * so it was every such move, not a corner.
-		 * --enable-rcu-debug is SILENT on it: the poison is a
+		 * --enable-rcu-debug was SILENT on it: the poison was a
 		 * documented release-mode answer, not an assert.
 		 *
-		 * So ask the DESCRIPTOR first and chain onto what this op has
+		 * So ask the txn first and chain onto what this op has
 		 * already recorded for the word.  Fall back to the live count
 		 * only where it recorded nothing.  The paragraph above still
 		 * describes that fallback exactly.  It was only ever a
@@ -22918,9 +22924,10 @@ struct ft_glue {
 	 * cluster.  A same-commit detach that then edits @cn publishes into
 	 * @cn->child and refreshes @cn's SKIP_X dual.  That writes a node this
 	 * commit destroys.  It also collides on the word the forward publish
-	 * repoints.  The engine reports the collision as a value mismatch on
-	 * that word.  The descriptor poisons, the commit aborts, and the op
-	 * re-plans the identical shape for ever.
+	 * repoints.  That is a value mismatch on that word.  A DEBUG_RCU build
+	 * asserts on it in urcu_txn_sw_record_chain().  Under the MCAS engine,
+	 * the descriptor poisoned, the commit aborted, and the op re-planned
+	 * the identical shape for ever.
 	 *
 	 * The detach cannot derive any of this: it is handed @cn and a lock ctx,
 	 * and the split is a step it never sees.  So the BUILD names it, exactly
@@ -24097,10 +24104,10 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 *
 	 * @child_marked is two-valued, and both of its values are wrong here:
 	 *  - FALSE records the §4.B MW validate below.  Its expected-old is
-	 *    the word CLEAN, but the word carries the op's OWN LOCK.  So the
-	 *    install CAS can never match, and every attempt aborts
-	 *    deterministically.  This presents as a livelock with no
-	 *    contention.
+	 *    the word CLEAN, but the word carries the op's OWN LOCK.  Under
+	 *    the MCAS engine the install CAS could never match, and every
+	 *    attempt aborted deterministically.  This presented as a
+	 *    livelock with no contention.
 	 *  - TRUE records the SW {live_state -> live_state} form, which IS a
 	 *    release.  Releasing a mark this step never took hands the word
 	 *    a second terminal.
@@ -25826,8 +25833,9 @@ void ft_glue_tombstone_free_list(struct ft_glue *g)
 		 * ft_glue_txn_commit_edges records its {LOCK|s ->
 		 * TOMBSTONE|s} terminal.  A SECOND plain tombstone here would
 		 * DOUBLE-record @cn's state word.  That is
-		 * guard/retire-then-release, a permanent poison: every commit
-		 * aborts.  So skip it.  @cn stays on the free list (retired)
+		 * guard/retire-then-release.  A DEBUG_RCU build asserts on it.
+		 * Under the MCAS engine it was a permanent poison: every commit
+		 * aborted.  So skip it.  @cn stays on the free list (retired)
 		 * for reclaim, and the fenced retire owns its LIVE->DEAD
 		 * transition.
 		 *
@@ -26533,8 +26541,10 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 			 * other end is a root-level source junction, that node
 			 * is the ROOT.  The detach recompacts the ROOT and
 			 * therefore retires it.  A release recorded beside
-			 * that retire poisons the descriptor permanently.  One
-			 * word, one terminal; the retire outranks.
+			 * that retire breaks the ordering rule.  A DEBUG_RCU
+			 * build asserts on it.  Under the MCAS engine it
+			 * poisoned the descriptor permanently.  One word, one
+			 * terminal; the retire outranks.
 			 */
 			ft_flip_txn_lock_register(g->txn, g->publish_gp_holder,
 				g->publish_gp_snap);

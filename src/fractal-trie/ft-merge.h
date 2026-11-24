@@ -2334,8 +2334,9 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		 * Coarsening can put that anchor on an overlap node this op has
 		 * already fenced, and root-only puts EVERY member on one word.
 		 * Claiming it here would record a second terminal on a word
-		 * whose fenced retire already owns one.  The engine poisons
-		 * that.
+		 * whose fenced retire already owns one.  A DEBUG_RCU build
+		 * asserts on that in urcu_txn_sw_record_chain().  Under the
+		 * MCAS engine it poisoned the descriptor.
 		 */
 		if (!took && ph.shared) {
 			gd.publish_parent_holder = NULL;

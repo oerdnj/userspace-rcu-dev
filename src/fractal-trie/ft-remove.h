@@ -193,11 +193,13 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		 * This gives two records on one word whose expected-olds
 		 * disagree.  The dual chains {skip(cn_child) -> skip(head)}.
 		 * The glue then chains {skip(cn_child) -> top}.
-		 * urcu_txn_record_chain finds r->new_ptr != old_ptr and poisons
-		 * the descriptor.  The commit aborts and the op re-plans the
-		 * identical shape.  Measured on the shipping build: 310,024
-		 * poisons in 40 s on one such shape, with a fresh cluster
-		 * allocated per attempt.
+		 * Under the MCAS engine, urcu_txn_record_chain found
+		 * r->new_ptr != old_ptr and poisoned the descriptor.  The
+		 * commit aborted and the op re-planned the identical shape.
+		 * Measured on the shipping build: 310,024 poisons in 40 s on
+		 * one such shape, with a fresh cluster allocated per attempt.
+		 * Under the single-writer engine, urcu_txn_sw_record_chain()
+		 * asserts on it in a DEBUG_RCU build.
 		 *
 		 * ☠ Curing only that collision commits a wrong trie.  Measured
 		 * with the collision cured (a read-your-own-writes expected-old
@@ -2534,15 +2536,15 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			 * @parent_cn's child under its fresh cluster.  Two
 			 * steps, one word, incompatible plans.
 			 *
-			 * ☠ AND --enable-rcu-debug CANNOT SEE IT HERE.  MEASURED
-			 * on a release probe build: this shape poisons the
-			 * descriptor THREE times per attempt.  Every one is
-			 * SW-against-SW:
-			 *   - the kind assert never fires;
-			 *   - @cn's state word is retired twice;
-			 *   - a {live -> live} validate chains after a
+			 * ☠ AND UNDER THE MCAS ENGINE --enable-rcu-debug COULD
+			 * NOT SEE IT HERE.  MEASURED on a release probe build:
+			 * this shape poisoned the descriptor THREE times per
+			 * attempt.  Every one was SW-against-SW:
+			 *   - the kind assert never fired;
+			 *   - @cn's state word was retired twice;
+			 *   - a {live -> live} validate chained after a
 			 *     tombstone.
-			 * The livelock is the only detector.  That is why the
+			 * The livelock was the only detector.  That is why the
 			 * refusal is what makes the shape reportable at all.
 			 *
 			 * Serving it needs the merged node re-based BELOW the
@@ -2631,9 +2633,10 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	 * A same-key insert can append a duplicate between that read and the
 	 * acquire above.  A remover preempted there is all it takes.  The
 	 * freeze below would then record {NULL -> MARK(NULL)} over the live
-	 * @freeze_leaf->next.  Under MW the install CAS absorbed that stale
-	 * plan.  Under SW the record parks and stores BLIND.  So the appended
-	 * node is dropped with the key, UNMARKED: a lost insert.
+	 * @freeze_leaf->next.  Under the MCAS engine, an MW record's install
+	 * CAS absorbed that stale plan.  The single-writer engine stores every
+	 * record BLIND.  So the appended node is dropped with the key,
+	 * UNMARKED: a lost insert.
 	 *
 	 * MEASURED under preemption (2 cpus, 2 competing spinners), per-node
 	 * and root-only: 9 stale plans here of ~5.9M.  That is one per lost
@@ -2797,8 +2800,9 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			 * re-applies the old parent over this.  A RECORDED
 			 * re-parent here would plant an MW parent+PSO pair on
 			 * a node the glue's free-list retire also settles.
-			 * That is the measured record_chain collision that
-			 * poisons (release) or asserts (rcu-debug).
+			 * That is the record_chain collision measured under
+			 * the MCAS engine: it poisoned (release) or asserted
+			 * (rcu-debug).
 			 */
 			ft_set_parent(ft, new_cn->child, new_cn_flag,
 				&new_cn->child);
@@ -3560,10 +3564,10 @@ int ft_detach_node(struct cds_ft *ft,
 		 * ☠ THE FLIP-PROXY HALF WAS MISSING HERE, AND IT FAULTS.  (It
 		 * is now done once, at the load above -- see there for why
 		 * once.)  This slot can hold a parked proxy: a concurrent
-		 * one-commit splice parks a type-7 MCAS descriptor in it.
-		 * The low nibble 0xF then fails ft_node_external.  So the
-		 * type check below admits it, and ft_flag_to_metadata
-		 * computes a metadata address from a DESCRIPTOR pointer.
+		 * one-commit splice parks a type-7 proxy in it.  The low
+		 * nibble 0xF then fails ft_node_external.  So the type check
+		 * below admits it, and ft_flag_to_metadata computes a
+		 * metadata address from a PROXY pointer.
 		 *
 		 * Two neighbouring comments already name that outcome:
 		 *   - The comment on the very next statement: "the SKIP_X
@@ -8516,9 +8520,9 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 	 *     neighbours.
 	 *   - Head-no-successor records the {LOCK|s -> s} RELEASE + registers
 	 *     it.  So it FUSES with the same-word nr_child--.  A masking guard
-	 *     would disagree on expected-old and poison.  The txn owns the
-	 *     clear: commit consumes it, abort/destroy auto-clears the
-	 *     registered fence.
+	 *     would disagree on expected-old, and a DEBUG_RCU build asserts on
+	 *     that.  The txn owns the clear: commit consumes it, abort/destroy
+	 *     auto-clears the registered fence.
 	 *
 	 * Under the FT-wide writer_lock no peer contends, so the acquire never
 	 * misses in soak.  FEATURE_FT_FAULT_INJECT drives the -EAGAIN bail
@@ -8905,9 +8909,10 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * publishes into.  When holding its lock (hmeta), record the
 		 * {LOCK|s -> s} RELEASE + register.  It then FUSES with the
 		 * fused nr_child-- on the same word.  A masking guard would
-		 * disagree on expected-old and poison the descriptor.  The
-		 * txn owns the fence outcome: commit consumes it, and an
-		 * aborted/destroyed commit auto-clears the registered fence.
+		 * disagree on expected-old, and a DEBUG_RCU build asserts on
+		 * that.  The txn owns the fence outcome: commit consumes it,
+		 * and an aborted/destroyed commit auto-clears the registered
+		 * fence.
 		 * So the flip_into abort below needs no manual clear.
 		 */
 		ft_flip_txn_hold_or_lock_parent(ft, txn, ctx, parent_nf,

@@ -2997,8 +2997,9 @@ int ft_attach_node(struct cds_ft *ft,
 			 *    {LOCK|s -> s+1}: release AND increment in one
 			 *    record.
 			 *  - count-then-release would arrive with expected old
-			 *    LOCK|s against a pending s+1, and POISON the
-			 *    descriptor.
+			 *    LOCK|s against a pending s+1.  A DEBUG_RCU
+			 *    build asserts on that.  A release build would
+			 *    keep the release's s and lose the increment.
 			 * The ordering rule is spelled out at
 			 * ft_flip_txn_record_release_lock.
 			 */

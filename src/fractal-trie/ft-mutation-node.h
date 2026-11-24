@@ -1184,7 +1184,8 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 	 *     The raw value then hands the engine a proxy as
 	 *     expected-old (rcu-txn-mcas.h's `!urcu_txn_is_proxy`
 	 *     assert).
-	 * Both were MEASURED on inv_concurrent_remove_all_nolist.
+	 * Both were MEASURED under the MCAS engine, on
+	 * inv_concurrent_remove_all_nolist.
 	 *
 	 * The recompacting tier read the slot under the {C,P,GP} lock.
 	 * There the two values could not differ.  The in-place tier
@@ -3525,10 +3526,13 @@ skip_copy:
 					 * holds the publish parent, which is a
 					 * root child.  The validate expects the
 					 * word CLEAN, but the word carries the
-					 * op's OWN LOCK.  So the install CAS
-					 * can never match and every attempt
-					 * aborts: a livelock with no
-					 * contention.
+					 * op's OWN LOCK.  Under the MCAS
+					 * engine the install CAS could never
+					 * match, and every attempt aborted: a
+					 * livelock with no contention.  The
+					 * single-writer engine would store
+					 * CLEAN blind and drop the op's own
+					 * lock at the commit.
 					 *
 					 * So hand the recorder @ctx, the op's
 					 * whole held set, and let it answer the

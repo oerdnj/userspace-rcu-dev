@@ -408,9 +408,10 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 	 *     two sites that are not converted are measured UNREACHED (0 of 0).
 	 *     That is a coverage statement and is labelled as one.
 	 *
-	 *   3 AN SW ABORT WRITES.  urcu_txn_settle stores old_ptr back BLIND.
-	 *     So an expected-old that is a caller's BELIEF becomes a published
-	 *     lie.  FT_CHAIN_OLD converts the five of them to loads.
+	 *   3 AN SW ABORT WROTE.  Under the MCAS engine, urcu_txn_settle
+	 *     stored old_ptr back BLIND.  So an expected-old that was a
+	 *     caller's BELIEF became a published lie.  FT_CHAIN_OLD converts
+	 *     the five of them to loads.
 	 *
 	 *   4 THE SERIALIZING NULL ON THE APPEND SIDE (ft_hlist_append_run_
 	 *     prepare) was missed entirely last time.  It had ZERO concurrent
@@ -506,11 +507,13 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
  *   - succ->prev <- pos;
  *   - pred->next <- elem and next->prev <- elem, in the unlink;
  *   - the two in replace.
- * Under MW that is harmless and slightly stronger than a load: a wrong
- * belief just fails the install CAS.  ☠ Under SW it is a WRITE.
- * urcu_txn_settle stores old_ptr back BLIND on an abort.  So a belief that
- * never matched the word is published into a live slot.  That was refutation
- * #3 of the 2026-09-17 attempt.
+ * Under the MCAS engine, an MW record made that harmless: a wrong belief just
+ * failed the install CAS.  An SW record's abort stored old_ptr back BLIND.  So
+ * a belief that never matched the word was published into a live slot.  That
+ * was refutation #3 of the 2026-09-17 attempt.
+ * ☠ The single-writer engine stores every record blind and cannot abort.
+ * But until the commit flips, a reader resolves the parked proxy to
+ * old_ptr.  So a wrong belief would be visible to readers in that window.
  *
  * MEASURED with -DFT_DEBUG_HLIST_EXPECTED_OLD: these five disagree with the
  * word ZERO times over both suites and all three spacings.  So the
