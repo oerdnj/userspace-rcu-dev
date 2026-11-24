@@ -6103,12 +6103,26 @@ static int ft_ch_head_reachable(const struct cds_ft *ft,
 	{
 		unsigned int b;
 
+		/*
+		 * Compare each slot, never follow it.  This audit holds
+		 * nothing, and the holder came from @en's prev, which can
+		 * be stale on a recycled fresh node.  ft_node_get_nth
+		 * resolves a skip slot through its child's back-pointer,
+		 * and a parked proxy through its record.  Both faulted on
+		 * inv_prefix_shape_zoo.  A slot that reaches @en names
+		 * @en as its child, skip or not.  A parked proxy is
+		 * undecided, as above.
+		 */
 		for (b = 0; b < 256; b++) {
-			struct cds_ft_inode_flag *v = ft_node_get_nth(ft,
+			struct cds_ft_inode_flag *v = ft_node_get_nth_skip(
 				holder, NULL, (uint8_t) b, FT_PF_NONE);
 
-			if (v && !ft_node_flip_proxy(v) &&
-					(struct cds_ft_node *) ft_node_ptr(v) == en)
+			if (!v)
+				continue;
+			if (ft_node_flip_proxy(v))
+				return -1;
+			if ((struct cds_ft_node *) ft_node_ptr(
+					ft_skip_child_ptr(v)) == en)
 				return 1;
 		}
 	}
