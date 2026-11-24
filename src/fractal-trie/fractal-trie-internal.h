@@ -811,7 +811,7 @@ struct ft_ord_cell {
 	 * splice/unsplice/replace use the list's composable _prepare ops,
 	 * folded into the FT structural flip-txn.  The cell edges carry the
 	 * concurrent list's engine proxy tag (URCU_TXN_TAG, bit 0).  Readers
-	 * resolve them with urcu_txn_list_resolve (ft_ord_cell_resolve_ord).
+	 * resolve them with ft_txn_list_resolve (ft_ord_cell_resolve_ord).
 	 */
 	struct urcu_txn_list_node lnode;
 	struct cds_ft_node *node;
@@ -4523,12 +4523,12 @@ void ft_seam_check_list(struct cds_ft *h, const void *site)
 	if (!h || !h->ordered_list)
 		return;
 	s = &h->ord_sentinel.node;
-	first = urcu_txn_list_unmark(urcu_txn_list_next_rcu(s));
-	last = urcu_txn_list_unmark(urcu_txn_list_prev_rcu(s));
+	first = urcu_txn_list_unmark(ft_txn_list_next_rcu(s));
+	last = urcu_txn_list_unmark(ft_txn_list_prev_rcu(s));
 	if (first == s && last == s)
 		return;				/* empty: self-looped */
-	fp = first ? urcu_txn_list_unmark(urcu_txn_list_prev_rcu(first)) : NULL;
-	ln = last ? urcu_txn_list_unmark(urcu_txn_list_next_rcu(last)) : NULL;
+	fp = first ? urcu_txn_list_unmark(ft_txn_list_prev_rcu(first)) : NULL;
+	ln = last ? urcu_txn_list_unmark(ft_txn_list_next_rcu(last)) : NULL;
 	if (caa_likely(first && last && fp == s && ln == s))
 		return;
 	fprintf(stderr, "FT SEAM RULE: trie %p dropped its writer lock for a grace "

@@ -1081,7 +1081,7 @@ bool ft_owner_ctx_holds(const struct ft_lock_ctx *ctx,
  *  - STRUCTURAL trie edges carry FT's type-7 / 0xF tag (FT_FLIP_PROXY_TAG).
  *    ft_resolve_flip_proxy resolves it on the read hot path.
  *  - ORDERED-CELL list edges carry the concurrent list's engine tag
- *    (URCU_TXN_TAG, bit 0).  urcu_txn_list_resolve resolves it.
+ *    (URCU_TXN_TAG, bit 0).  ft_txn_list_resolve resolves it.
  *
  * Commit OWNS reclaim.  The committed descriptor is deferred-freed through the
  * FT's RCU flavor, because a reader may hold a parked record.  The exclusive
@@ -2453,9 +2453,9 @@ void ft_sh_stall_dump(struct cds_ft *ft, const char *who)
 	fprintf(stderr, "FT SLOT HIST STALL: %s (tid %ld) retried > 2 s on trie %p\n",
 		who, (long) syscall(SYS_gettid), (void *) ft);
 	if (ft->ordered_list) {
-		h = urcu_txn_list_resolve(CMM_LOAD_SHARED(s->next));
+		h = ft_txn_list_resolve(CMM_LOAD_SHARED(s->next));
 		f = h && h != s ?
-			urcu_txn_list_resolve(CMM_LOAD_SHARED(h->next)) : NULL;
+			ft_txn_list_resolve(CMM_LOAD_SHARED(h->next)) : NULL;
 		fprintf(stderr, "FT SLOT HIST head: sentinel %p {next %p prev %p} "
 			"first %p {next %p prev %p} succ %p {next %p prev %p}\n",
 			(void *) s, CMM_LOAD_SHARED(s->next),
@@ -14321,7 +14321,7 @@ struct ft_ord_cell_edge {
 	/*
 	 * Per-edge engine proxy tag.  Two values:
 	 *   - URCU_TXN_TAG (bit 0) for an ORDERED-CELL list edge.  Readers
-	 *     resolve via urcu_txn_list_resolve.
+	 *     resolve via ft_txn_list_resolve.
 	 *   - 0 / left unset for a STRUCTURAL trie edge.  ft_edge_tag()
 	 *     normalizes it to FT_FLIP_PROXY_TAG.  Readers resolve via
 	 *     ft_resolve_flip_proxy.
@@ -16264,7 +16264,7 @@ void ft_cell_torn(const struct cds_ft *ft, const char *what,
 /*
  * IS @c LOGICALLY DELETED?  The mark is in the cell's OWN next word.  That
  * word may currently hold a proxy.  So resolve the proxy to the value its
- * commit denotes, then test the MARK of that value.  urcu_txn_list_resolve()
+ * commit denotes, then test the MARK of that value.  ft_txn_list_resolve()
  * is no use here: it strips the very bit in question.
  */
 static inline
@@ -19542,7 +19542,7 @@ int ft_ord_cell_find_pred_from_head(struct cds_ft *ft,
  * match.  Arena recycling makes the match likely.  The result is an
  * out-of-order or resurrected cell.
  *
- * Readers mask the bit: urcu_txn_list_next_rcu strips URCU_TXN_TAG |
+ * Readers mask the bit: ft_txn_list_next_rcu strips URCU_TXN_TAG |
  * URCU_TXN_LIST_MARK.  So a parked reader still walks off the dead cell
  * exactly as before.
  *
@@ -19713,7 +19713,7 @@ int ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 	 * FT_ORD_CELL_SWAP_REC_MAX_EDGES covers that set, so the pre-reserved commit
 	 * is infallible.  The concurrent list's URCU_TXN_TAG applies, so the
 	 * bidirectional ordered reader resolves the splice atomically via
-	 * urcu_txn_list_resolve.  Sentinel topology: @old_cell's neighbours are its
+	 * ft_txn_list_resolve.  Sentinel topology: @old_cell's neighbours are its
 	 * sentinel when it is the list first / last, so the same splice stores ARE
 	 * the old head / tail relocation -- no endpoint edge.  The concurrent op
 	 * takes (old, new), matching the single-updater list and cds_list_replace_rcu().

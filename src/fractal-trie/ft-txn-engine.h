@@ -100,6 +100,34 @@ void *ft_txn_read(void **slot, uintptr_t tag)
 }
 
 /*
+ * The ordered-cell list uses the format of <urcu/rcu-txn-list.h>: a link
+ * is parked under URCU_TXN_TAG (bit 0), and a deleted node carries
+ * URCU_TXN_LIST_MARK (bit 1).  Resolve a link loaded from such a slot
+ * through the engine, and strip the mark.  urcu_txn_list_resolve() does
+ * the same through the MCAS engine only.
+ */
+static inline
+struct urcu_txn_list_node *ft_txn_list_resolve(void *raw)
+{
+	if (caa_unlikely((uintptr_t) raw & (URCU_TXN_TAG | URCU_TXN_LIST_MARK)))
+		return urcu_txn_list_unmark(ft_txn_resolve(raw, URCU_TXN_TAG));
+	return (struct urcu_txn_list_node *) raw;
+}
+
+/* The resolved next and previous links of @node, in a read-side section. */
+static inline
+struct urcu_txn_list_node *ft_txn_list_next_rcu(struct urcu_txn_list_node *node)
+{
+	return ft_txn_list_resolve((void *) rcu_dereference(node->next));
+}
+
+static inline
+struct urcu_txn_list_node *ft_txn_list_prev_rcu(struct urcu_txn_list_node *node)
+{
+	return ft_txn_list_resolve((void *) rcu_dereference(node->prev));
+}
+
+/*
  * FT's txn handle.  It wraps the engine's handle, so that an engine swap
  * changes the member and not every function that passes a handle.
  *

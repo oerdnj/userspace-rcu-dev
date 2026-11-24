@@ -160,7 +160,7 @@ struct cds_ft_inode_flag *ft_resolve_head_prev(const struct cds_ft *ft, void *pr
  * The ordered-cell list rides <urcu/rcu-txn-list.h>.  So its edges carry the
  * concurrent list's ENGINE proxy tag (URCU_TXN_TAG, bit 0), NOT FT's type-7
  * structural tag.  A logically-deleted node carries the list deletion MARK
- * (bit 1).  urcu_txn_list_resolve strips both and resolves the MCAS proxy.
+ * (bit 1).  ft_txn_list_resolve strips both and resolves the proxy.
  * Raw cells are >= 8-byte aligned (bits 0-1 clear), so the resolve is
  * unambiguous.  Under writer exclusion no proxy is installed at rest (a no-op
  * on the write side).
@@ -170,7 +170,7 @@ struct ft_ord_cell *ft_ord_cell_resolve_ord(struct urcu_txn_list_node *const *sl
 {
 	struct urcu_txn_list_node *p = rcu_dereference(*slot);
 
-	p = urcu_txn_list_resolve((void *) p);
+	p = ft_txn_list_resolve((void *) p);
 	/*
 	 * Circular topology: a link "off the end" resolves to the per-trie
 	 * sentinel node, NOT NULL.  The returned value is then a pseudo-cell
