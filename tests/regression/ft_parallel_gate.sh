@@ -140,9 +140,10 @@ ALL_CONFIGS=(
 	# count through a weak symbol (cds_ft_debug_node_balance).  Without
 	# this config they run their moves and say they cannot count, so a
 	# leak stays green.  cds_ft_group_destroy also prints every leak it
-	# finds, and run_test_leg reports that as LEAKED.  ft_unit only:
-	# ft_inv's concurrent tests still print leak reports, not yet triaged.
-	"counters|-DDEBUG_COUNTERS|u"
+	# finds, and run_test_leg reports that as LEAKED.  The ft_inv legs
+	# run here too.  Some insert leaks need a peer writer, so only
+	# concurrent tests such as inv_prefix_shape_zoo show them.
+	"counters|-DDEBUG_COUNTERS|u ion ioff imw"
 	# ★ THE REMOVE RETRY CAP.  Its rekey twin rides on "audit" above; this one
 	# could not, and the gap was VERIFIED: none of the 15 legs armed
 	# -DFT_DEBUG_REMOVE_RETRY_CAP, so the gate had NO WAY TO TELL A REMOVE
