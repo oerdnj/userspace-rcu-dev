@@ -172,7 +172,16 @@ ALL_CONFIGS=(
 	# because the class they detect HIDES IN ONE spacing.  This one detects
 	# non-termination, which the coarse spacings already surface as their own
 	# hangs; the sweep is a separate question from arming the detector at all.
-	"rmcap|-DFT_DEBUG_REMOVE_RETRY_CAP -DFT_REMOVE_TAIL_QUIET -DFT_REMOVE_SLOW_NS=0|u ion ioff imw"
+	#
+	# -DFT_DEBUG_OP_RETRY_CAP is armed here too.  It caps the retry loops of
+	# insert-replace, replace, remove, remove_all and rekey at 50,000
+	# attempts.  At the cap it aborts with "FT OP RETRY LIVELOCK".  It names
+	# the retry site, the lock and the proxy the op kept losing to.  No
+	# other config arms it.  Without it, a remove_all that never converges
+	# shows up only as a timeout.  Without FT_ENABLE_TRACING it costs one
+	# increment and one compare per attempt.  The cost figures above were
+	# measured before it was added.
+	"rmcap|-DFT_DEBUG_REMOVE_RETRY_CAP -DFT_DEBUG_OP_RETRY_CAP -DFT_REMOVE_TAIL_QUIET -DFT_REMOVE_SLOW_NS=0|u ion ioff imw"
 	"vam|-DFEATURE_FT_VERIFY_AT_MUTATION|u"
 	# The TRANSACTION ENGINE's own debug features.  Every other config
 	# compiles them out, so an engine-contract violation the FT commits is
