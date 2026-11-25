@@ -511,6 +511,17 @@ int ft_key_cmp_ordinals(const uint8_t *a, const uint8_t *b,
 		unsigned int len, unsigned int readable_bytes,
 		bool signed_cmp, unsigned int *mismatch_pos)
 {
+#ifdef CMM_SANITIZE_THREAD
+	/*
+	 * The wide loads below read up to @readable_bytes, past @len.  The
+	 * compare then masks out the extra bytes.  Those bytes may belong to
+	 * the next item of the arena, which a writer may be initializing.
+	 * ThreadSanitizer reports that as a race.  Load only @len bytes, so
+	 * that each report is about a byte the compare uses.  For the same
+	 * reason, skip ft_cmp_short_avx2() below: it always loads 32 bytes.
+	 */
+	readable_bytes = len;
+#endif
 	if (caa_likely(len <= 32)) {
 		/*
 		 * Hot path: caller-promised 32-B readable horizon on
@@ -543,7 +554,8 @@ int ft_key_cmp_ordinals(const uint8_t *a, const uint8_t *b,
 		if (len < 16)
 			return ft_cmp_word(a, b, len, signed_cmp, mismatch_pos);
 		/* 16 <= len <= 32 without 32-B contract: safe fallback. */
-# if defined(__AVX2__) && !defined(FT_NO_SIMD_CMP)
+# if defined(__AVX2__) && !defined(FT_NO_SIMD_CMP) && \
+	!defined(CMM_SANITIZE_THREAD)
 		return ft_cmp_short_avx2(a, b, len, signed_cmp, mismatch_pos);
 # elif defined(__SSE2__) && !defined(FT_NO_SIMD_CMP)
 		return ft_cmp_sse2(a, b, len, signed_cmp, mismatch_pos);
