@@ -11967,6 +11967,34 @@ static void drain_trie_keep_group(struct cds_ft *ft)
 	cds_ft_destroy(ft);
 }
 
+/*
+ * Remove every key from @ft, but do not free the removed nodes: the caller
+ * keeps them in its own arrays and frees them.  Call this before
+ * cds_ft_destroy(), which does not free the internal nodes and cells left in
+ * a non-empty trie.
+ */
+static void drain_trie_unowned(struct cds_ft *ft)
+{
+	struct cds_ft_iter *iter;
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	while (cds_ft_lookup_first(ft, iter) == CDS_FT_STATUS_OK) {
+		struct cds_ft_node *head;
+		enum cds_ft_status s = cds_ft_remove_all(ft, iter, &head);
+
+		if (s < 0 || s == CDS_FT_STATUS_NOT_FOUND) {
+			fprintf(stderr,
+				"drain_trie_unowned: remove_all: %s (%d)\n",
+				cds_ft_status_to_string(s), (int) s);
+			abort();
+		}
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+}
+
 /* Read a variable-length test node's stashed key bytes + length. */
 static size_t xview_node_key(struct cds_ft_node *node, uint8_t *out)
 {
@@ -27052,6 +27080,7 @@ static int inv_concurrent_same_key_append_run(bool ordered_list, bool coarse,
 	pthread_barrier_destroy(&c.bar);
 	cds_ft_iter_destroy(iter);
 	rcu_quiescent_state();
+	drain_trie_unowned(c.ft);
 	rcu_barrier();
 	cds_ft_destroy(c.ft);
 	cds_ft_group_destroy(group);
@@ -27884,6 +27913,7 @@ static int inv_concurrent_insert_unique_run(bool coarse, const char *name)
 	rcu_read_unlock();
 	cds_ft_iter_destroy(iter);
 	rcu_quiescent_state();
+	drain_trie_unowned(c.ft);
 	rcu_barrier();
 	cds_ft_destroy(c.ft);
 	cds_ft_group_destroy(group);
@@ -28209,6 +28239,7 @@ static int inv_concurrent_insert_unique_dense(void)
 	rcu_read_unlock();
 	cds_ft_iter_destroy(iter);
 	rcu_quiescent_state();
+	drain_trie_unowned(c->ft);
 	rcu_barrier();
 	cds_ft_destroy(c->ft);
 	cds_ft_group_destroy(group);
@@ -28440,6 +28471,7 @@ static int inv_concurrent_same_key_replace_run(bool coarse, const char *name)
 	rcu_read_unlock();
 	cds_ft_iter_destroy(iter);
 	rcu_quiescent_state();
+	drain_trie_unowned(c.ft);
 	rcu_barrier();
 	cds_ft_destroy(c.ft);
 	cds_ft_group_destroy(group);
@@ -29799,6 +29831,7 @@ static int inv_concurrent_insert_replace_run(bool coarse, const char *name)
 	}
 	cds_ft_iter_destroy(iter);
 	rcu_quiescent_state();
+	drain_trie_unowned(c.ft);
 	rcu_barrier();
 	cds_ft_destroy(c.ft);
 	cds_ft_group_destroy(group);
