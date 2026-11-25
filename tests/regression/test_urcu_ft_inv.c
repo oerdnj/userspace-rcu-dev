@@ -78,7 +78,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS_REKEY_DLM	23	/* inv_rekey_graft_{disjoint,cross_junction,run_junction,elevating_junction,glue_dst,coherent_readers,shared}, inv_rekey_merge_same_parent_coherent_readers, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,atomic_no_gap_varlen,atomic_no_gap_compressed_top}, inv_rekey_coarse_progress, inv_rekey_{coarse,fine,contended}_mixed_writers, inv_rekey_merge_{occupied,compressed,shared}_dst, inv_rekey_merge_compressed_dst_rootchurn */
+#define NR_TESTS_REKEY_DLM	24	/* inv_rekey_shape_concurrent, inv_rekey_graft_{disjoint,cross_junction,run_junction,elevating_junction,glue_dst,coherent_readers,shared}, inv_rekey_merge_same_parent_coherent_readers, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,atomic_no_gap_varlen,atomic_no_gap_compressed_top}, inv_rekey_coarse_progress, inv_rekey_{coarse,fine,contended}_mixed_writers, inv_rekey_merge_{occupied,compressed,shared}_dst, inv_rekey_merge_compressed_dst_rootchurn */
 
 /*
  * Base count = the RUN_TEST invocations in main() outside the DLM #ifdef.
@@ -30241,6 +30241,464 @@ static int inv_guard_compressed_publish(void)
 	return ret;
 }
 
+/*
+ * A REKEY ON A RANDOM SHAPE, AGAINST POINT WRITERS AND A READER.
+ *
+ * Each seed builds a random prefix-heavy key set, picks a src and a dst, and
+ * runs ONE rekey (graft into an empty dst, or merge) while two writers and a
+ * reader run.  The writers own disjoint keys outside src and dst, so the
+ * expected final state is known.  The other keys outside src and dst are
+ * never written.
+ *
+ * The reader checks, all along, that every unwritten key outside dst is
+ * present and that every moved key is present under its old name or its new
+ * one: the move is atomic and one-way.  After the join: cds_ft_verify is
+ * clean, and every key has exactly the expected number of entries.
+ *
+ * test_rekey_shape_corpus (ft_unit) runs rekeys with no writer and no reader.
+ * FT_INV_RKCF_SEEDS sets the seeds tried per mode (default 60).
+ */
+#define RKCF_KLEN	6
+#define RKCF_MAXK	14
+#define RKCF_NW		2
+#define RKCF_WKEYS	5
+#define RKCF_NAME	(RKCF_KLEN * 2 + 2)
+
+struct rkcf_w {
+	unsigned long seed;
+	char key[RKCF_WKEYS][RKCF_KLEN + 1];
+	int count[RKCF_WKEYS];
+	int nkeys;
+	unsigned long other;
+};
+
+static struct cds_ft *rkcf_ft;
+static char rkcf_src[RKCF_KLEN + 1], rkcf_dst[RKCF_KLEN + 1];
+static int rkcf_merge;
+static volatile int rkcf_go, rkcf_stop, rkcf_done;
+static enum cds_ft_status rkcf_st;
+static char rkcf_stable[RKCF_MAXK][RKCF_KLEN + 1];
+static int rkcf_nstable;
+static char rkcf_old[RKCF_MAXK][RKCF_KLEN + 1], rkcf_new[RKCF_MAXK][RKCF_NAME];
+static int rkcf_nmoved;
+static struct rkcf_w rkcf_ws[RKCF_NW];
+static unsigned long rkcf_reader_miss;
+
+static unsigned rkcf_rnd(unsigned long *s, unsigned m)
+{
+	*s = *s * 6364136223846793005ULL + 1442695040888963407ULL;
+	return (unsigned) ((*s >> 33) % m);
+}
+
+static int rkcf_isprefix(const char *p, const char *s)
+{
+	size_t lp = strlen(p);
+
+	return strlen(s) >= lp && !memcmp(p, s, lp);
+}
+
+static void rkcf_mkstr(unsigned long *s, char *b, int len)
+{
+	int i;
+
+	for (i = 0; i < len; i++)
+		b[i] = 'a' + rkcf_rnd(s, 3);
+	b[len] = 0;
+}
+
+/* Return the number of entries under @k.  Call it under rcu_read_lock(). */
+static int rkcf_chain_len(struct cds_ft_iter *it, const char *k)
+{
+	struct cds_ft_node *h;
+	int n = 0;
+
+	cds_ft_iter_set_key(it, (const uint8_t *) k, strlen(k));
+	if (cds_ft_lookup(rkcf_ft, it) != CDS_FT_STATUS_OK)
+		return 0;
+	for (h = cds_ft_iter_node(it); h; h = cds_ft_node_next_rcu(h))
+		n++;
+	return n;
+}
+
+static void rkcf_free_chain(struct cds_ft_node *h)
+{
+	while (h) {
+		struct cds_ft_node *next = cds_ft_node_next_rcu(h);
+
+		node_free_rcu(to_test_node(h));
+		h = next;
+	}
+}
+
+static void *rkcf_writer(void *arg)
+{
+	struct rkcf_w *w = arg;
+	struct cds_ft_iter *it;
+	unsigned long i;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(rkcf_ft, &it) < 0)
+		abort();
+	while (!uatomic_read(&rkcf_go))
+		rcu_quiescent_state();
+	for (i = 0; i < 100 || !uatomic_read(&rkcf_done); i++) {
+		int ki = rkcf_rnd(&w->seed, w->nkeys);
+		const char *k = w->key[ki];
+		size_t kl = strlen(k);
+		struct cds_ft_node *old = NULL, *n;
+		struct ft_test_node *fresh;
+		enum cds_ft_status s;
+
+		if (i > 100000)
+			break;	/* cap the run: a stuck rekey hangs the join */
+		rcu_read_lock();
+		switch (rkcf_rnd(&w->seed, 4)) {
+		case 0:
+			fresh = node_alloc(0);
+			s = cds_ft_insert(rkcf_ft, (const uint8_t *) k, kl,
+				&fresh->node);
+			if (s == CDS_FT_STATUS_OK)
+				w->count[ki]++;
+			else {
+				node_free(fresh);
+				w->other++;
+			}
+			break;
+		case 1:
+			cds_ft_iter_set_key(it, (const uint8_t *) k, kl);
+			if (cds_ft_lookup(rkcf_ft, it) != CDS_FT_STATUS_OK) {
+				if (w->count[ki])
+					w->other++;
+				break;
+			}
+			n = cds_ft_iter_node(it);
+			if (cds_ft_remove(rkcf_ft, it, n) == CDS_FT_STATUS_OK) {
+				w->count[ki]--;
+				node_free_rcu(to_test_node(n));
+			} else
+				w->other++;
+			break;
+		case 2:
+			fresh = node_alloc(0);
+			s = cds_ft_insert_replace(rkcf_ft,
+				(const uint8_t *) k, kl, &fresh->node, &old);
+			if (s == CDS_FT_STATUS_OK ||
+					s == CDS_FT_STATUS_DUPLICATE_FOUND) {
+				w->count[ki] = 1;
+				rkcf_free_chain(old);
+			} else {
+				node_free(fresh);
+				w->other++;
+			}
+			break;
+		default:
+			cds_ft_iter_set_key(it, (const uint8_t *) k, kl);
+			if (cds_ft_lookup(rkcf_ft, it) != CDS_FT_STATUS_OK)
+				break;
+			if (cds_ft_remove_all(rkcf_ft, it, &old) ==
+					CDS_FT_STATUS_OK) {
+				w->count[ki] = 0;
+				rkcf_free_chain(old);
+			} else
+				w->other++;
+			break;
+		}
+		rcu_read_unlock();
+		rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(it);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *rkcf_reader(void *arg)
+{
+	struct cds_ft_iter *it;
+
+	(void) arg;
+	rcu_register_thread();
+	if (cds_ft_iter_create(rkcf_ft, &it) < 0)
+		abort();
+	while (!uatomic_read(&rkcf_go))
+		rcu_quiescent_state();
+	while (!uatomic_read(&rkcf_stop)) {
+		int i;
+
+		rcu_read_lock();
+		for (i = 0; i < rkcf_nstable; i++)
+			if (!rkcf_chain_len(it, rkcf_stable[i]))
+				rkcf_reader_miss++;
+		/* Old name first: the move is one-way, old -> new. */
+		for (i = 0; i < rkcf_nmoved; i++)
+			if (!rkcf_chain_len(it, rkcf_old[i]) &&
+					!rkcf_chain_len(it, rkcf_new[i]))
+				rkcf_reader_miss++;
+		rcu_read_unlock();
+		rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(it);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *rkcf_rekey(void *arg)
+{
+	(void) arg;
+	rcu_register_thread();
+	while (!uatomic_read(&rkcf_go))
+		rcu_quiescent_state();
+	if (rkcf_merge)
+		rkcf_st = cds_ft_rekey_merge(rkcf_ft,
+			(const uint8_t *) rkcf_dst, strlen(rkcf_dst),
+			(const uint8_t *) rkcf_src, strlen(rkcf_src));
+	else
+		rkcf_st = cds_ft_rekey_graft(rkcf_ft,
+			(const uint8_t *) rkcf_dst, strlen(rkcf_dst),
+			(const uint8_t *) rkcf_src, strlen(rkcf_src));
+	uatomic_set(&rkcf_done, 1);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+struct rkcf_exp {
+	char name[RKCF_NAME];
+	int count;
+};
+
+static void rkcf_exp_add(struct rkcf_exp *e, int *ne, const char *name, int c)
+{
+	int i;
+
+	for (i = 0; i < *ne; i++)
+		if (!strcmp(e[i].name, name)) {
+			e[i].count += c;
+			return;
+		}
+	snprintf(e[*ne].name, RKCF_NAME, "%s", name);
+	e[(*ne)++].count = c;
+}
+
+/*
+ * Run one seed.  Return -1 on a failure, after printing a diagnostic.
+ * Return 0 otherwise, also when the shape does not fit the mode.
+ */
+static int rkcf_seed(unsigned long seed, int merge, int list)
+{
+	char keys[RKCF_MAXK][RKCF_KLEN + 1];
+	struct rkcf_exp ex[RKCF_MAXK * 2 + RKCF_NW * RKCF_WKEYS];
+	unsigned long rs = seed * 2654435761UL + 777, total = 0;
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft_iter *it;
+	pthread_t th[RKCF_NW + 2];
+	int nk, i, j, w, nex = 0, dst_occ = 0, ret = 0;
+	struct cds_ft_node *head;
+
+	nk = 4 + rkcf_rnd(&rs, RKCF_MAXK - 3);
+	for (i = 0; i < nk; i++) {
+		int dup;
+
+		do {
+			rkcf_mkstr(&rs, keys[i], 1 + rkcf_rnd(&rs, RKCF_KLEN));
+			dup = 0;
+			for (j = 0; j < i; j++)
+				if (!strcmp(keys[i], keys[j]))
+					dup = 1;
+		} while (dup);
+	}
+	i = rkcf_rnd(&rs, nk);
+	j = 1 + rkcf_rnd(&rs, (int) strlen(keys[i]));
+	memcpy(rkcf_src, keys[i], j);
+	rkcf_src[j] = 0;
+	j = 0;
+	do {
+		rkcf_mkstr(&rs, rkcf_dst, 1 + rkcf_rnd(&rs, RKCF_KLEN));
+	} while ((rkcf_isprefix(rkcf_dst, rkcf_src) ||
+			rkcf_isprefix(rkcf_src, rkcf_dst)) && ++j < 64);
+	if (rkcf_isprefix(rkcf_dst, rkcf_src) ||
+			rkcf_isprefix(rkcf_src, rkcf_dst))
+		return 0;
+	for (i = 0; i < nk; i++)
+		if (rkcf_isprefix(rkcf_dst, keys[i]))
+			dst_occ = 1;
+	if (!merge && dst_occ)
+		return 0;	/* rekey_graft needs an empty dst */
+	rkcf_merge = merge;
+	rkcf_nstable = rkcf_nmoved = 0;
+	memset(rkcf_ws, 0, sizeof(rkcf_ws));
+	for (w = 0; w < RKCF_NW; w++)
+		rkcf_ws[w].seed = rs ^ (0x9e3779b97f4a7c15UL * (w + 1));
+	for (i = 0, w = 0; i < nk; i++) {
+		if (rkcf_isprefix(rkcf_src, keys[i])) {
+			snprintf(rkcf_old[rkcf_nmoved], RKCF_KLEN + 1, "%s",
+				keys[i]);
+			snprintf(rkcf_new[rkcf_nmoved], RKCF_NAME, "%s%s",
+				rkcf_dst, keys[i] + strlen(rkcf_src));
+			rkcf_nmoved++;
+		} else if (rkcf_isprefix(rkcf_dst, keys[i]) ||
+				rkcf_rnd(&rs, 2)) {
+			if (!rkcf_isprefix(rkcf_dst, keys[i]))
+				snprintf(rkcf_stable[rkcf_nstable++],
+					RKCF_KLEN + 1, "%s", keys[i]);
+			rkcf_exp_add(ex, &nex, keys[i], 1);
+		} else {
+			struct rkcf_w *ww = &rkcf_ws[w++ % RKCF_NW];
+
+			if (ww->nkeys == RKCF_WKEYS) {
+				snprintf(rkcf_stable[rkcf_nstable++],
+					RKCF_KLEN + 1, "%s", keys[i]);
+				rkcf_exp_add(ex, &nex, keys[i], 1);
+				continue;
+			}
+			snprintf(ww->key[ww->nkeys], RKCF_KLEN + 1, "%s",
+				keys[i]);
+			ww->count[ww->nkeys++] = 1;
+		}
+	}
+	for (w = 0; w < RKCF_NW; w++)
+		if (!rkcf_ws[w].nkeys) {
+			/* Give the writer a fresh key outside src and dst. */
+			char k[RKCF_KLEN + 1];
+			int tries = 0, clash;
+
+			do {
+				rkcf_mkstr(&rs, k, 1 + rkcf_rnd(&rs, RKCF_KLEN));
+				clash = rkcf_isprefix(rkcf_src, k) ||
+					rkcf_isprefix(rkcf_dst, k);
+				for (i = 0; i < nk && !clash; i++)
+					clash = !strcmp(keys[i], k);
+				for (j = 0; j < RKCF_NW && !clash; j++)
+					clash = rkcf_ws[j].nkeys &&
+						!strcmp(rkcf_ws[j].key[0], k);
+			} while (clash && ++tries < 64);
+			if (clash)
+				return 0;
+			snprintf(rkcf_ws[w].key[0], RKCF_KLEN + 1, "%s", k);
+			rkcf_ws[w].count[0] = 0;
+			rkcf_ws[w].nkeys = 1;
+		}
+	if (!rkcf_nmoved)
+		return 0;
+
+	if (cds_ft_group_attr_create(&attr) < 0 ||
+	    cds_ft_group_attr_set_rekey(attr, true) < 0 ||
+	    cds_ft_group_attr_set_ordered_list(attr, list) < 0 ||
+	    cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &rkcf_ft) < 0)
+		abort();
+	cds_ft_make_shared(rkcf_ft);
+	rcu_read_lock();
+	for (i = 0; i < nk; i++)
+		if (cds_ft_insert(rkcf_ft, (const uint8_t *) keys[i],
+				strlen(keys[i]), &node_alloc(0)->node) !=
+				CDS_FT_STATUS_OK)
+			abort();
+	rcu_read_unlock();
+	rcu_quiescent_state();
+
+	rkcf_go = rkcf_stop = rkcf_done = 0;
+	rkcf_reader_miss = 0;
+	cmm_smp_mb();
+	pthread_create(&th[0], NULL, rkcf_rekey, NULL);
+	pthread_create(&th[1], NULL, rkcf_reader, NULL);
+	for (w = 0; w < RKCF_NW; w++)
+		pthread_create(&th[2 + w], NULL, rkcf_writer, &rkcf_ws[w]);
+	uatomic_set(&rkcf_go, 1);
+	rcu_thread_offline();
+	pthread_join(th[0], NULL);
+	for (w = 0; w < RKCF_NW; w++)
+		pthread_join(th[2 + w], NULL);
+	uatomic_set(&rkcf_stop, 1);
+	pthread_join(th[1], NULL);
+	rcu_thread_online();
+
+	for (i = 0; i < rkcf_nmoved; i++)
+		rkcf_exp_add(ex, &nex, rkcf_st == CDS_FT_STATUS_OK ?
+			rkcf_new[i] : rkcf_old[i], 1);
+	for (w = 0; w < RKCF_NW; w++)
+		for (j = 0; j < rkcf_ws[w].nkeys; j++)
+			rkcf_exp_add(ex, &nex, rkcf_ws[w].key[j],
+				rkcf_ws[w].count[j]);
+
+	rcu_read_lock();
+	if (cds_ft_iter_create(rkcf_ft, &it) < 0)
+		abort();
+	if (rkcf_st != CDS_FT_STATUS_OK &&
+			rkcf_st != CDS_FT_STATUS_NOT_SUPPORTED) {
+		fprintf(stderr, "inv_rekey_shape_concurrent: seed %lu: rekey "
+			"%s\n", seed, cds_ft_status_to_string(rkcf_st));
+		ret = -1;
+	}
+	if (cds_ft_verify(rkcf_ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "inv_rekey_shape_concurrent: seed %lu: verify "
+			"RED\n", seed);
+		ret = -1;
+	}
+	for (i = 0; i < nex; i++) {
+		int c = rkcf_chain_len(it, ex[i].name);
+
+		total += (unsigned long) ex[i].count;
+		if (c != ex[i].count) {
+			fprintf(stderr, "inv_rekey_shape_concurrent: seed %lu: "
+				"key %s has %d entries, want %d\n", seed,
+				ex[i].name, c, ex[i].count);
+			ret = -1;
+		}
+	}
+	if (cds_ft_count_entries(rkcf_ft) != total) {
+		fprintf(stderr, "inv_rekey_shape_concurrent: seed %lu: %lu "
+			"entries, want %lu\n", seed,
+			cds_ft_count_entries(rkcf_ft), total);
+		ret = -1;
+	}
+	if (rkcf_reader_miss || rkcf_ws[0].other || rkcf_ws[1].other) {
+		fprintf(stderr, "inv_rekey_shape_concurrent: seed %lu: reader "
+			"misses %lu, writer surprises %lu %lu\n", seed,
+			rkcf_reader_miss, rkcf_ws[0].other, rkcf_ws[1].other);
+		ret = -1;
+	}
+	while (cds_ft_lookup_first(rkcf_ft, it) == CDS_FT_STATUS_OK) {
+		if (cds_ft_remove_all(rkcf_ft, it, &head) != CDS_FT_STATUS_OK)
+			abort();
+		rkcf_free_chain(head);
+	}
+	cds_ft_iter_destroy(it);
+	rcu_read_unlock();
+	rcu_quiescent_state();
+	rcu_barrier();
+	cds_ft_destroy(rkcf_ft);
+	rcu_barrier();
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int inv_rekey_shape_concurrent(void)
+{
+	const char *env = getenv("FT_INV_RKCF_SEEDS");
+	unsigned long nseeds = env ? strtoul(env, NULL, 10) : 60, s;
+	int mode;
+
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# inv_rekey_shape_concurrent: skipped (set "
+			"FT_INV_MW=1 to run it)\n");
+		return 0;
+	}
+	if (!cds_ft_merge_enabled()) {
+		fprintf(stderr, "# inv_rekey_shape_concurrent: skipped, merge "
+			"compiled out\n");
+		return 0;
+	}
+	for (mode = 0; mode < 4; mode++)
+		for (s = 1; s <= nseeds; s++)
+			if (rkcf_seed(s, mode & 1, !!(mode & 2)) < 0)
+				return -1;
+	fprintf(stderr, "# inv_rekey_shape_concurrent: %lu seeds tried x 4 "
+		"modes\n", nseeds);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	const char *filter = (argc >= 2) ? argv[1] : NULL;
@@ -30297,6 +30755,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_rekey_merge_occupied_dst);
 	RUN_TEST(inv_rekey_merge_compressed_dst);
 	RUN_TEST(inv_rekey_merge_compressed_dst_rootchurn);
+	RUN_TEST(inv_rekey_shape_concurrent);
 	RUN_TEST(inv_rekey_merge_shared_dst);
 	RUN_TEST(inv_rekey_src_mutated);
 	RUN_TEST(inv_sibling_split_compress);
