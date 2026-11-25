@@ -135,6 +135,14 @@ ALL_CONFIGS=(
 	# is where every rekey shape the tests can reach gets driven.  A detector
 	# compiled into no configuration is not coverage.
 	"audit|-DFT_DEBUG_TOMBSTONE_AUDIT -DFT_DEBUG_REKEY_RETRY_CAP|u ion ioff"
+	# THE NODE BALANCE.  DEBUG_COUNTERS counts the nodes and cells each
+	# group allocates and frees.  The unit suite's balance tests read that
+	# count through a weak symbol (cds_ft_debug_node_balance).  Without
+	# this config they run their moves and say they cannot count, so a
+	# leak stays green.  cds_ft_group_destroy also prints every leak it
+	# finds, and run_test_leg reports that as LEAKED.  ft_unit only:
+	# ft_inv's concurrent tests still print leak reports, not yet triaged.
+	"counters|-DDEBUG_COUNTERS|u"
 	# ★ THE REMOVE RETRY CAP.  Its rekey twin rides on "audit" above; this one
 	# could not, and the gap was VERIFIED: none of the 15 legs armed
 	# -DFT_DEBUG_REMOVE_RETRY_CAP, so the gate had NO WAY TO TELL A REMOVE
@@ -750,7 +758,7 @@ run_test_leg() {	# $1=name $2=test $3=spacing $4=rep $5=outfile -- ONE leg
 	local IM=$dir/tests/regression/.libs/test_urcu_ft_inv_memb
 	local SP=$dir/tests/unit/.libs/test_rcu_txn_settle_premise
 	local cores=$GATE/$name.cores
-	local o ok notok abrt lbl rc plan ran cdir bin tmo c mem
+	local o ok notok abrt lbl rc plan ran cdir bin tmo c mem leak
 	local env_x
 	: > "$out"
 	cdir=$cores/$sp-$t-$rep
@@ -798,6 +806,18 @@ run_test_leg() {	# $1=name $2=test $3=spacing $4=rep $5=outfile -- ONE leg
 	if [ "$notok" -gt 0 ]; then
 		printf '%s' "$o" | grep '^not ok ' | sed "s/^/      [$name] $lbl /" >> "$out"
 	fi
+	# A LEAK AT GROUP DESTROY FAILS NO TEST.  cds_ft_group_destroy prints
+	# one line per leaked kind (cells, nodes) on a DEBUG_COUNTERS build,
+	# and returns.  So copy and count those lines here, and make the leg
+	# red.  Not anchored: stdout reaches the pipe in buffered blocks, so a
+	# partial TAP line can sit in front of the unbuffered stderr report.
+	leak=$(printf '%s' "$o" | grep -c '\[error\] Fractal Trie leaked')
+	if [ "$leak" -gt 0 ]; then
+		printf '%s' "$o" | grep '\[error\] Fractal Trie leaked' | \
+			sed "s/^/      [$name] $lbl /" >> "$out"
+		echo "$name: $lbl LEAKED ($leak leak lines at group destroy)" \
+			>> "$out"
+	fi
 	# A HUNG suite used to score GREEN.  The run is killed, its PARTIAL
 	# ok-count is reported, and with no 'not ok ' line and no abort the
 	# config passed -- so a single-threaded DLM self-deadlock rode in on
@@ -829,7 +849,8 @@ run_test_leg() {	# $1=name $2=test $3=spacing $4=rep $5=outfile -- ONE leg
 	# is (see the KEEP THE CORE note above).  "Red" is deliberately
 	# WIDER here than the RESULTS grep below: a leg killed by a timeout
 	# or a signal leaves a core too, and that core is the entire point
-	# of having kept the directory.
+	# of having kept the directory.  A LEAKED leg is the one exception:
+	# it leaves no core to keep.
 	if [ "$notok" -gt 0 ] || [ "$abrt" -gt 0 ] || [ "$rc" -ne 0 ] \
 			|| [ -z "$plan" ] || [ "$ran" -ne "$plan" ]; then
 		c=$(ls "$cdir"/core* 2>/dev/null | head -1)
@@ -866,7 +887,7 @@ for c in "${CONFIGS[@]}"; do
 	# on it, so a leg that completed its plan with no failing TAP line and a
 	# non-zero status -- a crash in teardown after the last test, an explicit
 	# exit(1) -- reported its own red line under a "GATE PASS".
-	   grep -qE 'BUILD FAIL|CONFIG ERROR|notok=[1-9]|abrt=[1-9]|ok=0 notok=|INCOMPLETE|NO TAP PLAN|NONZERO EXIT' "$GATE/$n.result"; then
+	   grep -qE 'BUILD FAIL|CONFIG ERROR|notok=[1-9]|abrt=[1-9]|ok=0 notok=|INCOMPLETE|NO TAP PLAN|NONZERO EXIT|LEAKED' "$GATE/$n.result"; then
 		rc=1
 	fi
 done
