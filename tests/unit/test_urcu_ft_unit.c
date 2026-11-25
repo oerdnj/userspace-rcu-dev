@@ -12755,6 +12755,35 @@ static const struct {
 	{ { "baab", "aaaabbb", "b", "bbbabb" }, "bbba", "aaaab", 1 },
 };
 
+/*
+ * A FRAME UNDER A RUN, BELOW THE ROOT.  The node the merge must copy hangs
+ * off a run, so its copy cannot be republished by one store.  The copy
+ * climbs past the run to the run's parent, at any depth.  In the first
+ * two rows the dst head itself also hangs off a run (@via_run), so the
+ * climb starts one level up.  The rows are seeds of the out-of-tree rekey
+ * shape fuzzer, with the seed number in each comment.  root_frame_one()
+ * checks each row.  @serve as same_path_cases.
+ */
+static const struct {
+	const char *keys[8];
+	const char *dst, *src;
+	int serve;
+} run_parent_cases[] = {
+	/* 14465 */
+	{ { "bbaba", "ba", "aa", "abaaab", "ababbba" }, "abaaab", "ba", 1 },
+	/* 4320 */
+	{ { "aaca", "ccaca", "cb", "aab", "b", "ba", "ca" }, "aaca", "ba", 1 },
+	/* 7819: the frame is on the source path */
+	{ { "ab", "babbbb", "baba", "aaabba", "a", "babbba", "baaa",
+		"aaabab" }, "baaa", "babbba", 1 },
+	/* 13087 */
+	{ { "aaaa", "bbaa", "abbabbba", "bba", "babaabaa", "bbabbaab",
+		"abbab", "abbbb" }, "bbaa", "aaaa", 1 },
+	/* 8630 */
+	{ { "aacb", "da", "bd", "dcdc", "bb", "aacc", "dcca", "abd" },
+		"aacb", "da", 1 },
+};
+
 static int root_frame_one(struct cds_ft *ft, const char *what,
 		const char *const *keys, const char *dst, const char *src,
 		int serve)
@@ -12970,6 +12999,34 @@ static void same_path_child(void)
 				fprintf(stderr,
 					"root_frame: geometry %u mode %u failed\n",
 					g, m);
+				_exit(1);
+			}
+		}
+	}
+	/* The frame under a run below the root, under the same bound. */
+	for (g = 0; g < sizeof(run_parent_cases) / sizeof(run_parent_cases[0]);
+			g++) {
+		for (m = 0; m < 4; m++) {
+			bool rank = (m >= 2), list = (m & 1) != 0;
+			int bad;
+
+			if (rank)
+				ft = create_varlen_rankstats_list_ft(list,
+					&group);
+			else
+				ft = create_varlen_ft(&group);
+			rcu_read_lock();
+			bad = root_frame_one(ft, "run_parent",
+				run_parent_cases[g].keys,
+				run_parent_cases[g].dst,
+				run_parent_cases[g].src,
+				run_parent_cases[g].serve);
+			rcu_read_unlock();
+			rcu_quiescent_state();
+			(void) group;
+			if (bad) {
+				fprintf(stderr, "run_parent: geometry %u mode "
+					"%u failed\n", g, m);
 				_exit(1);
 			}
 		}

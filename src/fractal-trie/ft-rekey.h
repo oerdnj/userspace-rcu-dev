@@ -2744,25 +2744,52 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 	 * run's parent.  That is recorded at commit time, after the detach
 	 * may have relocated that parent.  But nothing requires THIS frame:
 	 * the witness is any plain node on the dst path getting a fresh
-	 * address.  So climb once more, to the run's parent.  The descent
-	 * knows that parent only when it is the ROOT (@pppdepth 0, its slot
-	 * &ft->root, no parent to fence).  A deeper one stays refused,
-	 * because its parent slot is outside the descent frame.
+	 * address.  So climb once more, past the run, to the run's parent.
+	 * The window holds that node, its slot and the slot's owner:
+	 *  - for a frame at @pnf: @pppnf, @pppnfp and @ppppnf;
+	 *  - for a frame at @ppnf (@via_run): @ppppnf, @ppppnfp and
+	 *    @pppppnf.
+	 * The owner is NULL when the slot is &ft->root.  A run's parent is
+	 * never a run, so the copy is a plain node.  Its own parent may still
+	 * be a run.  A copy of it is then refused (ft_rekey_cow_frame_ok).
 	 * Corpus seed 1424 is `{acc,cbc,ac,b}` dst acc src b.  There the dst
 	 * head's parent is under a run off the root, and the src junction is
 	 * the root itself.
+	 *
+	 * No climb when the frame IS the src junction (@src_pnf).  The src
+	 * detach rebuilds it and folds the publish in, whatever its parent
+	 * is (FT_REKEY_WITNESS_BY_DETACH below).  A climb would move the
+	 * frame off the node the fold reaches.
 	 */
-	if (!via_run && cow_pnf && (ft_node_compressed(cow_pnf)
+	if (cow_nf != src_pnf && cow_pnf && (ft_node_compressed(cow_pnf)
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			|| ft_node_skip_compressed(cow_pnf)
 #endif
-			) && d_dst->pppnf && d_dst->pppdepth == 0 &&
-			d_dst->pppnfp == &ft->root) {
-		cow_nf = d_dst->pppnf;
-		cow_depth = 0;
-		cow_pnf = NULL;
-		cow_slot = d_dst->pppnfp;
-		cow_pdepth = 0;
+			)) {
+		struct cds_ft_inode_flag *up_nf, **up_slot, *up_pnf;
+		unsigned int up_depth, up_pdepth;
+
+		if (via_run) {
+			up_nf = d_dst->ppppnf;
+			up_depth = d_dst->ppppdepth;
+			up_slot = d_dst->ppppnfp;
+			up_pnf = d_dst->pppppnf;
+			up_pdepth = d_dst->pppppdepth;
+		} else {
+			up_nf = d_dst->pppnf;
+			up_depth = d_dst->pppdepth;
+			up_slot = d_dst->pppnfp;
+			up_pnf = d_dst->ppppnf;
+			up_pdepth = d_dst->ppppdepth;
+		}
+		if (!up_nf || !up_slot ||
+				(up_slot != &ft->root && !up_pnf))
+			return FT_REKEY_UNCOVERED;
+		cow_nf = up_nf;
+		cow_depth = up_depth;
+		cow_slot = up_slot;
+		cow_pnf = up_slot == &ft->root ? NULL : up_pnf;
+		cow_pdepth = up_slot == &ft->root ? 0 : up_pdepth;
 	}
 	*frame_above_pnf = cow_nf != d_dst->pnf;
 	/*
@@ -2799,6 +2826,15 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 			ft_node_skip_compressed(merged_plain) ||
 			ft_node_external(merged_plain) ||
 			!ft_glue_is_fresh(ft, glue, merged_plain)))
+		return FT_REKEY_UNCOVERED;
+	/*
+	 * A frame above @pnf does not hold the attach slot, which is in @pnf.
+	 * The copy folds the announced publish only into its own slots.  So a
+	 * glue-built top is refused here, for the copy before the detach and
+	 * for the copy after it.  A splice leaves the slot as it is and needs
+	 * no fold.
+	 */
+	if (merged_pub != d_dst->nf && *frame_above_pnf)
 		return FT_REKEY_UNCOVERED;
 	/*
 	 * ☠ THE RELOCATED NODE MUST NOT BE ON THE SOURCE PATH.  Every node the
@@ -2923,7 +2959,7 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 			 *   - a run frame (the deep fold);
 			 *   - anything the glue did not build;
 			 *   - a frame ABOVE the attach slot's parent (the
-			 *     climb past a run off the root).
+			 *     climb past a run, also refused above).
 			 * For the last one, the fold cannot reach a slot two
 			 * levels down.  The subsumption that then replaces
 			 * the fold skips the forward store.  That is right

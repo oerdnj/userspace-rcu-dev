@@ -78,7 +78,7 @@ void (*cds_ft_dbg_interleave_hook)(int point);
  * G5.5's ANCESTOR LEDGER: the descent path, root-first, for the widening.
  *
  * ☠ NOTHING ELSE IN THE TREE CAN ANSWER "every ancestor":
- *  - The descent retains only a four-deep window (nf/pnf/ppnf/pppnf).
+ *  - The descent retains only a six-deep window (nf up to pppppnf).
  *  - The metadata->parent up-walk is refuted.  The parent goes transiently
  *    NULL while a detach or graft re-homes a node.  A NULL parent reads as
  *    ROOT, so the walk truncates SILENTLY.
@@ -259,6 +259,14 @@ struct ft_descent {
 	struct cds_ft_inode_flag *pppnf;	/* Great-grandparent node-flag value. */
 	struct cds_ft_inode_flag **pppnfp;	/* Slot that holds @pppnf. */
 	/*
+	 * Two more levels, for a rekey frame that climbs past a run
+	 * (ft_rekey_merge_cow_publish_parent).  A node is NULL when the slot it
+	 * would hold is &ft->root, or when the descent is not that deep yet.
+	 */
+	struct cds_ft_inode_flag *ppppnf;	/* Node that holds @pppnfp. */
+	struct cds_ft_inode_flag **ppppnfp;	/* Slot that holds @ppppnf. */
+	struct cds_ft_inode_flag *pppppnf;	/* Node that holds @ppppnfp. */
+	/*
 	 * Byte-depth each window slot STARTS at, rotated with the slot itself.
 	 * @depth alone cannot recover them.  A compressed ancestor starts
 	 * cn->len bytes back, not one.  The span is not derivable from the
@@ -270,6 +278,8 @@ struct ft_descent {
 	unsigned int pdepth;			/* Byte-depth of @pnf. */
 	unsigned int ppdepth;			/* Byte-depth of @ppnf. */
 	unsigned int pppdepth;			/* Byte-depth of @pppnf. */
+	unsigned int ppppdepth;			/* Byte-depth of @ppppnf. */
+	unsigned int pppppdepth;		/* Byte-depth of @pppppnf. */
 	/*
 	 * A reanchoring descent step (ft_descent_step) landed the live node
 	 * SHALLOWER than the dispatched child.  This is ft_skip_reanchor with
@@ -449,6 +459,10 @@ void ft_descent_anchor_validate(const struct ft_descent *d)
 		assert(d->ppdepth < d->pdepth);
 	if (d->pppnf)
 		assert(d->pppdepth < d->ppdepth);
+	if (d->ppppnf)
+		assert(d->ppppdepth < d->pppdepth);
+	if (d->pppppnf)
+		assert(d->pppppdepth < d->ppppdepth);
 }
 #else
 static inline
@@ -483,6 +497,8 @@ void ft_descent_rename(struct ft_descent *d, const struct cds_ft_inode *old,
 	FT_DESCENT_RENAME(d->pnf);
 	FT_DESCENT_RENAME(d->ppnf);
 	FT_DESCENT_RENAME(d->pppnf);
+	FT_DESCENT_RENAME(d->ppppnf);
+	FT_DESCENT_RENAME(d->pppppnf);
 #undef FT_DESCENT_RENAME
 }
 
@@ -693,6 +709,8 @@ void ft_descent_init(struct ft_descent *d, struct cds_ft *ft)
 	d->pdepth = 0;
 	d->ppdepth = 0;
 	d->pppdepth = 0;
+	d->ppppdepth = 0;
+	d->pppppdepth = 0;
 #ifdef FT_ANC_LEDGER
 	d->anc_rec = caa_unlikely(ft_bulk_active(ft));
 	d->anc_gen = 0;
@@ -721,6 +739,9 @@ void ft_descent_init(struct ft_descent *d, struct cds_ft *ft)
 	d->ppnfp = NULL;
 	d->pppnf = NULL;
 	d->pppnfp = NULL;
+	d->ppppnf = NULL;
+	d->ppppnfp = NULL;
+	d->pppppnf = NULL;
 	d->skip_conflict = false;
 }
 
@@ -737,6 +758,11 @@ void ft_descent_traverse_compressed(struct cds_ft *ft, struct ft_descent *d,
 {
 	unsigned int rewind;
 
+	d->pppppnf = d->ppppnf;
+	d->pppppdepth = d->ppppdepth;
+	d->ppppnf = d->pppnf;
+	d->ppppnfp = d->pppnfp;
+	d->ppppdepth = d->pppdepth;
 	d->pppnf  = d->ppnf;
 	d->pppnfp = d->ppnfp;
 	d->pppdepth = d->ppdepth;
@@ -792,6 +818,11 @@ struct cds_ft_inode_flag *ft_descent_step(struct cds_ft *ft, struct ft_descent *
 {
 	unsigned int rewind;
 
+	d->pppppnf = d->ppppnf;
+	d->pppppdepth = d->ppppdepth;
+	d->ppppnf = d->pppnf;
+	d->ppppnfp = d->pppnfp;
+	d->ppppdepth = d->pppdepth;
 	d->pppnf  = d->ppnf;
 	d->pppnfp = d->ppnfp;
 	d->pppdepth = d->ppdepth;
