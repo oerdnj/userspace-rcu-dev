@@ -4148,6 +4148,11 @@ int _cds_ft_insert(struct cds_ft *ft,
 	int ret;
 	struct ft_ord_cell *precell;
 	void *cell = NULL;			/* @precell's carrier; reused across retries */
+	/*
+	 * Set when this attempt's ft_chain_node() appended @node to a
+	 * duplicate chain (see insert_done).
+	 */
+	bool appended = false;
 	enum urcu_txn_status cst = URCU_TXN_STATUS_OK;	/* last commit outcome */
 	FT_SH_STALL_DECL;
 	struct ft_insert_commit ic = { 0 };
@@ -4218,6 +4223,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 	ft_txn_op_init(ft, &optxn);
 
 restart_attempt:
+	appended = false;
 	FT_SH_STALL_TICK(ft, "_cds_ft_insert");
 	ft_op_begin(&optxn);
 	/*
@@ -4568,6 +4574,7 @@ restart_attempt:
 					ft_meta_lock_release(dup_hmeta);
 				if (ret)
 					goto insert_done;
+				appended = true;
 			} else {
 				/* New key at this internal node. */
 				ft_external_head_set_parent(ft, node, d.nf, /*prefix=*/ true);
@@ -4814,6 +4821,7 @@ restart_attempt:
 				ft_meta_lock_release(dup_hmeta);
 			if (ret)
 				goto insert_done;
+			appended = true;
 		}
 	} else {
 		/* Found NULL node or external node before end of key. */
@@ -4876,11 +4884,11 @@ insert_done:
 		goto restart_attempt;
 	}
 	/*
-	 * @node became a fresh head iff node->prev is still its (cell)
-	 * carrier, i.e. not external.  A duplicate append or a failed insert
-	 * leaves @precell orphaned: free it.  (In a duplicate append,
-	 * ft_chain_node repointed node->prev at the predecessor.)  On
-	 * failure, also restore node->prev to its zeroed state so the
+	 * A duplicate append or a failed insert leaves @precell orphaned:
+	 * free it.  Test @appended, not node->prev, for the append.  The
+	 * append published @node, so a peer may have rewritten node->prev
+	 * since, with a cell that is not @precell.
+	 * On failure, also restore node->prev to its zeroed state so the
 	 * application may retry.  Otherwise splice the kept cell into the
 	 * ordered list.
 	 *
@@ -4922,7 +4930,7 @@ insert_done:
 			ft_ord_cell_free_unpublished(ft, precell);
 			if (ic.txn)
 				ft_flip_txn_destroy(ic.txn);
-		} else if (ft_node_external((struct cds_ft_inode_flag *) node->prev)) {
+		} else if (appended) {
 			ft_ord_cell_free_unpublished(ft, precell);
 			if (ic.txn)
 				ft_flip_txn_destroy(ic.txn);
