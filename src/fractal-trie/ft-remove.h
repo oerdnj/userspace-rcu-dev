@@ -1817,7 +1817,21 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * can give without an owner.
 		 */
 		pending_glue = ft_glue_of_ctx(ctx);
-		if (pending_glue)
+		/*
+		 * ☠ NOT THROUGH THE ONE-HOP DECODE when the caller announced
+		 * the top's PLAIN flag (@pending_pub_plain).  The decode of a
+		 * skip word goes through its child's back-pointer.  For a
+		 * wrapper over a LIVE head, the glue still queues the update
+		 * of that back-pointer.  So the decode finds the OLD run, and
+		 * this fold would absorb and free a live node.  The DEL
+		 * recompaction's fold uses the same plain flag.
+		 */
+		if (pending_glue && ft_node_skip_compressed(pending_child) &&
+				shared_txn && shared_txn->pending_pub_plain &&
+				shared_txn->pending_pub_val == pending_child)
+			pending_cn = ft_compressed_node_ptr(
+				shared_txn->pending_pub_plain);
+		else if (pending_glue)
 			pending_cn = ft_node_skip_compressed(pending_child) ?
 				ft_skip_to_compressed(ft, pending_child) :
 				ft_compressed_node_ptr(pending_child);

@@ -12654,7 +12654,9 @@ static const struct {
  *
  * The rows are the six corpus shapes the root class held (seed numbers in
  * the comments), the one pass-through shape the corpus held, and the
- * pass-through case the design named ({ac,axy,axz}).  MEASURED on the gate
+ * pass-through case the design named ({ac,axy,axz}).  Later rows add
+ * same-path frames under a glue-built wrapper top, one of them (fuzzer 8313)
+ * below the root.  MEASURED on the gate
  * that used to refuse the root, simply lifted, before the post-detach arm
  * existed: 1244 and 2520 walked a reader into a NULL parent
  * (ft_skip_reanchor), 2031 and 1999 left a head's back edge naming the dead
@@ -12707,6 +12709,16 @@ static const struct {
 	 * the shared parent's DEL recompaction folds it in and re-homes it by
 	 * its PLAIN flag (@pending_pub_plain) */
 	{ { "abcccc", "cacaa", "accca", "caaaca", "aaa" }, "accc", "aa", 2 },
+	/* rekey shape fuzzer 1252: the same wrapper top, and the frame (the
+	 * root) is left with one child and no key.  The root is never
+	 * collapsed, so it is DEL-recompacted like the row above */
+	{ { "bbb", "ab" }, "bb", "a", 1 },
+	/* fuzzer 8313: the same below the root.  The frame collapses into a
+	 * run, which absorbs the wrapper.  The collapse must find the wrapper
+	 * by its plain flag: the one-hop decode of the skip word names the OLD
+	 * run */
+	{ { "baaaa", "bbbbaaba", "baabaa", "bbaab", "bbab" }, "baaba",
+		"baaa", 1 },
 	/* the COMPOSITION of the two: a glue-built wrapper top AND a frame
 	 * climbed past a run off the root.  The fold cannot reach a slot two
 	 * levels down and the subsumption would skip the wrapper's store, so

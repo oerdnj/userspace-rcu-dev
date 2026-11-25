@@ -2906,8 +2906,6 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 		 *   - a kind conflict under rank stats.
 		 */
 		if (merged_pub != d_dst->nf) {
-			struct cds_ft_metadata *fm;
-
 			/*
 			 * ...OR A GLUE-BUILT WRAPPER over the spliced head.
 			 * The dst ends inside a run over the head (seed
@@ -2916,10 +2914,10 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 			 * re-homed there by its PLAIN flag
 			 * (@pending_pub_plain).
 			 *
-			 * The frame must be DEL-RECOMPACTED, not collapsed.
-			 * A collapse takes the folded word as a run's child,
-			 * and a skip word is not a node.  So the frame keeps
-			 * another child or a key after the src byte leaves.
+			 * A non-root frame left with one child and no key
+			 * is COLLAPSED instead (ft_chain_compress_fused).
+			 * The merged run absorbs the wrapper.  It also
+			 * finds the wrapper by @pending_pub_plain.
 			 *
 			 * Three shapes stay refused:
 			 *   - a run frame (the deep fold);
@@ -2934,10 +2932,6 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 			if (*frame_above_pnf || ft_node_skip_compressed(merged_plain) ||
 					ft_node_external(merged_plain) ||
 					!ft_glue_is_fresh(ft, glue, merged_plain))
-				return FT_REKEY_UNCOVERED;
-			fm = ft_flag_to_metadata(ft, cow_nf);
-			if (!fm || (ft_meta_nr_child_load(fm) <= 2 &&
-					!fm->external_nodes))
 				return FT_REKEY_UNCOVERED;
 		} else if (!ft_node_external(merged_pub))
 			return FT_REKEY_UNCOVERED;
