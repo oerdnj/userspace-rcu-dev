@@ -1803,11 +1803,10 @@ static void ft_sw_stale_check(const struct ft_rec_dbg *r)
 	/*
 	 * ☞ THE RELEASE-SHAPED RECORD IS NOT STALE.  The op has marked a
 	 * state word.  The word gets its release as an SW {s -> s}, with LOCK
-	 * masked out of both values.  See ft_reparent_record_meta's
-	 * @child_marked arm, "the release-shaped SW form".  The SW record does
-	 * not validate, so it writes s on commit AND on abort: a release
-	 * either way.  Its s was loaded under the lock, so nothing about it
-	 * is stale.
+	 * masked out of both values.  See the @child_marked arm of
+	 * ft_reparent_record_meta.  The SW record does not validate, so it
+	 * writes s on commit AND on abort: a release either way.  Its s was
+	 * loaded under the lock, so nothing about it is stale.
 	 *
 	 * Recognised EXACTLY: the live word differs by LOCK alone and the
 	 * record writes back its own old.  A TOMBSTONE difference still
@@ -9701,8 +9700,13 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 	 * structural word the lock protects is plain.  Otherwise a peer
 	 * acquires on the strength of the release while our SW parks are still
 	 * parked, and our own settle overwrites what the peer publishes.  So
-	 * this commit carries no release.  The releases run after it returns
-	 * (@rel_after), when every record is settled.
+	 * the releases run after this commit returns (@rel_after), when every
+	 * record is settled.
+	 *
+	 * One record kind is the exception: the @child_marked arm of
+	 * ft_reparent_record_meta() releases a lock inside the commit.  The
+	 * comment there says why no peer can take that lock before the
+	 * commit returns.
 	 */
 #ifdef FT_DEBUG_HIDDEN_FILL
 	ft_hidden_fill_at_commit(t);
@@ -24331,6 +24335,19 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		 * is recorded, and the ledger must forget the word.  Nothing
 		 * else will: the caller skips its release sweep once the
 		 * commit consumed the marks.
+		 *
+		 * The commit settles its records in record order, so this
+		 * release can land before a later record of the same txn.
+		 * That is safe only if no peer can take the lock in between.
+		 * Every caller but one is a step of a bulk op: the graft,
+		 * merge and detach glue (ft_glue_*) or the rekey
+		 * copy-on-write (ft_rekey_cow_*).  A bulk op holds the
+		 * FT-wide lock, with point writers flipped onto it, or runs
+		 * on a coarse or exclusive trie.  Either way
+		 * ft_flip_txn_excludes_all() is true, and no peer writes
+		 * until the commit returns.  The other caller is
+		 * _cds_ft_debug_cow_replace_root(), a single-threaded test
+		 * hook.
 		 */
 		/*
 		 * The state word is loaded HERE, in the one arm that records
