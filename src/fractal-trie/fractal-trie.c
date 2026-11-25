@@ -766,6 +766,19 @@ int _cds_ft_debug_skip_compressed_enabled(void)
 }
 
 /*
+ * Does @ft use the skip-compressed encoding?  A build with the feature can
+ * still create a group without it: ft_skip_compressed_validate() turns it off
+ * when its mmap() probe fails, for example under ThreadSanitizer.  A test of a
+ * shape whose legality depends on skip mode must ask this for its own trie.
+ *
+ * Test-only.
+ */
+int _cds_ft_debug_ft_skip_compressed(struct cds_ft *ft)
+{
+	return ft_group_skip_compressed(ft->group);
+}
+
+/*
  * Is the in-place occupancy-bitmap tier compiled in?
  *
  * Test-only.  It must be ASKED OF THE LIBRARY, not reproduced as a test-side

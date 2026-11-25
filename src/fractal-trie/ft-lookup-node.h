@@ -273,6 +273,22 @@ uint16_t *ft_popcount_2l_sub_bm_addr(struct cds_ft_inode *node,
 }
 
 /*
+ * Prefetch the sibling a next/prev walk will likely visit.  @slot may be one
+ * past the pointer array, so the load can read the start of the next arena
+ * item.  A writer may be initializing that item.  The value is only a hint,
+ * but ThreadSanitizer reports the read as a race, so skip it there.
+ */
+static inline
+void ft_prefetch_neighbor(struct cds_ft_inode_flag **slot)
+{
+#ifdef CMM_SANITIZE_THREAD
+	(void) slot;
+#else
+	ft_maybe_prefetch_nta(uatomic_load(slot));
+#endif
+}
+
+/*
  * Load a popcount bitmap word of a node that readers can reach.  An
  * in-place insert changes it concurrently, with relaxed stores, so load it
  * with a relaxed atomic load.  The bitmap orders nothing: an in-place insert
@@ -913,8 +929,8 @@ struct cds_ft_inode_flag *ft_popcount_2l_node_get_direction(
 			 * ft_maybe_prefetch (__builtin_prefetch) silently drops
 			 * NULL / non-canonical addresses without faulting.
 			 */
-			ft_maybe_prefetch_nta(uatomic_load(dir == FT_RIGHT ?
-					&slot[1] : &slot[-1]));
+			ft_prefetch_neighbor(dir == FT_RIGHT ?
+					&slot[1] : &slot[-1]);
 			*result_key = (uint8_t) byte;
 			return ptr;
 		}
@@ -1207,10 +1223,10 @@ uint8_t ft_popcount_1l_node_get_nr_child(const struct cds_ft_type *type,
 		(const struct ft_popcount_1l_header *) &node->data[0];
 	(void) type;
 	return (uint8_t) (
-		__builtin_popcountll(hdr->bm[0]) +
-		__builtin_popcountll(hdr->bm[1]) +
-		__builtin_popcountll(hdr->bm[2]) +
-		__builtin_popcountll(hdr->bm[3]));
+		__builtin_popcountll(uatomic_load(&hdr->bm[0], CMM_RELAXED)) +
+		__builtin_popcountll(uatomic_load(&hdr->bm[1], CMM_RELAXED)) +
+		__builtin_popcountll(uatomic_load(&hdr->bm[2], CMM_RELAXED)) +
+		__builtin_popcountll(uatomic_load(&hdr->bm[3], CMM_RELAXED)));
 }
 
 /*
@@ -1238,13 +1254,14 @@ void ft_popcount_1l_node_get_ith_pos(const struct cds_ft_type *type,
 	(void) type;
 
 	for (word_idx = 0; word_idx < 4; word_idx++) {
-		pop = (unsigned int) __builtin_popcountll(hdr->bm[word_idx]);
+		pop = (unsigned int) __builtin_popcountll(
+			uatomic_load(&hdr->bm[word_idx], CMM_RELAXED));
 		if (rem < pop)
 			break;
 		rem -= pop;
 	}
 	assert(word_idx < 4);
-	word = hdr->bm[word_idx];
+	word = uatomic_load(&hdr->bm[word_idx], CMM_RELAXED);
 	while (rem--)
 		word &= word - 1ULL;	/* clear lowest set bit */
 	bit = (unsigned int) __builtin_ctzll(word);
@@ -1306,11 +1323,16 @@ struct cds_ft_inode_flag *ft_popcount_1l_node_get_direction(
 	{
 		struct ft_popcount_1l_header *hdr =
 			(struct ft_popcount_1l_header *) &node->data[0];
-		unsigned long *bm = (unsigned long *) hdr->bm;
+		unsigned long bm[sizeof(hdr->bm) / sizeof(unsigned long)];
+		unsigned int k;
 		int i;
 
 		(void) type;	/* inline bitmap: the vtable type arg is unused here */
 retry:
+		/* A relaxed snapshot: an in-place insert may set a bit. */
+		for (k = 0; k < sizeof(bm) / sizeof(bm[0]); k++)
+			bm[k] = uatomic_load(&((unsigned long *) hdr->bm)[k],
+					CMM_RELAXED);
 		if (dir == FT_LEFT)
 			i = cds_find_prev_bit(bm, FT_ENTRY_PER_NODE, n - 1);
 		else
@@ -1343,7 +1365,8 @@ retry:
 			 *   - +1: FT_FAR_METADATA after the 2 MiB run;
 			 *   - -1: bitmap header before pointers.
 			 */
-			ft_maybe_prefetch_nta(dir == FT_RIGHT ? slot[1] : slot[-1]);
+			ft_prefetch_neighbor(dir == FT_RIGHT ?
+					&slot[1] : &slot[-1]);
 			*result_key = (uint8_t) i;
 			return ptr;
 		}

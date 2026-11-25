@@ -5194,7 +5194,7 @@ unsigned int ft_insert_replace_leaf_sedges(struct cds_ft *ft,
 			ft_txn_parent_slot(cn_meta, ft, mtxn);
 
 		FT_DUAL_SLOT_SETTLED_CHECK(sslot, gp_held);
-		if (sslot && ft_node_skip_compressed(*sslot)) {
+		if (sslot && ft_node_skip_compressed(uatomic_load(sslot))) {
 			/*
 			 * ☠ BOTH EXPECTED-OLDS ARE RESOLVED, and both used to
 			 * be RAW loads.  The acquires do not make a raw load
