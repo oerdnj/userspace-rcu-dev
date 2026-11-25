@@ -2620,26 +2620,29 @@ int ft_rekey_merge_cow_after_decide(struct cds_ft *ft,
  *
  * COW @d_dst->pnf to a fresh address.  @d_dst->pnf is the immediate internal
  * parent of the node the merge attached to.  Republish the copy one level up,
- * at (@d_dst->ppnf, @d_dst->pnfp).  The interior is untouched: the copy is
- * verbatim and every child keeps its address.  Only one thing changes: the
- * identity of the node a descent passes THROUGH on its way to the merged
- * chain.  That identity is the whole product.  It is what the two-descent
- * witness of the rekey-coherent reader observes.
+ * at (@d_dst->ppnf, @d_dst->pnfp).  Every child keeps its address.  The copy
+ * is verbatim, except that a glue-built top replaces the child in the attach
+ * slot.  Only one thing changes for a reader: the identity of the node a
+ * descent passes THROUGH on its way to the merged chain.  That identity is
+ * the whole product.  It is what the two-descent witness of the
+ * rekey-coherent reader observes.
  *
  * ☞ WHY THE WITNESS IS OWED HERE AT ALL.  The caller's exit is taken exactly
- * when the union produced nothing fresh (a duplicate-chain splice onto a live
- * app-owned head).  The dst path then has no fresh address anywhere.  Take a
- * later insert on that same chain.  A reader looking up the ORIGINAL SRC key
- * could find it, at a location the move was supposed to have vacated.  A
- * torn descent would match a clean one, and the two-descent scheme would have
- * nothing to disagree about.
+ * when the union's top is no fresh node that a reader visits.  It is either
+ * the live app-owned head of a duplicate-chain splice, or a glue-built run,
+ * which the witness skips.  The dst path down to the top then has no fresh
+ * address.  Take a later insert on that same chain.  A reader looking up the
+ * ORIGINAL SRC key could find it, at a location the move was supposed to have
+ * vacated.  A torn descent would match a clean one, and the two-descent scheme
+ * would have nothing to disagree about.
  *
  * ☠ THE PRIMITIVE IS ft_rekey_cow_stop.  THE TWO OBVIOUS ALTERNATIVES BOTH
  * FAIL.  This was measured, not reasoned:
  *  - ft_node_replace_ptr DOES NOT RELOCATE HERE.  It rebuilds a node only
- *    when the node's SHAPE must change.  This shape replaces one slot with
- *    the value it already holds (@merged_pub == the old child), which leaves
- *    nothing to do.  So it returns 0 with the LIVE node back and serves zero.
+ *    when the node's SHAPE must change.  The splice shape replaces one slot
+ *    with the value it already holds (@merged_pub == the old child), which
+ *    leaves nothing to do.  So it returns 0 with the LIVE node back and
+ *    serves zero.
  *  - FT_RECOMPACT_RELOCATE publishes and re-parents children EAGERLY.  Its
  *    own contract calls that a "point of no return".  So it cannot build a
  *    copy for a commit that has not happened yet.
@@ -2691,7 +2694,7 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 	 */
 	struct cds_ft_inode_flag *cow_nf, *cow_pnf, **cow_slot;
 	unsigned int cow_depth, cow_pdepth;
-	bool via_run, on_src_path;
+	bool via_run, on_src_path, fold_top;
 	int ret;
 
 	*frame_above_pnf = false;
@@ -2785,17 +2788,17 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 	 * SUPERSEDED child and lose the built one.  So that case keeps the
 	 * refusal.
 	 *
-	 * The POST-DETACH copy is the exception.  Its copy loop folds the
-	 * announced publish into the slot.  So a GLUE-BUILT top is admitted
-	 * there (a dst ending inside the head's key, wrapped by
-	 * ft_merge_wrap_prefix).  This holds for a plain frame only.  A run
-	 * frame keeps the verbatim rule, because its publish is the
-	 * compressed-parent kind.
+	 * A GLUE-BUILT top is the exception: a dst ending inside the head's
+	 * key, wrapped by ft_merge_wrap_prefix.  The copy loop folds the
+	 * announced publish into the attach slot.  A frame off the src path
+	 * is copied here, before the detach.  A frame on the path is copied
+	 * after it (ft_rekey_merge_cow_after_decide).  A run frame keeps the
+	 * verbatim rule, because its publish is the compressed-parent kind.
 	 */
-	if (merged_pub != d_dst->nf && !(on_src_path && !via_run &&
-			!ft_node_skip_compressed(merged_plain) &&
-			!ft_node_external(merged_plain) &&
-			ft_glue_is_fresh(ft, glue, merged_plain)))
+	if (merged_pub != d_dst->nf && (via_run ||
+			ft_node_skip_compressed(merged_plain) ||
+			ft_node_external(merged_plain) ||
+			!ft_glue_is_fresh(ft, glue, merged_plain)))
 		return FT_REKEY_UNCOVERED;
 	/*
 	 * ☠ THE RELOCATED NODE MUST NOT BE ON THE SOURCE PATH.  Every node the
@@ -3028,8 +3031,23 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 
 	ft_lock_ctx_init(&cctx, d_dst, txn, optxn);
 	cctx.held.glue = glue;
+	/*
+	 * Fold a GLUE-BUILT top into the copy, in place of the child it
+	 * replaces.  The copy loop reads the attach slot from the announced
+	 * publish.  The sweep wires the top's parent with a plain store
+	 * (ft_rekey_cow_glue_fresh_meta).  Both need @ryw on and a live
+	 * record set, which cow_stop's own reserve creates.  The detach has
+	 * not run yet, so every other slot is copied as it stands.
+	 */
+	fold_top = merged_pub != d_dst->nf;
+	if (fold_top) {
+		txn->pending_pub_slot = d_dst->nfp;
+		txn->pending_pub_val = merged_pub;
+		txn->pending_pub_plain = NULL;
+	}
 	ret = ft_rekey_cow_stop(ft, &cctx, txn, cow_nf, cow_depth,
-			/*cut=*/ 0, /*ryw=*/ false, NULL, &pp_prime, marks, nr_marks);
+			/*cut=*/ 0, /*ryw=*/ fold_top, NULL, &pp_prime, marks,
+			nr_marks);
 	if (ret)
 		return ret;
 	ft_rekey_marks_to_txn(txn, marks, *nr_marks);
@@ -3050,13 +3068,15 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 	 * of its own.
 	 */
 	ft_glue_track(glue, pp_prime);
+	/* Without a record set the copy was verbatim, so refuse it. */
+	if (fold_top && !ft_txn_live(txn->mtxn))
+		return FT_REKEY_UNCOVERED;
 	/*
 	 * The COPY is what the grandparent's slot must hold.  @merged_pub is
-	 * already in the copy's own slot: cow_stop copied the parent
-	 * verbatim, and the merge changed nothing at that slot.  cow_stop
-	 * also recorded the external head's back edge onto the copy, along
-	 * with every other child's.  So the attach point needs no publish of
-	 * its own.
+	 * already in the copy's own slot.  Either the merge changed nothing
+	 * at that slot, or cow_stop folded the built top in.  cow_stop also
+	 * re-homed that slot's child onto the copy, along with every other
+	 * child.  So the attach point needs no publish of its own.
 	 */
 	ft_glue_set_publish(ft, glue, cow_pnf, cow_slot, pp_prime);
 	/*

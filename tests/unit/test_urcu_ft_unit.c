@@ -12717,8 +12717,35 @@ static const struct {
 	{ { "xab", "xc", "xd" }, "xc", "xab", 1 },
 };
 
-static int root_frame_one(struct cds_ft *ft, const char *const *keys,
-		const char *dst, const char *src, int serve)
+/*
+ * A FRAME OFF THE SOURCE PATH, ABOVE A BUILT TOP.  The dst ends inside a run
+ * over the head, so the merge builds a wrapper and publishes it in skip form.
+ * The reader's witness does not visit a run, so the plain parent of the
+ * attach slot is copied.  The src key does not pass through that parent, so
+ * the copy is taken before the detach.  The rows are seeds of the rekey shape
+ * fuzzer.  root_frame_one() checks each row, and @serve has the meaning it
+ * has in root_frame_cases.
+ */
+static const struct {
+	const char *keys[8];
+	const char *dst, *src;
+	int serve;
+} off_path_cases[] = {
+	/* 16307 */
+	{ { "aba", "bbababba", "bababa" }, "baba", "a", 1 },
+	/* 3992 */
+	{ { "caaaac", "cc", "acbc", "a", "b", "bcaac" }, "bca", "caaa", 1 },
+	/* 17957 */
+	{ { "ab", "baabba", "bbbb", "baab", "baaaaabb" }, "bbb", "a", 1 },
+	/* 1090 */
+	{ { "ba", "a", "babaaaa", "aaaa" }, "aaa", "babaaa", 1 },
+	/* 5731 */
+	{ { "baab", "aaaabbb", "b", "bbbabb" }, "bbba", "aaaab", 1 },
+};
+
+static int root_frame_one(struct cds_ft *ft, const char *what,
+		const char *const *keys, const char *dst, const char *src,
+		int serve)
 {
 	char want[8][32];
 	unsigned long distinct = 0, n;
@@ -12745,15 +12772,15 @@ static int root_frame_one(struct cds_ft *ft, const char *const *keys,
 	}
 	s = ft_rekey(ft, dst, src);
 	if (s != CDS_FT_STATUS_OK && s != CDS_FT_STATUS_NOT_SUPPORTED) {
-		fprintf(stderr, "root_frame(dst %s src %s): %s\n", dst, src,
+		fprintf(stderr, "%s(dst %s src %s): %s\n", what, dst, src,
 			cds_ft_status_to_string(s));
 		return -1;
 	}
 	if (serve == 2)
 		serve = _cds_ft_debug_compress_enabled();
 	if (serve && s != CDS_FT_STATUS_OK) {
-		fprintf(stderr, "root_frame(dst %s src %s): REFUSED (%s) a "
-			"root-frame move the tree serves\n", dst, src,
+		fprintf(stderr, "%s(dst %s src %s): REFUSED (%s) a "
+			"move the tree serves\n", what, dst, src,
 			cds_ft_status_to_string(s));
 		return -1;
 	}
@@ -12764,8 +12791,9 @@ static int root_frame_one(struct cds_ft *ft, const char *const *keys,
 		if (!ft_test_has_key(ft, k) ||
 		    (s == CDS_FT_STATUS_OK && moved &&
 		     ft_test_has_key(ft, keys[i]))) {
-			fprintf(stderr, "root_frame(dst %s src %s): %s but %s=%d "
-				"%s=%d\n", dst, src, cds_ft_status_to_string(s),
+			fprintf(stderr, "%s(dst %s src %s): %s but %s=%d "
+				"%s=%d\n", what, dst, src,
+				cds_ft_status_to_string(s),
 				k, ft_test_has_key(ft, k), keys[i],
 				ft_test_has_key(ft, keys[i]));
 			return -1;
@@ -12773,8 +12801,8 @@ static int root_frame_one(struct cds_ft *ft, const char *const *keys,
 	}
 	n = cds_ft_count_keys(ft);
 	if (n != (s == CDS_FT_STATUS_OK ? distinct : nk)) {
-		fprintf(stderr, "root_frame(dst %s src %s): %s count %lu want "
-			"%lu\n", dst, src, cds_ft_status_to_string(s), n,
+		fprintf(stderr, "%s(dst %s src %s): %s count %lu want "
+			"%lu\n", what, dst, src, cds_ft_status_to_string(s), n,
 			s == CDS_FT_STATUS_OK ? distinct : (unsigned long) nk);
 		return -1;
 	}
@@ -12784,13 +12812,14 @@ static int root_frame_one(struct cds_ft *ft, const char *const *keys,
 	 */
 	n = cds_ft_count_entries(ft);
 	if (n != nk) {
-		fprintf(stderr, "root_frame(dst %s src %s): %s entries %lu want "
-			"%u\n", dst, src, cds_ft_status_to_string(s), n, nk);
+		fprintf(stderr, "%s(dst %s src %s): %s entries %lu want "
+			"%u\n", what, dst, src, cds_ft_status_to_string(s), n,
+			nk);
 		return -1;
 	}
 	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
-		fprintf(stderr, "root_frame(dst %s src %s): verify RED\n",
-			dst, src);
+		fprintf(stderr, "%s(dst %s src %s): verify RED\n",
+			what, dst, src);
 		return -1;
 	}
 	return 0;
@@ -12918,7 +12947,8 @@ static void same_path_child(void)
 			else
 				ft = create_varlen_ft(&group);
 			rcu_read_lock();
-			bad = root_frame_one(ft, root_frame_cases[g].keys,
+			bad = root_frame_one(ft, "root_frame",
+				root_frame_cases[g].keys,
 				root_frame_cases[g].dst, root_frame_cases[g].src,
 				root_frame_cases[g].serve);
 			rcu_read_unlock();
@@ -12928,6 +12958,33 @@ static void same_path_child(void)
 				fprintf(stderr,
 					"root_frame: geometry %u mode %u failed\n",
 					g, m);
+				_exit(1);
+			}
+		}
+	}
+	/* The frame off the source path, under the same bound. */
+	for (g = 0; g < sizeof(off_path_cases) / sizeof(off_path_cases[0]);
+			g++) {
+		for (m = 0; m < 4; m++) {
+			bool rank = (m >= 2), list = (m & 1) != 0;
+			int bad;
+
+			if (rank)
+				ft = create_varlen_rankstats_list_ft(list,
+					&group);
+			else
+				ft = create_varlen_ft(&group);
+			rcu_read_lock();
+			bad = root_frame_one(ft, "off_path",
+				off_path_cases[g].keys,
+				off_path_cases[g].dst, off_path_cases[g].src,
+				off_path_cases[g].serve);
+			rcu_read_unlock();
+			rcu_quiescent_state();
+			(void) group;
+			if (bad) {
+				fprintf(stderr, "off_path: geometry %u mode "
+					"%u failed\n", g, m);
 				_exit(1);
 			}
 		}
