@@ -11720,6 +11720,9 @@ void ft_flip_txn_claim_per_op_armable(const struct cds_ft *ft,
 		return;
 	if (!ft_txn_per_op_spacing_ok(ft))
 		return;		/* the claim must refuse what the ARM refuses */
+	/* A bulk window: see ft_flip_txn_arm_per_op_at. */
+	if (t->trie_wide_sw && !t->structural_sw)
+		return;
 	ft_flip_txn_claim_per_op(t);
 }
 
@@ -11818,6 +11821,19 @@ void ft_flip_txn_arm_per_op_at(const struct cds_ft *ft, struct ft_flip_txn *t,
 	if (ft_txn_content_sw_ok(ft)) {
 		FT_ARM_REACH_HIT(rs, triewide);
 		return;		/* the constructor armed it trie-wide */
+	}
+	/*
+	 * A BULK WINDOW (ft_txn_bulk_window): the op holds the FT-wide writer
+	 * lock, so no other writer can race its records.  They park SW through
+	 * @held_sw.  A per-op arm would license them by the lock registry
+	 * instead.  A point op serialized behind a bulk op does not register
+	 * the owner of every word it records, so its record would abort.  The
+	 * bulk writer itself is already armed structural (@sw_body), and keeps
+	 * this arm for the audit.
+	 */
+	if (t->trie_wide_sw && !t->structural_sw) {
+		FT_ARM_REACH_HIT(rs, triewide);
+		return;
 	}
 	if (!ft || !ft->lock_fine) {
 		FT_ARM_REACH_HIT(rs, nofine);
