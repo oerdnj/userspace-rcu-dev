@@ -36,7 +36,7 @@ static struct cds_ft_group *test_ft_group;
 /* Provide mutual exclusion across Fractal Trie updates. */
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
-volatile int test_go, test_stop;
+int test_go, test_stop;
 
 unsigned long wdelay;
 
@@ -1568,7 +1568,7 @@ void *test_ft_rw_thr_reader(void *_count)
 
 	rcu_register_thread();
 
-	while (!test_go)
+	while (!uatomic_load(&test_go, CMM_ACQUIRE))
 	{
 	}
 	cmm_smp_mb();
@@ -1640,7 +1640,7 @@ void *test_ft_rw_thr_writer(void *_count)
 	if (cds_ft_iter_create(test_ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!uatomic_load(&test_go, CMM_ACQUIRE))
 	{
 	}
 	cmm_smp_mb();
@@ -1852,7 +1852,7 @@ int do_mt_test(void)
 
 	cmm_smp_mb();
 
-	test_go = 1;
+	uatomic_store(&test_go, 1, CMM_RELEASE);
 
 	urcu_qsbr_thread_offline();
 
@@ -1861,7 +1861,7 @@ int do_mt_test(void)
 		remain = sleep(remain);
 	} while (remain > 0);
 
-	test_stop = 1;
+	uatomic_store(&test_stop, 1, CMM_RELEASE);
 
 	for (i = 0; i < nr_readers; i++) {
 		err = pthread_join(tid_reader[i], &tret);

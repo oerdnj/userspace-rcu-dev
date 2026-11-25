@@ -310,6 +310,7 @@ extern int _cds_ft_debug_cow_replace_root(struct cds_ft *ft);
 extern int _cds_ft_debug_flag_is_compressed(void *flag);
 extern int _cds_ft_debug_flag_is_external(void *flag);
 extern int _cds_ft_debug_skip_compressed_enabled(void);
+extern int _cds_ft_debug_ft_skip_compressed(struct cds_ft *ft);
 extern int _cds_ft_debug_compress_enabled(void);
 extern int _cds_ft_debug_in_place_enabled(void);
 extern int _cds_ft_debug_flag_has_external_chain(struct cds_ft *ft, void *flag);
@@ -14264,6 +14265,17 @@ static int rekey_fold_collapse_two_child(int rank, int ordered_list)
 			return -1;
 		}
 	}
+	if (!_cds_ft_debug_ft_skip_compressed(ft)) {
+		/*
+		 * The build has skip mode, but this group runs without it.
+		 * Then a one-child internal is legal and the collapse must
+		 * not arm.
+		 */
+		diag("rekey_fold_collapse_two_child: skipped, the group runs "
+			"without skip-compressed encoding");
+		ret = 0;
+		goto out_destroy;
+	}
 	rcu_read_lock();
 	cds_ft_insert(ft, (const uint8_t *) "bbbc", 4, &node_alloc(1)->node);
 	cds_ft_insert(ft, (const uint8_t *) "baaab", 5, &node_alloc(2)->node);
@@ -14315,6 +14327,7 @@ static int rekey_fold_collapse_two_child(int rank, int ordered_list)
 out:
 	rcu_read_unlock();
 	drain_trie(ft);
+out_destroy:
 	rcu_barrier();
 	cds_ft_destroy(ft);
 	cds_ft_group_destroy(group);

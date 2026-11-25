@@ -81,7 +81,11 @@ void ft_test_node_init(struct ft_test_node *node, uint64_t key)
 	node->key = key;
 }
 
-extern volatile int test_go, test_stop;
+/*
+ * The start and stop flags of the test threads.  They are set with release
+ * and read with acquire.
+ */
+extern int test_go, test_stop;
 
 extern unsigned long wdelay;
 
@@ -126,12 +130,12 @@ extern pthread_mutex_t affinity_mutex;
  */
 static inline int test_duration_write(void)
 {
-	return !test_stop;
+	return !uatomic_load(&test_stop, CMM_ACQUIRE);
 }
 
 static inline int test_duration_read(void)
 {
-	return !test_stop;
+	return !uatomic_load(&test_stop, CMM_ACQUIRE);
 }
 
 extern DECLARE_URCU_TLS(unsigned long long, nr_writes);

@@ -136,9 +136,10 @@ struct ft_test_node {
 	 * This is the representation the speculative inequality lookup copies
 	 * from the leaf, so it must hold exactly the bytes the trie navigates
 	 * on (NOT the host-order @key shadow above).  create_fixed_ft points
-	 * speculative_key_offset here.
+	 * speculative_key_offset here.  It must hold the longest key a test
+	 * inserts: a test which copies more writes past the end of the node.
 	 */
-	uint8_t okey[8];
+	uint8_t okey[16];
 };
 
 static inline
@@ -944,12 +945,33 @@ static unsigned long inv_repeat(const char *filter)
 	return n ? n : 1;
 }
 
+/*
+ * Return true if @name is in @filter, a comma-separated list of test names.
+ * A NULL @filter selects every test.
+ */
+static bool inv_filter_match(const char *filter, const char *name)
+{
+	size_t len = strlen(name);
+	const char *p = filter;
+
+	if (!filter)
+		return true;
+	while (p) {
+		if (!strncmp(p, name, len) && (p[len] == ',' || p[len] == '\0'))
+			return true;
+		p = strchr(p, ',');
+		if (p)
+			p++;
+	}
+	return false;
+}
+
 #define RUN_TEST(fn)							\
 	do {								\
 		unsigned long rep_n__, rep_i__;				\
 		int rep_ok__ = 1;					\
 									\
-		if (filter && strcmp(filter, #fn) != 0) {		\
+		if (!inv_filter_match(filter, #fn)) {			\
 			skip(1, "filtered out: " #fn);			\
 			break;						\
 		}							\
@@ -6623,6 +6645,9 @@ static int rkmix_probe_writer_reached(struct cds_ft *ft, struct rk_writer_arg *w
 #define WDJ_KLEN	16	/* deep keys -- the whole point of the arm */
 #define WDJ_JUNCT	12	/* the byte src/dst diverge at: the junction */
 #define WDJ_SEED	6	/* keys seeded under each mover's source */
+
+_Static_assert(WDJ_KLEN <= sizeof(((struct ft_test_node *) 0)->okey),
+	"a WDJ key does not fit in ft_test_node.okey");
 #define WDJ_TOP_MOVER	0x10
 #define WDJ_TOP_POINT	0x40
 
