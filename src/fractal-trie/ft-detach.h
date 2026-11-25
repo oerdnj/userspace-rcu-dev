@@ -150,7 +150,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			struct cds_ft_metadata *m = cds_ft_item_to_metadata(
 				ft_node_ptr(detached->root));
 
-			CMM_STORE_SHARED(m->parent_word, ft_trie_parent(detached));
+			uatomic_store(&m->parent_word, ft_trie_parent(detached));
 			ft_meta_parent_slot_offset_set(m, 0);
 		}
 		uatomic_store(&detached->max_used_key_len,

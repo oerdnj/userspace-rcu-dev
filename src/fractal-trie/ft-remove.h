@@ -286,7 +286,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			}
 			g->deferred[idx].child =
 				(struct cds_ft_inode_flag *) topmost_external_nodes;
-			CMM_STORE_SHARED(*g->deferred[idx].slot,
+			uatomic_store(g->deferred[idx].slot,
 				(struct cds_ft_inode_flag *) topmost_external_nodes);
 			return 0;
 		}
@@ -1902,7 +1902,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 #endif
 	FT_TP(chain_compress_enter, (const void *) iter_node_flag,
 		(const void *) iter_meta,
-		(const void *) CMM_LOAD_SHARED(iter_meta->external_nodes),
+		(const void *) rcu_dereference(iter_meta->external_nodes),
 		(const void *) freeze_leaf, (const void *) dead_cell,
 		plan_nr_child, (int) record_only);
 	/*
@@ -2961,7 +2961,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 					!ft_hlist_chain_plan_ok(ft,
 						ft_flip_txn_handle(txn),
 						freeze_leaf, freeze_len)) {
-				void *raw = CMM_LOAD_SHARED(freeze_leaf->next);
+				void *raw = rcu_dereference(freeze_leaf->next);
 
 				FT_TP(lock_stolen, (const void *) freeze_leaf,
 					0u, (const void *) raw, 0u,
@@ -3001,7 +3001,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 */
 		FT_TP(chain_compress_exit, (const void *) iter_node_flag,
 			(const void *) iter_meta,
-			(const void *) CMM_LOAD_SHARED(iter_meta->external_nodes),
+			(const void *) rcu_dereference(iter_meta->external_nodes),
 			-1);
 		if (ft_remove_commit_rec(ft, &rec, dead_cell, run, txn,
 				record_only) != URCU_TXN_STATUS_OK) {
@@ -3059,7 +3059,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	}
 	FT_TP(chain_compress_exit, (const void *) iter_node_flag,
 		(const void *) iter_meta,
-		(const void *) CMM_LOAD_SHARED(iter_meta->external_nodes), 0);
+		(const void *) rcu_dereference(iter_meta->external_nodes), 0);
 	free_cds_ft_node(ft, ft_node_ptr(iter_node_flag));
 	if (parent_cn)
 		free_compressed_node(ft, parent_cn);
@@ -3547,7 +3547,8 @@ int ft_detach_node(struct cds_ft *ft,
 		 * compressed -> the removed leaf).
 		 */
 		struct cds_ft_inode_flag *detach_child =
-			ft_resolve_flip_proxy(*detach_node_flag_ptr);
+			ft_resolve_flip_proxy(
+			rcu_dereference(*detach_node_flag_ptr));
 
 		/*
 		 * ☠ THE SLOT MUST STILL HOLD THE CALLER'S LEAF.  Every
@@ -3976,7 +3977,7 @@ int ft_detach_node(struct cds_ft *ft,
 						pair_bad, nr_branch, (void *) cur,
 						(void *) metadata, (void *) resolved_parent,
 						(int) is_root, (void *) detach_parent_flag_ptr,
-						(void *) CMM_LOAD_SHARED(*detach_parent_flag_ptr),
+						(void *) rcu_dereference(*detach_parent_flag_ptr),
 						(void *) held, (void *) held_res,
 						(void *) entry_holder_slot,
 						(void *) dbg_arg_parent_slot, (int) climbed);
@@ -4059,7 +4060,7 @@ int ft_detach_node(struct cds_ft *ft,
 			FT_DT_INC(ft_dt_climb_tomb);
 			return -EAGAIN;
 		}
-		if (!prev_external_nodes_found && (nr_child == 1 && !metadata->external_nodes && !is_root)) {
+		if (!prev_external_nodes_found && (nr_child == 1 && !rcu_dereference(metadata->external_nodes) && !is_root)) {
 			nr_clear++;
 		}
 		nr_branch++;
@@ -4087,7 +4088,8 @@ int ft_detach_node(struct cds_ft *ft,
 		 * `&& topmost_external_nodes` guard.
 		 */
 		if (prev_external_nodes_found || nr_child > 1 ||
-		    (metadata->external_nodes && topmost_external_nodes) ||
+		    (uatomic_load(&metadata->external_nodes) &&
+		     topmost_external_nodes) ||
 		    is_root) {
 			if (!is_root) {
 				struct cds_ft_metadata *parent_meta;
@@ -4176,7 +4178,7 @@ int ft_detach_node(struct cds_ft *ft,
 			 */
 			if (!ft_node_compressed(cur) &&
 					caa_unlikely(!ft_node_find_child(ft, cur,
-						*detach_node_flag_ptr, &n, NULL)))
+						rcu_dereference(*detach_node_flag_ptr), &n, NULL)))
 				return -EAGAIN;	/* stale plan: re-descend */
 			/*
 			 * PLAN -> COMMIT window (-DFT_DELAY_INJECT only, no-op
@@ -4201,9 +4203,11 @@ int ft_detach_node(struct cds_ft *ft,
 		 * surviving level.
 		 */
 		/* Resolve a parked splice proxy before republish (see above). */
-		if (metadata->external_nodes && !topmost_external_nodes) {
-			topmost_external_nodes = ft_dereference_external(
-				metadata->external_nodes);
+		struct cds_ft_node *en =
+			rcu_dereference(metadata->external_nodes);
+
+		if (en && !topmost_external_nodes) {
+			topmost_external_nodes = ft_dereference_external(en);
 			topmost_src_meta = metadata;
 			/*
 			 * The junction the prune empties.  Its head takes its
@@ -4356,8 +4360,8 @@ int ft_detach_node(struct cds_ft *ft,
 		}
 	}
 
-	iter_node_flag = *detach_parent_flag_ptr;
-	elevated_old_child = *detach_node_flag_ptr;
+	iter_node_flag = rcu_dereference(*detach_parent_flag_ptr);
+	elevated_old_child = rcu_dereference(*detach_node_flag_ptr);
 	/*
 	 * F1 / RESOLVED-POINTER CONTRACT (ft-helpers.h).  A peer mid-commit
 	 * may be recompacting or re-homing the boundary (or the detach
@@ -6872,7 +6876,7 @@ int ft_detach_node(struct cds_ft *ft,
 							(int) climbed, (int) climb_promoted,
 							(void *) entry_holder_slot,
 							(void *) entry_holder_raw,
-							(void *) CMM_LOAD_SHARED(*entry_holder_slot),
+							(void *) rcu_dereference(*entry_holder_slot),
 							(void *) holder_old_flag,
 							(void *) detach_node_flag_ptr,
 							(void *) detach_parent_flag_ptr,
@@ -7456,8 +7460,9 @@ int ft_detach_node(struct cds_ft *ft,
 		 */
 		if (!record_only &&
 		    ft_meta_nr_child(iter_meta) == 1 &&
-		    !iter_meta->external_nodes &&
-		    ft_parent_node(iter_meta->parent_word) != NULL) {
+		    !rcu_dereference(iter_meta->external_nodes) &&
+		    ft_parent_node(
+			    rcu_dereference(iter_meta->parent_word)) != NULL) {
 			/*
 			 * Post-commit: the structural commit consumed its own
 			 * registry, so only the orphan marks this op still owns
@@ -10787,7 +10792,8 @@ bool ft_locate_chain_head(struct cds_ft *ft, struct cds_ft_node *head,
 	 * be in flight must not decide it.
 	 */
 	return (struct cds_ft_node *) ft_node_ptr(
-			ft_resolve_flip_proxy(**head_slot_p)) == head;
+			ft_resolve_flip_proxy(
+				rcu_dereference(**head_slot_p))) == head;
 }
 
 

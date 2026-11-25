@@ -105,7 +105,7 @@ static inline
 void ft_rec_dbg_will_commit(const struct ft_rec_dbg *r)
 {
 #ifdef FT_DEBUG_SLOT_HIST
-	void *cur = CMM_LOAD_SHARED(*r->slot);
+	void *cur = rcu_dereference(*r->slot);
 
 	if (cur != r->old_ptr)
 		ft_sh_clobber(r, cur);

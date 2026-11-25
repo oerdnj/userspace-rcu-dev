@@ -129,7 +129,7 @@ int ft_tk_site_register(struct ft_tk_site *s)
 		id = ft_tk_nr_sites++;
 		ft_tk_sites[id] = s;
 	}
-	CMM_STORE_SHARED(s->id, id);
+	uatomic_store(&s->id, id);
 unlock:
 	pthread_mutex_unlock(&ft_tk_lock);
 	return id;
@@ -138,7 +138,7 @@ unlock:
 static inline
 int ft_tk_site_id(struct ft_tk_site *s)
 {
-	int id = CMM_LOAD_SHARED(s->id);
+	int id = uatomic_load(&s->id);
 
 	if (caa_likely(id >= 0))
 		return id;

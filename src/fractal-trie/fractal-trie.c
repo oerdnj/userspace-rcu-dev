@@ -1044,7 +1044,7 @@ void cds_ft_debug_ext_violation(unsigned int kind, struct cds_ft *ft,
 	int anc_tomb = -1, anc_root = -1;
 
 	if (node) {
-		prev = CMM_LOAD_SHARED(node->prev);
+		prev = rcu_dereference(node->prev);
 		holder = ft_node_holder(ft, node);
 	}
 	if (holder && !ft_node_external(holder)) {
@@ -1071,7 +1071,7 @@ void cds_ft_debug_ext_violation(unsigned int kind, struct cds_ft *ft,
 			if (cn)
 				hext = (struct cds_ft_node *)
 					ft_node_ptr(ft_resolve_flip_proxy(
-						CMM_LOAD_SHARED(cn->child)));
+						rcu_dereference(cn->child)));
 		} else if (hm) {
 			hext = hm->external_nodes;
 		}
@@ -1103,11 +1103,11 @@ void cds_ft_debug_ext_violation(unsigned int kind, struct cds_ft *ft,
 			if (anc_tomb < 0 &&
 			    (ft_meta_state_load(m) & FT_STATE_TOMBSTONE))
 				anc_tomb = hops;
-			if (ft_parent_is_trie(CMM_LOAD_SHARED(m->parent_word))) {
+			if (ft_parent_is_trie(rcu_dereference(m->parent_word))) {
 				anc_root = hops;
 				break;
 			}
-			nf = ft_parent_node(CMM_LOAD_SHARED(m->parent_word));
+			nf = ft_parent_node(rcu_dereference(m->parent_word));
 		}
 	}
 	FT_TP(ext_violation, kind, node, holder, hext, (uint64_t) hstate,

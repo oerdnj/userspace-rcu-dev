@@ -41,7 +41,7 @@ void (*cds_ft_dbg_interleave_hook)(int point);
 # define FT_INTERLEAVE(point)						\
 	do {								\
 		void (*_ft_il)(int) =					\
-			CMM_LOAD_SHARED(cds_ft_dbg_interleave_hook);	\
+			uatomic_load(&cds_ft_dbg_interleave_hook);	\
 		if (_ft_il)						\
 			_ft_il(point);					\
 	} while (0)
@@ -1840,7 +1840,7 @@ static void ft_sw_stale_check(const struct ft_rec_dbg *r)
 	int nbt, isproxy = 0;
 
 	uatomic_inc(&ft_sws_checked);
-	cur = CMM_LOAD_SHARED(*r->slot);
+	cur = rcu_dereference(*r->slot);
 	if (ft_txn_is_proxy(cur, r->tag)) {
 		/* A peer parked on a word this op records SW: no exclusion. */
 		uatomic_inc(&ft_sws_proxy);
@@ -1970,7 +1970,7 @@ static void ft_sw_commit_check(const struct ft_rec_dbg *r)
 	int nbt, isproxy;
 
 	uatomic_inc(&ft_swc_checked);
-	cur = CMM_LOAD_SHARED(*r->slot);
+	cur = rcu_dereference(*r->slot);
 	if (cur == r->old_ptr)
 		return;
 	isproxy = ft_txn_is_proxy(cur, r->tag);
@@ -2417,11 +2417,11 @@ static void ft_sh_note(const struct ft_rec_dbg *r, void *v)
 static void ft_sh_replay(const char *name, void *const *slot)
 {
 	struct ft_sh_slot *sl = ft_sh_slot_of(slot);
-	unsigned long h = CMM_LOAD_SHARED(sl->head);
+	unsigned long h = rcu_dereference(sl->head);
 	unsigned long i = h > FT_SH_HIST ? h - FT_SH_HIST : 0;
 
 	fprintf(stderr, "FT SLOT HIST %s %p = %p now (%lu stores hashed here)\n",
-		name, (void *) slot, CMM_LOAD_SHARED(*slot), h);
+		name, (void *) slot, rcu_dereference(*slot), h);
 	for (; i < h; i++) {
 		const struct ft_sh_ev *e = &sl->ev[i % FT_SH_HIST];
 		const char *ph = e->val == e->nw ? "NEW" :
@@ -2545,17 +2545,17 @@ void ft_sh_stall_dump(struct cds_ft *ft, const char *who)
 	fprintf(stderr, "FT SLOT HIST STALL: %s (tid %ld) retried > 2 s on trie %p\n",
 		who, (long) syscall(SYS_gettid), (void *) ft);
 	if (ft->ordered_list) {
-		h = ft_txn_list_resolve(CMM_LOAD_SHARED(s->next));
+		h = ft_txn_list_resolve(rcu_dereference(s->next));
 		f = h && h != s ?
-			ft_txn_list_resolve(CMM_LOAD_SHARED(h->next)) : NULL;
+			ft_txn_list_resolve(rcu_dereference(h->next)) : NULL;
 		fprintf(stderr, "FT SLOT HIST head: sentinel %p {next %p prev %p} "
 			"first %p {next %p prev %p} succ %p {next %p prev %p}\n",
-			(void *) s, CMM_LOAD_SHARED(s->next),
-			CMM_LOAD_SHARED(s->prev), (void *) h,
-			h ? CMM_LOAD_SHARED(h->next) : NULL,
-			h ? CMM_LOAD_SHARED(h->prev) : NULL, (void *) f,
-			f ? CMM_LOAD_SHARED(f->next) : NULL,
-			f ? CMM_LOAD_SHARED(f->prev) : NULL);
+			(void *) s, rcu_dereference(s->next),
+			rcu_dereference(s->prev), (void *) h,
+			h ? rcu_dereference(h->next) : NULL,
+			h ? rcu_dereference(h->prev) : NULL, (void *) f,
+			f ? rcu_dereference(f->next) : NULL,
+			f ? rcu_dereference(f->prev) : NULL);
 		ft_sh_replay("sentinel.next", (void **) &s->next);
 		ft_sh_replay("sentinel.prev", (void **) &s->prev);
 		if (h && h != s) {
@@ -6062,7 +6062,7 @@ static int ft_ch_meta_reachable(const struct cds_ft *ft,
 		uintptr_t cur;
 
 		ft_ch_reach_hop = hops;
-		praw = (struct cds_ft_inode_flag *) CMM_LOAD_SHARED(m->parent_word);
+		praw = (struct cds_ft_inode_flag *) rcu_dereference(m->parent_word);
 		if (!praw) {
 			ft_ch_reach_why = FT_CH_R_NOPW;
 			return 0;
@@ -6076,7 +6076,7 @@ static int ft_ch_meta_reachable(const struct cds_ft *ft,
 			ft_ch_reach_why = FT_CH_R_ROOT_OWNER;
 			if (!owner || owner->exclusive)
 				return 0;
-			rv = (struct cds_ft_inode_flag *) CMM_LOAD_SHARED(owner->root);
+			rv = (struct cds_ft_inode_flag *) rcu_dereference(owner->root);
 			if (!rv)
 				return 0;
 			if (ft_node_flip_proxy(rv))
@@ -6093,7 +6093,7 @@ static int ft_ch_meta_reachable(const struct cds_ft *ft,
 			ft_ch_reach_why = FT_CH_R_PEXT;
 			return 0;
 		}
-		cur = CMM_LOAD_SHARED(m->parent_slot_offset);
+		cur = uatomic_load(&m->parent_slot_offset);
 		if (cur & FT_STATE_PROXY)
 			return -1;
 		slot = (struct cds_ft_inode_flag **) ((char *) ft_node_ptr(parent) +
@@ -6102,7 +6102,7 @@ static int ft_ch_meta_reachable(const struct cds_ft *ft,
 			ft_ch_reach_why = FT_CH_R_SLOT_OUT;
 			return 0;
 		}
-		val = (struct cds_ft_inode_flag *) CMM_LOAD_SHARED(*slot);
+		val = (struct cds_ft_inode_flag *) rcu_dereference(*slot);
 		if (!val) {
 			ft_ch_reach_why = FT_CH_R_SLOT_NULL;
 			return 0;
@@ -6173,7 +6173,7 @@ static int ft_ch_head_reachable(const struct cds_ft *ft,
 		ft_ch_head_why = 2;
 		if (!owner || owner->exclusive)
 			return 0;
-		rv = (struct cds_ft_inode_flag *) CMM_LOAD_SHARED(owner->root);
+		rv = (struct cds_ft_inode_flag *) rcu_dereference(owner->root);
 		if (rv && ft_node_flip_proxy(rv))
 			return -1;
 		return rv && (struct cds_ft_node *) ft_node_ptr(rv) == en;
@@ -9016,7 +9016,7 @@ static int ft_sa_rec_slot(const struct ft_tk_site *site, void *pc0, void *pc1)
 
 	for (i = 0; i < FT_SA_REC_ENTRIES; i++) {
 		idx = (unsigned int) ((h + i) & (FT_SA_REC_ENTRIES - 1));
-		if (!CMM_LOAD_SHARED(ft_sa_rec_keys[idx].valid))
+		if (!uatomic_load(&ft_sa_rec_keys[idx].valid))
 			break;
 		if (ft_sa_rec_keys[idx].site == site &&
 				ft_sa_rec_keys[idx].pc0 == pc0 &&
@@ -9030,7 +9030,7 @@ static int ft_sa_rec_slot(const struct ft_tk_site *site, void *pc0, void *pc1)
 			ft_sa_rec_keys[idx].site = site;
 			ft_sa_rec_keys[idx].pc0 = pc0;
 			ft_sa_rec_keys[idx].pc1 = pc1;
-			CMM_STORE_SHARED(ft_sa_rec_keys[idx].valid, 1);
+			uatomic_store(&ft_sa_rec_keys[idx].valid, 1);
 			pthread_mutex_unlock(&ft_sa_rec_lock);
 			return (int) idx;
 		}
@@ -12706,7 +12706,7 @@ bool ft_dlm_member_linked(const struct cds_ft *ft,
 	if (!slot)
 		return false;
 	v = ft_resolve_flip_proxy((struct cds_ft_inode_flag *)
-			CMM_LOAD_SHARED(*slot));
+			rcu_dereference(*slot));
 	if (!v)
 		return false;
 	/*
@@ -12965,7 +12965,7 @@ int ft_bl_upwalk_depth(const struct cds_ft *ft, struct cds_ft_inode_flag *nf,
 		if (!m)
 			return 1;
 		par = (struct cds_ft_inode_flag *)
-				CMM_LOAD_SHARED(m->parent_word);
+				rcu_dereference(m->parent_word);
 		if (ft_parent_is_trie(par)) {
 			*out = depth;		/* reached the ROOT */
 			return 0;
@@ -13146,7 +13146,7 @@ static void ft_ba_note(const char *fn, int line, const struct cds_ft *ft,
 	int i;
 
 	for (i = 0; i < FT_BA_SITES; i++) {
-		const char *cur = CMM_LOAD_SHARED(ft_ba_sites[i].fn);
+		const char *cur = uatomic_load(&ft_ba_sites[i].fn);
 
 		if (cur == fn && ft_ba_sites[i].line == line) {
 			st = &ft_ba_sites[i];
@@ -13163,7 +13163,7 @@ static void ft_ba_note(const char *fn, int line, const struct cds_ft *ft,
 				break;
 			if (!ft_ba_sites[i].fn) {
 				ft_ba_sites[i].line = line;
-				CMM_STORE_SHARED(ft_ba_sites[i].fn, fn);
+				uatomic_store(&ft_ba_sites[i].fn, fn);
 				break;
 			}
 		}
@@ -13279,7 +13279,7 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	 */
 	if (ft_bulk_self_depth) {
 		struct cds_ft_inode_flag *root__ = (struct cds_ft_inode_flag *)
-				CMM_LOAD_SHARED(ft->root);
+				rcu_dereference(ft->root);
 		int j__;
 
 		uatomic_inc(&ft_bl_acq);
@@ -16930,7 +16930,7 @@ void ft_flip_txn_lock_born(struct ft_flip_txn *t, struct cds_ft_metadata *meta)
 	(void) t;
 	return;
 #endif
-	CMM_STORE_SHARED(meta->state, s | FT_STATE_LOCK);
+	uatomic_store(&meta->state, s | FT_STATE_LOCK);
 	FT_DT_TAKE(meta);
 #ifdef FT_DEBUG_BORN_RELEASE
 	/*
@@ -18399,7 +18399,7 @@ struct cds_ft_node *ft_node_mark_removed_flip(struct cds_ft *ft,
 {
 	(void) ft;
 	for (;;) {
-		struct cds_ft_node *old = CMM_LOAD_SHARED(node->next);
+		struct cds_ft_node *old = rcu_dereference(node->next);
 
 		if (caa_unlikely((uintptr_t) old & FT_HLIST_TAG)) {
 			caa_cpu_relax();
@@ -21656,7 +21656,7 @@ void ft_set_parent_raw(struct cds_ft *ft, struct cds_ft_inode_flag *child,
 	{
 		struct cds_ft_metadata *dm = cds_ft_item_to_metadata(ft_node_ptr(child));
 		struct cds_ft_inode_flag *oldp = ft_parent_node(
-			(struct cds_ft_inode_flag *) CMM_LOAD_SHARED(dm->parent_word));
+			(struct cds_ft_inode_flag *) rcu_dereference(dm->parent_word));
 		struct cds_ft_inode_flag *newp = ft_parent_node(value);
 		static unsigned long ft_dt_raw_pw;
 
@@ -21668,7 +21668,7 @@ void ft_set_parent_raw(struct cds_ft *ft, struct cds_ft_inode_flag *child,
 
 			fprintf(stderr, "FT RAW-REPARENT-WORD meta=%p old_parent=%p new_parent=%p off=%u state=%#lx\n",
 				(void *) dm, (void *) oldp, (void *) newp,
-				(unsigned int) FT_PSO_DECODE(CMM_LOAD_SHARED(dm->parent_slot_offset)),
+				(unsigned int) FT_PSO_DECODE(uatomic_load(&dm->parent_slot_offset)),
 				(unsigned long) ft_meta_state_load(dm));
 			backtrace_symbols_fd(bt, nbt, 2);
 		}
@@ -25281,11 +25281,11 @@ bool ft_glue_held_snap_one(const struct ft_glue *g,
 						ft_meta_state_load(
 							g->free_list[i].holder)
 						: 0UL,
-						(unsigned long) CMM_LOAD_SHARED(
-							meta->dbg_owner_tid),
+						(unsigned long) uatomic_load(
+							&meta->dbg_owner_tid),
 						g->free_list[i].holder ?
-						(unsigned long) CMM_LOAD_SHARED(
-							g->free_list[i].holder
+						(unsigned long) uatomic_load(
+							&g->free_list[i].holder
 							->dbg_owner_tid) : 0UL,
 						(unsigned long)
 							pthread_self());

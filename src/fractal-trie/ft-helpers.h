@@ -330,14 +330,15 @@ bool ft_in_place_insert_excl_ok(const struct cds_ft *ft)
 static inline
 struct cds_ft_node *ft_node_next(const struct cds_ft_node *node)
 {
-	return (struct cds_ft_node *) ((uintptr_t) node->next &
+	return (struct cds_ft_node *) ((uintptr_t) rcu_dereference(node->next) &
 			~CDS_FT_NODE_REMOVED_FLAG);
 }
 
 static inline
 bool ft_node_is_removed(const struct cds_ft_node *node)
 {
-	return ((uintptr_t) node->next & CDS_FT_NODE_REMOVED_FLAG) != 0;
+	return ((uintptr_t) rcu_dereference(node->next) &
+		CDS_FT_NODE_REMOVED_FLAG) != 0;
 }
 
 /*
@@ -2880,7 +2881,7 @@ void ft_set_parent_slot(struct cds_ft_metadata *meta,
 	 */
 	{
 		struct cds_ft_inode_flag *oldp = ft_parent_node(
-			(struct cds_ft_inode_flag *) CMM_LOAD_SHARED(meta->parent_word));
+			(struct cds_ft_inode_flag *) rcu_dereference(meta->parent_word));
 		static unsigned long ft_dt_raw_reparent;
 
 		if (oldp && !ft_node_flip_proxy(oldp) &&
@@ -2891,7 +2892,7 @@ void ft_set_parent_slot(struct cds_ft_metadata *meta,
 
 			fprintf(stderr, "FT RAW-REPARENT-OFFSET meta=%p old_parent=%p new_parent=%p old_off=%u new_off=%u state=%#lx\n",
 				(void *) meta, (void *) oldp, (void *) parent,
-				(unsigned int) FT_PSO_DECODE(CMM_LOAD_SHARED(meta->parent_slot_offset)),
+				(unsigned int) FT_PSO_DECODE(uatomic_load(&meta->parent_slot_offset)),
 				(unsigned int) (((char *) slot - (char *) ft_node_ptr(parent)) / sizeof(void *)),
 				(unsigned long) ft_meta_state_load(meta));
 			backtrace_symbols_fd(bt, nbt, 2);
@@ -3264,10 +3265,10 @@ static void ft_dual_slot_unsettled(const char *fn, int line, void *slot, void *v
 # define FT_DUAL_SLOT_SETTLED_CHECK(slot, held)				\
 	do {								\
 		if (caa_unlikely((held) && (slot) &&			\
-				ft_node_flip_proxy(CMM_LOAD_SHARED(*(slot))))) \
+				ft_node_flip_proxy(rcu_dereference(*slot)))) \
 			ft_dual_slot_unsettled(__func__, __LINE__,	\
 				(void *) (slot),			\
-				(void *) CMM_LOAD_SHARED(*(slot)));	\
+				(void *) rcu_dereference(*slot));	\
 	} while (0)
 #else
 # define FT_DUAL_SLOT_SETTLED_CHECK(slot, held)	do { } while (0)
@@ -3377,7 +3378,7 @@ bool ft_dt_live_via_pair(const struct cds_ft_metadata *meta,
 		struct cds_ft_inode_flag **slot;
 		uintptr_t cur;
 
-		praw = (struct cds_ft_inode_flag *) CMM_LOAD_SHARED(m->parent_word);
+		praw = (struct cds_ft_inode_flag *) rcu_dereference(m->parent_word);
 		if (!praw || ft_node_flip_proxy(praw))
 			return false;
 		if (ft_parent_is_root_position(praw)) {
@@ -3400,7 +3401,7 @@ bool ft_dt_live_via_pair(const struct cds_ft_metadata *meta,
 			owner = ft_parent_trie(praw);
 			if (owner->exclusive)
 				return false;
-			rv = (struct cds_ft_inode_flag *) CMM_LOAD_SHARED(owner->root);
+			rv = (struct cds_ft_inode_flag *) rcu_dereference(owner->root);
 			return rv && !ft_node_flip_proxy(rv) &&
 				ft_node_ptr(ft_skip_child_ptr(rv)) ==
 				cds_ft_metadata_to_item((struct cds_ft_metadata *) m);
@@ -3415,14 +3416,14 @@ bool ft_dt_live_via_pair(const struct cds_ft_metadata *meta,
 				&& !ft_node_skip_compressed(parent)
 #endif
 				;
-		cur = CMM_LOAD_SHARED(m->parent_slot_offset);
+		cur = uatomic_load(&m->parent_slot_offset);
 		if (cur & FT_STATE_PROXY)
 			return false;
 		slot = (struct cds_ft_inode_flag **) ((char *) ft_node_ptr(parent) +
 				FT_PSO_DECODE(cur) * sizeof(void *));
 		if (!ft_slot_in_node(parent, slot))
 			return false;
-		val = (struct cds_ft_inode_flag *) CMM_LOAD_SHARED(*slot);
+		val = (struct cds_ft_inode_flag *) rcu_dereference(*slot);
 		if (!val || ft_node_flip_proxy(val))
 			return false;
 		if (ft_node_ptr(ft_skip_child_ptr(val)) !=
@@ -3472,7 +3473,7 @@ static void ft_dt_pso_store_probe(const struct cds_ft_metadata *meta, unsigned i
 	bool internal;
 
 	uatomic_inc(&ft_dt_pso_asked);
-	cur = CMM_LOAD_SHARED(meta->parent_slot_offset);
+	cur = uatomic_load(&meta->parent_slot_offset);
 	if (!(cur & FT_STATE_PROXY) && FT_PSO_DECODE(cur) == (uintptr_t) off)
 		return;			/* same-value republish: the pair does not move */
 	if (!ft_dt_live_via_pair(meta, &internal))
@@ -4422,7 +4423,7 @@ void _ft_publish_to_parent_meta_at(const char *pub_fn, int pub_line,
 			cn->len,
 			cn->key_bytes,
 			(const void *) new_child,
-			(const void *) ft_parent_node(CMM_LOAD_SHARED(cn_meta->parent_word)));
+			(const void *) ft_parent_node(rcu_dereference(cn_meta->parent_word)));
 	}
 	FT_TP(publish_to_parent, (const void *) parent_nf,
 		(const void *) parent_slot,

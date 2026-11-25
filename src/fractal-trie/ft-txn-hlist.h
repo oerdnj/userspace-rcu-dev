@@ -1199,7 +1199,7 @@ static inline
 void ft_hlist_why_tail(struct cds_ft *ft, struct ft_txn *txn,
 		struct cds_ft_node *head)
 {
-	void *live = (void *) CMM_LOAD_SHARED(head->next);
+	void *live = (void *) rcu_dereference(head->next);
 
 	struct ft_hlist_why_site *e = NULL;
 	const char *fn = ft_hlist_why_fn ? ft_hlist_why_fn : "(unstamped)";
@@ -1292,7 +1292,7 @@ void ft_hlist_why_tail(struct cds_ft *ft, struct ft_txn *txn,
 #ifdef FEATURE_FT_HOLD_TRACE
 		{
 			unsigned long owner = hm ?
-				CMM_LOAD_SHARED(hm->dbg_owner_tid) : 0;
+				uatomic_load(&hm->dbg_owner_tid) : 0;
 
 			if (!owner)
 				uatomic_inc(&e->excl_none);
@@ -1385,7 +1385,7 @@ unsigned int ft_hlist_chain_len_at(struct cds_ft_node *head)
 
 	while (head) {
 		n++;
-		head = ft_hlist_resolve((void *) CMM_LOAD_SHARED(head->next));
+		head = ft_hlist_resolve((void *) rcu_dereference(head->next));
 	}
 	return n;
 }

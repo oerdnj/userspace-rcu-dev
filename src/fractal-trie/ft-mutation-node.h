@@ -2890,7 +2890,7 @@ skip_copy:
 
 			fprintf(stderr, "FT RECOMPACT-OVERFLOW old state=%#lx parent_word=%#lx\n",
 				(unsigned long) ft_meta_state_load(metadata),
-				(unsigned long) CMM_LOAD_SHARED(metadata->parent_word));
+				(unsigned long) rcu_dereference(metadata->parent_word));
 			for (i = 0; i < pc; i++) {
 				struct cds_ft_inode_flag *it;
 				uint8_t v;
@@ -2903,7 +2903,7 @@ skip_copy:
 						(uint64_t) (uintptr_t) ft_node_ptr(it));
 				if (it && !ft_node_flip_proxy(it) && ft_node_external(it))
 					fprintf(stderr, "FT RECOMPACT-OVERFLOW   raw prev=%p\n",
-						(void *) CMM_LOAD_SHARED(((struct cds_ft_node *) ft_node_ptr(it))->prev));
+						(void *) rcu_dereference(((struct cds_ft_node *) ft_node_ptr(it))->prev));
 				fprintf(stderr, "FT RECOMPACT-OVERFLOW   slot[%u] byte=%u ptr=%p proxy=%d ext=%d removed=%d holder=%p next=%p\n",
 					i, (unsigned int) v, (void *) it,
 					it ? (int) ft_node_flip_proxy(it) : -1,
@@ -2913,7 +2913,7 @@ skip_copy:
 					(it && !ft_node_flip_proxy(it) && ft_node_external(it)) ?
 						(void *) ft_node_holder(ft, (struct cds_ft_node *) ft_node_ptr(it)) : NULL,
 					(it && !ft_node_flip_proxy(it) && ft_node_external(it)) ?
-						(void *) CMM_LOAD_SHARED(((struct cds_ft_node *) ft_node_ptr(it))->next) : NULL);
+						(void *) rcu_dereference(((struct cds_ft_node *) ft_node_ptr(it))->next) : NULL);
 			}
 #ifdef FT_ENABLE_TRACING
 			{
@@ -2926,7 +2926,7 @@ skip_copy:
 #endif
 			{
 				struct cds_ft_inode_flag *pnf = ft_parent_node(
-					CMM_LOAD_SHARED(metadata->parent_word));
+					rcu_dereference(metadata->parent_word));
 				struct cds_ft_inode_flag **pslot = NULL;
 				struct cds_ft_inode_flag *pchild = NULL;
 

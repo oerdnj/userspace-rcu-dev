@@ -1858,7 +1858,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 * compressed nodes are never at the root.
 	 */
 	FT_TP(tree_edge_set, (const void *) ft,
-		(const void *) ft_parent_node(CMM_LOAD_SHARED(cn_meta->parent_word)),
+		(const void *) ft_parent_node(rcu_dereference(cn_meta->parent_word)),
 		(unsigned int) (node_depth - 1),
 		(uint8_t) iter_key[-1],
 		(const void *) top_flag);
@@ -2511,8 +2511,11 @@ int ft_attach_node(struct cds_ft *ft,
 	 * fails fast.  The publish re-checks the slot under its owner's lock.
 	 * No-op under retained exclusion.
 	 */
-	if ((old_node_flag_ptr && ft_node_ptr_raw(*old_node_flag_ptr) && !external_nodes) ||
-			(attach_node_flag_ptr && ft_node_ptr_raw(*attach_node_flag_ptr) !=
+	if ((old_node_flag_ptr &&
+			ft_node_ptr_raw(rcu_dereference(*old_node_flag_ptr)) &&
+			!external_nodes) ||
+			(attach_node_flag_ptr && ft_node_ptr_raw(
+				rcu_dereference(*attach_node_flag_ptr)) !=
 				ft_node_ptr_raw(attach_node_flag))) {
 		ret = -EAGAIN;
 		goto check_error;
@@ -5330,7 +5333,7 @@ static inline void ft_irh_probe(struct cds_ft *ft, unsigned int arm,
 
 		if (slot)
 			sn = (struct cds_ft_node *) ft_node_ptr(
-				ft_resolve_flip_proxy(CMM_LOAD_SHARED(*slot)))
+				ft_resolve_flip_proxy(rcu_dereference(*slot)))
 				== displaced;
 		uatomic_inc(&ft_irh_cls[arm][lr][hr][sn]);
 		if (!lr && !hr) {
@@ -5341,14 +5344,14 @@ static inline void ft_irh_probe(struct cds_ft *ft, unsigned int arm,
 			if (uatomic_add_return(&printed, 1) <= 6)
 				fprintf(stderr, "FT IR HOLDER LIVE/LIVE: head %p prev raw %p | locked X %p state %#lx | head-holder Y %p state %#lx | X slot raw %p | txn acquire_miss=%d\n",
 					(void *) displaced,
-					CMM_LOAD_SHARED(displaced->prev),
+					rcu_dereference(displaced->prev),
 					(void *) locked,
 					(unsigned long) ft_meta_state_load(
 					    ft_flag_to_metadata(ft, locked)),
 					(void *) hh,
 					(unsigned long) ft_meta_state_load(
 						ft_flag_to_metadata(ft, hh)),
-					slot ? (void *) CMM_LOAD_SHARED(*slot) : NULL,
+					slot ? (void *) rcu_dereference(*slot) : NULL,
 					t ? (int) t->acquire_miss : -1);
 		}
 	}
@@ -7820,7 +7823,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 		{
 			static unsigned long ft_ls_checked, ft_ls_proxy,
 				ft_ls_proxy_marked;
-			void *raw = CMM_LOAD_SHARED(old_node->next);
+			void *raw = rcu_dereference(old_node->next);
 
 			uatomic_inc(&ft_ls_checked);
 			if (ft_txn_is_proxy(raw, FT_HLIST_TAG)) {

@@ -2192,7 +2192,7 @@ void ft_meta_parent_slot_offset_set(struct cds_ft_metadata *meta, unsigned int o
 	ft_dt_pso_store_probe(meta, off);
 #endif
 	for (;;) {
-		uintptr_t s = CMM_LOAD_SHARED(meta->parent_slot_offset);
+		uintptr_t s = uatomic_load(&meta->parent_slot_offset);
 
 		if (caa_unlikely(s & FT_STATE_PROXY)) {
 			caa_cpu_relax();
@@ -4763,7 +4763,7 @@ bool ft_move_active(const struct cds_ft *ft)
 	 */
 	if (ft->rekey_always_coherent)
 		return true;
-	return CMM_LOAD_SHARED(ft->move_active) != 0;
+	return uatomic_load(&ft->move_active) != 0;
 }
 
 /*
@@ -4776,7 +4776,7 @@ bool ft_move_active(const struct cds_ft *ft)
 static inline
 bool ft_bulk_active(const struct cds_ft *ft)
 {
-	return CMM_LOAD_SHARED(ft->bulk_state) != 0;
+	return uatomic_load(&ft->bulk_state) != 0;
 }
 
 /*
@@ -4974,7 +4974,7 @@ void ft_bulk_gate_enter_gp(struct cds_ft *ft, enum ft_bulk_kind kind)
 			FT_BG_TALLY(ft_bg_gp_saved);
 	}
 	if (kind == FT_BULK_COHERENT && ft->move_gate_nr++ == 0) {
-		CMM_STORE_SHARED(ft->move_active, 1);
+		uatomic_store(&ft->move_active, 1);
 		/*
 		 * A READER word, so every mode that has a reader to TRANSITION
 		 * needs the fence.  An ALWAYS-COHERENT trie has none.  Its
@@ -4998,7 +4998,7 @@ void ft_bulk_gate_enter_gp(struct cds_ft *ft, enum ft_bulk_kind kind)
 		} else
 			FT_BG_TALLY(ft_bg_gp_coherent_saved);
 	}
-	CMM_STORE_SHARED(ft->bulk_state, ft->bulk_gate_nr);
+	uatomic_store(&ft->bulk_state, ft->bulk_gate_nr);
 	if (own_gp) {
 #ifdef FT_DEBUG_ES_GP
 		{
@@ -5249,12 +5249,12 @@ void ft_bulk_gate_exit(struct cds_ft *ft, enum ft_bulk_kind kind)
 		/* Nothing of this mover's may still be unpublished here. */
 		urcu_assert_debug(!ft_flip_txn_open_nr);
 #endif
-		CMM_STORE_SHARED(ft->move_active, 0);
+		uatomic_store(&ft->move_active, 0);
 	}
 	if (--ft->bulk_gate_nr) {
-		CMM_STORE_SHARED(ft->bulk_state, ft->bulk_gate_nr);
+		uatomic_store(&ft->bulk_state, ft->bulk_gate_nr);
 	} else {
-		CMM_STORE_SHARED(ft->bulk_state, 0);
+		uatomic_store(&ft->bulk_state, 0);
 #ifdef FT_DEBUG_BULK_WINDOW
 		{
 			uint64_t now__ = ft_bw_now();
