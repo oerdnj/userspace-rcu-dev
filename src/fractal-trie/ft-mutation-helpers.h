@@ -6627,7 +6627,7 @@ void ft_ch_audit_head_at(const char *fn, int line, const struct cds_ft *ft,
  *
  * ☞ WHY THIS CLASS IS WORTH DECLARING.  Its sites are gated on
  * `in_place || defer_parent`.  @in_place is the CALLER's vouch that this op
- * holds the node.  See ft_in_place_ok's header: the point-op tier takes the
+ * holds the node.  Under the point-op tier (ft-helpers.h), the op takes the
  * node's lock or anchor BEFORE the reserve (ft_attach_node's hoist).
  *
  * A site declares HIDDEN when @defer_parent and LOCKED otherwise.  This turns

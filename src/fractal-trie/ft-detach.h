@@ -502,8 +502,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 						false, NULL, pubp, runp, NULL, NULL, 0,
 						-(long) detached_count, NULL, false,
 						NULL, NULL,
-						/* bulk: exclusive-only tier */
-						ft_in_place_delete_excl_ok(ft));
+						false /*bulk: never in place*/);
 				ft_op_end(&optxn);
 				assert(ret != -ENOENT);
 				if (ret < 0) {

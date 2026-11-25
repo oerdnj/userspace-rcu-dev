@@ -55,11 +55,7 @@
  *    hand back a live node.
  * The src side relocates too (a delete recompacts, -EFBIG), but it is not
  * load-bearing.
- * The single exception is the bulk reserves' ft_in_place_excl_ok =
- * FEATURE_FT_INSERT_IN_PLACE && ft->exclusive.  An exclusive trie has NO
- * CONCURRENT READERS by contract.  (The POINT ops' in-place tier,
- * ft_in_place_ok, is wider.  But no bulk reserve or detach vouches it: a
- * move's dst attach parent relocates on a shared trie regardless.)
+ * This holds on every trie: no bulk op edits in place (ft-helpers.h).
  *
  * So the fresh address this function gives @stop is REDUNDANT FOR THE WITNESS.
  * It is still needed for everything else below:
@@ -1948,15 +1944,13 @@ bool ft_rekey_slot_names(struct cds_ft_inode_flag *raw,
  * pair (@d_src.nfp, @d_src.nf_raw) as this one.
  */
 static inline
-bool ft_rekey_fold_shape_ok(struct cds_ft *ft,
-		struct cds_ft_inode_flag *graft_c,
+bool ft_rekey_fold_shape_ok(struct cds_ft_inode_flag *graft_c,
 		struct cds_ft_inode_flag *edited,
 		enum ft_graft_prep prep, bool merge_dst, unsigned int src_cut,
 		bool edited_dropped, bool cut_ok)
 {
 	return !merge_dst && (!src_cut || cut_ok) &&
 		prep == FT_GRAFT_PREP_NOSPLIT &&
-		!ft_in_place_excl_ok(ft) &&
 		ft_node_internal(graft_c) && !ft_node_compressed(graft_c) &&
 		!ft_node_skip_compressed(graft_c) &&
 		(ft_node_internal(edited) ||
@@ -2597,12 +2591,9 @@ int ft_rekey_merge_cow_after_decide(struct cds_ft *ft,
 {
 	/*
 	 * The whole argument below is "the detach's edits are RECORDS in the
-	 * descriptor".  An in-place tier edits nodes where they stand, so this
-	 * copy would read nothing of them.  The tier is refused, as the
-	 * same-path arm refuses it: loudly, not silently torn.
+	 * descriptor".  That holds because a bulk op never edits in place
+	 * (ft-helpers.h).
 	 */
-	if (ft_in_place_excl_ok(ft))
-		return FT_REKEY_UNCOVERED;
 	if ((size_t) cow_depth >= src_len)
 		return FT_REKEY_UNCOVERED;
 	if (!ft_rekey_cow_frame_ok(cow_nf, cow_pnf))
@@ -2862,12 +2853,6 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 		 * ft_chain_compress_fused and the matching skip in
 		 * ft_glue_apply_deferred.
 		 *
-		 * The gate is the in-place predicate, by design.  When the
-		 * in-place tier returns, a detach that edits @pnf in place
-		 * produces no witness, and the fold never fires.  The
-		 * post-detach check then turns this into a loud refusal, not
-		 * a silent torn descent.
-		 *
 		 * The DEEPER src that only passes THROUGH the frame (its
 		 * junction is below) is the POST-DETACH arm.  The detach
 		 * publishes its fresh junction INTO the frame's slot.  So
@@ -2875,7 +2860,7 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 		 * ☞ ft_rekey_merge_cow_after_decide.  So is the root, which
 		 * every source path crosses.
 		 */
-		if (src_pnf != cow_nf || ft_in_place_excl_ok(ft))
+		if (src_pnf != cow_nf)
 			return ft_rekey_merge_cow_after_decide(ft, d_dst, glue,
 					merged_pub, merged_plain, cow_nf, cow_pnf,
 					cow_slot, cow_depth, cow_pdepth, src_len,
@@ -5490,11 +5475,10 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			 * the head. There the rekey moves only the last byte
 			 * of the key, so the last-level internal node is the
 			 * same node.  Today, every internal mutation a bulk op
-			 * makes relocates on a shared trie (the bulk reserves
-			 * and detaches vouch only ft_in_place_excl_ok). So a
+			 * makes relocates: no bulk op edits in place. So a
 			 * gate written now would read "changed" for the wrong
-			 * reason. It would flip silently if that tier were
-			 * ever widened. This exit already stands on one
+			 * reason. It would flip silently if a bulk op ever
+			 * edited in place. This exit already stands on one
 			 * predicate: the attach point got no fresh address.
 			 * That is the decidable half. It fails safe. An
 			 * in-place ft_merge_build handing back a mutated D
@@ -5791,14 +5775,10 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * BP itself and chooses.  Only it knows the suffix length the
 		 * fused run has to fit in.
 		 *
-		 * The remaining terms keep the fresh-body seam the whole
-		 * design rests on:
-		 *   - a CUT source has no BP to recompact;
-		 *   - the in-place tier can reserve a slot WITHOUT
-		 *     relocating.  That would edit BP where it stands, under
-		 *     the node this flip retires.
+		 * The remaining terms skip a CUT source, which has no BP to
+		 * recompact.
 		 */
-		if (d_src.pnf && d_src.nfp && !ft_in_place_excl_ok(ft) &&
+		if (d_src.pnf && d_src.nfp &&
 				ft_node_internal(d_src.pnf) &&
 				!ft_node_compressed(d_src.pnf) &&
 				!ft_node_skip_compressed(d_src.pnf)) {
@@ -5887,7 +5867,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * CORRECTLY.  The discriminator was @prep itself.
 		 * Nothing here may reach the staleness terms.
 		 */
-		if (!src_cut && !ft_in_place_excl_ok(ft) && d_src.pnf && d_src.nfp &&
+		if (!src_cut && d_src.pnf && d_src.nfp &&
 				(ft_node_internal(d_src.pnf) ||
 					ft_node_compressed(d_src.pnf)) &&
 				!ft_node_skip_compressed(d_src.pnf) &&
@@ -6168,27 +6148,10 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		d_src.pnf == graft_c;
 	/*
 	 * ...and may that folded shape publish into &ft->root?  Only where ARMED
-	 * also means FOLDED.
-	 *
-	 * ☠ ft_node_set_nth_rec HAS AN IN-PLACE ARM THAT NEVER RUNS THE COPY
-	 * LOOP.  That loop is what consumes the drop and sets
-	 * @pending_del_folded.  Take an EXCLUSIVE trie built with
-	 * FEATURE_FT_INSERT_IN_PLACE.  There the graft can reserve BP's slot
-	 * without relocating BP.  The drop is then never consumed, and the
-	 * detach runs after all.
-	 *
-	 * Refusing that at PLAN TIME is the point.  The detach notices too
-	 * late.  By then the in-place reserve has already changed the LIVE
-	 * node.  It has set BP's bitmap bit and appended a NULL pointer.  No
-	 * bail path takes those back.  So a late refusal would leave a
-	 * permanent reserved hole, instead of a trie byte-for-byte as it
-	 * was.  The term costs nothing on a shared trie, where the bulk
-	 * reserve's ft_in_place_excl_ok is false.
-	 *
-	 * It gates ONLY the root admission, never @del_folds_into_graft
-	 * itself.  Disarming the fold would send the detach at a copy the
-	 * prepare retires.  That is the very bug the arming exists to
-	 * prevent.
+	 * also means FOLDED, which now always holds.  The graft's reserve
+	 * always relocates BP, since a bulk op never edits in place
+	 * (ft-helpers.h).  That copy loop consumes the drop and sets
+	 * @pending_del_folded.
 	 */
 	/*
 	 * THE CLIMB, HOISTED ABOVE THE ROOT GATE because the arming below feeds
@@ -6280,7 +6243,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	if (!del_folds_into_graft && climb_top && graft_c &&
 			climb_reaches_graft && climb_rest == graft_c &&
 			climb_steps >= 1 &&
-			ft_rekey_fold_shape_ok(ft, graft_c, climb_top, prep,
+			ft_rekey_fold_shape_ok(graft_c, climb_top, prep,
 				merge_dst, src_cut,
 				true /*@climb_top is DROPPED, not edited*/,
 				false /*a cut is not this arm's shape*/) &&
@@ -6337,7 +6300,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 */
 	if (!del_folds_into_graft && !bp_folds_into_graft_c && graft_c &&
 			climb_rest && !climb_reaches_graft &&
-			ft_rekey_fold_shape_ok(ft, graft_c, climb_rest, prep,
+			ft_rekey_fold_shape_ok(graft_c, climb_rest, prep,
 				merge_dst, src_cut,
 				false /*@climb_rest is EDITED*/,
 				climb_steps == 0 /*BP itself: see @cut_ok*/) &&
@@ -6496,8 +6459,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * 6/6 on nocompress and noskip.  300 and 150 moves completed.  (6/6
 	 * on FINE too, which is out of contract and reported only as a note.)
 	 */
-	root_pub_ok = !ft_in_place_excl_ok(ft) &&
-		(del_folds_into_graft || bp_folds_into_graft_c || d_src.ppnf);
+	root_pub_ok = del_folds_into_graft || bp_folds_into_graft_c ||
+		d_src.ppnf;
 	/*
 	 * A ROOT-LEVEL JUNCTION is a SHAPE this cut declines, and it owes
 	 * FT_REKEY_UNCOVERED rather than -EINVAL.  The two are not
@@ -7599,8 +7562,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 					&fresh, &fold_rest_old,
 					ft_flag_to_metadata(ft, climb_rest),
 					rn, NULL /*delete*/,
-					/* bulk: the exclusive-only in-place tier */
-					ft_in_place_delete_excl_ok(ft),
+					false /*bulk: never in place*/,
 					false /*is_root: a child of @graft_c*/,
 					fold_rest_depth, &rpub, txn,
 					NULL /*held_hint: no publish to guard*/,
@@ -7891,20 +7853,14 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * as "the obligation is broken" on a move that honours it.
 		 * Whoever lifts the gate would read it that way.
 		 *
-		 * The bulk in-place tier stays the documented exception.
-		 * ft_in_place_excl_ok requires @ft->exclusive,
-		 * "single-writer, NO CONCURRENT READERS".  So there is no
-		 * reader to owe a fresh visited-node set to.  The POINT-op
-		 * tier (ft_in_place_ok) is wider and never reaches this
-		 * arm: the graft reserve vouches only the exclusive tier.
-		 * A bulk caller may one day start vouching it.  Then this
-		 * line turns the silent witness loss into a loud one.
+		 * No bulk op edits in place, so the graft reserve always
+		 * relocates.  Should one ever edit in place, this line
+		 * turns the silent witness loss into a loud one.
 		 */
 		FT_REKEY_DST_FRESH_REACH(1);
 		urcu_assert_debug(gst_st.old_recompacted_node != NULL ||
 			(gst_st.displaced_shape &&
-				ft_glue_is_fresh(ft, &glue, gst_st.attached)) ||
-			ft_in_place_insert_excl_ok(ft));
+				ft_glue_is_fresh(ft, &glue, gst_st.attached)));
 	}
 
 	/*
@@ -8063,8 +8019,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 					.parent_held = src_parent_held,
 					.parent_guard = true },
 				&detach_rc /*old + fresh BP copies, reclaimed post-commit*/,
-				/* bulk: exclusive-only tier */
-				ft_in_place_delete_excl_ok(ft));
+				false /*bulk: never in place*/);
 	} else if (bp_folds_into_graft_c) {
 		/*
 		 * THE FOLD'S OWN HALF OF THE DETACH.  The slot drop already

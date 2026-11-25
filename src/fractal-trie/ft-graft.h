@@ -514,8 +514,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 				&fresh, &glue->old_dir_replace.old_body,
 				ft_flag_to_metadata(ft, cn_child),
 				rn, NULL /*delete*/,
-				/* bulk: the exclusive-only in-place tier */
-				ft_in_place_delete_excl_ok(ft),
+				false /*bulk: never in place*/,
 				false /*is_root: a child of @cn*/,
 				glue->old_dir_replace.depth, &rpub, glue->txn,
 				NULL /*held_hint: no publish to guard*/,
@@ -1177,13 +1176,12 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 				.parent_guard = glue->record_only },
 			&gctx,
 			/*
-			 * BULK reserve: the legacy exclusive-only in-place tier.
-			 * Nothing here holds @dest before the reserve writes
-			 * it.  Also, a same-trie move's reader-coherence
-			 * witness needs the dst attach parent to RELOCATE on a
-			 * shared trie (ft_in_place_excl_ok's header).
+			 * BULK reserve: never in place.  Nothing here holds
+			 * @dest before the reserve writes it.  And a same-trie
+			 * move's reader-coherence witness needs the dst attach
+			 * parent to RELOCATE.
 			 */
-			ft_in_place_insert_excl_ok(ft), &st->count_deferred);
+			false, &st->count_deferred);
 		/*
 		 * -EAGAIN is a TRANSIENT peer conflict, not an allocation
 		 * failure: the reserve found its byte filled under it.  Report
@@ -1284,7 +1282,7 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 					.parent_guard = glue->record_only },
 				&gctx,
 				/* Bulk reserve: see the depth == key_len arm. */
-				ft_in_place_insert_excl_ok(ft), &st->count_deferred);
+				false, &st->count_deferred);
 			/* Transient peer conflict, not OOM: see the
 			 * depth == key_len arm above. */
 			if (ret)
@@ -5321,8 +5319,7 @@ retry_swap:
 					gs_ord ? &drun : NULL, NULL, NULL, 0,
 					-(long) old_count /* fold -old_count onto the detach commit */,
 					NULL, false, NULL, NULL,
-					/* bulk: exclusive-only tier */
-					ft_in_place_delete_excl_ok(dst_ft));
+					false /*bulk: never in place*/);
 			cds_ft_alloc_reserve_deactivate(dst_ft);
 			/*
 			 * MW LOCK_FINE drop: under the FT-wide lock this detach

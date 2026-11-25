@@ -772,15 +772,11 @@ int _cds_ft_debug_skip_compressed_enabled(void)
  * #ifdef.  A test that maintains its own copy of a build flag reports on its
  * own copy.  A build whose library and tests disagree then reads as a pass.
  *
- * ☠ THE FLAG IS ONLY HALF THE CONDITION FOR THE BULK ARMS.  A graft's
- * reserve vouches ft_in_place_excl_ok(), which also requires an EXCLUSIVE
- * trie.  So a test that wants ft_store_at_graft_point_commit's in-place arm
- * must ALSO create an exclusive trie.  This is why an in-place build alone
- * never reached that arm.
+ * The bulk ops never edit in place, on any trie (ft-helpers.h).  So this
+ * flag says only whether the POINT ops may.
  *
- * This answers for the INSERT tier (the graft reserve's).  The delete tier
- * has its own switch, FEATURE_FT_DELETE_IN_PLACE.  The point ops' tier
- * (ft_in_place_ok) is the flag alone.
+ * This answers for the INSERT tier.  The delete tier has its own switch,
+ * FEATURE_FT_DELETE_IN_PLACE.
  */
 int _cds_ft_debug_in_place_enabled(void)
 {

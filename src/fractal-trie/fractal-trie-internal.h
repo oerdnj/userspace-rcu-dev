@@ -625,19 +625,18 @@ int ft_op_in_lane(void)
  *
  * The following holds on EVERY trie type.  The insert store is safe against
  * concurrent WRITERS because the op HOLDS the node before it writes.  The
- * hold is one of these (ft_attach_node's acquire hoist; ft_in_place_ok's
- * header):
+ * hold is one of these (ft_attach_node's acquire hoist; the point-op tier
+ * header in ft-helpers.h):
  *   - the node's DLM lock;
  *   - the node's anchor, at a coarser spacing;
  *   - the FT-wide lock, under the coarse strategy.
  * The store is safe against concurrent READERS because an in-place mutation
  * never removes a bitmap bit.  So no existing rank moves.
  *
- * The bulk ops (graft / merge / rekey reserves and detaches) and the
- * build-path wrapper stay on the exclusive-only tier (ft_in_place_excl_ok).
- * Each stays there until it is converted to lock-before-write.  On a shared
- * trie, the dst attach parent of a same-trie move must relocate anyway, for
- * the reader-coherence witness.
+ * The bulk ops (graft / merge / rekey reserves and detaches) never edit in
+ * place, on any trie (ft-helpers.h).  The build-path wrapper stays on the
+ * exclusive-only tier (ft_in_place_insert_excl_ok) until it is converted to
+ * lock-before-write.
  *
  * Without the insert tier, every new-occupancy insert reports -ERANGE
  * instead.  A new-occupancy insert is any insert that is not an in-place
@@ -1658,16 +1657,17 @@ struct ft_pub_rec {
  *              the resolve path dereferenced.  The MCAS engine's debug
  *              net covered the RECORD path only.
  *              ☠ AND ITS REACH WAS NARROWER THAN IT LOOKED, which is the
- *              part worth keeping.  The delete arm returns -EFBIG unless
- *              ft_in_place_ok(), i.e. -DFEATURE_FT_INSERT_IN_PLACE on an
- *              EXCLUSIVE trie.  That is NOT the default, which recompacts
+ *              part worth keeping.  The delete arm returned -EFBIG unless
+ *              the in-place tier was on.  At the time that tier needed
+ *              -DFEATURE_FT_INSERT_IN_PLACE and an EXCLUSIVE trie.  That
+ *              was NOT the default, which recompacts
  *              on remove.  Measured: 0 reaches across ft_unit and ft_inv's
  *              four list/rank modes with the detector armed.  The assert
  *              fires at ft_unit test 24 of the in-place build.  So it was
  *              LATENT, never live: the one config that plants the bad tag
  *              has no concurrent resolver by that feature's own contract.
  *              In-place IS now extended to concurrent tries for the point
- *              ops (ft_in_place_ok).  That is what the assert beside the
+ *              ops (ft-helpers.h).  That is what the assert beside the
  *              edge is armed for.
  *              ☞ ft_state_edge.  Its one caller (ft_remove_one_commit's
  *              not-held nr_child--) now records with FT_STATE_PROXY spelled

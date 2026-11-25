@@ -224,10 +224,11 @@ void static_array_size_check(void)
  *
  * The alternative is to route through a whole-node recompact.
  *
- * There are TWO predicates because the tree has two in-place tiers.  Each
- * tier has its own safety argument.  A site must say which one it stands on.
+ * The tree has two in-place tiers, each with its own safety argument.  A
+ * site must say which one it stands on.
  *
- * ft_in_place_ok(ft) is the POINT-OP tier.
+ * ft_in_place_insert_ok(ft) and ft_in_place_delete_ok(ft) are the POINT-OP
+ * tier.
  *
  *   The build flag is the OPT-IN.  The SAFETY CONDITION is the CALLER's: it
  *   must HOLD the node before it writes.  What it holds depends on the
@@ -240,33 +241,25 @@ void static_array_size_check(void)
  *   Under FINE the lock is taken BEFORE the reserve.  The same commit that
  *   publishes the edge releases it (ft_attach_node).
  *
- *   ☐ The delete side (ft_detach_node's in-place arm) never stores raw at
- *   all -- its slot NULL and nr_child-- are RECORDS in the commit, arbitrated
- *   on the holder's state word -- but the point removes still vouch only the
- *   exclusive tier below: one op at a time, and the delete's own validation
- *   step is next.
+ *   The delete side (ft_detach_node's in-place arm) never stores raw.  Its
+ *   slot NULL and nr_child-- are RECORDS in the commit, arbitrated on the
+ *   holder's state word.  The point removes vouch this tier
+ *   (ft_in_place_delete_ok).
  *
- *   The predicate answers true on EVERY trie type: shared or exclusive,
- *   coarse or fine.  So it is the build flag alone.  The caller's vouch is
- *   what a site passes down as @in_place.
+ *   Each predicate answers the same on EVERY trie type: shared or
+ *   exclusive, coarse or fine.  It is the build flag alone, except inside a
+ *   bulk op (below).  The caller's vouch is what a site passes down as
+ *   @in_place.
  *
- * ft_in_place_excl_ok(ft) is the legacy EXCLUSIVE-ONLY tier.
+ * ft_in_place_insert_excl_ok(ft) is the legacy EXCLUSIVE-ONLY tier.
  *
- *   It serves the sites that have NOT been converted to lock-before-write:
- *
- *     - the bulk reserves (a graft's / rekey's dst attach parent, ft-graft.h);
- *     - the build-path wrapper ft_node_set_nth;
- *     - the bulk detaches.
+ *   It serves the one site that has NOT been converted to
+ *   lock-before-write: the build-path wrapper ft_node_set_nth.  Inside a
+ *   bulk op it answers no, like the point-op predicates (below).
  *
  *   cds_ft_attr_set_exclusive declares "single-writer, no concurrent
  *   readers".  That is what makes an unlocked in-place store sound there
  *   (mcas-multiwriter-readiness.md §5.2).
- *
- *   It ALSO keeps the same-trie move's reader-coherence witness honest.  A
- *   rekey's dst attach parent must RELOCATE on a shared trie.  Only then does
- *   the address fold of ft_lookup_two_descents perturb
- *   (ft-reintroduce-in-place-mutations.md §3).  This predicate is false on a
- *   shared trie.
  *
  * WHY THE POINT-OP TIER IS SOUND AGAINST READERS: an in-place mutation NEVER
  * REMOVES A BITMAP BIT, so no existing entry's rank moves.
@@ -287,18 +280,13 @@ void static_array_size_check(void)
  * (FEATURE_FT_DELETE_IN_PLACE) are separate build switches.  Each has its own
  * predicate.  A site that EDITS in place asks the tier of the edit it makes.
  *
- * ft_in_place_ok / ft_in_place_excl_ok answer "EITHER tier".  They are for the
- * sites that refuse or re-route a shape (the same-trie rekey's gates).  Such
- * a site does so because an in-place tier would edit a node where it stands.
- * It must refuse as soon as either tier could.
- *
  * With both tiers compiled out (-DNO_FEATURE_FT_{INSERT,DELETE}_IN_PLACE)
  * every predicate answers no and every caller recompacts.
  */
 /*
  * A BULK OP RUNS WITHOUT THE IN-PLACE TIERS, on any trie.  Inside the bulk
  * gate (@ft_bulk_self_depth non-zero on this thread), both point-tier
- * predicates below answer no, and so do the exclusive-tier ones built on
+ * predicates below answer no, and so does the exclusive-tier one built on
  * them.
  *
  * A bulk op edits only the few nodes where a subtree is cut out or attached.
@@ -334,27 +322,9 @@ bool ft_in_place_delete_ok(const struct cds_ft *ft)
 }
 
 static inline
-bool ft_in_place_ok(const struct cds_ft *ft)
-{
-	return ft_in_place_insert_ok(ft) || ft_in_place_delete_ok(ft);
-}
-
-static inline
 bool ft_in_place_insert_excl_ok(const struct cds_ft *ft)
 {
 	return ft_in_place_insert_ok(ft) && ft->exclusive;
-}
-
-static inline
-bool ft_in_place_delete_excl_ok(const struct cds_ft *ft)
-{
-	return ft_in_place_delete_ok(ft) && ft->exclusive;
-}
-
-static inline
-bool ft_in_place_excl_ok(const struct cds_ft *ft)
-{
-	return ft_in_place_ok(ft) && ft->exclusive;
 }
 
 static inline

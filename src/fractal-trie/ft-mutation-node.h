@@ -154,7 +154,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		    !((qp_root >> qp_hi & 1U) && ((qp_bms >> qp_p) & 1ULL))) {
 			/*
 			 * @in_place is the CALLER's vouch that it holds this
-			 * node (ft_in_place_ok's header).  A caller that
+			 * node (ft-helpers.h).  A caller that
 			 * declines the tier lands here and recompacts.
 			 * Examples: a bulk reserve, the build-path wrapper.
 			 * The audit still declares LOCKED on this refused
@@ -356,7 +356,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		    !(((qp_root >> qp_hi) & 1ULL) && ((qp_bms >> qp_p) & 1ULL))) {
 			/*
 			 * @in_place is the CALLER's vouch that it holds this
-			 * node (ft_in_place_ok's header).  A caller that
+			 * node (ft-helpers.h).  A caller that
 			 * declines the tier lands here and recompacts.
 			 * Examples: a bulk reserve, the build-path wrapper.
 			 * The audit still declares LOCKED on this refused
@@ -554,7 +554,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 			if (!qp_present) {
 				/*
 				 * @in_place is the CALLER's vouch that it
-				 * holds this node (ft_in_place_ok's header).
+				 * holds this node (ft-helpers.h).
 				 * A caller that declines the tier lands here
 				 * and recompacts.  Examples: a bulk reserve,
 				 * the build-path wrapper.  The audit still
@@ -759,7 +759,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		if (!in_place && !defer_parent && !(word & bit)) {
 			/*
 			 * @in_place is the CALLER's vouch that it holds this
-			 * node (ft_in_place_ok's header).  A caller that
+			 * node (ft-helpers.h).  A caller that
 			 * declines the tier lands here and recompacts.
 			 * Examples: a bulk reserve, the build-path wrapper.
 			 * The audit still declares LOCKED on this refused
@@ -941,15 +941,15 @@ int ft_pigeon_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 	 * anywhere on the graft arm.  A torn descent could not be told from
 	 * a clean one.
 	 *
-	 * ★ AND IN-PLACE IS RE-ALLOWED for the POINT ops on every trie type
-	 * (ft_in_place_ok).  So this arm is exactly where the move's
-	 * coherence had to stop free-riding.  It does so by SITE, not by
-	 * predicate.  The bulk reserves and the bulk detaches pass
-	 * ft_in_place_excl_ok, which is false on any trie with readers.
-	 * The bulk reserves are a graft's / rekey's dst attach parent
-	 * (ft_store_at_graft_point_prepare).  So a move's dst attach parent
-	 * still RELOCATES there, while a point insert next to it appends in
-	 * place.  The destination attach parent is the load-bearing one.
+	 * ★ AND IN-PLACE IS RE-ALLOWED for the POINT ops on every trie type.
+	 * So this arm is exactly where the move's coherence had to stop
+	 * free-riding.  It does so by SITE, not by predicate.  The bulk
+	 * reserves and the bulk detaches pass @in_place false: no bulk op
+	 * edits in place (ft-helpers.h).  The bulk reserves are a graft's /
+	 * rekey's dst attach parent (ft_store_at_graft_point_prepare).  So a
+	 * move's dst attach parent still RELOCATES there, while a point
+	 * insert next to it appends in place.  The destination attach
+	 * parent is the load-bearing one.
 	 * The src side relocates too, but it is not what the witness needs.
 	 * On the merge arm the carrier is ft_merge_build's fresh union
 	 * node.  ft_rekey_graft_simple_attempt has a publish-time assert
@@ -959,14 +959,12 @@ int ft_pigeon_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 	 *
 	 * The delete side carries the same dependency
 	 * (ft_popcount_node_replace_ptr / ft_pigeon_node_replace_ptr, -EFBIG),
-	 * and the same split through ft_detach_node's @in_place -- ☐ where the
-	 * point removes still vouch ft_in_place_excl_ok until the delete tier
-	 * gets its own validation step.
+	 * and the same split through ft_detach_node's @in_place.
 	 */
 	if (!in_place && !defer_parent && !*ptr) {
 		/*
 		 * @in_place is the CALLER's vouch that it holds this node
-		 * (ft_in_place_ok's header).  A caller that declines the tier
+		 * (ft-helpers.h).  A caller that declines the tier
 		 * lands here and recompacts.  Examples: a bulk reserve, the
 		 * build-path wrapper.  The audit still declares LOCKED on
 		 * this refused arm, so that population stays measurable.
@@ -1098,7 +1096,7 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 		 * (bitmap, nr_child) is then published in ONE pointer swap.
 		 *
 		 * The in-place tier (@in_place, the caller's vouch -- see
-		 * ft_in_place_ok) stores NULL into the child slot and
+		 * ft-helpers.h) stores NULL into the child slot and
 		 * decrements nr_child on the LIVE node.
 		 *
 		 * It is sound against readers because the bitmap bit stays
@@ -4136,8 +4134,9 @@ int ft_node_set_nth_rec(struct cds_ft *ft,
  * SKIP_X dual then flips atomically with the forward publish.
  *
  * No lock is derived here, so this wrapper stands on the EXCLUSIVE-only
- * in-place tier (ft_in_place_excl_ok).  On a shared trie a new occupancy
- * always recompacts, exactly as before the point-op tier was widened.
+ * in-place tier (ft_in_place_insert_excl_ok).  On a shared trie a new
+ * occupancy always recompacts, exactly as before the point-op tier was
+ * widened.  Inside a bulk op it always recompacts (ft-helpers.h).
  */
 static
 int ft_node_set_nth(struct cds_ft *ft,

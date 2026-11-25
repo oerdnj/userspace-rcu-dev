@@ -217,8 +217,7 @@ int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
 				 * machinery is magnitude-agnostic.
 				 */
 				-(long) detached_count, NULL, false, NULL, NULL,
-				/* bulk: exclusive-only tier */
-				ft_in_place_delete_excl_ok(src_ft));
+				false /*bulk: never in place*/);
 	}
 	if (ret < 0) {
 		/*
