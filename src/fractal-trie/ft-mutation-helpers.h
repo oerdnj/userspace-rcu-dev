@@ -1008,7 +1008,26 @@ bool ft_owner_ctx_holds(const struct ft_lock_ctx *ctx,
 			ft_owner_ctx_holds((ctx), (owner)) ||		\
 			ft_owner_retire_witnessed((ctx), (owner),	\
 					(slot), (new_ptr)))
+/*
+ * A lock released inside the commit (the @child_marked arm of
+ * ft_reparent_record_meta) needs every peer writer excluded until the
+ * commit returns.  Assert it.  @dbg_single_writer_hook exempts
+ * _cds_ft_debug_cow_replace_root, which runs single-threaded.
+ */
+# define FT_INTXN_REL_TXN_FIELD	bool dbg_single_writer_hook;
+# define FT_INTXN_REL_INIT(t)						\
+	do { (t)->dbg_single_writer_hook = false; } while (0)
+# define FT_INTXN_REL_SET_HOOK(t)					\
+	do { (t)->dbg_single_writer_hook = true; } while (0)
+# define FT_INTXN_REL_ASSERT(t, ft)					\
+	urcu_assert_debug(ft_flip_txn_excludes_all((t), (ft)) ||	\
+			(t)->dbg_single_writer_hook)
 #else
+# define FT_INTXN_REL_TXN_FIELD
+# define FT_INTXN_REL_INIT(t)		do { } while (0)
+# define FT_INTXN_REL_SET_HOOK(t)	do { } while (0)
+# define FT_INTXN_REL_ASSERT(t, ft)					\
+	do { (void) (t); (void) (ft); } while (0)
 # define FT_OWNER_ASSERT_TXN_FIELD
 # define FT_OWNER_ASSERT_INIT(t)	do { } while (0)
 # define FT_OWNER_ASSERT_SET_PER_OP(t)	do { } while (0)
@@ -3443,6 +3462,8 @@ struct ft_flip_txn {
 	 * trie-wide arm is exempt.
 	 */
 	FT_OWNER_ASSERT_TXN_FIELD
+	/* --enable-rcu-debug only: see FT_INTXN_REL_ASSERT. */
+	FT_INTXN_REL_TXN_FIELD
 	/*
 	 * -DFT_DEBUG_TXN_KIND only (ft-txn-kind-stats.h): where this txn was
 	 * created, and whether the record in flight is the DLM lock TAKE.  The
@@ -4306,6 +4327,7 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	FT_ROOT_ASSERT_INIT(t, ft);
 	FT_OWNER_ASSERT_INIT(t);
+	FT_INTXN_REL_INIT(t);
 	FT_TK_TXN_INIT(t, dbg_site);	/* names @t before anything counts against it */
 	if (ft_txn_content_sw_ok(ft)) {
 		t->trie_wide_sw = true;
@@ -4597,6 +4619,7 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->structural_sw = false;
 	FT_ROOT_ASSERT_INIT(t, ft);
 	FT_OWNER_ASSERT_INIT(t);
+	FT_INTXN_REL_INIT(t);
 	FT_TK_TXN_INIT(t, dbg_site);	/* names @t before anything counts against it */
 	if (ft_txn_content_sw_ok(ft)) {
 		t->trie_wide_sw = true;
@@ -4719,6 +4742,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	FT_ROOT_ASSERT_INIT(t, ft);
 	FT_OWNER_ASSERT_INIT(t);
+	FT_INTXN_REL_INIT(t);
 	FT_TK_TXN_INIT(t, dbg_site);	/* names @t before anything counts against it */
 	if (ft_txn_content_sw_ok(ft)) {
 		t->trie_wide_sw = true;
@@ -24347,8 +24371,10 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		 * ft_flip_txn_excludes_all() is true, and no peer writes
 		 * until the commit returns.  The other caller is
 		 * _cds_ft_debug_cow_replace_root(), a single-threaded test
-		 * hook.
+		 * hook.  FT_INTXN_REL_ASSERT checks this under
+		 * --enable-rcu-debug.
 		 */
+		FT_INTXN_REL_ASSERT(txn, ft);
 		/*
 		 * The state word is loaded HERE, in the one arm that records
 		 * it.  The op holds the child through its mark, so no peer

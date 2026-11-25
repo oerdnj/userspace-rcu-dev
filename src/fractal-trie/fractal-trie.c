@@ -602,6 +602,8 @@ int _cds_ft_debug_cow_replace_root(struct cds_ft *ft)
 		return -ENOMEM;
 	/* PHASE B, STEP B6: the one door, at creation (see the rekey writer). */
 	ft_flip_txn_arm_structural(ft, txn);
+	/* Single-threaded: no peer can take a lock released in the commit. */
+	FT_INTXN_REL_SET_HOOK(txn);
 
 	/* The ROOT is its own anchor under every spacing: byte-depth 0. */
 	ret = ft_rekey_cow_stop(ft, NULL, txn, root, 0, 0 /*cut*/,
