@@ -9171,9 +9171,23 @@ cells_done:
 		 * owner.  And this site is on the COMMITTED branch alone,
 		 * which is what the rcu_head warning above is about.
 		 */
-		if ((!merge_dst || src_cut) && !s_top_external &&
-				!(src_cut && glue.old_dir_dropped))
-			cds_ft_free_item_deferred(ft, s_top_meta);
+		/*
+		 * ☠ ...AND THE DROP HANDS THE FREE TO THE GLUE ONLY WHILE ITS
+		 * ENTRY STAYS @retired.  ft_rekey_cow_stop above already
+		 * recorded S_top's retire.  Under FINE locking the split fences
+		 * S_top, and the glue's tombstone pass skips it.  Without that
+		 * fence (COARSE, which rank stats force), the pass reads this
+		 * txn's own tombstone as a peer's and clears @retired.  So ask
+		 * the glue, and free S_top here when the glue will not.
+		 */
+		if ((!merge_dst || src_cut) && !s_top_external) {
+			bool glue_frees = src_cut && glue.old_dir_dropped &&
+				ft_glue_frees_node(&glue,
+					cds_ft_metadata_to_item(s_top_meta));
+
+			if (!glue_frees)
+				cds_ft_free_item_deferred(ft, s_top_meta);
+		}
 		if (fresh_cell) {
 			assert(fresh_cell->parent);
 			fresh_published = true;

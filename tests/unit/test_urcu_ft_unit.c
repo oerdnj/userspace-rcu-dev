@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (418 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (419 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (365 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (366 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -36286,6 +36286,85 @@ static int test_merge_shape_corpus(void)
 	return ret;
 }
 
+/*
+ * A CUT REKEY FREES ITS SOURCE RUN EXACTLY ONCE, WITH RANK STATS TOO.
+ *
+ * {bab, aaba} holds "bab" under a run "ab".  Moving "ba" to "bbababaa"
+ * cuts that run, and the destination branches off it.  So the rekey
+ * copies the run (ft_rekey_cow_stop) and the split drops its old
+ * direction.  Rank stats force the COARSE writer strategy.  Before the
+ * fix, the glue's tombstone pass cleared the run's @retired, and the
+ * rekey still left the free to the glue: one compressed node leaked per
+ * move.  The node balance is a weak symbol, so a build without
+ * DEBUG_COUNTERS runs the moves and only says it could not count.
+ */
+static int rekey_cut_rank_balance_one(int list, int merge)
+{
+	struct cds_ft_group *g = ft_corpus_group(list, 1, 1);
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+	unsigned long na, nf;
+	int ret = -1;
+
+	if (cds_ft_create(g, NULL, &ft) < 0)
+		abort();
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *) "bab", 3, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "aaba", 4, &node_alloc(2)->node);
+	rcu_read_unlock();
+	rcu_quiescent_state();
+	s = merge ? cds_ft_rekey_merge(ft, (const uint8_t *) "bbababaa", 8,
+			(const uint8_t *) "ba", 2) :
+		cds_ft_rekey_graft(ft, (const uint8_t *) "bbababaa", 8,
+			(const uint8_t *) "ba", 2);
+	rcu_read_lock();
+	if (s != CDS_FT_STATUS_OK)
+		diag("rekey_cut_rank_balance(list %d merge %d): %s", list,
+			merge, cds_ft_status_to_string(s));
+	else if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+			!ft_test_has_key(ft, "bbababaab") ||
+			ft_test_has_key(ft, "bab") ||
+			!ft_test_has_key(ft, "aaba"))
+		diag("rekey_cut_rank_balance(list %d merge %d): wrong keys or "
+			"verify red", list, merge);
+	else
+		ret = 0;
+	rcu_read_unlock();
+	if (drain_trie(ft) < 0)
+		ret = -1;
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	rcu_barrier();
+	if (cds_ft_debug_node_balance) {
+		cds_ft_debug_node_balance(g, &na, &nf);
+		if (na != nf) {
+			diag("rekey_cut_rank_balance(list %d merge %d): group "
+				"node leak alloc %lu != freed %lu", list, merge,
+				na, nf);
+			ret = -1;
+		}
+	} else if (!list && !merge) {
+		diag("rekey_cut_rank_balance: moves exercised, node balance "
+			"not available (no DEBUG_COUNTERS)");
+	}
+	cds_ft_group_destroy(g);
+	return ret;
+}
+
+static int test_rekey_cut_rank_balance(void)
+{
+	int list, merge;
+
+	for (merge = 0; merge < 2; merge++) {
+		if (merge && !cds_ft_merge_enabled())
+			break;
+		for (list = 0; list < 2; list++)
+			if (rekey_cut_rank_balance_one(list, merge) < 0)
+				return -1;
+	}
+	return 0;
+}
+
 static int test_walk_past_empty_internal(void)
 {
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
@@ -42716,6 +42795,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_merge_collide_absorbed_run);
 	RUN_TEST(test_rekey_shape_corpus);
 	RUN_TEST(test_merge_shape_corpus);
+	RUN_TEST(test_rekey_cut_rank_balance);
 	RUN_TEST(test_walk_past_deep_empty_internal);
 	RUN_TEST(test_verify_disjoint_cross_trie);
 

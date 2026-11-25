@@ -22382,6 +22382,13 @@ struct ft_glue_free_item {
 	 * same shared node both reach the reclaim.
 	 *
 	 * Default true: the retiring committer frees it exactly once.
+	 *
+	 * ☠ "A peer" includes an EARLIER RECORD OF THIS SAME TXN.  The RYW
+	 * old then shows a tombstone which this op recorded itself, before
+	 * the glue's pass.  ft_rekey_cow_stop's retire of a rekey source is
+	 * one.  The code which recorded that retire then owns the free.  It
+	 * must call ft_glue_frees_node() instead of assuming the glue frees
+	 * the node.
 	 */
 	bool retired;
 	/*
@@ -27813,6 +27820,22 @@ enum urcu_txn_status ft_glue_publish_replace(struct cds_ft *ft,
 		ft_flip_txn_record_count_parent(ft, txn, g->publish_parent,
 			g->count_delta);
 	return ft_ord_cell_flip_rec_replace(ft, txn, &rec, run);
+}
+
+/*
+ * Return true if ft_glue_free_old() will free @node: @node is on the free
+ * list and its entry is still @retired.  Call it after the tombstone pass,
+ * which can clear @retired.
+ */
+static inline
+bool ft_glue_frees_node(const struct ft_glue *g, const void *node)
+{
+	int i;
+
+	for (i = 0; i < g->nr_free; i++)
+		if (g->free_list[i].node == node)
+			return g->free_list[i].retired;
+	return false;
 }
 
 /*
