@@ -272,6 +272,38 @@ uint16_t *ft_popcount_2l_sub_bm_addr(struct cds_ft_inode *node,
 	return (uint16_t *) &node->data[offset];
 }
 
+/*
+ * Load a popcount bitmap word of a node that readers can reach.  An
+ * in-place insert changes it concurrently, with relaxed stores, so load it
+ * with a relaxed atomic load.  The bitmap orders nothing: an in-place insert
+ * only appends at the highest rank, into a slot that is still NULL, and
+ * publishes the child with a release store.  A reader which sees the new
+ * bit before the child reads NULL, and finds the key absent.
+ */
+static inline
+uint16_t ft_pc_bm16(const struct cds_ft_inode *node, unsigned int off)
+{
+	return uatomic_load((const uint16_t *) &node->data[off], CMM_RELAXED);
+}
+
+static inline
+uint32_t ft_pc_bm32(const struct cds_ft_inode *node, unsigned int off)
+{
+	return uatomic_load((const uint32_t *) &node->data[off], CMM_RELAXED);
+}
+
+static inline
+uint64_t ft_pc_bm64(const struct cds_ft_inode *node, unsigned int off)
+{
+	return uatomic_load((const uint64_t *) &node->data[off], CMM_RELAXED);
+}
+
+static inline
+uint16_t ft_pc_bm(const uint16_t *bm)
+{
+	return uatomic_load(bm, CMM_RELAXED);
+}
+
 static inline_lookup
 unsigned int ft_popcount_2l_header_bytes(unsigned int max_lc)
 {
@@ -326,7 +358,7 @@ struct cds_ft_inode_flag *ft_popcount_2l_scan_16_16_max_3(
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n, enum ft_pf_target pf_hint)
 {
-	uint64_t bms = *(const uint64_t *) &node->data[0];
+	uint64_t bms = ft_pc_bm64(node, 0);
 	uint16_t root = (uint16_t) bms;
 	uint64_t subs = bms >> 16;
 	unsigned int hi = (unsigned int) n >> 4;
@@ -390,7 +422,7 @@ struct cds_ft_inode_flag *ft_popcount_2l_scan_16_16_max_5(
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n, enum ft_pf_target pf_hint)
 {
-	uint16_t root = *(const uint16_t *) &node->data[0];
+	uint16_t root = ft_pc_bm16(node, 0);
 	const uint16_t *subs = (const uint16_t *) (node->data + 2);
 	unsigned int hi = (unsigned int) n >> 4;
 	unsigned int lo = (unsigned int) n & 0xFU;
@@ -457,8 +489,8 @@ struct cds_ft_inode_flag *ft_popcount_2l_scan_32_8(
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n, enum ft_pf_target pf_hint)
 {
-	uint32_t root = *(const uint32_t *) &node->data[0];
-	uint64_t bms  = *(const uint64_t *) &node->data[4];
+	uint32_t root = ft_pc_bm32(node, 0);
+	uint64_t bms  = ft_pc_bm64(node, 4);
 	unsigned int hi = (unsigned int) n >> 3;
 	unsigned int lo = (unsigned int) n & 0x7U;
 	unsigned int slot1, p, ptr_idx;
@@ -517,8 +549,8 @@ struct cds_ft_inode_flag *ft_popcount_2l_scan_64_4(
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n, enum ft_pf_target pf_hint)
 {
-	uint64_t root = *(const uint64_t *) &node->data[0];
-	uint64_t bms  = *(const uint64_t *) &node->data[8];
+	uint64_t root = ft_pc_bm64(node, 0);
+	uint64_t bms  = ft_pc_bm64(node, 8);
 	unsigned int hi = (unsigned int) n >> 2;
 	unsigned int lo = (unsigned int) n & 0x3U;
 	unsigned int slot1, p, ptr_idx;
@@ -564,12 +596,12 @@ uint8_t ft_popcount_2l_node_get_nr_child(const struct cds_ft_type *type,
 
 	if (max_lc == 6) {
 		/* Flat 5+3 layout: nr_child = popcount of packed_bms. */
-		uint64_t bms = *(const uint64_t *) &node->data[4];
+		uint64_t bms = ft_pc_bm64(node, 4);
 		return (uint8_t) __builtin_popcountll(bms);
 	}
 	if (max_lc == 12 || max_lc == 14 || max_lc == 16) {
 		/* Flat 6+2 layout: nr_child = popcount of packed_bms. */
-		uint64_t bms = *(const uint64_t *) &node->data[8];
+		uint64_t bms = ft_pc_bm64(node, 8);
 		return (uint8_t) __builtin_popcountll(bms);
 	}
 	{
@@ -577,7 +609,8 @@ uint8_t ft_popcount_2l_node_get_nr_child(const struct cds_ft_type *type,
 
 		for (k = 0; k < max_lc; k++)
 			total += (unsigned int) __builtin_popcount(
-					*ft_popcount_2l_sub_bm_addr(node, max_lc, k));
+					ft_pc_bm(ft_popcount_2l_sub_bm_addr(
+						node, max_lc, k)));
 		return (uint8_t) total;
 	}
 }
@@ -601,8 +634,8 @@ void ft_popcount_2l_node_get_ith_pos(const struct cds_ft_type *type,
 
 	if (max_lc == 6) {
 		/* Flat 5+3 layout: find i-th set bit in packed_bms. */
-		uint32_t root = *(const uint32_t *) &node->data[0];
-		uint64_t bms  = *(const uint64_t *) &node->data[4];
+		uint32_t root = ft_pc_bm32(node, 0);
+		uint64_t bms  = ft_pc_bm64(node, 4);
 		unsigned int slot1, lo, hi, p, j;
 		uint64_t walk = bms;
 		uint32_t r_walk;
@@ -624,8 +657,8 @@ void ft_popcount_2l_node_get_ith_pos(const struct cds_ft_type *type,
 	}
 	if (max_lc == 12 || max_lc == 14 || max_lc == 16) {
 		/* Flat 6+2 layout: find i-th set bit in packed_bms. */
-		uint64_t root = *(const uint64_t *) &node->data[0];
-		uint64_t bms  = *(const uint64_t *) &node->data[8];
+		uint64_t root = ft_pc_bm64(node, 0);
+		uint64_t bms  = ft_pc_bm64(node, 8);
 		unsigned int slot1, lo, hi, p, j;
 		uint64_t walk = bms, r_walk;
 
@@ -645,13 +678,15 @@ void ft_popcount_2l_node_get_ith_pos(const struct cds_ft_type *type,
 		return;
 	}
 	{
-		uint16_t root = *ft_popcount_2l_root_bm_addr(node, max_lc);
+		uint16_t root = ft_pc_bm(
+			ft_popcount_2l_root_bm_addr(node, max_lc));
 		unsigned int target = i, k, hi, lo;
 		uint16_t sub = 0, root_walk;
 		unsigned int sub_pop = 0;
 
 		for (k = 0; k < max_lc; k++) {
-			sub = *ft_popcount_2l_sub_bm_addr(node, max_lc, k);
+			sub = ft_pc_bm(
+				ft_popcount_2l_sub_bm_addr(node, max_lc, k));
 			sub_pop = (unsigned int) __builtin_popcount(sub);
 			if (target < sub_pop)
 				break;
@@ -807,11 +842,11 @@ struct cds_ft_inode_flag *ft_popcount_2l_node_get_direction(
 	assert(dir == FT_LEFT || dir == FT_RIGHT);
 
 	if (max_lc == 6) {			/* scan_32_8: 5+3 */
-		root = *(const uint32_t *) &node->data[0];
-		subs_lo = *(const uint64_t *) &node->data[4];
+		root = ft_pc_bm32(node, 0);
+		subs_lo = ft_pc_bm64(node, 4);
 		lo_bits = 3;
 	} else if (max_lc == 3) {		/* scan_16_16_max_3: 4+4 packed */
-		uint64_t bms = *(const uint64_t *) &node->data[0];
+		uint64_t bms = ft_pc_bm64(node, 0);
 
 		root = (uint16_t) bms;
 		subs_lo = bms >> 16;
@@ -820,15 +855,15 @@ struct cds_ft_inode_flag *ft_popcount_2l_node_get_direction(
 	} else if (max_lc == 5) {		/* scan_16_16_max_5: 5 x u16, 80-bit concat */
 		const uint16_t *s = (const uint16_t *) &node->data[2];
 
-		root = *(const uint16_t *) &node->data[0];
+		root = ft_pc_bm16(node, 0);
 		subs_lo = (uint64_t) s[0] | ((uint64_t) s[1] << 16)
 			| ((uint64_t) s[2] << 32) | ((uint64_t) s[3] << 48);
 		subs_hi = s[4];		/* top group -> bits 64..79 */
 		lo_bits = 4;
 #endif
 	} else {				/* scan_64_4: 6+2 (max 12/14/16) */
-		root = *(const uint64_t *) &node->data[0];
-		subs_lo = *(const uint64_t *) &node->data[8];
+		root = ft_pc_bm64(node, 0);
+		subs_lo = ft_pc_bm64(node, 8);
 		lo_bits = 2;
 	}
 	nr_groups = (unsigned int) __builtin_popcountll(root);
@@ -878,7 +913,8 @@ struct cds_ft_inode_flag *ft_popcount_2l_node_get_direction(
 			 * ft_maybe_prefetch (__builtin_prefetch) silently drops
 			 * NULL / non-canonical addresses without faulting.
 			 */
-			ft_maybe_prefetch_nta(dir == FT_RIGHT ? slot[1] : slot[-1]);
+			ft_maybe_prefetch_nta(uatomic_load(dir == FT_RIGHT ?
+					&slot[1] : &slot[-1]));
 			*result_key = (uint8_t) byte;
 			return ptr;
 		}
