@@ -19093,24 +19093,16 @@ out:
 }
 
 /*
- * THE GRAFT'S IN-PLACE RESERVE ARM -- ft_store_at_graft_point_commit's `else`
- * of `if (st->old_recompacted_node)`, the branch taken when reserving the graft
- * byte did NOT have to rebuild the destination's attach node.
+ * A GRAFT INTO AN EXCLUSIVE TRIE DOES NOT EDIT IN PLACE.  No bulk op uses the
+ * in-place tiers, on any trie: the bulk gate turns them off on its thread
+ * (ft-helpers.h).  So reserving the graft byte rebuilds the destination's
+ * attach node even when the byte would fit, and the node under "a" moves to
+ * a new address.
  *
- * ★ WHY IT NEEDED ITS OWN TEST.  Reaching it takes BOTH halves of
- * ft_in_place_excl_ok() -- the bulk reserves' tier: the
- * -DFEATURE_FT_INSERT_IN_PLACE build flag AND an EXCLUSIVE destination trie.
- * The gate carries the flag (its `in-place` config) and still never reached
- * this arm, because nothing else in either suite grafts into an exclusive trie
- * -- so the branch had ZERO coverage in every configuration.  A build flag
- * being in the gate matrix is not the same as the feature's runtime
- * precondition being met.
- *
- * ★ AND IT ASSERTS THE ARM RAN, not merely that the graft worked.  An in-place
- * reserve mutates the attach node's occupancy bitmap where it stands; a
- * recompact republishes a fresh copy at a NEW address.  So the node under the
- * "a" prefix keeping its identity across the graft IS the discriminator, and
- * the ordinary graft assertions below would pass either way without it.
+ * The shape is one that an in-place reserve would keep: an EXCLUSIVE
+ * destination, an attach node with room for one more byte, and the in-place
+ * tiers compiled in.  The address change is the discriminator.  The ordinary
+ * graft assertions below would pass either way without it.
  *
  * The feature question goes to the LIBRARY (_cds_ft_debug_in_place_enabled),
  * never to a test-side #ifdef: a test holding its own copy of a build flag
@@ -19132,7 +19124,7 @@ static int test_graft_inplace_exclusive(void)
 	int i, ret = -1;
 
 	if (!_cds_ft_debug_in_place_enabled()) {
-		diag("test_graft_inplace_exclusive: skipped, in-place tier not "
+		diag("test_graft_inplace_exclusive: skipped, in-place tier "
 			"compiled out (-DNO_FEATURE_FT_INSERT_IN_PLACE)");
 		return 0;
 	}
@@ -19152,8 +19144,8 @@ static int test_graft_inplace_exclusive(void)
 	rcu_read_lock();
 	/*
 	 * Enough children under "a" that the attach node is a real branch, but
-	 * short of the type boundary -- one more byte has to FIT, or even the
-	 * in-place tier grows the node and takes the recompact arm instead.
+	 * short of the type boundary.  One more byte FITS, so an in-place
+	 * reserve could keep the node.  The graft must still rebuild it.
 	 */
 	for (i = 0; i < 20; i++) {
 		snprintf(k, sizeof k, "a%c", 'a' + i);
@@ -19183,15 +19175,13 @@ static int test_graft_inplace_exclusive(void)
 	attach_after = _cds_ft_debug_child_at(dst, (const uint8_t *) "a", 1);
 	rcu_read_unlock();
 	/*
-	 * THE ARM CHECK.  Same node, same address: the reserve mutated it in
-	 * place.  A different address means the reserve recompacted and this
-	 * ran the OTHER branch -- which every other assertion here would still
-	 * be happy with.
+	 * THE CHECK.  A new address: the reserve recompacted.  The same address
+	 * would mean a bulk op edited the node in place.
 	 */
-	if (attach_after != attach_before) {
-		fprintf(stderr, "graft_inplace: attach node RELOCATED (%p -> %p) "
-			"-- the in-place reserve arm did not run\n",
-			attach_before, attach_after);
+	if (attach_after == attach_before) {
+		fprintf(stderr, "graft_inplace: attach node kept its address "
+			"(%p) -- the graft edited it in place\n",
+			attach_after);
 		goto out;
 	}
 

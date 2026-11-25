@@ -10000,9 +10000,6 @@ enum cds_ft_status ft_rekey_dispatch(struct cds_ft *ft,
 		dst_key_len <= ft->group->max_key_len;
 
 	ft_move_gate_enter(ft);
-#ifndef FT_DEBUG_REKEY_IN_PLACE
-	ft_tls_in_place_off++;		/* see ft_tls_in_place_off */
-#endif
 #ifdef FT_RED_REKEY_NOLOCK
 	ft_red_rekey_nolock = 1;	/* red control; see fractal-trie-internal.h */
 #endif
@@ -10050,9 +10047,6 @@ enum cds_ft_status ft_rekey_dispatch(struct cds_ft *ft,
 out:
 #ifdef FT_RED_REKEY_NOLOCK
 	ft_red_rekey_nolock = 0;
-#endif
-#ifndef FT_DEBUG_REKEY_IN_PLACE
-	ft_tls_in_place_off--;
 #endif
 	ft_move_gate_exit(ft);
 	return status;

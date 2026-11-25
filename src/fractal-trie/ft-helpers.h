@@ -296,31 +296,27 @@ void static_array_size_check(void)
  * every predicate answers no and every caller recompacts.
  */
 /*
- * THE SAME-TRIE REKEY RUNS WITHOUT THE IN-PLACE TIERS, on the thread running it
- * (ft_rekey_dispatch holds this non-zero).
+ * A BULK OP RUNS WITHOUT THE IN-PLACE TIERS, on any trie.  Inside the bulk
+ * gate (@ft_bulk_self_depth non-zero on this thread), both point-tier
+ * predicates below answer no, and so do the exclusive-tier ones built on
+ * them.
  *
- * The rekey's folds assume that every edit is a RECORD in the descriptor or a
- * build-invisible copy.  Its gates refuse a shape outright wherever an
- * in-place tier could edit a node where it stands (ft_in_place_excl_ok, an
- * exclusive trie's bulk tier).  So with a tier compiled in, an EXCLUSIVE
- * trie's rekey refused moves that the same build without the tier serves.
- * This was measured with test_rekey_exclusive_drain_after_loss on nocompress,
- * with either tier.
+ * A bulk op edits only the few nodes where a subtree is cut out or attached.
+ * So an in-place store saves it a node copy or two at most.  And the rekey
+ * needs the tiers off.  Its folds assume that every edit is a RECORD in the
+ * descriptor or a build-invisible copy.  With a tier on, an exclusive trie's
+ * rekey refused moves that the same build without the tier serves
+ * (test_rekey_exclusive_drain_after_loss, nocompress, either tier).
  *
- * A bulk op already pays grace periods, so the in-place stores buy it nothing.
- *
- * The counter is thread-local.  An exclusive trie has one writer, and a shared
- * trie never reaches the exclusive tier.  So no other op can observe the
- * difference.
+ * The depth is thread-local.  Point ops on other threads keep their tiers.
  */
-static __thread unsigned int ft_tls_in_place_off;
 
 static inline
 bool ft_in_place_insert_ok(const struct cds_ft *ft)
 {
 	(void) ft;
 #ifdef FEATURE_FT_INSERT_IN_PLACE
-	return !ft_tls_in_place_off;
+	return !ft_bulk_self_depth;
 #else
 	return false;
 #endif
@@ -331,7 +327,7 @@ bool ft_in_place_delete_ok(const struct cds_ft *ft)
 {
 	(void) ft;
 #ifdef FEATURE_FT_DELETE_IN_PLACE
-	return !ft_tls_in_place_off;
+	return !ft_bulk_self_depth;
 #else
 	return false;
 #endif
