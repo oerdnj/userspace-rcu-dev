@@ -144,6 +144,16 @@ ALL_CONFIGS=(
 	# run here too.  Some insert leaks need a peer writer, so only
 	# concurrent tests such as inv_prefix_shape_zoo show them.
 	"counters|-DDEBUG_COUNTERS|u ion ioff imw"
+	# THE MEMORY-ORDERING DETECTOR.  @TSAN@ builds the tree with
+	# ThreadSanitizer and --enable-compiler-atomic-builtins (see
+	# setup_tree).  Any ThreadSanitizer report fails the leg as TSAN RACES.
+	# A plain or volatile access to a word that another thread changes
+	# atomically is a report, and so is a handshake without
+	# release/acquire.  The other configs cannot see either: on x86 such
+	# code compiles to the right instructions.  inv-tsan runs a short list
+	# of concurrent ft_inv tests (FT_GATE_TSAN_INV_TESTS): the whole MW
+	# suite takes hours under ThreadSanitizer.
+	"tsan|@TSAN@|u inv-tsan"
 	# ★ THE REMOVE RETRY CAP.  Its rekey twin rides on "audit" above; this one
 	# could not, and the gap was VERIFIED: none of the 15 legs armed
 	# -DFT_DEBUG_REMOVE_RETRY_CAP, so the gate had NO WAY TO TELL A REMOVE
@@ -420,6 +430,15 @@ setup_tree() {	# $1=name $2=cppflags -- one-time: copy source + configure WITH f
 	# the whole matrix with the engine's and FT's debug checks armed).
 	# Appended before the cache check, so a changed set reconfigures.
 	flags="$flags${FT_GATE_EXTRA_CPPFLAGS:+ $FT_GATE_EXTRA_CPPFLAGS}"
+	local tsan=0 cflags=${CFLAGS-} ldflags=${LDFLAGS-} extra=()
+	if [[ "$flags" == *@TSAN@* ]]; then
+		# urcu must use the compiler atomics too, so that its own
+		# uatomic operations are visible to ThreadSanitizer.
+		tsan=1
+		cflags="-g -O1 -fsanitize=thread"
+		ldflags="-fsanitize=thread"
+		extra=(--enable-compiler-atomic-builtins)
+	fi
 	if [ -f "$dir/config.status" ] && \
 	   grep -qxF "CPPFLAGS=$flags" "$dir/.gate_flags" 2>/dev/null; then
 		return 0	# already configured with these exact flags
@@ -459,7 +478,10 @@ setup_tree() {	# $1=name $2=cppflags -- one-time: copy source + configure WITH f
 		return
 	fi
 	if ! ( cd "$dir" && make distclean >/dev/null 2>&1
-	       CPPFLAGS="$flags" ./configure --quiet >>"$GATE/$1.setup" 2>&1 ); then
+	       CPPFLAGS="${flags//@TSAN@/}" CFLAGS="$cflags" \
+		LDFLAGS="$ldflags" \
+		./configure --quiet ${extra[@]+"${extra[@]}"} \
+		>>"$GATE/$1.setup" 2>&1 ); then
 		echo "  setup $1 FAILED (configure -- see $GATE/$1.setup)"
 		echo "$1: CONFIG ERROR (configure failed; see $GATE/$1.setup)" >> "$GATE/$1.result"
 		return
@@ -470,6 +492,11 @@ setup_tree() {	# $1=name $2=cppflags -- one-time: copy source + configure WITH f
 		return
 	fi
 	printf 'CPPFLAGS=%s\n' "$flags" > "$dir/.gate_flags"
+	if [ "$tsan" = 1 ]; then
+		touch "$dir/.gate_tsan"
+	else
+		rm -f "$dir/.gate_tsan"
+	fi
 	echo "  setup $1 ok"
 }
 
@@ -504,6 +531,11 @@ FT_GATE_MEM_U=${FT_GATE_MEM_U:-16G}
 FT_GATE_MEM_INV=${FT_GATE_MEM_INV:-16G}
 FT_GATE_MEM_IMW=${FT_GATE_MEM_IMW:-24G}
 FT_GATE_MEM_SP=${FT_GATE_MEM_SP:-4G}
+# The tsan config's runtime options.  die_after_fork=0: some unit tests fork
+# a child that starts threads, which ThreadSanitizer otherwise kills.
+FT_GATE_TSAN_OPTIONS=${FT_GATE_TSAN_OPTIONS:-halt_on_error=0 die_after_fork=0 report_signal_unsafe=0}
+# The concurrent ft_inv tests the inv-tsan leg runs, comma-separated.
+FT_GATE_TSAN_INV_TESTS=${FT_GATE_TSAN_INV_TESTS:-inv_rekey_shape_concurrent,inv_prefix_shape_zoo,inv_widen_deep_junction,inv_rekey_fine_mixed_writers}
 # ☠ A PER-LEG CAP BOUNDS NO SUM, and wrapping the gate in an outer scope does
 # not bound it either: each leg's `systemd-run --scope` lands in the DEFAULT
 # slice (app.slice), not under the scope it was started from.  FT_GATE_SLICE
@@ -759,8 +791,8 @@ run_test_leg() {	# $1=name $2=test $3=spacing $4=rep $5=outfile -- ONE leg
 	local IM=$dir/tests/regression/.libs/test_urcu_ft_inv_memb
 	local SP=$dir/tests/unit/.libs/test_rcu_txn_settle_premise
 	local cores=$GATE/$name.cores
-	local o ok notok abrt lbl rc plan ran cdir bin tmo c mem leak
-	local env_x
+	local o ok notok abrt lbl rc plan ran cdir bin tmo c mem leak tsan
+	local env_x args=()
 	: > "$out"
 	cdir=$cores/$sp-$t-$rep
 	mkdir -p "$cdir"
@@ -790,9 +822,17 @@ run_test_leg() {	# $1=name $2=test $3=spacing $4=rep $5=outfile -- ONE leg
 	# constructs its violation rather than waiting for one, so it is
 	# ~20 ms and carries no spacing dependence.
 	sp)   bin=$SP; tmo=120; lbl="txn settle"; env_x=() mem=$FT_GATE_MEM_SP ;;
+	inv-tsan) bin=$I; tmo=300; lbl="ft_inv tsan"; mem=$FT_GATE_MEM_IMW
+	      env_x=(FT_INV_MW=1 FT_INV_RKCF_SEEDS=10 FT_INV_ZOO_MS=1000)
+	      args=("$FT_GATE_TSAN_INV_TESTS") ;;
 	esac
+	if [ -f "$dir/.gate_tsan" ]; then
+		env_x+=("TSAN_OPTIONS=$FT_GATE_TSAN_OPTIONS")
+		tmo=$((tmo * 4))
+		mem=$(( ${mem%G} * 2 ))G
+	fi
 	o=$(run_leg "$cdir" "$tmo" "$mem" env LD_LIBRARY_PATH="$LIB" \
-		${env_x[@]+"${env_x[@]}"} "$bin"); rc=$?
+		${env_x[@]+"${env_x[@]}"} "$bin" ${args[@]+"${args[@]}"}); rc=$?
 	# The SPACING rides every label below: a red that names only the
 	# suite is unattributable when three spacings run the same leg.
 	lbl="$lbl $sp"
@@ -812,6 +852,13 @@ run_test_leg() {	# $1=name $2=test $3=spacing $4=rep $5=outfile -- ONE leg
 	# and returns.  So copy and count those lines here, and make the leg
 	# red.  Not anchored: stdout reaches the pipe in buffered blocks, so a
 	# partial TAP line can sit in front of the unbuffered stderr report.
+	tsan=$(printf '%s' "$o" | grep -c 'WARNING: ThreadSanitizer')
+	if [ "$tsan" -gt 0 ]; then
+		printf '%s' "$o" | grep -A3 'WARNING: ThreadSanitizer' | \
+			grep '#0 ' | sort | uniq -c | sort -rn | head -10 | \
+			sed "s/^/      [$name] $lbl /" >> "$out"
+		echo "$name: $lbl TSAN RACES ($tsan reports)" >> "$out"
+	fi
 	leak=$(printf '%s' "$o" | grep -c '\[error\] Fractal Trie leaked')
 	if [ "$leak" -gt 0 ]; then
 		printf '%s' "$o" | grep '\[error\] Fractal Trie leaked' | \
@@ -888,7 +935,7 @@ for c in "${CONFIGS[@]}"; do
 	# on it, so a leg that completed its plan with no failing TAP line and a
 	# non-zero status -- a crash in teardown after the last test, an explicit
 	# exit(1) -- reported its own red line under a "GATE PASS".
-	   grep -qE 'BUILD FAIL|CONFIG ERROR|notok=[1-9]|abrt=[1-9]|ok=0 notok=|INCOMPLETE|NO TAP PLAN|NONZERO EXIT|LEAKED' "$GATE/$n.result"; then
+	   grep -qE 'BUILD FAIL|CONFIG ERROR|notok=[1-9]|abrt=[1-9]|ok=0 notok=|INCOMPLETE|NO TAP PLAN|NONZERO EXIT|LEAKED|TSAN RACES' "$GATE/$n.result"; then
 		rc=1
 	fi
 done
