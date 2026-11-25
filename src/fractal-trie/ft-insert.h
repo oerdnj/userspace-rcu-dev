@@ -3639,6 +3639,46 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 		branch = dest;
 		br_meta = cds_ft_item_to_metadata(ft_node_ptr(branch));
 		/*
+		 * ☠ LIST THE FRESH NODES FOR THE ROLLBACK.  When a peer wins
+		 * the commit, ft_insert_abort_cb frees @ic->created, and
+		 * nothing else frees this attempt's build.
+		 * ft_free_unpublished_split_cluster frees the list from its
+		 * end, parent first, so put the deepest node first and
+		 * @branch last.  Store plain compressed flags, so that the
+		 * free never resolves a skip-encoded node through its
+		 * child's back-pointer.
+		 */
+		{
+			struct cds_ft_inode_flag *chain[FT_MAX_DEPTH];
+			struct cds_ft_inode_flag *top = inner;
+			int n = 0;
+
+			while (top &&
+					top != (struct cds_ft_inode_flag *) node) {
+				struct cds_ft_compressed_node *ccn;
+				uint8_t v;
+
+				urcu_assert_debug(n < FT_MAX_DEPTH - 1);
+				if (ft_node_skip_compressed(top) ||
+						ft_node_compressed(top)) {
+					ccn = ft_node_skip_compressed(top) ?
+						ft_skip_to_compressed(ft, top) :
+						ft_compressed_node_ptr(top);
+					chain[n++] =
+						ft_compressed_node_flag(ccn);
+					top = ccn->child;
+				} else {
+					chain[n++] = top;
+					top = ft_node_get_direction(ft, top, -1,
+						&v, FT_RIGHT, false);
+				}
+			}
+			ic->nr_created = 0;
+			while (n)
+				ic->created[ic->nr_created++] = chain[--n];
+			ic->created[ic->nr_created++] = branch;
+		}
+		/*
 		 * Phase 1 (build-invisible): wire branch's own parent and its
 		 * cluster-internal external_nodes pointer.  The back-channel
 		 * publish (cn->child->prev = branch) is deferred to Phase 2
