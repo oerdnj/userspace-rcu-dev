@@ -10300,6 +10300,22 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 		(const void *) old_ptr, (const void *) new_ptr, tag);
 	if (ft_flip_txn_record_is_noop(t, slot, old_ptr, new_ptr))
 		return;
+#if FT_DT_ARMED
+	/*
+	 * A lock release must wait for the end of the commit:
+	 * ft_flip_txn_record_state_kind_ctx stages it in @rel_after.  Catch a
+	 * record which clears LOCK on @owner's own state word.  A state word
+	 * recorded under another @owner is not checked: its tag cannot tell it
+	 * from a pointer.
+	 */
+	if (owner && slot == (void **) &owner->state &&
+			((uintptr_t) old_ptr & FT_STATE_LOCK) &&
+			!((uintptr_t) new_ptr & FT_STATE_LOCK)) {
+		fprintf(stderr, "FT LOCK RELEASED IN COMMIT: state word %p "
+			"old %p new %p\n", (void *) slot, old_ptr, new_ptr);
+		abort();
+	}
+#endif
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	if (!FT_TK_TXN_IS_TAKE(t)) {
 		void *pc0 = __builtin_return_address(0);
