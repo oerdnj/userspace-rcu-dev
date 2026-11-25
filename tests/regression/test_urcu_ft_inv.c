@@ -732,7 +732,32 @@ lookup_u64(struct cds_ft *ft, uint64_t v, struct cds_ft_node **out)
 /* Shared concurrent-test control                                     */
 /* ------------------------------------------------------------------ */
 
-static volatile int test_go, test_stop;
+/*
+ * The start and stop flags of the worker threads.  Set them with release and
+ * read them with acquire, so that the setup before a start, and the work
+ * before a stop, are visible to the thread which sees the flag.
+ */
+static int test_go, test_stop;
+
+static inline int test_go_load(void)
+{
+	return uatomic_load(&test_go, CMM_ACQUIRE);
+}
+
+static inline int test_stop_load(void)
+{
+	return uatomic_load(&test_stop, CMM_ACQUIRE);
+}
+
+static inline void test_go_set(int v)
+{
+	uatomic_store(&test_go, v, CMM_RELEASE);
+}
+
+static inline void test_stop_set(int v)
+{
+	uatomic_store(&test_stop, v, CMM_RELEASE);
+}
 static volatile int test_drained;	/* inv_remove_cross_view: pool emptied */
 
 static unsigned long long elapsed_ms(struct timespec *start)
@@ -971,11 +996,11 @@ static void *inv_iter_order_reader(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t prev = 0;
 		int first = 1;
 		int count = 0;
@@ -1025,11 +1050,11 @@ static void *inv_iter_order_writer(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t key = (uint64_t)(rand_r(&seed) % WRITER_POOL_SIZE);
 		int do_insert = rand_r(&seed) & 1;
 
@@ -1096,8 +1121,8 @@ static int inv_iteration_order(void)
 	}
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -1106,7 +1131,7 @@ static int inv_iteration_order(void)
 		pthread_create(&writers[i], NULL, inv_iter_order_writer, &shared.ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 
@@ -1115,7 +1140,7 @@ static int inv_iteration_order(void)
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
@@ -1244,11 +1269,11 @@ static void *mw_writer(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(w->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t off = (uint64_t)(rand_r(&seed) % MW_RANGE);
 		uint64_t key = w->base + off;
 		struct cds_ft_node *found;
@@ -1394,19 +1419,19 @@ static int inv_concurrent_writers_disjoint(void)
 		w[i].base = (uint64_t) i * MW_RANGE;
 	}
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < MW_NR_WRITERS; i++)
 		pthread_create(&writers[i], NULL, mw_writer, &w[i]);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < MW_NR_WRITERS; i++)
 		pthread_join(writers[i], NULL);
@@ -1518,11 +1543,11 @@ static void *rk_writer(void *arg)
 	unsigned long iters = 0;
 
 	rcu_register_thread();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint8_t cur = w->at_dst ? w->dp : w->bp;
 		uint8_t oth = w->at_dst ? w->bp : w->dp;
 		uint8_t src_key[2] = { cur, w->sb };
@@ -1670,19 +1695,19 @@ static int inv_rekey_graft_disjoint(void)
 		live += 8;
 	}
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RK_NW; i++)
 		pthread_create(&writers[i], NULL, rk_writer, &w[i]);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RK_NW; i++)
 		pthread_join(writers[i], NULL);
@@ -1913,11 +1938,11 @@ static void *rkm_writer(void *arg)
 	dst_key[0] = w->dp;
 
 	rcu_register_thread();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		int rc;
 
 		/*
@@ -2161,19 +2186,19 @@ static int rkm_run(const char *name, int nsib, int churn)
 		live += (unsigned long) nsib + 2;
 	}
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RKM_NW; i++)
 		pthread_create(&writers[i], NULL, rkm_writer, &w[i]);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RKM_NW; i++)
 		pthread_join(writers[i], NULL);
@@ -2408,11 +2433,11 @@ static void *rkms_writer(void *arg)
 	dst_key[0] = w->dp; dst_key[1] = RKMS_SB;
 
 	rcu_register_thread();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t kp = rkm_key(w->bp, RKMS_SB, w->mine);
 		uint64_t kg = rkm_key(w->bp, RKMS_SB, w->guard);
 		uint64_t dp_priv = rkm_key(w->dp, RKMS_SB, w->mine);
@@ -2553,19 +2578,19 @@ static int inv_rekey_merge_shared_dst(void)
 		rcu_read_unlock();
 	}
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RKMS_NW; i++)
 		pthread_create(&writers[i], NULL, rkms_writer, &w[i]);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RKMS_NW; i++)
 		pthread_join(writers[i], NULL);
@@ -2680,11 +2705,11 @@ static void *rkx_writer(void *arg)
 	unsigned long iters = 0;
 
 	rcu_register_thread();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint8_t cur = w->at_w2 ? w->w2 : w->w1;
 		uint8_t oth = w->at_w2 ? w->w1 : w->w2;
 		uint8_t src_key[3] = { cur, 1, 3 };
@@ -2773,11 +2798,11 @@ static void *rkr_writer(void *arg)
 	unsigned long iters = 0;
 
 	rcu_register_thread();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint8_t cur = w->at_x2 ? RKR_X2 : RKR_X1;
 		uint8_t oth = w->at_x2 ? RKR_X1 : RKR_X2;
 		uint8_t src_key[2] = { w->root, cur };
@@ -2868,19 +2893,19 @@ static int inv_rekey_graft_run_junction(void)
 		live += RKR_NSUB;
 	}
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RKR_NW; i++)
 		pthread_create(&writers[i], NULL, rkr_writer, &w[i]);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RKR_NW; i++)
 		pthread_join(writers[i], NULL);
@@ -3017,11 +3042,11 @@ static void *rke_writer(void *arg)
 	unsigned long iters = 0;
 
 	rcu_register_thread();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint8_t cur = w->at_b ? RKE_B : RKE_A;
 		uint8_t oth = w->at_b ? RKE_A : RKE_B;
 		uint8_t src_key[4] = { w->root, cur, RKE_P, RKE_X };
@@ -3126,19 +3151,19 @@ static int inv_rekey_graft_elevating_junction(void)
 		live += 4 + RKE_NSUB;
 	}
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RKE_NW; i++)
 		pthread_create(&writers[i], NULL, rke_writer, &w[i]);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RKE_NW; i++)
 		pthread_join(writers[i], NULL);
@@ -3293,19 +3318,19 @@ static int inv_rekey_graft_cross_junction(void)
 		live += 6 + RKX_NSUB;
 	}
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RKX_NW; i++)
 		pthread_create(&writers[i], NULL, rkx_writer, &w[i]);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RKX_NW; i++)
 		pthread_join(writers[i], NULL);
@@ -3459,11 +3484,11 @@ static void *rkgl_writer(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(w->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		int rc, c;
 
 		/* No read lock: the move enters the gate, which waits a GP. */
@@ -3604,19 +3629,19 @@ static int inv_rekey_graft_glue_dst(void)
 		live += 4 + RKGL_NSUB;
 	}
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RKGL_NW; i++)
 		pthread_create(&writers[i], NULL, rkgl_writer, &w[i]);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RKGL_NW; i++)
 		pthread_join(writers[i], NULL);
@@ -3790,11 +3815,11 @@ static void *rk_reader(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(r->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		int wi = rand_r(&seed) % r->nw;
 		struct rk_writer_arg *w = &r->w[wi];
 		uint64_t bpk = (uint64_t) w->bp << 24, dpk = (uint64_t) w->dp << 24;
@@ -3953,21 +3978,21 @@ static int inv_rekey_graft_coherent_readers(void)
 		r[i].nw = RK_NW;
 	}
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RK_NW; i++)
 		pthread_create(&writers[i], NULL, rk_writer, &w[i]);
 	for (i = 0; i < RK_NR; i++)
 		pthread_create(&readers[i], NULL, rk_reader, &r[i]);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RK_NW; i++)
 		pthread_join(writers[i], NULL);
@@ -4215,11 +4240,11 @@ static void *rksp_writer(void *arg)
 	unsigned long iters = 0;
 
 	rcu_register_thread();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		int f = (int) (iters % RKSP_NF);
 		uint64_t mk, dk;
 
@@ -4315,11 +4340,11 @@ static void *rksp_reader(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(r->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		int wi = rand_r(&seed) % r->nw;
 		struct rksp_writer_arg *w = &r->w[wi];
 		int pick = rand_r(&seed) % 8, f = pick & 1;
@@ -4503,21 +4528,21 @@ static void rksp_child(void)
 		r[i].nw = RKSP_NW;
 	}
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RKSP_NW; i++)
 		pthread_create(&writers[i], NULL, rksp_writer, &w[i]);
 	for (i = 0; i < RKSP_NR; i++)
 		pthread_create(&readers[i], NULL, rksp_reader, &r[i]);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RKSP_NW; i++)
 		pthread_join(writers[i], NULL);
@@ -4765,19 +4790,19 @@ static int inv_rekey_graft_shared(void)
 		live += 4;
 	}
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RKS_NW; i++)
 		pthread_create(&writers[i], NULL, rk_writer, &w[i]);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RKS_NW; i++)
 		pthread_join(writers[i], NULL);
@@ -5051,11 +5076,11 @@ static void *rkl_reader(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(r->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		struct rk_writer_arg *w = &r->w[rand_r(&seed) % r->nw];
 		uint8_t X = (rand_r(&seed) & 1) ? w->dp : w->bp;
 		uint64_t Xk = (uint64_t) X << 24;
@@ -5251,21 +5276,21 @@ static int inv_rekey_linearizability(void)
 		r[i].nw = RK_NW;
 	}
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RK_NW; i++)
 		pthread_create(&writers[i], NULL, rk_writer, &w[i]);
 	for (i = 0; i < RKL_NR; i++)
 		pthread_create(&readers[i], NULL, rkl_reader, &r[i]);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RK_NW; i++)
 		pthread_join(writers[i], NULL);
@@ -5629,7 +5654,7 @@ static void *rkp_writer(void *arg)
 	unsigned long iters = 0;
 
 	rcu_register_thread();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	/*
@@ -5638,12 +5663,12 @@ static void *rkp_writer(void *arg)
 	 * and the readers below take grace periods (the coherent lookup does
 	 * not, but their call_rcu drain does).
 	 */
-	while (!rkp_moving && !test_stop) {
+	while (!rkp_moving && !test_stop_load()) {
 		rcu_quiescent_state();
 		usleep(200);
 	}
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint8_t s = w->at_dst ? w->dp : w->bp;
 		uint8_t d = w->at_dst ? w->bp : w->dp;
 		uint8_t s_slot = w->at_dst ? RKP_SLOT_DP : RKP_SLOT_BP;
@@ -5748,11 +5773,11 @@ static void *rkp_reader(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(r->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		struct rkp_writer_arg *w = &r->w[rand_r(&seed) % r->nw];
 		int pick = rand_r(&seed) & 7;
 		struct cds_ft_node *got = NULL;
@@ -5944,8 +5969,8 @@ static int inv_rekey_public_no_gap_run(enum rkp_mode mode, enum rkp_gap gap,
 		r[i].nw = RKP_NW;
 	}
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	rkp_moving = 0;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RKP_NW; i++)
@@ -5953,7 +5978,7 @@ static int inv_rekey_public_no_gap_run(enum rkp_mode mode, enum rkp_gap gap,
 	for (i = 0; i < RKP_NR; i++)
 		pthread_create(&readers[i], NULL, rkp_reader, &r[i]);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	/* CONTROL: readers only.  Every band probe must answer the run. */
@@ -5965,7 +5990,7 @@ static int inv_rekey_public_no_gap_run(enum rkp_mode mode, enum rkp_gap gap,
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RKP_NW; i++)
 		pthread_join(writers[i], NULL);
@@ -6244,11 +6269,11 @@ static void *rkmix_kv_writer(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(w->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		unsigned int off = (unsigned int) (rand_r(&seed) % RKMIX_RANGE);
 		uint64_t key = w->base + off;
 		struct cds_ft_node *found = NULL;
@@ -6346,11 +6371,11 @@ static void *rkmix_rekey_writer(void *arg)
 	struct rk_writer_arg *w = (struct rk_writer_arg *) arg;
 
 	rcu_register_thread();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint8_t cur = w->at_dst ? w->dp : w->bp;
 		uint8_t oth = w->at_dst ? w->bp : w->dp;
 		uint8_t src_key[2] = { cur, w->sb };
@@ -6405,11 +6430,11 @@ static void *rkmix_reader(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(r->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		unsigned int pick = (unsigned int) rand_r(&seed) & 7;
 		/*
 		 * Aim INTO the contended junctions (top bytes 1 and 2), which is
@@ -6633,10 +6658,10 @@ static void *wdj_mover(void *arg)
 	struct wdj_mover_arg *w = (struct wdj_mover_arg *) arg;
 
 	rcu_register_thread();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint8_t src[WDJ_JUNCT + 1], dst[WDJ_JUNCT + 1];
 
 		wdj_prefix(src, w->top, w->at_dst ? 2 : 1);
@@ -6665,10 +6690,10 @@ static void *wdj_point(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(w->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint8_t key[WDJ_KLEN];
 		struct ft_test_node *n;
 		struct cds_ft_node *found;
@@ -6728,10 +6753,10 @@ static void *wdj_reader(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(r->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint8_t key[WDJ_KLEN];
 
 		memset(key, 0, sizeof(key));
@@ -6869,8 +6894,8 @@ static int inv_widen_deep_junction(void)
 	}
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < WDJ_NW; i++) {
 		w[i].ft = ft;
@@ -6894,13 +6919,13 @@ static int inv_widen_deep_junction(void)
 		pthread_create(&readers[i], NULL, wdj_reader, &rd[i]);
 	}
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < RKMIX_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < WDJ_NW; i++)
 		pthread_join(movers[i], NULL);
@@ -7070,8 +7095,8 @@ static int inv_rekey_mixed_writers_run(enum rkp_mode mode,
 	if (rkmix_probe_writer_reached(ft, &w[0], want, name) < 0)
 		ret = -1;
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RK_NW; i++)
 		pthread_create(&writers[i], NULL, rkmix_rekey_writer, &w[i]);
@@ -7082,13 +7107,13 @@ static int inv_rekey_mixed_writers_run(enum rkp_mode mode,
 		pthread_create(&readers[i], NULL, rkmix_reader, &rd[i]);
 	}
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < RKMIX_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RK_NW; i++)
 		pthread_join(writers[i], NULL);
@@ -7442,11 +7467,11 @@ static void *sibp_writer(void *arg)
 	unsigned long miss_streak = 0;
 
 	rcu_register_thread();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		struct ft_test_node *n = node_alloc(w->key);
 		struct cds_ft_node *f = NULL;
 		enum cds_ft_status st;
@@ -7481,7 +7506,7 @@ static void *sibp_writer(void *arg)
 		w->inflight = n;	/* the run owes this node a reclaim */
 		rcu_read_unlock();
 
-		for (a = 0; a < SIBP_TAKEBACK_TRIES && !test_stop; a++) {
+		for (a = 0; a < SIBP_TAKEBACK_TRIES && !test_stop_load(); a++) {
 			int gone = 0;
 
 			if (sibp_remove(w->ft, w->key, n, &gone) ==
@@ -7551,7 +7576,7 @@ static void *sibp_writer(void *arg)
 			 *           it can never take back.
 			 * Report which, so the failure names its own shape.
 			 */
-			if (test_stop) {
+			if (test_stop_load()) {
 				w->stuck++;
 				goto out;
 			}
@@ -7746,11 +7771,11 @@ static void *rksm_mover(void *arg)
 	dst_key[0] = w->dp; dst_key[1] = RKSM_SB;
 
 	rcu_register_thread();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t kp = rkm_key(w->bp, RKSM_SB, w->mine);
 		uint64_t kg = rkm_key(w->bp, RKSM_SB, w->guard);
 		int rc;
@@ -7899,11 +7924,11 @@ static void *rksm_mutator(void *arg)
 	unsigned long iters = 0;
 
 	rcu_register_thread();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		/*
 		 * DEEPER than a sibling of S_top's children, on purpose.  As a
 		 * sibling this key can be the ONLY one under (bp,SB) in the window
@@ -8064,21 +8089,21 @@ static int inv_rekey_src_mutated(void)
 	}
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RKSM_NW; i++) {
 		pthread_create(&movers[i], NULL, rksm_mover, &mv[i]);
 		pthread_create(&mutators[i], NULL, rksm_mutator, &mu[i]);
 	}
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS && !stop_all)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < RKSM_NW; i++) {
 		pthread_join(movers[i], NULL);
@@ -8337,19 +8362,19 @@ static int sibling_split_compress_body(const char *name, bool pin_prefix)
 	}
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < SIBP_NW * 2; i++)
 		pthread_create(&th[i], NULL, sibp_writer, &w[i]);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS && !stop_all)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < SIBP_NW * 2; i++)
 		pthread_join(th[i], NULL);
@@ -8542,11 +8567,11 @@ static void *mw_shared_writer(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(w->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t key = (uint64_t)(rand_r(&seed) % MW_SHARED_RANGE);
 		struct cds_ft_node *found;
 		uint8_t k[8];
@@ -8635,19 +8660,19 @@ static int inv_concurrent_writers_shared(void)
 		w[i].seed0 = (unsigned int)(i * 2654435761u + 1u);
 	}
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < MW_NR_WRITERS; i++)
 		pthread_create(&writers[i], NULL, mw_shared_writer, &w[i]);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < MW_NR_WRITERS; i++)
 		pthread_join(writers[i], NULL);
@@ -8742,19 +8767,19 @@ static int inv_concurrent_writers_coarse_lock(void)
 		w[i].base = (uint64_t) i * MW_RANGE;
 	}
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < MW_COARSE_NR_WRITERS; i++)
 		pthread_create(&writers[i], NULL, mw_writer, &w[i]);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < MW_COARSE_NR_WRITERS; i++)
 		pthread_join(writers[i], NULL);
@@ -8856,19 +8881,19 @@ static int inv_concurrent_writers_fine_lock(void)
 		w[i].base = (uint64_t) i * MW_RANGE;
 	}
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < MW_FINE_NR_WRITERS; i++)
 		pthread_create(&writers[i], NULL, mw_writer, &w[i]);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < MW_FINE_NR_WRITERS; i++)
 		pthread_join(writers[i], NULL);
@@ -9168,11 +9193,11 @@ static void *mw_xt_writer(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(x->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		unsigned int p = (unsigned int)(rand_r(&seed) % MW_XT_PREFIXES);
 		uint8_t prefix[2] = { (uint8_t) p, (uint8_t) x->mid };
 		unsigned int s;
@@ -9366,11 +9391,11 @@ static void *mw_xt_point_writer(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(x->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		unsigned int p = (unsigned int)(rand_r(&seed) % MW_XT_PREFIXES);
 		unsigned int s;
 
@@ -9532,20 +9557,20 @@ static int mw_xt_oracle(const char *tname, int attach_mode, bool list_on,
 		}
 	}
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < nr_total; i++)
 		pthread_create(&writers[i], NULL,
 			x[i].point ? mw_xt_point_writer : mw_xt_writer, &x[i]);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < nr_total; i++)
 		pthread_join(writers[i], NULL);
@@ -9901,11 +9926,11 @@ static void *mw_gs_writer(void *arg)
 	unsigned int seed = (unsigned int)(uintptr_t) x + 0x9e3779b9u;
 
 	rcu_register_thread();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		unsigned int p = (unsigned int)(rand_r(&seed) % MW_XT_PREFIXES);
 		uint8_t prefix[2] = { (uint8_t) p, (uint8_t) x->w };
 		struct ft_test_node *newn[MW_XT_SUFFIXES] = { NULL };
@@ -10004,19 +10029,19 @@ static int mw_gs_oracle(void)
 		x[i].w = i;
 	}
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < MW_XT_NR_WRITERS; i++)
 		pthread_create(&writers[i], NULL, mw_gs_writer, &x[i]);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < MW_XT_NR_WRITERS; i++)
 		pthread_join(writers[i], NULL);
@@ -10113,11 +10138,11 @@ static void *inv_bind_resume_reader(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t prev = 0;
 		int first = 1;
 		int in_batch = 0;
@@ -10193,8 +10218,8 @@ static int inv_bind_resume_order(void)
 	}
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -10203,7 +10228,7 @@ static int inv_bind_resume_order(void)
 		pthread_create(&writers[i], NULL, inv_iter_order_writer, &shared.ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 
@@ -10212,7 +10237,7 @@ static int inv_bind_resume_order(void)
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
@@ -10375,11 +10400,11 @@ static void *inv_reverse_iter_reader(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t prev = UINT64_MAX;
 		int first = 1;
 		int count = 0;
@@ -10439,8 +10464,8 @@ static int inv_reverse_iteration_order(void)
 	}
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -10449,7 +10474,7 @@ static int inv_reverse_iteration_order(void)
 		pthread_create(&writers[i], NULL, inv_iter_order_writer, &shared.ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 
@@ -10457,7 +10482,7 @@ static int inv_reverse_iteration_order(void)
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
@@ -10504,11 +10529,11 @@ static void *inv_lookup_consistency_reader(void *arg)
 	rcu_register_thread();
 	seed = (unsigned int)(uintptr_t)pthread_self() ^ (unsigned int)time(NULL);
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t key = (uint64_t)(rand_r(&seed) % READER_POOL_SIZE);
 		struct cds_ft_node *found;
 
@@ -10545,11 +10570,11 @@ static void *inv_lookup_consistency_writer(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t key = (uint64_t)(rand_r(&seed) % WRITER_POOL_SIZE);
 		int do_insert = rand_r(&seed) & 1;
 
@@ -10611,8 +10636,8 @@ static int inv_lookup_consistency(void)
 	}
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -10621,7 +10646,7 @@ static int inv_lookup_consistency(void)
 		pthread_create(&writers[i], NULL, inv_lookup_consistency_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 
@@ -10629,7 +10654,7 @@ static int inv_lookup_consistency(void)
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
@@ -10680,11 +10705,11 @@ static void *inv_splice_window_reader(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t key = (uint64_t)(rand_r(&seed) % WRITER_POOL_SIZE);
 		uint8_t k[8];
 		enum cds_ft_status s;
@@ -10746,8 +10771,8 @@ static int inv_insert_splice_window(void)
 	}
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -10756,7 +10781,7 @@ static int inv_insert_splice_window(void)
 		pthread_create(&writers[i], NULL, inv_lookup_consistency_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 
@@ -10764,7 +10789,7 @@ static int inv_insert_splice_window(void)
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
@@ -10805,11 +10830,11 @@ static void *inv_splice_window_replace_writer(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t key = (uint64_t)(rand_r(&seed) % WRITER_POOL_SIZE);
 		int do_insert = rand_r(&seed) & 1;
 
@@ -10887,8 +10912,8 @@ static int inv_insert_replace_splice_window(void)
 	}
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -10898,7 +10923,7 @@ static int inv_insert_replace_splice_window(void)
 			inv_splice_window_replace_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 
@@ -10906,7 +10931,7 @@ static int inv_insert_replace_splice_window(void)
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
@@ -10957,11 +10982,11 @@ static void *inv_skipx_replace_reader(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t key = INV_SKIPX_KEY(rand_r(&seed) % WRITER_POOL_SIZE);
 		uint8_t k[8];
 		enum cds_ft_status s;
@@ -11007,11 +11032,11 @@ static void *inv_skipx_replace_writer(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t key = INV_SKIPX_KEY(rand_r(&seed) % WRITER_POOL_SIZE);
 		int do_insert = rand_r(&seed) & 1;
 
@@ -11085,8 +11110,8 @@ static int inv_insert_replace_skipx_splice_window(void)
 	}
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -11096,7 +11121,7 @@ static int inv_insert_replace_skipx_splice_window(void)
 			inv_skipx_replace_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 
@@ -11104,7 +11129,7 @@ static int inv_insert_replace_skipx_splice_window(void)
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
@@ -11150,11 +11175,11 @@ static void *inv_replace_skipx_writer(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t key = INV_SKIPX_KEY(rand_r(&seed) % WRITER_POOL_SIZE);
 		struct ft_test_node *newn = node_alloc(key);
 		struct cds_ft_node *old;
@@ -11225,8 +11250,8 @@ static int inv_replace_skipx(void)
 	}
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -11235,7 +11260,7 @@ static int inv_replace_skipx(void)
 		pthread_create(&writers[i], NULL, inv_replace_skipx_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 
@@ -11243,7 +11268,7 @@ static int inv_replace_skipx(void)
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
@@ -11294,11 +11319,11 @@ static void *inv_remove_xview_reader(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		struct cds_ft_node *n1, *n2;
 		uint64_t k1, k2;
 		uint8_t kb[8];
@@ -11343,11 +11368,11 @@ static void *inv_remove_xview_drainer(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		struct cds_ft_node *node;
 		uint64_t k;
 		uint8_t kb[8];
@@ -11410,8 +11435,8 @@ static int run_remove_cross_view(struct cds_ft *ft, struct cds_ft_group *group,
 	ctx.test_name = test_name;
 	pthread_mutex_init(&ctx.lock, NULL);
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	test_drained = 0;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
@@ -11420,7 +11445,7 @@ static int run_remove_cross_view(struct cds_ft *ft, struct cds_ft_group *group,
 	pthread_create(&drainer, NULL, drainer_fn, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 
@@ -11429,7 +11454,7 @@ static int run_remove_cross_view(struct cds_ft *ft, struct cds_ft_group *group,
 	       !__atomic_load_n(&test_drained, __ATOMIC_RELAXED))
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	pthread_join(drainer, NULL);
@@ -12014,11 +12039,11 @@ static void *inv_remove_xview_reader_max(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		struct cds_ft_node *n1, *n2;
 		uint8_t k1[8], k2[8];
 		size_t l1, l2;
@@ -12062,11 +12087,11 @@ static void *inv_remove_xview_drainer_max(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		struct cds_ft_node *node;
 		uint8_t k[8];
 		size_t l;
@@ -12153,11 +12178,11 @@ static void *inv_remove_xview_reader_minvl(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		struct cds_ft_node *n1, *n2;
 		uint8_t k1[8], k2[8];
 		size_t l1, l2;
@@ -12208,11 +12233,11 @@ static void *inv_remove_xview_drainer_minvl(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		struct cds_ft_node *node;
 		uint8_t k[8];
 		size_t l;
@@ -12259,11 +12284,11 @@ static void *inv_remove_xview_drainer_minvl_all(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		struct cds_ft_node *node, *removed;
 		uint8_t k[8];
 		size_t l;
@@ -12452,11 +12477,11 @@ static void *inv_graft_xview_appear_reader(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		struct cds_ft_node *n;
 		uint8_t kf1[8], kf2[8], ks[8];
 		size_t lf1, lf2, lks;
@@ -12521,14 +12546,14 @@ static int inv_graft_cross_view(void)
 
 	ctx.ft = ft;
 	ctx.test_name = "inv_graft_cross_view";
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_create(&readers[i], NULL,
 			inv_graft_xview_appear_reader, &ctx);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	/*
 	 * Graft a fresh 2-key run at a strictly DECREASING 2-byte prefix, so each
@@ -12568,7 +12593,7 @@ cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 			break;
 	}
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_join(readers[i], NULL);
@@ -12776,11 +12801,11 @@ static void *inv_graft_nolist_reader(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		rcu_read_lock();
 		cds_ft_iter_set_key(iter, NOLIST_STABLE, sizeof(NOLIST_STABLE));
 		cds_ft_lookup(ctx->ft, iter);
@@ -12822,13 +12847,13 @@ static int inv_graft_no_list_diverge(void)
 
 	ctx.ft = ft;
 	ctx.test_name = "inv_graft_no_list_diverge";
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_create(&readers[i], NULL, inv_graft_nolist_reader, &ctx);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	for (k = 0; k < GRAFT_NOLIST_ITERS; k++) {
@@ -12869,7 +12894,7 @@ cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 			break;
 	}
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_join(readers[i], NULL);
@@ -12907,11 +12932,11 @@ static void *inv_graft_dispext_reader(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		rcu_read_lock();
 		cds_ft_iter_set_key(iter, DISPEXT_STABLE, sizeof(DISPEXT_STABLE));
 		cds_ft_lookup(ctx->ft, iter);
@@ -12951,13 +12976,13 @@ static int inv_graft_displaced_external(void)
 
 	ctx.ft = ft;
 	ctx.test_name = "inv_graft_displaced_external";
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_create(&readers[i], NULL, inv_graft_dispext_reader, &ctx);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	for (k = 0; k < GRAFT_DISPEXT_ITERS; k++) {
@@ -12996,7 +13021,7 @@ cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 			break;
 	}
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_join(readers[i], NULL);
@@ -13064,11 +13089,11 @@ static void *inv_rootswap_appear_reader(void *arg)
 	static const uint8_t SUBMIN[1] = { 0x00 };
 
 	rcu_register_thread();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		struct cds_ft *dst = rcu_dereference(ctx->cur);
 		bool front1, front2, struct_full;
 
@@ -13134,14 +13159,14 @@ static int inv_graft_root_swap_cross_view(void)
 
 	ctx.cur = NULL;
 	ctx.test_name = "inv_graft_root_swap_cross_view";
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_create(&readers[i], NULL,
 			inv_rootswap_appear_reader, &ctx);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	for (k = 0; k < ROOTSWAP_XVIEW_GRAFTS; k++) {
@@ -13179,7 +13204,7 @@ static int inv_graft_root_swap_cross_view(void)
 			break;
 	}
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_join(readers[i], NULL);
@@ -13254,14 +13279,14 @@ static int inv_merge_root_swap_cross_view(void)
 
 	ctx.cur = NULL;
 	ctx.test_name = "inv_merge_root_swap_cross_view";
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < ROOTSWAP_XVIEW_READERS; i++)
 		pthread_create(&readers[i], NULL,
 			inv_rootswap_appear_reader, &ctx);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	for (k = 0; k < ROOTSWAP_XVIEW_GRAFTS; k++) {
@@ -13309,7 +13334,7 @@ static int inv_merge_root_swap_cross_view(void)
 			break;
 	}
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < ROOTSWAP_XVIEW_READERS; i++)
 		pthread_join(readers[i], NULL);
@@ -13375,11 +13400,11 @@ static void *inv_rootswap_disappear_reader(void *arg)
 	static const uint8_t SUBMIN[1] = { 0x00 };
 
 	rcu_register_thread();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		struct cds_ft *src = rcu_dereference(ctx->cur);
 		bool front1, front2, struct_full;
 
@@ -13904,10 +13929,10 @@ static void *prefix_park_writer(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(a->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint8_t key[2] = { (uint8_t) (0x40 + a->w), 0 };
 		size_t klen = 1;
 		struct ft_test_node *n;
@@ -13991,8 +14016,8 @@ static int inv_prefix_key_park_vs_holder_churn(void)
 		}
 	}
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < PREFIX_PARK_PAIRS * 2; i++) {
 		a[i].ft = ft;
@@ -14002,11 +14027,11 @@ static int inv_prefix_key_park_vs_holder_churn(void)
 		pthread_create(&th[i], NULL, prefix_park_writer, &a[i]);
 	}
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < PREFIX_PARK_MS)
 		rcu_quiescent_state();
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < PREFIX_PARK_PAIRS * 2; i++) {
 		pthread_join(th[i], NULL);
@@ -14110,10 +14135,10 @@ static void *prefix_pair_writer(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(a->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		rcu_quiescent_state();
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		struct ft_test_node *n = node_alloc(a->w);
 		struct cds_ft_node *out = NULL;
 		enum cds_ft_status st;
@@ -14239,8 +14264,8 @@ static int prefix_pair_run(const char *name, bool siblings)
 		if (cds_ft_insert(ft, sk, sizeof(sk), &n->node) != CDS_FT_STATUS_OK)
 			abort();
 	}
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	if (pairs < 1 || pairs > PREFIX_PAIR_PAIRS_MAX)
 		pairs = 1;
@@ -14268,11 +14293,11 @@ static int prefix_pair_run(const char *name, bool siblings)
 		pthread_create(&th[i], NULL, prefix_pair_writer, &a[i]);
 	}
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < ms)
 		rcu_quiescent_state();
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	rcu_thread_offline();
 	for (i = 0; i < pairs * 2; i++) {
@@ -14368,10 +14393,10 @@ static void *dup_promote_writer(void *arg)
 			abort();
 		live[i] = &n->node;
 	}
-	while (!test_go)
+	while (!test_go_load())
 		rcu_quiescent_state();
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		struct cds_ft_node *h, *out = NULL;
 		struct ft_test_node *n;
 		unsigned int idx;
@@ -14438,17 +14463,17 @@ static int inv_prefix_dup_promote_vs_extension(void)
 	prefix_pair_stale = 0;
 	/* P changes hands here: the K writer must not check a fixed anchor. */
 	memset(prefix_pair_anchor, 0, sizeof(prefix_pair_anchor));
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	pthread_create(&dt, NULL, dup_promote_writer, &da);
 	pthread_create(&kt, NULL, prefix_pair_writer, &ka);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < ms)
 		rcu_quiescent_state();
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	rcu_thread_offline();
 	pthread_join(dt, NULL);
@@ -14569,17 +14594,18 @@ static void *zoo_writer(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(a->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		rcu_quiescent_state();
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	while (!test_stop) {
-		if (uatomic_read(&zoo_pause)) {
-			uatomic_inc(&zoo_paused);
+	while (!test_stop_load()) {
+		if (uatomic_load(&zoo_pause, CMM_ACQUIRE)) {
+			uatomic_inc(&zoo_paused, CMM_RELEASE);
 			rcu_thread_offline();
-			while (uatomic_read(&zoo_pause) && !test_stop)
+			while (uatomic_load(&zoo_pause, CMM_ACQUIRE) &&
+					!test_stop_load())
 				caa_cpu_relax();
 			rcu_thread_online();
-			uatomic_dec(&zoo_paused);
+			uatomic_dec(&zoo_paused, CMM_RELEASE);
 			continue;
 		}
 		unsigned int r = rand_r(&a->seed);
@@ -14692,8 +14718,8 @@ static int inv_prefix_shape_zoo(void)
 		cds_ft_group_destroy(group);
 		return 0;
 	}
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < ZOO_WRITERS; i++) {
 		memset(&a[i], 0, sizeof(a[i]));
@@ -14703,7 +14729,7 @@ static int inv_prefix_shape_zoo(void)
 		pthread_create(&th[i], NULL, zoo_writer, &a[i]);
 	}
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	/*
 	 * Verify every @win ms (FT_INV_ZOO_WIN_MS, default 5), writers parked,
@@ -14720,8 +14746,9 @@ static int inv_prefix_shape_zoo(void)
 			clock_gettime(CLOCK_MONOTONIC, &tw);
 			while (elapsed_ms(&tw) < win)
 				rcu_quiescent_state();
-			uatomic_set(&zoo_pause, 1);
-			while (uatomic_read(&zoo_paused) != ZOO_WRITERS)
+			uatomic_store(&zoo_pause, 1, CMM_RELEASE);
+			while (uatomic_load(&zoo_paused, CMM_ACQUIRE) !=
+					ZOO_WRITERS)
 				rcu_quiescent_state();
 			nwin++;
 			if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
@@ -14729,8 +14756,8 @@ static int inv_prefix_shape_zoo(void)
 					nwin);
 				abort();
 			}
-			uatomic_set(&zoo_pause, 0);
-			while (uatomic_read(&zoo_paused) != 0)
+			uatomic_store(&zoo_pause, 0, CMM_RELEASE);
+			while (uatomic_load(&zoo_paused, CMM_ACQUIRE) != 0)
 				rcu_quiescent_state();
 		}
 		fprintf(stderr, "# inv_prefix_shape_zoo: %lu windows verified\n",
@@ -14738,7 +14765,7 @@ static int inv_prefix_shape_zoo(void)
 	} else
 	while (elapsed_ms(&t0) < ms)
 		rcu_quiescent_state();
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	rcu_thread_offline();
 	for (i = 0; i < ZOO_WRITERS; i++)
@@ -15034,14 +15061,14 @@ static int owned_pause, owned_paused;
 
 static void owned_park(void)
 {
-	if (!uatomic_read(&owned_pause))
+	if (!uatomic_load(&owned_pause, CMM_ACQUIRE))
 		return;
-	uatomic_inc(&owned_paused);
+	uatomic_inc(&owned_paused, CMM_RELEASE);
 	rcu_thread_offline();
-	while (uatomic_read(&owned_pause) && !test_stop)
+	while (uatomic_load(&owned_pause, CMM_ACQUIRE) && !test_stop_load())
 		caa_cpu_relax();
 	rcu_thread_online();
-	uatomic_dec(&owned_paused);
+	uatomic_dec(&owned_paused, CMM_RELEASE);
 }
 
 struct owned_expect {
@@ -15175,11 +15202,12 @@ static void *owned_writer(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(a->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		rcu_quiescent_state();
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	while (a->replace && !test_stop && !*a->stop_all) {
-		for (i = 0; i < a->nr_keys && !test_stop && !*a->stop_all; i++) {
+	while (a->replace && !test_stop_load() && !*a->stop_all) {
+		for (i = 0; i < a->nr_keys && !test_stop_load() &&
+				!*a->stop_all; i++) {
 			int r;
 
 			owned_park();
@@ -15194,8 +15222,9 @@ static void *owned_writer(void *arg)
 			a->ops++;
 		}
 	}
-	while (!a->replace && !test_stop && !*a->stop_all) {
-		for (i = 0; i < a->nr_keys && !test_stop && !*a->stop_all; i++) {
+	while (!a->replace && !test_stop_load() && !*a->stop_all) {
+		for (i = 0; i < a->nr_keys && !test_stop_load() &&
+				!*a->stop_all; i++) {
 			struct owned_key *k = &a->keys[i];
 			struct ft_test_node *n;
 			struct cds_ft_node *o;
@@ -15221,7 +15250,8 @@ static void *owned_writer(void *arg)
 			rcu_quiescent_state();
 			a->ops++;
 		}
-		for (i = 0; i < a->nr_keys && !test_stop && !*a->stop_all; i++) {
+		for (i = 0; i < a->nr_keys && !test_stop_load() &&
+				!*a->stop_all; i++) {
 			struct owned_key *k = &a->keys[i];
 			struct cds_ft_node *o;
 
@@ -15330,8 +15360,8 @@ static int owned_body(const char *name, unsigned int nwriters,
 	}
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < nwriters; i++) {
 		memset(&a[i], 0, sizeof(a[i]));
@@ -15346,7 +15376,7 @@ static int owned_body(const char *name, unsigned int nwriters,
 		pthread_create(&th[i], NULL, owned_writer, &a[i]);
 	}
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	if (win) {
 		unsigned long nwin = 0;
@@ -15357,9 +15387,10 @@ static int owned_body(const char *name, unsigned int nwriters,
 			clock_gettime(CLOCK_MONOTONIC, &tw);
 			while (elapsed_ms(&tw) < win && !stop_all)
 				rcu_quiescent_state();
-			uatomic_set(&owned_pause, 1);
+			uatomic_store(&owned_pause, 1, CMM_RELEASE);
 			clock_gettime(CLOCK_MONOTONIC, &tw);
-			while (uatomic_read(&owned_paused) != (int) nwriters &&
+			while (uatomic_load(&owned_paused, CMM_ACQUIRE) !=
+					(int) nwriters &&
 					!stop_all) {
 				rcu_quiescent_state();
 				if (elapsed_ms(&tw) < 2000)
@@ -15413,8 +15444,8 @@ static int owned_body(const char *name, unsigned int nwriters,
 					stop_all = 1, ret = -1;
 				rcu_read_unlock();
 			}
-			uatomic_set(&owned_pause, 0);
-			while (uatomic_read(&owned_paused) != 0)
+			uatomic_store(&owned_pause, 0, CMM_RELEASE);
+			while (uatomic_load(&owned_paused, CMM_ACQUIRE) != 0)
 				rcu_quiescent_state();
 		}
 		fprintf(stderr, "# %s: %lu windows checked\n", name, nwin);
@@ -15422,7 +15453,7 @@ static int owned_body(const char *name, unsigned int nwriters,
 	rcu_thread_offline();
 	while (elapsed_ms(&t0) < ms && !stop_all)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < nwriters; i++)
 		pthread_join(th[i], NULL);
@@ -15536,10 +15567,10 @@ static void *irpr_writer(void *arg)
 		abort();
 	irpr_key(k, a->pair, 'a');
 	k[IRPR_KLEN] = 'b';
-	while (!test_go)
+	while (!test_go_load())
 		rcu_quiescent_state();
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	while (!test_stop && !*a->stop_all) {
+	while (!test_stop_load() && !*a->stop_all) {
 		struct ft_test_node *n = node_alloc(0);
 		struct cds_ft_node *res = NULL;
 		enum cds_ft_status st;
@@ -15613,8 +15644,8 @@ static int inv_ir_prefix_roundtrip(void)
 	}
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < nthreads; i++) {
 		a[i] = (struct irpr_arg) { .ft = ft, .pair = (int) (i / 2),
@@ -15622,7 +15653,7 @@ static int inv_ir_prefix_roundtrip(void)
 		pthread_create(&th[i], NULL, irpr_writer, &a[i]);
 	}
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < ms && !stop_all) {
 		struct timespec tw;
@@ -15630,8 +15661,9 @@ static int inv_ir_prefix_roundtrip(void)
 		clock_gettime(CLOCK_MONOTONIC, &tw);
 		while (elapsed_ms(&tw) < 1)
 			rcu_quiescent_state();
-		uatomic_set(&owned_pause, 1);
-		while (uatomic_read(&owned_paused) != (int) nthreads &&
+		uatomic_store(&owned_pause, 1, CMM_RELEASE);
+		while (uatomic_load(&owned_paused, CMM_ACQUIRE) !=
+				(int) nthreads &&
 				!stop_all)
 			rcu_quiescent_state();
 		if (!stop_all) {
@@ -15641,14 +15673,14 @@ static int inv_ir_prefix_roundtrip(void)
 				stop_all = 1, ret = -1;
 			rcu_read_unlock();
 		}
-		uatomic_set(&owned_pause, 0);
-		while (uatomic_read(&owned_paused) != 0)
+		uatomic_store(&owned_pause, 0, CMM_RELEASE);
+		while (uatomic_load(&owned_paused, CMM_ACQUIRE) != 0)
 			rcu_quiescent_state();
 	}
 	if (stop_all)
 		ret = -1;
 	fprintf(stderr, "# %s: %lu windows checked\n", name, nwin);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	rcu_thread_offline();
 	for (i = 0; i < nthreads; i++)
@@ -15696,10 +15728,10 @@ static void *unique_prefix_writer(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(a->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		rcu_quiescent_state();
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		struct ft_test_node *n = node_alloc(a->id);
 		struct cds_ft_node *res = NULL, *out = NULL;
 		enum cds_ft_status st;
@@ -15761,8 +15793,8 @@ static int inv_concurrent_insert_unique_prefix(void)
 		if (cds_ft_insert(ft, k, kl, &n->node) != CDS_FT_STATUS_OK)
 			abort();
 	}
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < UNIQUE_PREFIX_WRITERS; i++) {
 		a[i].ft = ft;
@@ -15771,11 +15803,11 @@ static int inv_concurrent_insert_unique_prefix(void)
 		pthread_create(&th[i], NULL, unique_prefix_writer, &a[i]);
 	}
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < ms)
 		rcu_quiescent_state();
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	rcu_thread_offline();
 	for (i = 0; i < UNIQUE_PREFIX_WRITERS; i++) {
@@ -15863,10 +15895,10 @@ static void *detach_orphan_writer(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(a->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		rcu_quiescent_state();
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		unsigned int p = (unsigned int) rand_r(&seed) %
 			DETACH_ORPHAN_PREFIXES;
 		uint8_t key[DETACH_ORPHAN_MAX_LEN + 2];
@@ -15927,8 +15959,8 @@ static int inv_detach_orphan_shape_one(bool list_on)
 	int ret = 0;
 
 	detach_orphan_bad = 0;
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < DETACH_ORPHAN_WRITERS; i++) {
 		memset(&a[i], 0, sizeof(a[i]));
@@ -15937,11 +15969,11 @@ static int inv_detach_orphan_shape_one(bool list_on)
 		pthread_create(&th[i], NULL, detach_orphan_writer, &a[i]);
 	}
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < ms)
 		rcu_quiescent_state();
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	rcu_thread_offline();
 	for (i = 0; i < DETACH_ORPHAN_WRITERS; i++) {
@@ -16106,10 +16138,10 @@ static void *cr_mover(void *arg)
 	struct cr_mover_arg *a = (struct cr_mover_arg *) arg;
 
 	rcu_register_thread();
-	while (!test_go)
+	while (!test_go_load())
 		rcu_quiescent_state();
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint8_t src[3] = { 'j', (uint8_t) a->m, a->at_b ? 'B' : 'A' };
 		uint8_t dst[3] = { 'j', (uint8_t) a->m, a->at_b ? 'A' : 'B' };
 		enum cds_ft_status st;
@@ -16240,8 +16272,8 @@ static int inv_compact_vs_bulk_one(bool list_on, bool graft)
 		rcu_read_unlock();
 	}
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (m = 0; m < CR_MOVERS; m++) {
 		memset(&a[m], 0, sizeof(a[m]));
@@ -16251,7 +16283,7 @@ static int inv_compact_vs_bulk_one(bool list_on, bool graft)
 		pthread_create(&th[m], NULL, cr_mover, &a[m]);
 	}
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	/* This thread is the compactor. */
 	rss0 = cr_rss_mb();
@@ -16285,7 +16317,7 @@ static int inv_compact_vs_bulk_one(bool list_on, bool graft)
 			break;
 		}
 	}
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	rcu_thread_offline();
 	for (m = 0; m < CR_MOVERS; m++) {
@@ -17965,14 +17997,14 @@ static int inv_merge_root_src_cross_view(void)
 
 	ctx.cur = NULL;
 	ctx.test_name = "inv_merge_root_src_cross_view";
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_create(&readers[i], NULL,
 			inv_rootswap_disappear_reader, &ctx);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	for (k = 0; k < ROOTSWAP_XVIEW_GRAFTS; k++) {
@@ -18028,7 +18060,7 @@ static int inv_merge_root_src_cross_view(void)
 			break;
 	}
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_join(readers[i], NULL);
@@ -18091,14 +18123,14 @@ static int inv_merge_cross_view(void)
 
 	ctx.ft = ft;
 	ctx.test_name = "inv_merge_cross_view";
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_create(&readers[i], NULL,
 			inv_graft_xview_appear_reader, &ctx);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	/*
 	 * Merge a fresh src subtree (at "S", keys {S,0},{S,1}) into dst at a
@@ -18137,7 +18169,7 @@ cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 			break;
 	}
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_join(readers[i], NULL);
@@ -18188,14 +18220,14 @@ static int inv_merge_spinecopy_cross_view(void)
 
 	ctx.ft = ft;
 	ctx.test_name = "inv_merge_spinecopy_cross_view";
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_create(&readers[i], NULL,
 			inv_graft_xview_appear_reader, &ctx);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	for (k = 0; k < MERGE_XVIEW_MERGES; k++) {
@@ -18240,7 +18272,7 @@ cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 			break;
 	}
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_join(readers[i], NULL);
@@ -18280,14 +18312,14 @@ static int inv_detach_cross_view(void)
 
 	ctx.ft = ft;
 	ctx.test_name = "inv_detach_cross_view";
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_create(&readers[i], NULL, inv_remove_xview_reader_minvl,
 			&ctx);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	/* Time-bounded: each detach is a full grace period, so the whole pool
 	 * may not drain within the window -- drain_and_destroy reclaims the rest. */
@@ -18305,7 +18337,7 @@ static int inv_detach_cross_view(void)
 			break;
 	}
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_join(readers[i], NULL);
@@ -18379,14 +18411,14 @@ static int inv_detach_root_cross_view(void)
 
 	ctx.ft = ft;
 	ctx.test_name = "inv_detach_root_cross_view";
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < DETACH_ROOT_XVIEW_READERS; i++)
 		pthread_create(&readers[i], NULL, inv_remove_xview_reader_minvl,
 			&ctx);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	/*
 	 * Round-trip the whole trie out and back.  Each detach is a grace
@@ -18414,7 +18446,7 @@ static int inv_detach_root_cross_view(void)
 		cds_ft_destroy(detached);	/* emptied by the graft-back */
 	}
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < DETACH_ROOT_XVIEW_READERS; i++)
 		pthread_join(readers[i], NULL);
@@ -18478,14 +18510,14 @@ static int inv_merge_src_cross_view(void)
 
 	ctx.ft = src;			/* readers watch the DRAINED source */
 	ctx.test_name = "inv_merge_src_cross_view";
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_create(&readers[i], NULL, inv_remove_xview_reader_minvl,
 			&ctx);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	/* Merge each prefix's subtree OUT of @src into @dst (same key, distinct in
 	 * @dst), in increasing order so @src only shrinks.  Each merge is a grace
@@ -18519,7 +18551,7 @@ static int inv_merge_src_cross_view(void)
 			break;
 	}
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_join(readers[i], NULL);
@@ -18600,14 +18632,14 @@ static int inv_merge_src_spinecopy_cross_view(void)
 
 	ctx.ft = src;			/* readers watch the DRAINED source */
 	ctx.test_name = "inv_merge_src_spinecopy_cross_view";
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_create(&readers[i], NULL, inv_remove_xview_reader_minvl,
 			&ctx);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	/* Merge each prefix's subtree OUT of @src into @dst at the SAME (occupied)
 	 * prefix -> spine-copy non-root-src.  Increasing order so @src only shrinks. */
@@ -18640,7 +18672,7 @@ static int inv_merge_src_spinecopy_cross_view(void)
 			break;
 	}
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_join(readers[i], NULL);
@@ -18686,11 +18718,11 @@ static void *inv_dup_chain_reader(void *arg)
 	rcu_register_thread();
 	seed = (unsigned int)(uintptr_t)pthread_self() ^ (unsigned int)time(NULL);
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t key = (uint64_t)(rand_r(&seed) % WRITER_POOL_SIZE);
 		struct cds_ft_node *found;
 
@@ -18749,8 +18781,8 @@ static int inv_dup_chain_acyclicity(void)
 	}
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -18759,7 +18791,7 @@ static int inv_dup_chain_acyclicity(void)
 		pthread_create(&writers[i], NULL, inv_lookup_consistency_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 
@@ -18767,7 +18799,7 @@ static int inv_dup_chain_acyclicity(void)
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
@@ -18810,11 +18842,11 @@ static void *inv_skipx_promote_reader(void *arg)
 	rcu_register_thread();
 	seed = (unsigned int)(uintptr_t)pthread_self() ^ (unsigned int)time(NULL);
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t key = INV_SKIPX_KEY(rand_r(&seed) % WRITER_POOL_SIZE);
 		struct cds_ft_node *found;
 
@@ -18857,11 +18889,11 @@ static void *inv_skipx_promote_writer(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t key = INV_SKIPX_KEY(rand_r(&seed) % WRITER_POOL_SIZE);
 		int do_insert = rand_r(&seed) & 1;
 
@@ -18928,8 +18960,8 @@ static int inv_dup_chain_skipx_head_promotion(void)
 	}
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -18938,7 +18970,7 @@ static int inv_dup_chain_skipx_head_promotion(void)
 		pthread_create(&writers[i], NULL, inv_skipx_promote_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 
@@ -18946,7 +18978,7 @@ static int inv_dup_chain_skipx_head_promotion(void)
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
@@ -19006,8 +19038,8 @@ static int inv_no_ordered_list_consistency(void)
 	}
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	/*
@@ -19024,7 +19056,7 @@ static int inv_no_ordered_list_consistency(void)
 			inv_lookup_consistency_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 
@@ -19032,7 +19064,7 @@ static int inv_no_ordered_list_consistency(void)
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
@@ -19089,11 +19121,11 @@ static void *inv_graft_swap_reader(void *arg)
 	if (cds_ft_iter_create(ctx->live, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		int saw_a = 0, saw_b = 0;
 		int saw_empty = 1;
 
@@ -19196,11 +19228,11 @@ static void *inv_graft_swap_writer(void *arg)
 	/* Prepare the first swap trie with range B keys. */
 	populate_range(swap, GRAFT_SWAP_RANGE_B_BASE, GRAFT_SWAP_POOL);
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		enum cds_ft_status s;
 
 		/*
@@ -19291,8 +19323,8 @@ static int inv_graft_swap_atomicity(void)
 	ctx.test_name = "inv_graft_swap_atomicity";
 	pthread_mutex_init(&ctx.lock, NULL);
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -19301,7 +19333,7 @@ static int inv_graft_swap_atomicity(void)
 	pthread_create(&writer, NULL, inv_graft_swap_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 
@@ -19309,7 +19341,7 @@ static int inv_graft_swap_atomicity(void)
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS * 2)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	pthread_join(writer, NULL);
@@ -19384,11 +19416,11 @@ static void *inv_graft_swap_xview_reader(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(ctx->live, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		int rl1, rs, rl2;
 
 		rcu_read_lock();
@@ -19419,13 +19451,13 @@ static void *inv_graft_swap_xview_writer(void *arg)
 		abort();
 	populate_range(swap, GRAFT_SWAP_RANGE_B_BASE, GRAFT_SWAP_POOL);
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	/* Ping-pong: graft_swap moves the old content into @swap, so the next
 	 * swap moves it straight back -- no drain/repopulate, far more windows. */
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		pthread_mutex_lock(&ctx->lock);
 		cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 		if (cds_ft_graft_swap(ctx->live, NULL, 0, swap) != CDS_FT_STATUS_OK)
@@ -19473,20 +19505,20 @@ static int inv_graft_swap_cross_view(void)
 	ctx.test_name = "inv_graft_swap_cross_view";
 	pthread_mutex_init(&ctx.lock, NULL);
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_create(&readers[i], NULL, inv_graft_swap_xview_reader, &ctx);
 	pthread_create(&writer, NULL, inv_graft_swap_xview_writer, &ctx);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	pthread_join(writer, NULL);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -19595,13 +19627,13 @@ static void *inv_graft_swap_sub_xview_writer(void *arg)
 	populate_at_prefix(swap, NULL, 0, GRAFT_SWAP_RANGE_B_BASE,
 		GRAFT_SWAP_SUB_POOL);
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	/* Ping-pong the subtree at {0x01}: graft_swap leaves run_D in @swap, so
 	 * the next swap moves it back -- no drain, far more windows. */
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		pthread_mutex_lock(&ctx->lock);
 		cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 		if (cds_ft_graft_swap(ctx->live, AT, 1, swap) != CDS_FT_STATUS_OK)
@@ -19654,20 +19686,20 @@ static int inv_graft_swap_sub_cross_view(void)
 	ctx.test_name = "inv_graft_swap_sub_cross_view";
 	pthread_mutex_init(&ctx.lock, NULL);
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_create(&readers[i], NULL, inv_graft_swap_xview_reader, &ctx);
 	pthread_create(&writer, NULL, inv_graft_swap_sub_xview_writer, &ctx);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	pthread_join(writer, NULL);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -19747,14 +19779,14 @@ static int inv_graft_swap_empty_cross_view(void)
 
 	ctx.ft = live;			/* readers watch the DRAINED live trie */
 	ctx.test_name = "inv_graft_swap_empty_cross_view";
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_create(&readers[i], NULL, inv_remove_xview_reader_minvl,
 			&ctx);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	/* Extract each prefix's subtree OUT of @live (empty-swap remove), in
 	 * increasing order so @live only shrinks, draining @swap back to empty
@@ -19771,7 +19803,7 @@ cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 			break;
 	}
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_join(readers[i], NULL);
@@ -19819,11 +19851,11 @@ static void *inv_relational_reader(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t key = (uint64_t)(rand_r(&seed) % READER_POOL_SIZE);
 		uint8_t k[4], rk[4];
 		size_t rk_len;
@@ -19916,8 +19948,8 @@ static int inv_relational_lookup(void)
 	}
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -19926,7 +19958,7 @@ static int inv_relational_lookup(void)
 		pthread_create(&writers[i], NULL, inv_lookup_consistency_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 
@@ -19934,7 +19966,7 @@ static int inv_relational_lookup(void)
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
@@ -19991,11 +20023,11 @@ static void *inv_nth_last_reader(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		enum cds_ft_status s;
 		uint8_t rk[8];
 		size_t rk_len;
@@ -20042,11 +20074,11 @@ static void *inv_nth_low_writer(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t key = (uint64_t)(rand_r(&seed) % NTH_WRITER_RANGE);
 		int do_insert = rand_r(&seed) & 1;
 
@@ -20118,8 +20150,8 @@ static int inv_nth_last_stability(void)
 	}
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -20128,14 +20160,14 @@ static int inv_nth_last_stability(void)
 		pthread_create(&writers[i], NULL, inv_nth_low_writer, &shared.ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
@@ -20177,11 +20209,11 @@ static void *inv_nth_first_reader(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		enum cds_ft_status s;
 		uint8_t rk[8];
 		size_t rk_len;
@@ -20225,11 +20257,11 @@ static void *inv_nth_high_writer(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t key = NTH_STABLE_BASE +
 			(uint64_t)(rand_r(&seed) % NTH_WRITER_RANGE);
 		int do_insert = rand_r(&seed) & 1;
@@ -20302,8 +20334,8 @@ static int inv_nth_first_stability(void)
 	}
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -20312,14 +20344,14 @@ static int inv_nth_first_stability(void)
 		pthread_create(&writers[i], NULL, inv_nth_high_writer, &shared.ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
@@ -20377,11 +20409,11 @@ static void *inv_skip_forward_reader(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		enum cds_ft_status s;
 		uint8_t rk[8];
 		size_t rk_len;
@@ -20471,11 +20503,11 @@ static void *inv_skip_low_writer(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t key = (uint64_t)(rand_r(&seed) % SKIP_WRITER_RANGE);
 		int do_insert = rand_r(&seed) & 1;
 
@@ -20547,8 +20579,8 @@ static int inv_skip_forward_stability(void)
 	}
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -20557,14 +20589,14 @@ static int inv_skip_forward_stability(void)
 		pthread_create(&writers[i], NULL, inv_skip_low_writer, &shared.ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
@@ -20607,11 +20639,11 @@ static void *inv_skip_reverse_reader(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		enum cds_ft_status s;
 		uint8_t rk[8];
 		size_t rk_len;
@@ -20700,11 +20732,11 @@ static void *inv_skip_high_writer(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t key = SKIP_HIGH_WRITER_BASE +
 			(uint64_t)(rand_r(&seed) % SKIP_WRITER_RANGE);
 		int do_insert = rand_r(&seed) & 1;
@@ -20777,8 +20809,8 @@ static int inv_skip_reverse_stability(void)
 	}
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -20787,14 +20819,14 @@ static int inv_skip_reverse_stability(void)
 		pthread_create(&writers[i], NULL, inv_skip_high_writer, &shared.ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
@@ -20875,11 +20907,11 @@ static void *inv_ext_park_reader(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		unsigned long n = (unsigned long)(rand_r(&seed) % ctx->groups);
 		int which = rand_r(&seed) & 3;
 		const char *qname;
@@ -20964,11 +20996,11 @@ static void *inv_ext_park_writer(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		unsigned int g = (unsigned int)(rand_r(&seed) % ctx->groups);
 		uint8_t kp[4] = { (uint8_t)(g >> 8), (uint8_t)(g & 0xff), 0, 0 };
 		int do_insert = rand_r(&seed) & 1;
@@ -21028,8 +21060,8 @@ static int inv_nth_external_nodes_resolve(void)
 	inv_ext_park_populate(ft);
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -21038,14 +21070,14 @@ static int inv_nth_external_nodes_resolve(void)
 		pthread_create(&writers[i], NULL, inv_ext_park_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
@@ -21111,11 +21143,11 @@ static void *inv_nr_keys_undercount_reader(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		unsigned long count_keys;
 		enum cds_ft_status s;
 
@@ -21178,11 +21210,11 @@ static void *inv_nr_keys_undercount_writer(void *arg)
 	rcu_register_thread();
 	seed = (unsigned int)(uintptr_t)pthread_self() ^ (unsigned int)time(NULL);
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t key = (uint64_t)(rand_r(&seed) % WRITER_POOL_SIZE);
 		struct ft_test_node *n = node_alloc(key);
 
@@ -21219,11 +21251,11 @@ static void *inv_nr_keys_remove_reader(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		unsigned long count_keys, iter_count;
 
 		rcu_read_lock();
@@ -21312,11 +21344,11 @@ static void *inv_nr_keys_remove_writer(void *arg)
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint64_t key = (uint64_t)(rand_r(&seed) % WRITER_POOL_SIZE);
 		struct cds_ft_node *found;
 		uint8_t k[8];
@@ -21424,8 +21456,8 @@ static int inv_nr_keys_undercount(void)
 	}
 	rcu_read_unlock();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -21436,14 +21468,14 @@ static int inv_nr_keys_undercount(void)
 			inv_nr_keys_undercount_writer, &shared.ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS / 2)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
@@ -21479,8 +21511,8 @@ static int inv_nr_keys_undercount(void)
 	 */
 	atomic_store(&violation_count, 0);
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -21491,14 +21523,14 @@ static int inv_nr_keys_undercount(void)
 			inv_nr_keys_remove_writer, &shared.ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS / 2)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
@@ -21564,11 +21596,11 @@ static void *inv_nr_keys_no_undercount_reader(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		unsigned long count_keys, iter_count = 0;
 
 		rcu_read_lock();
@@ -21618,8 +21650,8 @@ static int inv_nr_keys_no_undercount(void)
 	rcu_read_unlock();
 
 	atomic_store(&violation_count, 0);
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
 		pthread_create(&readers[i], NULL,
@@ -21628,13 +21660,13 @@ static int inv_nr_keys_no_undercount(void)
 		pthread_create(&writers[i], NULL,
 			inv_nr_keys_remove_writer, &shared.ctx);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
 		pthread_join(writers[i], NULL);
@@ -21731,11 +21763,11 @@ static void *inv_no_escape_reader(void *arg)
 	if (cds_ft_iter_create(ctx->T, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		bool reverse = (iters & 1) != 0;
 		enum cds_ft_status s;
 		unsigned int count = 0;
@@ -21800,11 +21832,11 @@ static void *inv_no_escape_writer(void *arg)
 
 	rcu_register_thread();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		struct cds_ft *D;
 		enum cds_ft_status s;
 
@@ -21908,8 +21940,8 @@ static int inv_ordered_no_escape_graft(void)
 	pthread_mutex_init(&ctx.lock, NULL);
 	ctx.test_name = "inv_ordered_no_escape_graft";
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -21917,14 +21949,14 @@ static int inv_ordered_no_escape_graft(void)
 	pthread_create(&writer, NULL, inv_no_escape_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	pthread_join(writer, NULL);
@@ -22007,11 +22039,11 @@ static void *inv_merge_no_escape_reader(void *arg)
 	if (cds_ft_iter_create(ra->trie, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		bool reverse = (iters & 1) != 0;
 		enum cds_ft_status s;
 		unsigned int count = 0;
@@ -22113,11 +22145,11 @@ static void *inv_merge_no_escape_writer(void *arg)
 	if (cds_ft_iter_create(ctx->dst, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		enum cds_ft_status s;
 
 		/*
@@ -22226,8 +22258,8 @@ static int inv_merge_no_escape(void)
 	ctx.test_name = "inv_merge_no_escape";
 	pthread_mutex_init(&ctx.lock, NULL);
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	/*
@@ -22249,14 +22281,14 @@ static int inv_merge_no_escape(void)
 	pthread_create(&writer, NULL, inv_merge_no_escape_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	pthread_join(writer, NULL);
@@ -22315,11 +22347,11 @@ static void *inv_merge_nonroot_dst_writer(void *arg)
 	if (cds_ft_iter_create(ctx->dst, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		enum cds_ft_status s;
 
 		/* Merge the root source into dst at the interior key "T". */
@@ -22410,8 +22442,8 @@ static int inv_merge_nonroot_dst_no_escape(void)
 	ctx.test_name = "inv_merge_nonroot_dst_no_escape";
 	pthread_mutex_init(&ctx.lock, NULL);
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	/* All readers traverse dst; namespace {T}{a,b}{a..d} across the merge. */
@@ -22427,14 +22459,14 @@ static int inv_merge_nonroot_dst_no_escape(void)
 	pthread_create(&writer, NULL, inv_merge_nonroot_dst_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	pthread_join(writer, NULL);
@@ -22522,11 +22554,11 @@ static void *inv_rerooted_reader(void *arg)
 	if (cds_ft_iter_create(ra->trie, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		bool reverse = (iters & 1) != 0;
 		enum cds_ft_status s;
 		unsigned int count = 0;
@@ -22604,11 +22636,11 @@ static void *inv_rerooted_writer(void *arg)
 	if (cds_ft_iter_create(ctx->dst, &iter) < 0)
 		abort();
 
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		enum cds_ft_status s;
 		unsigned int i;
 
@@ -22706,8 +22738,8 @@ static int inv_merge_rerooted_run(int shape, const char *name)
 	ctx.shape = shape;
 	pthread_mutex_init(&ctx.lock, NULL);
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < 2 * NR_READERS_DEFAULT; i++) {
@@ -22723,14 +22755,14 @@ static int inv_merge_rerooted_run(int shape, const char *name)
 	pthread_create(&writer, NULL, inv_rerooted_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	pthread_join(writer, NULL);
@@ -22795,11 +22827,11 @@ static void *inv_rekey_writer(void *arg)
 	struct inv_rerooted_ctx *ctx = (struct inv_rerooted_ctx *) arg;
 
 	rcu_register_thread();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		enum cds_ft_status s;
 
 		pthread_mutex_lock(&ctx->lock);
@@ -22880,8 +22912,8 @@ static int inv_rekey_no_escape(void)
 	ctx.shape = 0;
 	pthread_mutex_init(&ctx.lock, NULL);
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < 2 * NR_READERS_DEFAULT; i++) {
@@ -22895,14 +22927,14 @@ static int inv_rekey_no_escape(void)
 	pthread_create(&writer, NULL, inv_rekey_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	pthread_join(writer, NULL);
@@ -23080,9 +23112,9 @@ static void *rks_reader(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(ra->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		rcu_quiescent_state();
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint8_t k[32];
 		size_t kl;
 		unsigned int i = round % rks_nsuf;
@@ -23252,9 +23284,9 @@ static void *rks_writer(void *arg)
 	struct cds_ft *ft = (struct cds_ft *) arg;
 
 	rcu_register_thread();
-	while (!test_go)
+	while (!test_go_load())
 		rcu_quiescent_state();
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		enum cds_ft_status s;
 
 		if (rks_merge) {
@@ -23344,8 +23376,8 @@ static int rks_run(bool rank, bool bare, bool across, bool list, bool merge)
 	rcu_read_unlock();
 
 	rks_moves = 0;
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < 2 * NR_READERS_DEFAULT; i++) {
 		rargs[i].ft = ft;
@@ -23355,13 +23387,13 @@ static int rks_run(bool rank, bool bare, bool across, bool list, bool merge)
 	}
 	pthread_create(&writer, NULL, rks_writer, ft);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < (long) ms)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	pthread_join(writer, NULL);
 	for (i = 0; i < 2 * NR_READERS_DEFAULT; i++) {
@@ -23514,9 +23546,9 @@ static void *rkn_reader(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(ra->ft, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		rcu_quiescent_state();
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		unsigned long n;
 		int last;
 
@@ -23658,9 +23690,9 @@ static void *rkn_writer(void *arg)
 	size_t ll = strlen(rkn_sh->lpfx), sl = strlen(rkn_sh->spfx);
 
 	rcu_register_thread();
-	while (!test_go)
+	while (!test_go_load())
 		rcu_quiescent_state();
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		if (cds_ft_rekey_graft(ft, sh, sl, l, ll) != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "%s [%s]: long->short "
 				"failed\n", rkn_name, rkn_sh->name);
@@ -23694,9 +23726,9 @@ static void *rkn_swap_writer(void *arg)
 	size_t pl = strlen(rkn_sh->lpfx);
 
 	rcu_register_thread();
-	while (!test_go)
+	while (!test_go_load())
 		rcu_quiescent_state();
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		enum cds_ft_status st;
 
 		cds_ft_make_exclusive(fts[1]);
@@ -23777,8 +23809,8 @@ static int rkn_run(const struct rkn_shape *sh, bool rank,
 	rcu_read_unlock();
 
 	rkn_moves = 0;
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	for (i = 0; i < 2 * NR_READERS_DEFAULT; i++) {
 		rargs[i].ft = ft;
@@ -23791,13 +23823,13 @@ static int rkn_run(const struct rkn_shape *sh, bool rank,
 	else
 		pthread_create(&writer, NULL, rkn_writer, ft);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < (long) ms)
 		usleep(1000);
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	pthread_join(writer, NULL);
 	for (i = 0; i < 2 * NR_READERS_DEFAULT; i++) {
@@ -23900,11 +23932,11 @@ static void *inv_merge_compressed_dst_reader(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(ra->trie, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		bool reverse = (iters & 1) != 0;
 		enum cds_ft_status s;
 		unsigned int count = 0;
@@ -23954,11 +23986,11 @@ static void *inv_merge_compressed_dst_writer(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(ctx->dst, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		enum cds_ft_status s;
 		struct ft_test_node *n;
 
@@ -24031,8 +24063,8 @@ static int inv_merge_compressed_dst_no_escape(void)
 	ctx.test_name = "inv_merge_compressed_dst_no_escape";
 	pthread_mutex_init(&ctx.lock, NULL);
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < 2 * NR_READERS_DEFAULT; i++) {
@@ -24045,14 +24077,14 @@ static int inv_merge_compressed_dst_no_escape(void)
 	pthread_create(&writer, NULL, inv_merge_compressed_dst_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	pthread_join(writer, NULL);
@@ -24103,11 +24135,11 @@ static void *inv_merge_key_shorter_dst_reader(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(ra->trie, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		bool reverse = (iters & 1) != 0;
 		enum cds_ft_status s;
 		unsigned int count = 0;
@@ -24163,11 +24195,11 @@ static void *inv_merge_key_shorter_dst_writer(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(ctx->dst, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		enum cds_ft_status s;
 		struct ft_test_node *n;
 
@@ -24240,8 +24272,8 @@ static int inv_merge_key_shorter_dst_no_escape(void)
 	ctx.test_name = "inv_merge_key_shorter_dst_no_escape";
 	pthread_mutex_init(&ctx.lock, NULL);
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < 2 * NR_READERS_DEFAULT; i++) {
@@ -24254,14 +24286,14 @@ static int inv_merge_key_shorter_dst_no_escape(void)
 	pthread_create(&writer, NULL, inv_merge_key_shorter_dst_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	pthread_join(writer, NULL);
@@ -24330,11 +24362,11 @@ static void *inv_merge_compressed_parent_dst_reader(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(ra->trie, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		bool reverse = (iters & 1) != 0;
 		enum cds_ft_status s;
 		unsigned int count = 0;
@@ -24385,11 +24417,11 @@ static void *inv_merge_compressed_parent_dst_writer(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(ctx->dst, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		enum cds_ft_status s;
 		struct ft_test_node *n;
 
@@ -24464,8 +24496,8 @@ static int inv_merge_compressed_parent_dst_no_escape(void)
 	ctx.test_name = "inv_merge_compressed_parent_dst_no_escape";
 	pthread_mutex_init(&ctx.lock, NULL);
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < 2 * NR_READERS_DEFAULT; i++) {
@@ -24478,14 +24510,14 @@ static int inv_merge_compressed_parent_dst_no_escape(void)
 	pthread_create(&writer, NULL, inv_merge_compressed_parent_dst_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	pthread_join(writer, NULL);
@@ -25149,11 +25181,11 @@ static void *bulk_reader(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(ctx->A, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		uint32_t prev = 0;
 		int first = 1;
 		unsigned int count = 0;
@@ -25210,11 +25242,11 @@ static void *bulk_writer(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(ctx->A, &iter) < 0)
 		abort();
-	while (!test_go)
+	while (!test_go_load())
 		;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	while (!test_stop) {
+	while (!test_stop_load()) {
 		unsigned int op = iters % 3;
 
 		/*
@@ -25373,8 +25405,8 @@ static int inv_ordered_bulk_consistency(void)
 			"(-DNO_FEATURE_FT_MERGE); detach/graft and the "
 			"re-prefixing graft_swap still covered\n");
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -25382,14 +25414,14 @@ static int inv_ordered_bulk_consistency(void)
 	pthread_create(&writer, NULL, bulk_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	pthread_join(writer, NULL);
@@ -25541,9 +25573,9 @@ static void *inv_prefix_reader(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
-	while (!CMM_LOAD_SHARED(test_go))
+	while (!test_go_load())
 		caa_cpu_relax();
-	while (!CMM_LOAD_SHARED(test_stop)) {
+	while (!test_stop_load()) {
 		enum cds_ft_status status;
 
 		rcu_read_lock();
@@ -25624,9 +25656,9 @@ static void *inv_prefix_writer(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
-	while (!CMM_LOAD_SHARED(test_go))
+	while (!test_go_load())
 		caa_cpu_relax();
-	while (!CMM_LOAD_SHARED(test_stop)) {
+	while (!test_stop_load()) {
 		struct ft_test_node *first = inv_prefix_node_alloc(
 			INV_PREFIX_CHURN_TAG);
 		struct cds_ft_node *chain = NULL;
@@ -25741,8 +25773,8 @@ static int inv_prefix_head_retire_run(enum inv_prefix_retire retire,
 	rcu_read_unlock();
 	rcu_quiescent_state();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -25750,14 +25782,14 @@ static int inv_prefix_head_retire_run(enum inv_prefix_retire retire,
 	pthread_create(&writer, NULL, inv_prefix_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	pthread_join(writer, NULL);
@@ -25889,9 +25921,9 @@ static void *inv_splitpt_reader(void *arg)
 	bool reported = false;
 
 	rcu_register_thread();
-	while (!CMM_LOAD_SHARED(test_go))
+	while (!test_go_load())
 		caa_cpu_relax();
-	while (!CMM_LOAD_SHARED(test_stop)) {
+	while (!test_stop_load()) {
 		unsigned int i;
 
 		rcu_read_lock();
@@ -25958,9 +25990,9 @@ static void *inv_splitpt_writer(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
-	while (!CMM_LOAD_SHARED(test_go))
+	while (!test_go_load())
 		caa_cpu_relax();
-	while (!CMM_LOAD_SHARED(test_stop)) {
+	while (!test_stop_load()) {
 		struct ft_test_node *n = node_alloc(INV_SPLITPT_CHURN_TAG);
 
 		n->value = INV_SPLITPT_CHURN_TAG;
@@ -26024,8 +26056,8 @@ static int inv_split_point_lookup_run(bool ordered_list, const char *name)
 	rcu_read_unlock();
 	rcu_quiescent_state();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < NR_READERS_DEFAULT; i++)
@@ -26033,14 +26065,14 @@ static int inv_split_point_lookup_run(bool ordered_list, const char *name)
 	pthread_create(&writer, NULL, inv_splitpt_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	pthread_join(writer, NULL);
@@ -26169,9 +26201,9 @@ static void *inv_absent_reader(void *arg)
 	rcu_register_thread();
 	if (!inv_absent_pin_self())
 		CMM_STORE_SHARED(ctx->pinned, false);
-	while (!CMM_LOAD_SHARED(test_go))
+	while (!test_go_load())
 		caa_cpu_relax();
-	while (!CMM_LOAD_SHARED(test_stop)) {
+	while (!test_stop_load()) {
 		unsigned int i;
 
 		rcu_read_lock();
@@ -26302,9 +26334,9 @@ static void *inv_absent_writer(void *arg)
 		CMM_STORE_SHARED(ctx->pinned, false);
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
-	while (!CMM_LOAD_SHARED(test_go))
+	while (!test_go_load())
 		caa_cpu_relax();
-	while (!CMM_LOAD_SHARED(test_stop)) {
+	while (!test_stop_load()) {
 		rcu_read_lock();
 		/*
 		 * Let readers settle on the at-rest shape (a skip slot naming
@@ -26359,8 +26391,8 @@ static int inv_absent_key_run(bool ordered_list, const char *name)
 	rcu_read_unlock();
 	rcu_quiescent_state();
 
-	test_go = 0;
-	test_stop = 0;
+	test_go_set(0);
+	test_stop_set(0);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	for (i = 0; i < INV_ABSENT_READERS; i++)
@@ -26368,7 +26400,7 @@ static int inv_absent_key_run(bool ordered_list, const char *name)
 	pthread_create(&writer, NULL, inv_absent_writer, &ctx);
 
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
+	test_go_set(1);
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -26379,7 +26411,7 @@ static int inv_absent_key_run(bool ordered_list, const char *name)
 	while (elapsed_ms(&t0) < INV_ABSENT_DURATION_MS)
 		usleep(1000);
 
-	test_stop = 1;
+	test_stop_set(1);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	pthread_join(writer, NULL);
@@ -30339,7 +30371,7 @@ static void *rkcf_writer(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(rkcf_ft, &it) < 0)
 		abort();
-	while (!uatomic_read(&rkcf_go))
+	while (!uatomic_load(&rkcf_go, CMM_ACQUIRE))
 		rcu_quiescent_state();
 	for (i = 0; i < 100 || !uatomic_read(&rkcf_done); i++) {
 		int ki = rkcf_rnd(&w->seed, w->nkeys);
@@ -30419,9 +30451,9 @@ static void *rkcf_reader(void *arg)
 	rcu_register_thread();
 	if (cds_ft_iter_create(rkcf_ft, &it) < 0)
 		abort();
-	while (!uatomic_read(&rkcf_go))
+	while (!uatomic_load(&rkcf_go, CMM_ACQUIRE))
 		rcu_quiescent_state();
-	while (!uatomic_read(&rkcf_stop)) {
+	while (!uatomic_load(&rkcf_stop, CMM_ACQUIRE)) {
 		int i;
 
 		rcu_read_lock();
@@ -30445,7 +30477,7 @@ static void *rkcf_rekey(void *arg)
 {
 	(void) arg;
 	rcu_register_thread();
-	while (!uatomic_read(&rkcf_go))
+	while (!uatomic_load(&rkcf_go, CMM_ACQUIRE))
 		rcu_quiescent_state();
 	if (rkcf_merge)
 		rkcf_st = cds_ft_rekey_merge(rkcf_ft,
@@ -30605,12 +30637,12 @@ static int rkcf_seed(unsigned long seed, int merge, int list)
 	pthread_create(&th[1], NULL, rkcf_reader, NULL);
 	for (w = 0; w < RKCF_NW; w++)
 		pthread_create(&th[2 + w], NULL, rkcf_writer, &rkcf_ws[w]);
-	uatomic_set(&rkcf_go, 1);
+	uatomic_store(&rkcf_go, 1, CMM_RELEASE);
 	rcu_thread_offline();
 	pthread_join(th[0], NULL);
 	for (w = 0; w < RKCF_NW; w++)
 		pthread_join(th[2 + w], NULL);
-	uatomic_set(&rkcf_stop, 1);
+	uatomic_store(&rkcf_stop, 1, CMM_RELEASE);
 	pthread_join(th[1], NULL);
 	rcu_thread_online();
 

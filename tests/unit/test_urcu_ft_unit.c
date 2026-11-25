@@ -34849,12 +34849,12 @@ static int seam_park_armed, seam_park_parked, seam_park_release;
 
 static void seam_park_hook(struct cds_ft *ft)
 {
-	if (ft != seam_park_ft || !uatomic_read(&seam_park_armed))
+	if (ft != seam_park_ft || !uatomic_load(&seam_park_armed, CMM_ACQUIRE))
 		return;
-	uatomic_set(&seam_park_armed, 0);
-	uatomic_set(&seam_park_parked, 1);
+	uatomic_store(&seam_park_armed, 0, CMM_RELEASE);
+	uatomic_store(&seam_park_parked, 1, CMM_RELEASE);
 	rcu_thread_offline();
-	while (!uatomic_read(&seam_park_release))
+	while (!uatomic_load(&seam_park_release, CMM_ACQUIRE))
 		(void) usleep(1000);
 	rcu_thread_online();
 }
@@ -34923,9 +34923,9 @@ static int remove_moved_at_seam(bool detach)
 	rcu_thread_online();
 
 	seam_park_ft = dst;
-	uatomic_set(&seam_park_parked, 0);
-	uatomic_set(&seam_park_release, 0);
-	uatomic_set(&seam_park_armed, 1);
+	uatomic_store(&seam_park_parked, 0, CMM_RELEASE);
+	uatomic_store(&seam_park_release, 0, CMM_RELEASE);
+	uatomic_store(&seam_park_armed, 1, CMM_RELEASE);
 	cds_ft_fault_seam_hook = seam_park_hook;
 
 	rcu_read_lock();
@@ -34934,10 +34934,11 @@ static int remove_moved_at_seam(bool detach)
 	x = cds_ft_iter_node(it);
 	if (pthread_create(&th_op, NULL, seam_op_thread, &op))
 		abort();
-	for (waited = 0; !uatomic_read(&seam_park_parked) && waited < 10000;
+	for (waited = 0; !uatomic_load(&seam_park_parked, CMM_ACQUIRE) &&
+			waited < 10000;
 			waited++)
 		(void) usleep(1000);
-	if (!uatomic_read(&seam_park_parked)) {
+	if (!uatomic_load(&seam_park_parked, CMM_ACQUIRE)) {
 		fprintf(stderr, "remove at %s seam: the op never reached its "
 			"seam\n", name);
 		rc = -1;
@@ -34952,8 +34953,8 @@ static int remove_moved_at_seam(bool detach)
 	}
 	rcu_read_unlock();
 
-	uatomic_set(&seam_park_armed, 0);
-	uatomic_set(&seam_park_release, 1);
+	uatomic_store(&seam_park_armed, 0, CMM_RELEASE);
+	uatomic_store(&seam_park_release, 1, CMM_RELEASE);
 	rcu_thread_offline();
 	pthread_join(th_op, NULL);
 	rcu_thread_online();
