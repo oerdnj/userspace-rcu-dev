@@ -4814,6 +4814,18 @@ int ft_detach_node(struct cds_ft *ft,
 				goto end;
 			}
 			/*
+			 * A MOVE walk (!@free_detached_subtree) skips the
+			 * check above.  It stops at the top of the moved
+			 * subtree, not at @entry_target.  Its callers are bulk
+			 * ops (rekey, detach, graft_swap, merge).  Each holds
+			 * the FT-wide lock from its descent to its commit, or
+			 * runs on a coarse or exclusive trie.  So no peer can
+			 * change a link it walks.
+			 */
+			urcu_assert_debug(free_detached_subtree ||
+					ft_txn_content_sw_ok(ft) ||
+					ft_wlock_held == ft);
+			/*
 			 * As in the replace-ptr free-walk below.  A
 			 * skip-compressed external leaf at the chain end keeps
 			 * its path bytes in a separate skip-target compressed
