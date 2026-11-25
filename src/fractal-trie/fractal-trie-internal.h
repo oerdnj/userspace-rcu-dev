@@ -2018,10 +2018,23 @@ unsigned int ft_state_nr_child(uintptr_t state)
 			& FT_STATE_NR_CHILD_VALMASK);
 }
 
+/*
+ * Load @meta's state word.  Other threads change it with atomic operations.
+ * A volatile load of it (CMM_LOAD_SHARED()) is a data race in the C11 model,
+ * and ThreadSanitizer reports it.  So use an atomic load, and keep the
+ * cmm_smp_rmc() of CMM_LOAD_SHARED().
+ */
+static inline
+uintptr_t ft_meta_state_load(const struct cds_ft_metadata *meta)
+{
+	cmm_smp_rmc();
+	return uatomic_load(&meta->state, CMM_RELAXED);
+}
+
 static inline
 unsigned int ft_meta_nr_child(const struct cds_ft_metadata *meta)
 {
-	return ft_state_nr_child(meta->state);
+	return ft_state_nr_child(ft_meta_state_load(meta));
 }
 
 static inline
@@ -2055,7 +2068,7 @@ static inline
 void ft_meta_nr_child_inc(struct cds_ft_metadata *meta)
 {
 	for (;;) {
-		uintptr_t s = CMM_LOAD_SHARED(meta->state);
+		uintptr_t s = ft_meta_state_load(meta);
 
 		if (caa_unlikely(s & FT_STATE_INPLACE_WAIT_MASK)) {
 			caa_cpu_relax();
@@ -2071,7 +2084,7 @@ static inline
 void ft_meta_nr_child_dec(struct cds_ft_metadata *meta)
 {
 	for (;;) {
-		uintptr_t s = CMM_LOAD_SHARED(meta->state);
+		uintptr_t s = ft_meta_state_load(meta);
 
 		if (caa_unlikely(s & FT_STATE_INPLACE_WAIT_MASK)) {
 			caa_cpu_relax();
@@ -2199,7 +2212,7 @@ void ft_meta_parent_slot_offset_set(struct cds_ft_metadata *meta, unsigned int o
 static inline
 bool ft_meta_tombstone(const struct cds_ft_metadata *meta)
 {
-	return (meta->state & FT_STATE_TOMBSTONE) != 0;
+	return (ft_meta_state_load(meta) & FT_STATE_TOMBSTONE) != 0;
 }
 
 /*

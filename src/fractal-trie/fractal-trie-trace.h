@@ -99,7 +99,7 @@ static unsigned long ft_dbg_unique_head_gone;
 # define FT_DBG_UNIQUE_ACQFAIL(is_unique, meta, head)			\
 	do {								\
 		if (is_unique) {					\
-			uintptr_t s__ = CMM_LOAD_SHARED((meta)->state);	\
+			uintptr_t s__ = ft_meta_state_load((meta));	\
 									\
 			uatomic_inc(&ft_dbg_unique_acqfail);		\
 			if (ft_node_is_removed(head))			\

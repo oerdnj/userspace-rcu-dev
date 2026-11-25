@@ -1484,7 +1484,7 @@ void ft_dt_check_node(const char *site, int expect_ct_minus_nonnull,
 		fprintf(stderr, "FT DT-CHECK %s node=%p meta=%p pc=%u nonnull=%u count=%u (expect count-nonnull=%d) state=%#lx n=%u extra=%p\n",
 			site, (void *) node, (void *) meta, pc, nonnull, ct2,
 			expect_ct_minus_nonnull,
-			(unsigned long) CMM_LOAD_SHARED(meta->state), n, extra);
+			(unsigned long) ft_meta_state_load(meta), n, extra);
 }
 static
 void ft_dt_check_flag(const char *site, int expect_ct_minus_nonnull,
@@ -2889,7 +2889,7 @@ skip_copy:
 			unsigned int i;
 
 			fprintf(stderr, "FT RECOMPACT-OVERFLOW old state=%#lx parent_word=%#lx\n",
-				(unsigned long) CMM_LOAD_SHARED(metadata->state),
+				(unsigned long) ft_meta_state_load(metadata),
 				(unsigned long) CMM_LOAD_SHARED(metadata->parent_word));
 			for (i = 0; i < pc; i++) {
 				struct cds_ft_inode_flag *it;

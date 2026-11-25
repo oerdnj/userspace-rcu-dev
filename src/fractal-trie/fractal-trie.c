@@ -684,7 +684,7 @@ sweep:
 				 * the designed flow.  Taking a dead word
 				 * hard-refuses forever (the exp-MW storm).
 				 */
-				if (!(CMM_LOAD_SHARED(marks[i].lock->state) &
+				if (!(ft_meta_state_load(marks[i].lock) &
 						FT_STATE_TOMBSTONE))
 					marks[i].shared = true;
 			}
@@ -1051,7 +1051,7 @@ void cds_ft_debug_ext_violation(unsigned int kind, struct cds_ft *ft,
 		struct cds_ft_metadata *hm = ft_flag_to_metadata(ft, holder);
 
 		if (hm)
-			hstate = CMM_LOAD_SHARED(hm->state);
+			hstate = ft_meta_state_load(hm);
 		/*
 		 * ☠ THE HEAD IS NOT ALWAYS IN THE SAME FIELD.  A COMPRESSED
 		 * holder keeps its single external child in cn->child;
@@ -1101,7 +1101,7 @@ void cds_ft_debug_ext_violation(unsigned int kind, struct cds_ft *ft,
 			if (!m)
 				break;
 			if (anc_tomb < 0 &&
-			    (CMM_LOAD_SHARED(m->state) & FT_STATE_TOMBSTONE))
+			    (ft_meta_state_load(m) & FT_STATE_TOMBSTONE))
 				anc_tomb = hops;
 			if (ft_parent_is_trie(CMM_LOAD_SHARED(m->parent_word))) {
 				anc_root = hops;

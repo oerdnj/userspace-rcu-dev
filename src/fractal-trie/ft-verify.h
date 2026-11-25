@@ -601,7 +601,7 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 	 * ft_meta_lock_release.  Every future peer publish into this node
 	 * would then abort forever.
 	 */
-	if (cn_meta->state & FT_STATE_LOCK) {
+	if (ft_meta_state_load(cn_meta) & FT_STATE_LOCK) {
 		if (out)
 			fprintf(out, "ft_verify: depth %u: compressed node %p node lock set at rest (leaked lock)\n",
 				depth, node_flag);
@@ -615,7 +615,7 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 	 * free the node under that slot.  Every op that reaches it is
 	 * refused (or, before the refusal, misled).
 	 */
-	if (cn_meta->state & FT_STATE_TOMBSTONE) {
+	if (ft_meta_state_load(cn_meta) & FT_STATE_TOMBSTONE) {
 		if (out)
 			fprintf(out, "ft_verify: depth %u: compressed node %p is RETIRED (tombstone) yet reachable\n",
 				depth, node_flag);
@@ -996,14 +996,14 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			}
 		}
 		/* Leaked node lock: see the compressed-node check. */
-		if (metadata->state & FT_STATE_LOCK) {
+		if (ft_meta_state_load(metadata) & FT_STATE_LOCK) {
 			if (out)
 				fprintf(out, "ft_verify: depth %u: internal node %p node lock set at rest (leaked lock)\n",
 					depth, node_flag);
 			return -1;
 		}
 		/* Reachable yet retired: see the compressed-node check. */
-		if (metadata->state & FT_STATE_TOMBSTONE) {
+		if (ft_meta_state_load(metadata) & FT_STATE_TOMBSTONE) {
 			if (out)
 				fprintf(out, "ft_verify: depth %u: internal node %p is RETIRED (tombstone) yet reachable\n",
 					depth, node_flag);
@@ -1143,7 +1143,8 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 					(unsigned int) ft_types[ti].max_child,
 					cds_ft_item_order(node),
 					(unsigned int) metadata->incoming_byte,
-					(unsigned long) metadata->state,
+					(unsigned long)
+					ft_meta_state_load(metadata),
 					ft_nr_keys_get(metadata));
 			}
 			return -1;

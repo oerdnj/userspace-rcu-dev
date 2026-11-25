@@ -5343,11 +5343,11 @@ static inline void ft_irh_probe(struct cds_ft *ft, unsigned int arm,
 					(void *) displaced,
 					CMM_LOAD_SHARED(displaced->prev),
 					(void *) locked,
-					(unsigned long) CMM_LOAD_SHARED(
-						ft_flag_to_metadata(ft, locked)->state),
+					(unsigned long) ft_meta_state_load(
+					    ft_flag_to_metadata(ft, locked)),
 					(void *) hh,
-					(unsigned long) CMM_LOAD_SHARED(
-						ft_flag_to_metadata(ft, hh)->state),
+					(unsigned long) ft_meta_state_load(
+						ft_flag_to_metadata(ft, hh)),
 					slot ? (void *) CMM_LOAD_SHARED(*slot) : NULL,
 					t ? (int) t->acquire_miss : -1);
 		}

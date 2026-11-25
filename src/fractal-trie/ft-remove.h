@@ -6886,7 +6886,7 @@ int ft_detach_node(struct cds_ft *ft,
 							fprintf(stderr, "FT DEL-SPLIT-CTX   metadata_stack[%u]=%p item=%p state=%#lx\n",
 								di, (void *) metadata_stack[di],
 								cds_ft_metadata_to_item(metadata_stack[di]),
-								(unsigned long) CMM_LOAD_SHARED(metadata_stack[di]->state));
+								(unsigned long) ft_meta_state_load(metadata_stack[di]));
 					}
 				}
 #endif
@@ -7678,8 +7678,7 @@ end:
 				 * the designed flow.  Taking a dead word
 				 * hard-refuses forever (the exp-MW storm).
 				 */
-				if (!(CMM_LOAD_SHARED(
-						orphan_held[oi].lock->state) &
+				if (!(ft_meta_state_load(orphan_held[oi].lock) &
 						FT_STATE_TOMBSTONE))
 					orphan_held[oi].shared = true;
 			}
@@ -10558,8 +10557,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				int match = (sl->meta == m);
 
 				FT_TP(remove_anchor_starved, (const void *) m,
-					(unsigned long) CMM_LOAD_SHARED(
-						m->state),
+					(unsigned long) ft_meta_state_load(m),
 					ft_dbg_refused_streak,
 					ft_remove_attempts,
 					match ? sl->fn : "?",
@@ -10588,8 +10586,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				int prev_locked = -1;
 
 				do {
-					uintptr_t sw = CMM_LOAD_SHARED(
-						m->state);
+					uintptr_t sw = ft_meta_state_load(m);
 					int locked = !!(sw & FT_STATE_LOCK);
 
 					total++;

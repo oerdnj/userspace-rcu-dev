@@ -2182,7 +2182,8 @@ static void ft_parent_rcu_violation(struct cds_ft *ft,
 		(void *) ft, (void *) node, (void *) m);
 	if (m) {
 		fprintf(stderr, "  node parent_word=%p state=0x%lx\n",
-			(void *) m->parent_word, (unsigned long) m->state);
+			(void *) m->parent_word,
+			(unsigned long) ft_meta_state_load(m));
 		fprintf(stderr, "  node rcu_head words: %p %p\n",
 			((void **) m)[-2], ((void **) m)[-1]);
 	}
@@ -2892,7 +2893,7 @@ void ft_set_parent_slot(struct cds_ft_metadata *meta,
 				(void *) meta, (void *) oldp, (void *) parent,
 				(unsigned int) FT_PSO_DECODE(CMM_LOAD_SHARED(meta->parent_slot_offset)),
 				(unsigned int) (((char *) slot - (char *) ft_node_ptr(parent)) / sizeof(void *)),
-				(unsigned long) CMM_LOAD_SHARED(meta->state));
+				(unsigned long) ft_meta_state_load(meta));
 			backtrace_symbols_fd(bt, nbt, 2);
 		}
 	}
@@ -3660,7 +3661,7 @@ bool ft_flag_tombstoned(const struct cds_ft *ft,
 		return false;
 	meta = ft_flag_to_metadata(ft, nf);
 	return meta != NULL &&
-		(CMM_LOAD_SHARED(meta->state) & FT_STATE_TOMBSTONE) != 0;
+		(ft_meta_state_load(meta) & FT_STATE_TOMBSTONE) != 0;
 }
 
 /*
@@ -5006,11 +5007,11 @@ struct cds_ft_inode *alloc_cds_ft_node(struct cds_ft *ft,
 	{
 		static unsigned long ft_dt_alloc_stale;
 
-		if (CMM_LOAD_SHARED(metadata->state) != 0 &&
+		if (ft_meta_state_load(metadata) != 0 &&
 				uatomic_add_return(&ft_dt_alloc_stale, 1) <= 20)
 			fprintf(stderr, "FT DT-ALLOC-STALE node=%p meta=%p state=%#lx\n",
 				p, (void *) metadata,
-				(unsigned long) CMM_LOAD_SHARED(metadata->state));
+				(unsigned long) ft_meta_state_load(metadata));
 	}
 #endif
 	/*

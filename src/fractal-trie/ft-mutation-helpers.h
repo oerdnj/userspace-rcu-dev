@@ -646,7 +646,7 @@ static inline
 int ft_held_anchor_sample_node(const struct cds_ft_metadata *node,
 		uintptr_t *node_snap)
 {
-	uintptr_t s = CMM_LOAD_SHARED(node->state);
+	uintptr_t s = ft_meta_state_load(node);
 
 	if (caa_unlikely(s & (FT_STATE_PROXY | FT_SA_DEAD_REFUSE |
 			FT_STATE_LOCK)))
@@ -1590,8 +1590,8 @@ static inline void ft_dt_note_clear(const void *w, const void *pc, bool report,
 	 */
 	bal = uatomic_add_return(&e->bal, -1);
 	ft_dt_hist(e, engine ? 'E' : 'R', pc, engine ? 0 :
-		(uintptr_t) CMM_LOAD_SHARED(
-			((const struct cds_ft_metadata *) w)->state));
+		(uintptr_t) ft_meta_state_load(
+			(const struct cds_ft_metadata *) w));
 	if (caa_unlikely(bal < 0))
 		ft_dt_site_note_tab(ft_dt_ufsites, &ft_dt_ufsite_overflow,
 			engine ? opc : pc, engine ? NULL : opc);
@@ -2068,7 +2068,7 @@ static void ft_dt_rec_check(const struct ft_rec_dbg *r)
 			owner = uatomic_read(&e->tid);
 		ft_dt_ent_unlock(e);
 		if (owner && owner != self &&
-				(CMM_LOAD_SHARED(m->state) & FT_STATE_LOCK) &&
+				(ft_meta_state_load(m) & FT_STATE_LOCK) &&
 				uatomic_add_return(&ft_dt_rec_swblind, 1) <= 8) {
 			void *bt[20];
 			int nbt = backtrace(bt, 20);
@@ -2731,7 +2731,7 @@ void ft_ll_refused(const struct cds_ft_metadata *lock, uintptr_t s,
 	now = ft_ll_now_ns();
 	if (now - ft_ll_ref_t0 < FT_LL_STUCK_NS)
 		return;
-	if (CMM_LOAD_SHARED(lock->state) != s)
+	if (ft_meta_state_load(lock) != s)
 		return;			/* moved after all: not stuck */
 	sl = ft_ll_slot_of(lock);
 	h = uatomic_read(&sl->head);
@@ -2816,7 +2816,7 @@ void ft_ll_replay(const struct cds_ft_metadata *lock, const char *why)
 	Dl_info di;
 
 	fprintf(stderr, "FT LOCK HIST (%s) word %p state %#lx now\n", why,
-		(const void *) lock, (unsigned long) CMM_LOAD_SHARED(lock->state));
+		(const void *) lock, (unsigned long) ft_meta_state_load(lock));
 	for (; i < h; i++) {
 		const struct ft_ll_ev *e = &sl->ev[i % FT_LL_HIST];
 
@@ -3602,7 +3602,7 @@ void ft_ll_terminal(struct ft_flip_txn *t, int kind, int status)
 
 	for (i = 0; i < t->nr_locks; i++)
 		ft_ll_log(kind, t->locks[i].meta, t, (uintptr_t) status,
-			CMM_LOAD_SHARED(t->locks[i].meta->state),
+			ft_meta_state_load(t->locks[i].meta),
 			__builtin_return_address(0));
 	for (i = 0; i < t->ll_nrec; i++) {
 		for (j = 0; j < t->nr_locks; j++)
@@ -3611,7 +3611,7 @@ void ft_ll_terminal(struct ft_flip_txn *t, int kind, int status)
 		if (j < t->nr_locks)
 			continue;
 		ft_ll_log(kind, t->ll_rec[i], t, (uintptr_t) status,
-			CMM_LOAD_SHARED(t->ll_rec[i]->state),
+			ft_meta_state_load(t->ll_rec[i]),
 			__builtin_return_address(0));
 	}
 }
@@ -4051,7 +4051,7 @@ void ft_lane_refused_wait(void)
 	if (!w)
 		return;
 	FT_OP_LANE_STAT(rwait);
-	while (CMM_LOAD_SHARED(w->state) & FT_STATE_LOCK) {
+	while (ft_meta_state_load(w) & FT_STATE_LOCK) {
 		if (wl.step >= FT_LANE_REFUSED_WAIT_SPIN +
 				URCU_WAIT_LADDER_US_RUNGS)
 			return;			/* the microsecond rungs are spent */
@@ -4138,13 +4138,13 @@ void ft_dlm_linger(struct ft_op *op)
 	 */
 	if (op->retry < FT_OP_LANE_MIN)
 		return;
-	if (!(CMM_LOAD_SHARED(w->state) & FT_STATE_LOCK))
+	if (!(ft_meta_state_load(w) & FT_STATE_LOCK))
 		return;
 	if (caa_unlikely(!ft_linger_calls++))
 		fprintf(stderr, "FT DLM LINGER ARMED (cap %uus)\n",
 			(unsigned int) FT_DLM_LINGER_US);
 	t0 = ft_linger_now_ns();
-	while (CMM_LOAD_SHARED(w->state) & FT_STATE_LOCK) {
+	while (ft_meta_state_load(w) & FT_STATE_LOCK) {
 		caa_cpu_relax();
 		if (ft_linger_now_ns() - t0 >
 				(uint64_t) FT_DLM_LINGER_US * 1000ULL) {
@@ -5030,7 +5030,7 @@ void ft_seam_check_root(struct cds_ft *h, const void *site)
 		return;
 	}
 	m = ft_flag_to_metadata(h, r);
-	if (CMM_LOAD_SHARED(m->state) & FT_STATE_TOMBSTONE) {
+	if (ft_meta_state_load(m) & FT_STATE_TOMBSTONE) {
 		uatomic_inc(&ft_sr_tomb);	/* a RETIRED node published as root */
 		FT_SEAM_ROOT_STOP(h, site, "a RETIRED node is published as the root");
 	}
@@ -5287,7 +5287,7 @@ void ft_owner_stamp_claim(struct cds_ft_metadata *member,
 	old = uatomic_xchg(&member->dbg_owner_tid, self);
 	if (old && old != self) {
 		const struct cds_ft_metadata *oa = member->dbg_owner_anchor;
-		uintptr_t oa_st = oa ? CMM_LOAD_SHARED(oa->state) : 0;
+		uintptr_t oa_st = oa ? ft_meta_state_load(oa) : 0;
 		bool report = true;
 
 #ifdef FT_EXCL_REPORT_ONLY
@@ -5323,7 +5323,7 @@ void ft_owner_stamp_claim(struct cds_ft_metadata *member,
 				shared ? ft_dlm_dbg_dedupe_lane : "n/a (took it)",
 				anchor != oa ? "ANCHORS DIFFER" : "anchors agree",
 				(unsigned long) oa_st,
-				(unsigned long) CMM_LOAD_SHARED(anchor->state));
+				(unsigned long) ft_meta_state_load(anchor));
 		FT_TP(stamp_violation, (const void *) member,
 			(const void *) anchor, (const void *) oa, old,
 			(int) shared, (int) ft_hold_trace_holds(anchor),
@@ -5419,7 +5419,7 @@ static void ft_hold_trace_leak_canary(void)
 	unsigned int ci;
 
 	for (ci = 0; ci < ft_hold_trace_n; ci++) {
-		if (CMM_LOAD_SHARED(ft_hold_trace[ci].lock->state) &
+		if (ft_meta_state_load(ft_hold_trace[ci].lock) &
 				FT_STATE_LOCK)
 			continue;
 		fprintf(stderr, "FT HOLD LEDGER LEAK: word %p (taken at "
@@ -5492,7 +5492,7 @@ void ft_seam_check(const char *site)
 	for (ci = 0; ci < ft_hold_trace_n; ci++) {
 		const struct ft_hold_trace_ent *e = &ft_hold_trace[ci];
 
-		if (!(CMM_LOAD_SHARED(e->lock->state) & FT_STATE_LOCK))
+		if (!(ft_meta_state_load(e->lock) & FT_STATE_LOCK))
 			continue;	/* consumed by a commit terminal */
 		if (!e->member ||
 				uatomic_load(&e->member->dbg_owner_tid,
@@ -5610,7 +5610,7 @@ void ft_hold_trace_drop(const struct cds_ft_metadata *lock)
 		const struct ft_dbg_take_slot *sl = ft_dbg_take_slot_of(lock);
 
 		FT_TP(dlm_drop, (const void *) lock,
-			(unsigned long) CMM_LOAD_SHARED(lock->state));
+			(unsigned long) ft_meta_state_load(lock));
 		if (sl->meta == lock &&
 				sl->tid == (unsigned long) pthread_self()) {
 			uint64_t wall = ft_dbg_now_ns() - sl->ts_ns;
@@ -5652,7 +5652,7 @@ void ft_hold_trace_drop(const struct cds_ft_metadata *lock)
 		 * disagreement, caught in the act.
 		 */
 		FT_TP(stamp_drop, (const void *) lock,
-			(unsigned long) CMM_LOAD_SHARED(lock->state),
+			(unsigned long) ft_meta_state_load(lock),
 			nmatch__, (int) ft_hold_trace_n);
 	}
 }
@@ -5675,12 +5675,12 @@ void ft_hold_trace_refused(const struct cds_ft_metadata *lock, const char *fn,
 {
 	unsigned int i = ft_hold_trace_n;
 
-	if (!(CMM_LOAD_SHARED(lock->state) & FT_STATE_LOCK)) {
+	if (!(ft_meta_state_load(lock) & FT_STATE_LOCK)) {
 		if (ft_hold_trace_report_ok())
 			fprintf(stderr,
 				"FT REFUSED (not ours): %s:%d word %p state=%lx\n",
 				fn, line, (const void *) lock,
-				(unsigned long) CMM_LOAD_SHARED(lock->state));
+				(unsigned long) ft_meta_state_load(lock));
 		return;
 	}
 	while (i--) {
@@ -5723,7 +5723,7 @@ void ft_hold_trace_refused(const struct cds_ft_metadata *lock, const char *fn,
 			"FT REFUSED (LOCK, unknown holder): %s:%d word %p state=%lx "
 			"(ledger %u deep)\n",
 			fn, line, (const void *) lock,
-			(unsigned long) CMM_LOAD_SHARED(lock->state),
+			(unsigned long) ft_meta_state_load(lock),
 			ft_hold_trace_n);
 		for (i = ft_hold_trace_n; i-- > 0 && i + 8 >= ft_hold_trace_n;)
 			fprintf(stderr, "  held[%u] %p %s:%d\n", i,
@@ -7054,7 +7054,7 @@ int ft_meta_lock_acquire(struct cds_ft_metadata *meta,
 	 * reproduces nothing.  Inert in every build that does not ask for it.
 	 */
 	ft_delay_seam(FT_DELAY_SITE_ACQUIRE);
-	s = CMM_LOAD_SHARED(meta->state);
+	s = ft_meta_state_load(meta);
 
 #ifdef FEATURE_FT_AGREEMENT_RED
 	/*
@@ -7129,7 +7129,7 @@ void ft_meta_lock_release(struct cds_ft_metadata *meta)
 	 */
 	FT_DT_CLEAR(meta);
 	for (;;) {
-		uintptr_t s = CMM_LOAD_SHARED(meta->state);
+		uintptr_t s = ft_meta_state_load(meta);
 
 		if (caa_unlikely(s & FT_STATE_PROXY)) {
 			caa_cpu_relax();
@@ -7550,7 +7550,7 @@ static unsigned long ft_orphan_shared_reg;
 # define FT_ORPHAN_SHARED_REG()	uatomic_inc(&ft_orphan_shared_reg)
 # define FT_ORPHAN_PREMISE_CHECK(lock_)					\
 	do {								\
-		uintptr_t s__ = CMM_LOAD_SHARED((lock_)->state);	\
+		uintptr_t s__ = ft_meta_state_load((lock_));	\
 									\
 		if ((s__ & FT_STATE_LOCK) &&				\
 				!(s__ & FT_STATE_TOMBSTONE))		\
@@ -8124,16 +8124,15 @@ bool ft_held_set_snap(const struct ft_held_set *h,
 			 * scrubs shows up wherever it lives.
 			 */
 			if (h->extra[i].txn_owned &&
-					!(CMM_LOAD_SHARED(meta->state) &
+					!(ft_meta_state_load(meta) &
 						(FT_STATE_LOCK | FT_STATE_PROXY |
 						 FT_STATE_TOMBSTONE)) &&
 					ft_stale_report_ok())
 				fprintf(stderr, "FT EXTRAS STALE: txn-owned "
 					"entry answers for CLEAN word %p "
 					"(state %lx) -- unscrubbed hand-off\n",
-					(const void *) meta,
-					(unsigned long) CMM_LOAD_SHARED(
-						meta->state));
+					(const void *) meta, (unsigned long)
+					ft_meta_state_load(meta));
 #endif
 			*snap = h->extra[i].lock_snap;
 			return true;
@@ -9426,8 +9425,8 @@ static void ft_sa_anchor_props(const struct ft_flip_txn *t,
 				FT_SA_RV_P_PARENT_SHARES, false);
 		}
 	}
-	st = (uintptr_t) ft_txn_resolve((void *) CMM_LOAD_SHARED(
-		node->state), FT_STATE_PROXY);
+	st = (uintptr_t) ft_txn_resolve((void *) ft_meta_state_load(node),
+			FT_STATE_PROXY);
 	if (st & FT_STATE_LOCK)
 		ft_sa_rec_count(site, pc0, pc1, FT_SA_RV_P_WORD_LOCKED, false);
 	if ((!held || self || pdiff) &&
@@ -9827,7 +9826,7 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 
 	for (sa_i = 0; sa_i < t->sa_ntpend; sa_i++)
 		sa_tstate[sa_i] = (uintptr_t) ft_txn_resolve((void *)
-			CMM_LOAD_SHARED(t->sa_tpend[sa_i].owner->state),
+			ft_meta_state_load(t->sa_tpend[sa_i].owner),
 			FT_STATE_PROXY);
 
 	enum ft_sa_rv sa_cv[CAA_ARRAY_SIZE(t->sa_pend)];
@@ -9963,7 +9962,7 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 				(int) sa_cv[sa_i], sp->nlocks, t->nr_locks,
 				sp->nhold, sa_nhold, anc, arec,
 				(unsigned long) ft_txn_resolve((void *)
-					CMM_LOAD_SHARED(sp->owner->state),
+					ft_meta_state_load(sp->owner),
 					FT_STATE_PROXY));
 		}
 	}
@@ -12180,7 +12179,7 @@ void ft_flip_txn_record_state_kind(struct ft_flip_txn *t,
 static FT_LL_INLINE
 int ft_dlm_lock_now(struct cds_ft_metadata *meta, uintptr_t *snap)
 {
-	uintptr_t s = CMM_LOAD_SHARED(meta->state);
+	uintptr_t s = ft_meta_state_load(meta);
 
 	if (caa_unlikely(s & (FT_STATE_PROXY | FT_SA_DEAD_REFUSE |
 			FT_STATE_LOCK))) {
@@ -13580,7 +13579,7 @@ take:
 				deduped = true;
 				break;
 			}
-		} else if (caa_likely(CMM_LOAD_SHARED(lock->state) &
+		} else if (caa_likely(ft_meta_state_load(lock) &
 				(FT_STATE_LOCK | FT_STATE_PROXY |
 					FT_STATE_TOMBSTONE))) {
 			/*
@@ -13835,9 +13834,9 @@ e2_closing:
 
 		if (!set[i].nf)
 			continue;
-		if (!((uintptr_t) ft_txn_resolve((void *) CMM_LOAD_SHARED(
-				set[i].node->state), FT_STATE_PROXY) &
-				FT_STATE_TOMBSTONE))
+		if (!((uintptr_t) ft_txn_resolve(
+				(void *) ft_meta_state_load(set[i].node),
+				FT_STATE_PROXY) & FT_STATE_TOMBSTONE))
 			continue;
 		co = set[i].held.lock != set[i].node;
 		arm = set[i].held.shared ? (co ? 2 : 1) : (co ? 3 : 0);
@@ -13863,7 +13862,7 @@ e2_closing:
 		 * a candidate REAL exclusion gap, not ledger hygiene.
 		 */
 		if (set[i].held.shared &&
-				!(CMM_LOAD_SHARED(set[i].held.lock->state) &
+				!(ft_meta_state_load(set[i].held.lock) &
 					(FT_STATE_LOCK | FT_STATE_PROXY))) {
 			/*
 			 * Unreachable since the dedupe validation takes for
@@ -15607,7 +15606,7 @@ void ft_meta_state_transition(struct cds_ft_metadata *meta,
 		uintptr_t (*f)(uintptr_t), uintptr_t wait_mask)
 {
 	for (;;) {
-		uintptr_t s = CMM_LOAD_SHARED(meta->state);
+		uintptr_t s = ft_meta_state_load(meta);
 
 		if (caa_unlikely(s & wait_mask)) {
 			/*
@@ -15784,7 +15783,7 @@ uintptr_t ft_flip_txn_record_tombstone(struct ft_flip_txn *t,
 	 * and ask three witnesses who holds it.
 	 */
 	{
-		uintptr_t st = (uintptr_t) CMM_LOAD_SHARED(meta->state);
+		uintptr_t st = (uintptr_t) ft_meta_state_load(meta);
 		bool locked = !!(st & FT_STATE_LOCK);
 		bool ours = ft_flip_txn_owns(t, meta) ||
 			ft_hold_trace_holds(meta) ||
@@ -16923,7 +16922,7 @@ static __attribute__((destructor)) void ft_born_report(void)
 static inline
 void ft_flip_txn_lock_born(struct ft_flip_txn *t, struct cds_ft_metadata *meta)
 {
-	uintptr_t s = (uintptr_t) CMM_LOAD_SHARED(meta->state);
+	uintptr_t s = (uintptr_t) ft_meta_state_load(meta);
 
 	assert(!(s & (FT_STATE_LOCK | FT_STATE_TOMBSTONE)));
 #ifdef FT_RED_FRESH_UNLOCKED
@@ -20084,7 +20083,8 @@ int ft_remove_one_commit(struct cds_ft *ft,
 				fprintf(stderr, "FT DEL-SLOT-SPLIT #%lu slot=%p old=%p state_node=%p order=%zu state=%#lx slot_owner=%p state_meta=%p\n",
 					c, (void *) struct_slot, (void *) struct_old,
 					(void *) sn, order,
-					(unsigned long) CMM_LOAD_SHARED(state_meta->state),
+					(unsigned long)
+					ft_meta_state_load(state_meta),
 					(void *) slot_owner, (void *) state_meta);
 				backtrace_symbols_fd(bt, nbt, 2);
 			}
@@ -21669,7 +21669,7 @@ void ft_set_parent_raw(struct cds_ft *ft, struct cds_ft_inode_flag *child,
 			fprintf(stderr, "FT RAW-REPARENT-WORD meta=%p old_parent=%p new_parent=%p off=%u state=%#lx\n",
 				(void *) dm, (void *) oldp, (void *) newp,
 				(unsigned int) FT_PSO_DECODE(CMM_LOAD_SHARED(dm->parent_slot_offset)),
-				(unsigned long) CMM_LOAD_SHARED(dm->state));
+				(unsigned long) ft_meta_state_load(dm));
 			backtrace_symbols_fd(bt, nbt, 2);
 		}
 	}
@@ -25129,7 +25129,7 @@ void ft_glue_stale_check(unsigned int arm, const struct cds_ft_metadata *meta,
 	n = uatomic_add_return(&ft_glue_reach[arm], 1);
 	if (!(n % FT_GLUE_REACH_TICK))
 		ft_glue_reach_report();
-	st = CMM_LOAD_SHARED(meta->state);
+	st = ft_meta_state_load(meta);
 	if (st & (FT_STATE_LOCK | FT_STATE_PROXY | FT_STATE_TOMBSTONE))
 		return;
 	if (!ft_stale_report_ok())
@@ -25248,7 +25248,7 @@ bool ft_glue_held_snap_one(const struct ft_glue *g,
 			 * covered acquire.)
 			 */
 			if (g->free_list[i].consumed &&
-					CMM_LOAD_SHARED(meta->state) !=
+					ft_meta_state_load(meta) !=
 					((g->free_list[i].snap &
 						~FT_STATE_LOCK) |
 						FT_STATE_TOMBSTONE))
@@ -25256,7 +25256,7 @@ bool ft_glue_held_snap_one(const struct ft_glue *g,
 			FT_GLUE_ARM("freelist_item");
 #ifdef FEATURE_FT_HOLD_TRACE
 			{
-				uintptr_t st__ = CMM_LOAD_SHARED(meta->state);
+				uintptr_t st__ = ft_meta_state_load(meta);
 
 				if (!(st__ & (FT_STATE_LOCK | FT_STATE_PROXY |
 						FT_STATE_TOMBSTONE)) &&
@@ -25277,9 +25277,10 @@ bool ft_glue_held_snap_one(const struct ft_glue *g,
 						(int) g->free_list[i].consumed,
 						(void *) g->free_list[i].holder,
 						g->free_list[i].holder ?
-						(unsigned long) CMM_LOAD_SHARED(
-							g->free_list[i]
-							.holder->state) : 0UL,
+						(unsigned long)
+						ft_meta_state_load(
+							g->free_list[i].holder)
+						: 0UL,
 						(unsigned long) CMM_LOAD_SHARED(
 							meta->dbg_owner_tid),
 						g->free_list[i].holder ?
@@ -25313,7 +25314,7 @@ bool ft_glue_held_snap_one(const struct ft_glue *g,
 			 * whoever set it.
 			 */
 			if (caa_unlikely(g->freeze_terminal_done) &&
-					!(CMM_LOAD_SHARED(meta->state) &
+					!(ft_meta_state_load(meta) &
 						FT_STATE_TOMBSTONE)) {
 				FT_GLUE_SAVED_COUNT(2, g->free_list[i]
 					.holder_txn_owned);

@@ -167,14 +167,15 @@ static void ft_upwalk_parent_violation(const struct cds_ft *ft,
 
 		fprintf(stderr, "  cell meta=%p parent_word=%p state=0x%lx\n",
 			(void *) cm, (void *) cm->parent_word,
-			(unsigned long) cm->state);
+			(unsigned long) ft_meta_state_load(cm));
 	}
 	if (from) {
 		struct cds_ft_metadata *fm = ft_flag_to_metadata(ft, from);
 
 		fprintf(stderr, "  from=%p meta=%p parent_word=%p external_nodes=%p state=0x%lx\n",
 			(void *) from, (void *) fm, (void *) fm->parent_word,
-			(void *) fm->external_nodes, (unsigned long) fm->state);
+			(void *) fm->external_nodes,
+			(unsigned long) ft_meta_state_load(fm));
 		fprintf(stderr, "  from rcu_head words: %p %p\n",
 			((void **) fm)[-2], ((void **) fm)[-1]);
 	}
@@ -436,7 +437,7 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 			struct cds_ft_inode_flag *pnode = ft_parent_node(praw);
 
 			hist[level].nf = nf;
-			hist[level].state = meta->state;
+			hist[level].state = ft_meta_state_load(meta);
 			/* rcu_head sits immediately BEFORE the metadata. */
 			hist[level].rcu_func = ((void **) meta)[-1];
 			hist[level].parent_raw = praw;

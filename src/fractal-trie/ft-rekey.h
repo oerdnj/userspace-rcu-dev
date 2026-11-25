@@ -2281,7 +2281,7 @@ void ft_rekey_fold_sweep_orphan_marks(struct ft_held_anchor *held, int *nr_held,
 			 * SCRUB only RELEASED-LIVE: a TOMBSTONED word is a
 			 * CONSUMED fence and must keep answering holds().
 			 */
-			if (!(CMM_LOAD_SHARED(held[i].lock->state) &
+			if (!(ft_meta_state_load(held[i].lock) &
 					FT_STATE_TOMBSTONE))
 				held[i].shared = true;
 		}
@@ -9050,8 +9050,7 @@ cells_done:
 
 			for (sc_i = 0; sc_i < nr_marks; sc_i++)
 				if (marks[sc_i].txn_owned &&
-					!(CMM_LOAD_SHARED(
-						marks[sc_i].lock->state) &
+					!(ft_meta_state_load(marks[sc_i].lock) &
 						FT_STATE_TOMBSTONE))
 					marks[sc_i].shared = true;
 		}
@@ -9414,7 +9413,7 @@ sweep:
 				 * A released entry left listed is the
 				 * record-less stale frame of finding A.
 				 */
-				if (!(CMM_LOAD_SHARED(marks[i].lock->state) &
+				if (!(ft_meta_state_load(marks[i].lock) &
 						FT_STATE_TOMBSTONE))
 					marks[i].shared = true;
 			}
