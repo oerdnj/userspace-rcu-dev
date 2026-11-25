@@ -472,20 +472,35 @@ descend_loop:
 						 */
 						node_flag = anchor;
 						/*
-						 * The merged run begins within
-						 * the span this descent
-						 * already consumed.  A rewind
-						 * past @orig_key would mean
-						 * the re-anchor walked above
-						 * the search root.  That is
-						 * impossible on a well-formed
-						 * trie.  Catch a
-						 * corruption-driven underflow
-						 * here, rather than reading
-						 * before the caller's buffer.
+						 * The merged run normally
+						 * begins within the span this
+						 * descent already consumed.  A
+						 * rewind past @orig_key would
+						 * read before the caller's
+						 * buffer.
+						 *
+						 * ☠ A CONCURRENT REKEY CAN
+						 * CAUSE SUCH A REWIND.  It
+						 * moves a subtree under a
+						 * shorter key, so the walk
+						 * measures depth on the
+						 * subtree's NEW path.  Only a
+						 * witnessed descent can meet a
+						 * move in flight.  Tear its
+						 * witness, as for a stale slot,
+						 * so that the two-descent loop
+						 * retries.  Without a witness,
+						 * the trie is corrupt.
 						 */
-						assert((size_t) (key - orig_key) >=
-							(size_t) rewind + 1);
+						if (caa_unlikely((size_t) (key -
+								orig_key) <
+								(size_t) rewind + 1)) {
+							assert(wit);
+							if (wit)
+								ft_witness_tear(wit);
+							status = CDS_FT_STATUS_NOT_FOUND;
+							goto end;
+						}
 						key -= (size_t) rewind + 1;
 						goto descend_loop;
 					}
