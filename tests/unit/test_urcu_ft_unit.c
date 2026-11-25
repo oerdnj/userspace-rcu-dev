@@ -36456,39 +36456,38 @@ static int test_walk_past_empty_internal(void)
 		ret = -1;
 	}
 out:
-	{
-		unsigned int i;
-
-		for (i = 0; i < nr_stripped; i++)
-			node_free(to_test_node(stripped[i]));
-	}
 	/*
-	 * Do NOT drain: the remnant is deliberately malformed, and the drain
-	 * asserts its way through a well-formed trie.  Remove what is still
-	 * reachable, then destroy.
+	 * Insert the key of each stripped leaf again, with a new leaf node:
+	 * the stripped one still carries the links of its old position.  The
+	 * holder then has children again, so the trie is well formed and
+	 * drain_trie() frees every node, the holder included.
 	 */
 	rcu_read_lock();
 	{
-		struct cds_ft_node *f = NULL;
+		unsigned int i;
 
-		if (lookup_u64(ft, 0x0200, &f) == CDS_FT_STATUS_OK && f) {
-			struct cds_ft_iter *it2 = NULL;
+		for (i = 0; i < nr_stripped; i++) {
+			uint64_t k = to_test_node(stripped[i])->key;
+			struct ft_test_node *n = node_alloc(k);
 
-			if (cds_ft_iter_create(ft, &it2) == CDS_FT_STATUS_OK) {
-				uint8_t k[8];
-
-				cds_ft_u64_to_key(ft, 0x0200, k, CDS_FT_LEN_DEFAULT);
-				cds_ft_iter_set_key(it2, k, CDS_FT_LEN_DEFAULT);
-				if (cds_ft_lookup(ft, it2) == CDS_FT_STATUS_OK &&
-						cds_ft_iter_node(it2))
-					(void) cds_ft_remove(ft, it2,
-						cds_ft_iter_node(it2));
-				cds_ft_iter_destroy(it2);
+			node_free(to_test_node(stripped[i]));
+			if (insert_u64(ft, k, n) != CDS_FT_STATUS_OK) {
+				node_free(n);
+				ret = -1;
 			}
 		}
 	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		diag("test_walk_past_empty_internal: the refilled trie is "
+			"still verify-invalid");
+		rcu_read_unlock();
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
 	rcu_read_unlock();
-	node_free(b0);
+	if (drain_trie(ft) < 0)
+		ret = -1;
 	cds_ft_destroy(ft);
 	cds_ft_group_destroy(group);
 	return ret;
@@ -36639,42 +36638,41 @@ static int test_walk_past_deep_empty_internal(void)
 		ret = -1;
 out:
 	/*
-	 * The stripped leaves are the caller's again.  Forget them here rather
-	 * than only freeing them: a PARTIAL strip (the nr_stripped != 2 failure
-	 * above) can leave one both handed back and still reachable, and the
-	 * by-key sweep below would then free it a second time -- turning a
-	 * reported failure into a crash that hides it.
+	 * As in the test above, insert the key of each stripped leaf again and
+	 * drain.  The hook unlinks every leaf it returns, so free each one here,
+	 * once.  drain_trie() frees the leaves still in the trie.
 	 */
+	rcu_read_lock();
 	for (i = 0; i < nr_stripped; i++) {
 		unsigned int j;
 
-		for (j = 0; j < CAA_ARRAY_SIZE(leaf); j++)
-			if (leaf[j] == to_test_node(stripped[i]))
-				leaf[j] = NULL;
-		node_free(to_test_node(stripped[i]));
-	}
-	/*
-	 * Do NOT drain: the remnant is deliberately malformed.  Remove what is
-	 * still reachable by exact key, then destroy.
-	 */
-	rcu_read_lock();
-	for (i = 0; i < CAA_ARRAY_SIZE(keys); i++) {
-		struct cds_ft_iter *it2 = NULL;
+		for (j = 0; j < CAA_ARRAY_SIZE(leaf); j++) {
+			struct ft_test_node *n;
 
-		if (leaf[i] == NULL)
-			continue;
-		if (cds_ft_iter_create(ft, &it2) != CDS_FT_STATUS_OK)
-			continue;
-		cds_ft_iter_set_key(it2, (const uint8_t *) keys[i],
-			strlen(keys[i]));
-		if (cds_ft_lookup(ft, it2) == CDS_FT_STATUS_OK &&
-				cds_ft_iter_node(it2)) {
-			(void) cds_ft_remove(ft, it2, cds_ft_iter_node(it2));
-			node_free(leaf[i]);
+			if (leaf[j] != to_test_node(stripped[i]))
+				continue;
+			node_free(leaf[j]);
+			n = node_alloc(0);
+			if (cds_ft_insert(ft, (const uint8_t *) keys[j],
+					strlen(keys[j]), &n->node) !=
+						CDS_FT_STATUS_OK) {
+				node_free(n);
+				ret = -1;
+			}
+			break;
 		}
-		cds_ft_iter_destroy(it2);
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		diag("test_walk_past_deep_empty_internal: the refilled trie is "
+			"still verify-invalid");
+		rcu_read_unlock();
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
 	}
 	rcu_read_unlock();
+	if (drain_trie(ft) < 0)
+		ret = -1;
 	cds_ft_destroy(ft);
 	cds_ft_group_destroy(group);
 	return ret;

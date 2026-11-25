@@ -954,8 +954,9 @@ void *_cds_ft_debug_child_at(struct cds_ft *ft, const uint8_t *key,
  *   - @out is too small;
  *   - the trie is empty.
  *
- * Leaves the trie in a state cds_ft_verify REJECTS, on purpose.  Callers are
- * expected to walk it, assert whatever they are testing, and destroy it.
+ * Leaves the trie in a state cds_ft_verify REJECTS, on purpose.  Callers
+ * walk it and assert what they test.  Then they insert a new leaf for each
+ * stripped key and drain the trie: cds_ft_destroy() alone leaks the holder.
  */
 int _cds_ft_debug_empty_holder(struct cds_ft *ft, struct cds_ft_node *leaf,
 		struct cds_ft_node **out, unsigned int out_max,
