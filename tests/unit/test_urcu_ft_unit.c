@@ -69,7 +69,7 @@
 #endif
 
 /*
- * 372 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
+ * 373 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  *
  * ☠ BUMP BOTH ARMS.  A new unconditional test belongs to the fault-inject
@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (425 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (426 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (372 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (373 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -9752,6 +9752,98 @@ static int test_iteration_prefix_scoped_key_at_scope(void)
 	}
 
 	cds_ft_iter_destroy(iter);
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	return ret;
+}
+
+/*
+ * cds_ft_iter_set_key must drop the ordered-list cell which the iterator
+ * cached on its previous position.  A reader lands on "a" and leaves its
+ * read-side section.  "a" is removed, a grace period passes, "ab" is inserted
+ * and the same node object is inserted at "a" again, with a new cell.  The
+ * reader then sets the key "a", looks it up and steps: the next key is "ab".
+ * With the old cell still cached for that node, the step went through the
+ * freed cell and skipped "ab".
+ */
+static int test_iter_set_key_drops_cell_cursor(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *reader, *writer;
+	struct ft_test_node *a = node_alloc(1);
+	enum cds_ft_status s;
+	uint8_t key[8];
+	size_t key_len = 0;
+	int ret = -1;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, true) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	if (cds_ft_iter_create(ft, &reader) < 0 ||
+			cds_ft_iter_create(ft, &writer) < 0)
+		abort();
+
+	rcu_read_lock();
+	if (cds_ft_insert(ft, (const uint8_t *) "a", 1, &a->node)
+				!= CDS_FT_STATUS_OK ||
+			cds_ft_insert(ft, (const uint8_t *) "b", 1,
+				&node_alloc(2)->node) != CDS_FT_STATUS_OK ||
+			cds_ft_insert(ft, (const uint8_t *) "c", 1,
+				&node_alloc(3)->node) != CDS_FT_STATUS_OK)
+		abort();
+	/* The reader's first read-side section: land on "a". */
+	if (cds_ft_lookup_first(ft, reader) != CDS_FT_STATUS_OK ||
+			cds_ft_iter_node(reader) != &a->node)
+		abort();
+	rcu_read_unlock();
+	rcu_quiescent_state();
+
+	rcu_read_lock();
+	cds_ft_iter_set_key(writer, (const uint8_t *) "a", 1);
+	if (cds_ft_lookup(ft, writer) != CDS_FT_STATUS_OK ||
+			cds_ft_remove(ft, writer, &a->node) != CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_unlock();
+	synchronize_rcu();
+	rcu_barrier();
+	rcu_read_lock();
+	cds_ft_node_init(&a->node);
+	if (cds_ft_insert(ft, (const uint8_t *) "ab", 2, &node_alloc(4)->node)
+				!= CDS_FT_STATUS_OK ||
+			cds_ft_insert(ft, (const uint8_t *) "a", 1, &a->node)
+				!= CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_unlock();
+	rcu_quiescent_state();
+
+	/* The reader's second section: the documented way back in. */
+	rcu_read_lock();
+	cds_ft_iter_set_key(reader, (const uint8_t *) "a", 1);
+	s = cds_ft_lookup(ft, reader);
+	if (s == CDS_FT_STATUS_OK)
+		s = cds_ft_next(ft, reader);
+	if (s == CDS_FT_STATUS_OK)
+		(void) cds_ft_iter_get_key(reader, key, sizeof(key), &key_len);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK || key_len != 2 || memcmp(key, "ab", 2)) {
+		fprintf(stderr, "iter_set_key_drops_cell_cursor: next from "
+			"\"a\" -> %s, key \"%.*s\", expected \"ab\"\n",
+			cds_ft_status_to_string(s),
+			s == CDS_FT_STATUS_OK ? (int) key_len : 0, key);
+		goto out;
+	}
+	ret = 0;
+out:
+	cds_ft_iter_destroy(reader);
+	cds_ft_iter_destroy(writer);
 	if (drain_and_destroy(ft, group) < 0)
 		ret = -1;
 	return ret;
@@ -43012,6 +43104,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_lookup_relational);
 	RUN_TEST(test_lookup_first_last);
 	RUN_TEST(test_lookup_last_all_ff_key);
+	RUN_TEST(test_iter_set_key_drops_cell_cursor);
 
 	/* 4. Iteration */
 	diag("Iteration tests");

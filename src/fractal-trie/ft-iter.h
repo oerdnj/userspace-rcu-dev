@@ -943,6 +943,15 @@ void ft_iter_set_key_ordinals(struct cds_ft_iter *iter, const uint8_t *ordinals,
 	iter->path_len = 0;
 	iter->key_len = key_len;
 	iter->key_off = 0;	/* search key sits at the front of iter_key */
+	/*
+	 * Drop the cached cell with the position, as cds_ft_iter_bind_key
+	 * does.  cds_ft_iter_set_key is how an iterator is carried across a
+	 * dropped read-side lock, and the cell may be freed meanwhile.
+	 * ft_ord_cell_cursor trusts it whenever its node matches @node: a
+	 * node which was removed and inserted again matches.
+	 */
+	iter->ord_cell = NULL;
+	iter->ord_cell_node = NULL;
 }
 
 enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *key, size_t key_len)
