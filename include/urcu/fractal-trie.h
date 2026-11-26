@@ -2398,11 +2398,12 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
  * key.  So a speculative trie is refused with
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR.
  *
- * The group must be VARIABLE-length, for the same reason cds_ft_detach and
- * cds_ft_graft take a non-root key only there: the move is staged through a
- * detached subtree, whose keys are stripped of the prefix and so are shorter
- * than a fixed-length group's one key length.  A fixed-length group is refused
- * with CDS_FT_STATUS_INVALID_ARGUMENT_ERROR and the trie is left untouched.
+ * On a FIXED-length group, @dst_key and @src_key must have the same length.
+ * Every moved key then keeps the group's one key length.  A move between
+ * prefixes of different lengths would change it, so it is refused with
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR and the trie is left untouched.  So
+ * is, on such a group, a shape which the atomic writer does not cover (see
+ * below).  A VARIABLE-length group takes prefixes of any two lengths.
  *
  * COMPILED IN ON EVERY BUILD, including -DNO_FEATURE_FT_MERGE.  An empty
  * destination makes this a graft, not a union.  So none of the merge
@@ -2419,7 +2420,8 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
  * Returns CDS_FT_STATUS_OK (including when @src_key is absent -- a no-op),
  * CDS_FT_STATUS_POPULATED_ERROR if @dst_key is occupied, CDS_FT_STATUS_MEMORY_ERROR,
  * or CDS_FT_STATUS_INVALID_ARGUMENT_ERROR (NULL @ft, a key length exceeding the
- * group maximum, a fixed-length group, overlapping keys, or a speculative trie),
+ * group maximum, prefixes of different lengths on a fixed-length group,
+ * overlapping keys, or a speculative trie),
  * CDS_FT_STATUS_OVERFLOW_ERROR (a moved key would exceed the group maximum
  * length), or CDS_FT_STATUS_NOT_SUPPORTED (the group did not opt in with
  * cds_ft_group_attr_set_rekey(), or an uncovered shape, see above).
@@ -2450,7 +2452,7 @@ enum cds_ft_status cds_ft_rekey_graft(struct cds_ft *ft,
  * This is the merge (occupied-destination) counterpart of
  * cds_ft_rekey_graft.  It is to cds_ft_rekey_graft what cds_ft_merge_at is
  * to cds_ft_graft.  It has the same disjoint-key, EAGER and
- * variable-length-group requirements.  It returns the same statuses as
+ * fixed-length-group requirements.  It returns the same statuses as
  * cds_ft_rekey_graft, except that it never returns
  * CDS_FT_STATUS_POPULATED_ERROR: an occupied @dst_key is merged into.
  *

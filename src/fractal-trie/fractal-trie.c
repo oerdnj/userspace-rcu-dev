@@ -12,8 +12,8 @@
  * The Fractal Trie is a concurrent, RCU-protected ordered map from
  * opaque byte keys to application-owned nodes.  Lookups and ordered
  * traversals are wait-free under the RCU read-side lock.  They run
- * concurrently with mutations.  Writers are serialized by a
- * caller-provided mutex.
+ * concurrently with mutations.  How writers exclude each other is a group
+ * attribute: by default the point updates run concurrently.
  *
  * The public contract lives in <urcu/fractal-trie.h>: semantics,
  * guarantees, locking rules and error codes.  This comment is the
@@ -96,16 +96,22 @@
  *
  * Mutation and concurrency model
  * ------------------------------
- * Writers are serialized by a caller-provided mutex.
- * CDS_FT_SCOPED_WRITER only VALIDATES that exclusion; it is not itself a
- * lock.
+ * How writers exclude each other is the group's writer strategy (enum
+ * cds_ft_writer_strategy, documented in the header):
+ *   - LOCK_FINE, the default: the point updates run concurrently, and
+ *     coordinate through per-node lock-sets.  A bulk op flips the trie to
+ *     its trie-wide writer lock for as long as it runs.
+ *   - LOCK_COARSE: every update takes the trie-wide writer lock.
+ *   - EXTERNAL_SYNC: the caller serializes the writers.
+ * CDS_FT_SCOPED_WRITER is where an update enters that scheme.  Compaction
+ * and cds_ft_recompute_stats still need the caller's exclusion.
  *
  * Every change to published state follows a build-invisibly -> publish
  * -> reclaim discipline:
  *   1. Assemble a new node cluster where readers cannot reach it.
  *   2. Make it visible by a single release store.  A multi-edge commit,
- *      such as a non-empty merge, instead uses one urcu-flip-latch commit
- *      that flips all affected edges at once.
+ *      such as a non-empty merge, instead uses one transaction of the
+ *      rcu-txn engine, which flips all affected edges at once.
  *   3. Free the displaced nodes after a grace period.
  * A reader therefore always observes a complete prior-or-result state,
  * never a partial one.  The rcu-mutation rules spell out the discipline.
@@ -114,7 +120,7 @@
  *
  * The bulk ops move or combine whole sub-tries between tries of one
  * group.  They are graft, graft-swap, detach, merge and merge_at.  The
- * union cases spine-copy the overlap and commit through the flip latch.
+ * union cases spine-copy the overlap and commit through one transaction.
  *
  * A trie is either exclusive or concurrent:
  *   - exclusive: no concurrent readers.  Reclaim is synchronous and a
