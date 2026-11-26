@@ -69,7 +69,7 @@
 #endif
 
 /*
- * 370 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
+ * 371 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  *
  * ☠ BUMP BOTH ARMS.  A new unconditional test belongs to the fault-inject
@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (423 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (424 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (370 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (371 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -9754,6 +9754,130 @@ static int test_iteration_prefix_scoped_key_at_scope(void)
 	cds_ft_iter_destroy(iter);
 	if (drain_and_destroy(ft, group) < 0)
 		ret = -1;
+	return ret;
+}
+
+/*
+ * Check the scope against a compressed run.
+ *
+ * The trie holds the single key "abcdef", so everything below the root's "a"
+ * slot is one compressed run.  A scope which the run leaves ("abXX", "aXcd",
+ * "abcX") holds no key.  A scope which ends inside the run ("ab", "abcd")
+ * holds the key, and the relational lookups must still compare the rest of
+ * the key: from "abzz" there is nothing greater in the scope "ab".
+ *
+ * The descent took a run met inside the scope prefix for the scope's subtree
+ * whenever the going-up loop, which is bounded at the prefix, did not run.
+ */
+static const struct scoped_rel_case scoped_run[] = {
+	/* 'F' first, 'T' last: the run leaves the scope prefix. */
+	{ 'F', "abXX", 4, NULL },
+	{ 'T', "abXX", 4, NULL },
+	{ 'F', "aXcd", 4, NULL },
+	{ 'T', "aXcd", 4, NULL },
+	{ 'F', "abcX", 4, NULL },
+	{ 'T', "abcX", 4, NULL },
+	{ 'F', "abzz", 4, NULL },
+	{ 'T', "abzz", 4, NULL },
+	{ 'G', "abXX", 4, NULL },
+	{ 'L', "abzz", 4, NULL },
+	/* The scope ends inside the run. */
+	{ 'F', "abcd", 4, "abcdef" },
+	{ 'T', "abcd", 4, "abcdef" },
+	{ 'F', "ab", 2, "abcdef" },
+	{ 'T', "ab", 2, "abcdef" },
+	{ 'G', "abca", 2, "abcdef" },
+	{ 'g', "abca", 2, "abcdef" },
+	{ 'L', "abzz", 2, "abcdef" },
+	{ 'l', "abzz", 2, "abcdef" },
+	/* ...and the key is on the wrong side of the query. */
+	{ 'G', "abzz", 2, NULL },
+	{ 'g', "abzz", 2, NULL },
+	{ 'L', "abc", 2, NULL },
+	{ 'l', "abc", 2, NULL },
+	{ 'L', "abca", 2, NULL },
+};
+
+static int test_iteration_prefix_scoped_compressed_run(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter;
+	unsigned int i;
+	int list, ret = 0;
+
+	for (list = 0; list < 2; list++) {
+		struct ft_test_node *n = node_alloc(0);
+		struct cds_ft_group_attr *attr;
+
+		if (cds_ft_group_attr_create(&attr) < 0)
+			abort();
+		if (cds_ft_group_attr_set_ordered_list(attr, list) < 0)
+			abort();
+		if (cds_ft_group_create(attr, &group) < 0)
+			abort();
+		cds_ft_group_attr_destroy(attr);
+		if (cds_ft_create(group, NULL, &ft) < 0)
+			abort();
+		if (cds_ft_iter_create(ft, &iter) < 0)
+			abort();
+		rcu_read_lock();
+		if (cds_ft_insert(ft, (const uint8_t *) "abcdef", 6, &n->node)
+				!= CDS_FT_STATUS_OK)
+			abort();
+		rcu_read_unlock();
+		for (i = 0; i < CAA_ARRAY_SIZE(scoped_run); i++) {
+			const struct scoped_rel_case *c = &scoped_run[i];
+			enum cds_ft_status s;
+			uint8_t key[8];
+			size_t key_len = 0;
+
+			cds_ft_iter_set_key(iter, (const uint8_t *) c->key,
+				strlen(c->key));
+			cds_ft_iter_set_prefix_len(iter, c->prefix_len);
+			rcu_read_lock();
+			switch (c->op) {
+			case 'F':
+				s = cds_ft_lookup_first(ft, iter);
+				break;
+			case 'T':
+				s = cds_ft_lookup_last(ft, iter);
+				break;
+			case 'l':
+				s = cds_ft_lookup_lt(ft, iter);
+				break;
+			case 'L':
+				s = cds_ft_lookup_le(ft, iter);
+				break;
+			case 'G':
+				s = cds_ft_lookup_ge(ft, iter);
+				break;
+			default:
+				s = cds_ft_lookup_gt(ft, iter);
+				break;
+			}
+			if (s == CDS_FT_STATUS_OK)
+				(void) cds_ft_iter_get_key(iter, key, sizeof(key),
+					&key_len);
+			rcu_read_unlock();
+			if (c->expect ? (s != CDS_FT_STATUS_OK ||
+					key_len != strlen(c->expect) ||
+					memcmp(key, c->expect, key_len)) :
+					s != CDS_FT_STATUS_NOT_FOUND) {
+				fprintf(stderr, "scoped op '%c' key '%s' prefix_len %zu "
+					"(list %s): %s '%.*s', expected %s\n",
+					c->op, c->key, c->prefix_len,
+					list ? "on" : "off",
+					cds_ft_status_to_string(s),
+					s == CDS_FT_STATUS_OK ? (int) key_len : 0,
+					key, c->expect ? c->expect : "NOT_FOUND");
+				ret = -1;
+			}
+		}
+		cds_ft_iter_destroy(iter);
+		if (drain_and_destroy(ft, group) < 0)
+			ret = -1;
+	}
 	return ret;
 }
 
@@ -42791,6 +42915,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_iteration_reverse_order);
 	RUN_TEST(test_iteration_prefix_scoped);
 	RUN_TEST(test_iteration_prefix_scoped_key_at_scope);
+	RUN_TEST(test_iteration_prefix_scoped_compressed_run);
 	RUN_TEST(test_iteration_for_each_entry);
 	RUN_TEST(test_iter_copy);
 	RUN_TEST(test_iter_reset);

@@ -121,11 +121,17 @@ enum ft_descent_action ft_inequality_compressed(struct cds_ft_inode_flag **node_
 		if (fill_ordinal)
 			ordinal_key[level - 1 + mpos] = cmp_key[mpos];
 		if ((cmp_result > 0 && (mode == FT_LOOKUP_GE || mode == FT_LOOKUP_GT)) ||
-		    (cmp_result < 0 && (mode == FT_LOOKUP_LE || mode == FT_LOOKUP_LT))) {
+		    (cmp_result < 0 && (mode == FT_LOOKUP_LE || mode == FT_LOOKUP_LT)) ||
+		    (size_t) level - 1 + mpos < iter->prefix_len) {
 			/*
 			 * Going-up: the whole compressed subtree is on the wrong
 			 * side of the key, so back-track from the compressed node
 			 * itself.
+			 *
+			 * The same holds, whichever side it is on, for a run
+			 * which leaves the key INSIDE the scope prefix: no key
+			 * below it is in the scope.  The caller ends the lookup
+			 * for a climb which starts inside the prefix.
 			 *
 			 * Return its SHALLOW boundary depth: @level, where
 			 * its internal parent is the dispatcher at @level-1.
@@ -772,6 +778,26 @@ slow_path:
 				&iter_key, input_key, iter,
 				ordinal_key, &skip_eq_external_nodes,
 				keep_ordinal);
+			if (act == FT_DESCENT_GOING_UP &&
+					cmp_entry_level <= (ssize_t) iter->prefix_len) {
+				/*
+				 * The run starts inside the scope prefix, so it
+				 * is the only way into the scope.  The key lies
+				 * beyond its subtree, or the run leaves the
+				 * prefix: either way no key in the scope
+				 * matches.  The going-up loop is bounded at
+				 * prefix_len and would not run.  The fall-through
+				 * would then descend into the run and return a
+				 * key from the wrong side, or from outside the
+				 * scope.
+				 */
+				iter->node = NULL;
+				iter->cache_valid = true;
+				iter_debug_path_update(iter);
+				iter->path_len = iter->prefix_len + 1;
+				iter->status = CDS_FT_STATUS_NOT_FOUND;
+				goto end;
+			}
 			if (act == FT_DESCENT_GOING_UP) {
 				/*
 				 * @node_flag is the compressed node; it occupies
