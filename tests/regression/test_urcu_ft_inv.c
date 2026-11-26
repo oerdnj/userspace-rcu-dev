@@ -705,7 +705,7 @@ insert_u64(struct cds_ft *ft, uint64_t v, struct ft_test_node *n)
 
 	cds_ft_u64_to_key(ft, v, k, CDS_FT_LEN_DEFAULT);
 	/* Stash the ordinal key bytes for speculative leaf-key capture. */
-	memcpy(n->okey, k, sizeof(n->okey));
+	memcpy(n->okey, k, sizeof(k));
 	return cds_ft_insert(ft, k, CDS_FT_LEN_DEFAULT, &n->node);
 }
 
@@ -716,7 +716,7 @@ insert_replace_u64(struct cds_ft *ft, uint64_t v, struct ft_test_node *n,
 	uint8_t k[8] = { 0 };
 
 	cds_ft_u64_to_key(ft, v, k, CDS_FT_LEN_DEFAULT);
-	memcpy(n->okey, k, sizeof(n->okey));
+	memcpy(n->okey, k, sizeof(k));
 	return cds_ft_insert_replace(ft, k, CDS_FT_LEN_DEFAULT, &n->node, old_ret);
 }
 
@@ -11223,7 +11223,7 @@ static void *inv_replace_skipx_writer(void *arg)
 		 * later cds_ft_next the key 0.  The walk then asks for the
 		 * successor of the wrong key.
 		 */
-		memcpy(newn->okey, k, sizeof(newn->okey));
+		memcpy(newn->okey, k, sizeof(k));
 		rcu_read_lock();
 		pthread_mutex_lock(&ctx->lock);
 		/* Look up the current head under the writer mutex, then replace it
@@ -19211,7 +19211,7 @@ static void populate_range(struct cds_ft *ft, uint64_t base, unsigned int count)
 		uint8_t k[8] = { 0 };
 
 		cds_ft_u64_to_key(ft, base + i, k, 4);
-		memcpy(n->okey, k, sizeof(n->okey));
+		memcpy(n->okey, k, sizeof(k));
 		cds_ft_insert(ft, k, 4, &n->node);
 	}
 }
@@ -19633,7 +19633,7 @@ static void populate_at_prefix(struct cds_ft *ft, const uint8_t *prefix,
 		if (prefix_len)
 			memcpy(k, prefix, prefix_len);
 		k[kl++] = (uint8_t) i;		/* distinct suffix byte */
-		memcpy(n->okey, k, sizeof(n->okey));
+		memcpy(n->okey, k, sizeof(k));
 		if (cds_ft_insert(ft, k, kl, &n->node) != CDS_FT_STATUS_OK)
 			abort();
 	}
