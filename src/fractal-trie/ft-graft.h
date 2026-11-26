@@ -3571,6 +3571,17 @@ retry_attach:
 			if (nil_key_root)
 				cds_ft_item_to_metadata(graft_run_first)->incoming_byte =
 					key[key_len - 1];
+			/*
+			 * A source root with children keeps its zero-length
+			 * key as a prefix head, now of the key @key.  No
+			 * placement stamps a prefix head, but its cell holds
+			 * the last byte of its key all the same.
+			 */
+			else if (key_len)
+				(void) ft_head_set_key_end_byte(dst_ft,
+					ft_dereference_external(
+						src_rmeta->external_nodes),
+					key[key_len - 1], NULL);
 			graft_run.run_first = graft_run_first;
 			graft_run.run_last = graft_run_last;
 			graft_run.pred = graft_pred;
@@ -4531,6 +4542,17 @@ retry_swap:
 		swap_empty = (ft_meta_nr_child(swap_rmeta) == 0 && !swap_rmeta->external_nodes);
 		swap_nil_only = (ft_meta_nr_child(swap_rmeta) == 0 && swap_rmeta->external_nodes);
 		swap_count = swap_empty ? 0 : ft_nr_keys_get(swap_rmeta);
+		/*
+		 * The zero-length key of swap_ft becomes the key @key of dst.
+		 * Its cell holds the last byte of its key.  As the prefix head
+		 * of the swap root it is stamped by no placement.  Nothing
+		 * reads the byte of a zero-length key, and swap_ft is
+		 * exclusive, so set it before the build.
+		 */
+		if (key_len && swap_rmeta->external_nodes)
+			(void) ft_head_set_key_end_byte(dst_ft,
+				ft_dereference_external(swap_rmeta->external_nodes),
+				key[key_len - 1], NULL);
 
 		/*
 		 * Identify the displaced old-child and its key count.  KEY_SHORTER: the

@@ -69,7 +69,7 @@
 #endif
 
 /*
- * 373 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
+ * 374 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  *
  * ☠ BUMP BOTH ARMS.  A new unconditional test belongs to the fault-inject
@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (426 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (427 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (373 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (374 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -21745,6 +21745,208 @@ static int test_bulk_long_dst_key(void)
 	return 0;
 }
 
+/* Insert @key in @ft; abort on failure. */
+static void keb_insert(struct cds_ft *ft, const char *key)
+{
+	struct ft_test_node *n = node_alloc(0);
+
+	if (cds_ft_insert(ft, (const uint8_t *) key, strlen(key), &n->node)
+			!= CDS_FT_STATUS_OK)
+		abort();
+}
+
+/* Remove every node at @key in @ft; return 0 on success. */
+static int keb_remove(struct cds_ft *ft, struct cds_ft_iter *iter,
+		const char *key)
+{
+	struct cds_ft_node *head = NULL, *next;
+
+	cds_ft_iter_set_key(iter, (const uint8_t *) key, strlen(key));
+	if (cds_ft_remove_all(ft, iter, &head) != CDS_FT_STATUS_OK)
+		return -1;
+	for (; head; head = next) {
+		next = cds_ft_node_next_rcu(head);
+		node_free_rcu(to_test_node(head));
+	}
+	return 0;
+}
+
+/* Is @expect the only key which an ordered walk of @ft reports? */
+static int keb_only_key(struct cds_ft *ft, struct cds_ft_iter *iter,
+		const char *what, const char *expect)
+{
+	uint8_t key[16];
+	size_t key_len = 0;
+
+	cds_ft_iter_reset(iter);
+	if (cds_ft_lookup_first(ft, iter) != CDS_FT_STATUS_OK ||
+			cds_ft_iter_get_key(iter, key, sizeof(key), &key_len)
+				!= CDS_FT_STATUS_OK ||
+			key_len != strlen(expect) ||
+			memcmp(key, expect, key_len) ||
+			cds_ft_next(ft, iter) != CDS_FT_STATUS_NOT_FOUND ||
+			cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "bulk_move_key_end_byte(%s): the walk reports "
+			"\"%.*s\" (%zu bytes), expected only \"%s\"\n", what,
+			(int) key_len, key, key_len, expect);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * One leg of test_bulk_move_key_end_byte.  The source holds @src_top and
+ * @src_top "ca": a key which ends at the moved prefix, and one below it.
+ * @op moves them under "x" of a destination which holds @dst_key (or nothing),
+ * then every key but "x" is removed, so that "x" drops from a prefix head
+ * into a slot.  An ordered walk must then report "x".
+ *
+ * @op: 'm' cds_ft_merge_at, 'g' cds_ft_graft, 's' cds_ft_graft_swap.  The
+ * latter two move a whole trie, so @src_top is "" for them.
+ */
+static int bulk_move_key_end(const char *what, char op, const char *src_top,
+		const char *dst_key)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	struct cds_ft_iter *iter;
+	char below[16];
+	enum cds_ft_status s;
+	int ret = -1;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, true) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &dst) < 0 ||
+			cds_ft_create(group, NULL, &src) < 0)
+		abort();
+	if (cds_ft_iter_create(dst, &iter) < 0)
+		abort();
+	snprintf(below, sizeof(below), "%sca", src_top);
+	rcu_read_lock();
+	keb_insert(src, src_top);
+	keb_insert(src, below);
+	if (dst_key)
+		keb_insert(dst, dst_key);
+	rcu_read_unlock();
+	cds_ft_make_exclusive(src);
+	if (op == 'm')
+		s = cds_ft_merge_at(dst, (const uint8_t *) "x", 1, src,
+				(const uint8_t *) src_top, strlen(src_top));
+	else if (op == 'g')
+		s = cds_ft_graft(dst, (const uint8_t *) "x", 1, src);
+	else
+		s = cds_ft_graft_swap(dst, (const uint8_t *) "x", 1, src);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "bulk_move_key_end_byte(%s): %s\n", what,
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	rcu_read_lock();
+	/* graft_swap replaced whatever dst held under "x". */
+	if (keb_remove(dst, iter, "xca") ||
+			(dst_key && op != 's' && keb_remove(dst, iter, dst_key)))
+		fprintf(stderr, "bulk_move_key_end_byte(%s): a moved key is "
+			"missing\n", what);
+	else
+		ret = keb_only_key(dst, iter, what, "x");
+	rcu_read_unlock();
+out:
+	cds_ft_iter_destroy(iter);
+	drain_trie(src);
+	drain_trie(dst);
+	rcu_barrier();
+	cds_ft_destroy(src);
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * The ordered cell of a head holds the last byte of its key, for the walk to
+ * spell.  A cross-trie move changes that byte for the one key which ends at
+ * the moved prefix.  When that key was the prefix head of the moved subtree,
+ * no path stamped it: the walk spelled the old byte, or a zero byte, once the
+ * keys below were gone.
+ *
+ * Last leg: a merge which is refused must leave the source's byte alone.
+ */
+static int test_bulk_move_key_end_byte(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	struct cds_ft_iter *iter;
+	int ret = -1;
+
+	if (cds_ft_merge_enabled()) {
+		if (bulk_move_key_end("merge_at, empty dst", 'm', "babc", NULL))
+			return -1;
+		if (bulk_move_key_end("merge_at, sibling in dst", 'm', "babc",
+				"xq"))
+			return -1;
+		if (bulk_move_key_end("merge_at, overlap in dst", 'm', "babc",
+				"xcb"))
+			return -1;
+		if (bulk_move_key_end("merge_at, whole source", 'm', "", NULL))
+			return -1;
+	}
+	if (bulk_move_key_end("graft", 'g', "", NULL))
+		return -1;
+	if (bulk_move_key_end("graft, other key in dst", 'g', "", "yy"))
+		return -1;
+	if (bulk_move_key_end("graft_swap, leaf in dst", 's', "", "x"))
+		return -1;
+	if (bulk_move_key_end("graft_swap, subtree in dst", 's', "", "xzz"))
+		return -1;
+	if (!cds_ft_merge_enabled())
+		return 0;
+
+	/* "xyzwv" + "ca" is one byte too long: the merge is refused. */
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_max_key_len(attr, 6) < 0 ||
+			cds_ft_group_attr_set_ordered_list(attr, true) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &dst) < 0 ||
+			cds_ft_create(group, NULL, &src) < 0)
+		abort();
+	if (cds_ft_iter_create(src, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	keb_insert(src, "babc");
+	keb_insert(src, "babcca");
+	rcu_read_unlock();
+	cds_ft_make_exclusive(src);
+	if (cds_ft_merge_at(dst, (const uint8_t *) "xyzwv", 5, src,
+			(const uint8_t *) "babc", 4)
+			!= CDS_FT_STATUS_OVERFLOW_ERROR) {
+		fprintf(stderr, "bulk_move_key_end_byte: the over-long merge "
+			"was not refused\n");
+	} else {
+		rcu_read_lock();
+		if (!keb_remove(src, iter, "babcca"))
+			ret = keb_only_key(src, iter, "refused merge", "babc");
+		rcu_read_unlock();
+	}
+	cds_ft_iter_destroy(iter);
+	drain_trie(src);
+	drain_trie(dst);
+	rcu_barrier();
+	cds_ft_destroy(src);
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
 /*
  * Graft that would exceed the group's max key length returns
  * OVERFLOW_ERROR.
@@ -43238,6 +43440,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_graft_self_error);
 	RUN_TEST(test_graft_overflow_error);
 	RUN_TEST(test_bulk_long_dst_key);
+	RUN_TEST(test_bulk_move_key_end_byte);
 	RUN_TEST(test_graft_swap_basic);
 	RUN_TEST(test_graft_swap_into_empty);
 	RUN_TEST(test_graft_swap_nil_only_swap);

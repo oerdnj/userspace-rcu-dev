@@ -4052,6 +4052,50 @@ out:
 
 #endif /* FEATURE_FT_MERGE */
 
+#ifdef FEATURE_FT_MERGE
+/*
+ * The source head whose key is exactly @src_key ends, after the merge, at
+ * @dst_key.  Set the last key byte in its cell to that of @dst_key, and return
+ * the cell with its previous byte in *@old (see ft_head_set_key_end_byte).
+ * NULL when there is nothing to stamp, or when the arguments are ones the
+ * merge refuses.
+ *
+ * The attach paths stamp a moved LEAF themselves.  They do not stamp the
+ * prefix head of a moved internal node, whatever path attaches it.  So do it
+ * here, for all of them, while the source is still exclusive and whole.
+ */
+static
+struct ft_ord_cell *ft_merge_stamp_key_end(struct cds_ft *dst_ft,
+		const uint8_t *dst_key, size_t dst_key_len,
+		struct cds_ft *src_ft,
+		const uint8_t *src_key, size_t src_key_len, uint8_t *old)
+{
+	const struct rcu_flavor_struct *flavor;
+	const struct cds_ft_key_map *km;
+	struct cds_ft_node *head = NULL;
+	struct ft_ord_cell *cell = NULL;
+	size_t max_len;
+
+	if (!dst_ft || !src_ft || dst_ft == src_ft ||
+			dst_ft->group != src_ft->group || !src_ft->exclusive)
+		return NULL;
+	max_len = dst_ft->group->max_key_len;
+	if (!dst_key_len || !dst_key || dst_key_len > max_len ||
+			src_key_len > max_len || (src_key_len && !src_key))
+		return NULL;
+	km = &dst_ft->group->key_map;
+	flavor = dst_ft->group->flavor;
+	flavor->read_lock();
+	if (cds_ft_eager_lookup_key(src_ft, src_key, src_key_len, 0, &head)
+			== CDS_FT_STATUS_OK)
+		cell = ft_head_set_key_end_byte(src_ft, head, km->identity ?
+			dst_key[dst_key_len - 1] :
+			km->key_to_ordinal[dst_key[dst_key_len - 1]], old);
+	flavor->read_unlock();
+	return cell;
+}
+#endif
+
 enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		const uint8_t *dst_key, size_t dst_key_len,
 		struct cds_ft *src_ft,
@@ -4060,6 +4104,8 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 #ifdef FEATURE_FT_MERGE
 	{
 		enum cds_ft_status st__;
+		struct ft_ord_cell *end_cell;
+		uint8_t end_old = 0;
 
 		FT_BW_OP(FT_BW_MERGE_AT);
 		/*
@@ -4077,8 +4123,13 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		 */
 		CDS_FT_SCOPED_BULK_GATE(dst_ft, FT_BULK_WRITER_ONLY);
 
+		end_cell = ft_merge_stamp_key_end(dst_ft, dst_key, dst_key_len,
+				src_ft, src_key, src_key_len, &end_old);
 		st__ = ft_merge_at_inner(dst_ft, dst_key, dst_key_len, src_ft,
 				src_key, src_key_len);
+		/* A refused merge leaves the key where it was: so does this. */
+		if (st__ != CDS_FT_STATUS_OK && end_cell)
+			cds_ft_item_to_metadata(end_cell)->incoming_byte = end_old;
 		return st__;
 	}
 #else
