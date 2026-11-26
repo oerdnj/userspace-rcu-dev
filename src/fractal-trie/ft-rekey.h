@@ -1264,8 +1264,10 @@ int ft_rekey_ord_interleave(struct cds_ft *ft, struct cds_ft_inode_flag *D,
 			pool = np;
 			pool_cap = ncap;
 		}
-		memcpy(pool + pool_len, sbuf + (max_len - sfl) + src_len,
-			suf_len);
+		/* The pool is still NULL when the first suffixes are empty. */
+		if (suf_len)
+			memcpy(pool + pool_len,
+				sbuf + (max_len - sfl) + src_len, suf_len);
 		caps[nsrc].cell = sc;
 		caps[nsrc].suffix_off = pool_len;
 		caps[nsrc].suffix_len = suf_len;
