@@ -69,7 +69,7 @@
 #endif
 
 /*
- * 369 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
+ * 370 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  *
  * ☠ BUMP BOTH ARMS.  A new unconditional test belongs to the fault-inject
@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (422 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (423 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (369 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (370 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -21701,6 +21701,112 @@ fail:
 }
 
 /*
+ * One leg of test_graft_swap_nil_only_swap.  The live trie holds @live_key, the
+ * swap trie only its zero-length key.  They are swapped at @at, a prefix of
+ * @live_key, in a group whose keys are at most @max_len bytes long (0: the
+ * default).  Afterwards the live trie holds the swap node at @at, and the swap
+ * trie holds the live node at the rest of @live_key.
+ */
+static int graft_swap_nil_only(const char *live_key, const char *at,
+		size_t max_len, bool ordered_list)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *live, *swap;
+	struct ft_test_node *ln, *sn;
+	struct cds_ft_node *found = NULL;
+	struct cds_ft_iter *iter;
+	const char *rest = live_key + strlen(at);
+	enum cds_ft_status s;
+	int ret = -1;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (max_len && cds_ft_group_attr_set_max_key_len(attr, max_len) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &live) < 0 ||
+			cds_ft_create(group, NULL, &swap) < 0)
+		abort();
+	if (cds_ft_iter_create(live, &iter) < 0)
+		abort();
+
+	ln = node_alloc(1);
+	sn = node_alloc(2);
+	if (cds_ft_insert(live, (const uint8_t *) live_key, strlen(live_key),
+			&ln->node) != CDS_FT_STATUS_OK ||
+			cds_ft_insert(swap, (const uint8_t *) "", 0, &sn->node)
+				!= CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_lock();
+	cds_ft_make_exclusive(swap);
+	s = cds_ft_graft_swap(live, (const uint8_t *) at, strlen(at), swap);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_swap_nil_only(%s at %s): %s\n", live_key,
+			at, cds_ft_status_to_string(s));
+		goto out;
+	}
+	/* An ordered descent: the one which walked past the maximum length. */
+	if (cds_ft_lookup_first(live, iter) != CDS_FT_STATUS_OK ||
+			cds_ft_iter_node(iter) != &sn->node ||
+			cds_ft_eager_lookup_key(live, (const uint8_t *) at,
+				strlen(at), 0, &found) != CDS_FT_STATUS_OK ||
+			found != &sn->node || cds_ft_count_keys(live) != 1 ||
+			cds_ft_verify(live, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_swap_nil_only(%s at %s): the live trie "
+			"does not hold the swap node at the swap key\n",
+			live_key, at);
+		goto out;
+	}
+	if (cds_ft_eager_lookup_key(swap, (const uint8_t *) rest, strlen(rest),
+			0, &found) != CDS_FT_STATUS_OK ||
+			found != &ln->node || cds_ft_count_keys(swap) != 1 ||
+			cds_ft_verify(swap, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_swap_nil_only(%s at %s): the swap trie "
+			"does not hold the live node\n", live_key, at);
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	drain_trie(swap);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(swap);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * A swap trie which holds only its zero-length key has a childless root.
+ * cds_ft_graft_swap placed that root below the root of the live trie, where a
+ * childless internal node stands for a leaf.  With a swap key as long as the
+ * group allows, the next ordered lookup failed its depth assertion.
+ */
+static int test_graft_swap_nil_only_swap(void)
+{
+	int list;
+
+	for (list = 0; list < 2; list++) {
+		/* The swap key is a leaf, at the maximum key length. */
+		if (graft_swap_nil_only("abc", "abc", 3, list))
+			return -1;
+		if (graft_swap_nil_only("a", "a", 1, list))
+			return -1;
+		/* The swap key ends inside a compressed run. */
+		if (graft_swap_nil_only("abcdef", "abc", 0, list))
+			return -1;
+	}
+	return 0;
+}
+
+/*
  * graft_swap at root: exchange the entire trie content.
  */
 /*
@@ -42811,6 +42917,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_bulk_long_dst_key);
 	RUN_TEST(test_graft_swap_basic);
 	RUN_TEST(test_graft_swap_into_empty);
+	RUN_TEST(test_graft_swap_nil_only_swap);
 	RUN_TEST(test_graft_swap_extract_empty_compressed_parent);
 	RUN_TEST(test_graft_swap_extract_run_balance);
 	RUN_TEST(test_graft_swap_at_root);

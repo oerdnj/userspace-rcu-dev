@@ -4345,6 +4345,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 */
 		struct cds_ft_inode_flag *gs_pub_old = NULL;
 		bool swap_empty;
+		bool swap_nil_only;	/* swap holds only its zero-length key */
 		bool old_child_external = false;
 		bool have_insert = false;
 		unsigned long old_count = 0, swap_count;
@@ -4528,6 +4529,7 @@ retry_swap:
 #endif
 		swap_rmeta = ft_root_metadata(swap_ft);
 		swap_empty = (ft_meta_nr_child(swap_rmeta) == 0 && !swap_rmeta->external_nodes);
+		swap_nil_only = (ft_meta_nr_child(swap_rmeta) == 0 && swap_rmeta->external_nodes);
 		swap_count = swap_empty ? 0 : ft_nr_keys_get(swap_rmeta);
 
 		/*
@@ -4595,7 +4597,19 @@ retry_swap:
 		 * Insert side (cluster A): canonicalized swap content, placed at the
 		 * graft point in dst.  Empty swap inserts nothing (a remove).
 		 */
-		if (!swap_empty) {
+		if (swap_nil_only) {
+			/*
+			 * The swap content is one key, held by a childless root.
+			 * Such a node is only legal AT a root.  Placed below the
+			 * dst root it is a childless internal node where a leaf
+			 * belongs: with a @key as long as the group allows, the
+			 * next descent walks past the maximum key length.  Place
+			 * the key's chain head itself, as cds_ft_graft does.  The
+			 * emptied root is retired once swap_ft lets go of it.
+			 */
+			canon = (struct cds_ft_inode_flag *) ft_dereference_external(
+				swap_rmeta->external_nodes);
+		} else if (!swap_empty) {
 			canon = ft_compress_single_child_if_needed(dst_ft,
 				old_swap_root, &glue_insert);
 			if (canon == (struct cds_ft_inode_flag *) (long) -ENOMEM)
@@ -5264,6 +5278,16 @@ retry_swap:
 				swap_retire_txn = NULL;	/* consumed */
 				FT_TP(root_publish, (const void *) swap_ft,
 					(const void *) swap_ft->root);
+				/*
+				 * The childless root whose key chain went into
+				 * dst on its own: nothing names it any more, and
+				 * the exclusive swap_ft has no reader inside it.
+				 */
+				if (swap_nil_only) {
+					ft_meta_tombstone_set_flip(swap_rmeta);
+					free_cds_ft_node(swap_ft,
+						ft_node_ptr(old_swap_root));
+				}
 			}
 		} else {
 			/*
