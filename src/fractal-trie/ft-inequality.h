@@ -1024,9 +1024,14 @@ post_traversal:
 	 * Scoped traversal: a leaf above the scope prefix (level < prefix_len)
 	 * is outside the scope.  The scope guard before descend_children
 	 * answers NOT_FOUND for it.
+	 *
+	 * LIMIT_LAST takes this arm too.  Its search key is the scope prefix
+	 * padded with 0xff up to the maximum key length.  A leaf whose key is
+	 * the prefix followed only by 0xff bytes is a proper prefix of that
+	 * search key, and it is the greatest key in the scope.  Left to
+	 * going_up, it was skipped for the next smaller key.
 	 */
-	if (limit == FT_LOOKUP_LIMIT_NONE &&
-			(mode == FT_LOOKUP_LE || mode == FT_LOOKUP_LT) &&
+	if ((mode == FT_LOOKUP_LE || mode == FT_LOOKUP_LT) &&
 			node_flag && ft_node_external(node_flag) &&
 			level >= (ssize_t) iter->prefix_len &&
 			level < key_depth - 1) {

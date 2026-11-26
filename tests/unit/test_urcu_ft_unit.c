@@ -69,7 +69,7 @@
 #endif
 
 /*
- * 371 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
+ * 372 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  *
  * ☠ BUMP BOTH ARMS.  A new unconditional test belongs to the fault-inject
@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (424 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (425 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (371 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (372 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -9754,6 +9754,110 @@ static int test_iteration_prefix_scoped_key_at_scope(void)
 	cds_ft_iter_destroy(iter);
 	if (drain_and_destroy(ft, group) < 0)
 		ret = -1;
+	return ret;
+}
+
+/*
+ * cds_ft_lookup_last without the ordered list is a descent along the scope
+ * prefix padded with 0xff.  A leaf whose key is that prefix followed only by
+ * 0xff bytes is the greatest key, and a proper prefix of the padded key.  The
+ * descent skipped it for the next smaller key, or for NOT_FOUND when it was
+ * the only key.  cds_ft_lookup_nth_last(0) takes the same descent when the
+ * group keeps no rank statistics.
+ */
+struct last_ff_case {
+	const char *keys[4];	/* NULL-terminated */
+	const char *scope;
+	const char *expect;
+};
+
+static const struct last_ff_case last_ff[] = {
+	{ { "b", "\xff", NULL }, "", "\xff" },
+	{ { "\xff", NULL }, "", "\xff" },
+	{ { "b", "\xff\xff", NULL }, "", "\xff\xff" },
+	{ { "\xff", "\xff\xff", NULL }, "", "\xff\xff" },
+	{ { "\xff", "\xff\x01", NULL }, "", "\xff\x01" },
+	{ { "ab", "a\xff", "b", NULL }, "a", "a\xff" },
+	{ { "ab", "a\xff\xff", "b", NULL }, "a", "a\xff\xff" },
+};
+
+static int test_lookup_last_all_ff_key(void)
+{
+	unsigned int i, j;
+	int list, ret = 0;
+
+	for (list = 0; list < 2; list++) {
+		for (i = 0; i < CAA_ARRAY_SIZE(last_ff); i++) {
+			const struct last_ff_case *c = &last_ff[i];
+			struct cds_ft_group_attr *attr;
+			struct cds_ft_group *group;
+			struct cds_ft *ft;
+			struct cds_ft_iter *iter;
+			enum cds_ft_status s;
+			uint8_t key[8];
+			size_t key_len = 0;
+
+			if (cds_ft_group_attr_create(&attr) < 0)
+				abort();
+			if (cds_ft_group_attr_set_ordered_list(attr, list) < 0)
+				abort();
+			if (cds_ft_group_create(attr, &group) < 0)
+				abort();
+			cds_ft_group_attr_destroy(attr);
+			if (cds_ft_create(group, NULL, &ft) < 0)
+				abort();
+			if (cds_ft_iter_create(ft, &iter) < 0)
+				abort();
+			rcu_read_lock();
+			for (j = 0; c->keys[j]; j++) {
+				struct ft_test_node *n = node_alloc(j);
+
+				if (cds_ft_insert(ft, (const uint8_t *) c->keys[j],
+						strlen(c->keys[j]), &n->node)
+						!= CDS_FT_STATUS_OK)
+					abort();
+			}
+			cds_ft_iter_set_key(iter, (const uint8_t *) c->scope,
+				strlen(c->scope));
+			cds_ft_iter_set_prefix_len(iter, strlen(c->scope));
+			s = cds_ft_lookup_last(ft, iter);
+			if (s == CDS_FT_STATUS_OK)
+				(void) cds_ft_iter_get_key(iter, key, sizeof(key),
+					&key_len);
+			if (s != CDS_FT_STATUS_OK || key_len != strlen(c->expect) ||
+					memcmp(key, c->expect, key_len)) {
+				fprintf(stderr, "lookup_last case %u (list %s): %s, "
+					"key length %zu, expected the %zu byte "
+					"key\n", i, list ? "on" : "off",
+					cds_ft_status_to_string(s), key_len,
+					strlen(c->expect));
+				ret = -1;
+			}
+			if (!c->scope[0]) {
+				cds_ft_iter_reset(iter);
+				key_len = 0;
+				s = cds_ft_lookup_nth_last(ft, iter, 0);
+				if (s == CDS_FT_STATUS_OK)
+					(void) cds_ft_iter_get_key(iter, key,
+						sizeof(key), &key_len);
+				if (s != CDS_FT_STATUS_OK ||
+						key_len != strlen(c->expect) ||
+						memcmp(key, c->expect, key_len)) {
+					fprintf(stderr, "lookup_nth_last(0) case %u "
+						"(list %s): %s, key length %zu, "
+						"expected the %zu byte key\n", i,
+						list ? "on" : "off",
+						cds_ft_status_to_string(s), key_len,
+						strlen(c->expect));
+					ret = -1;
+				}
+			}
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			if (drain_and_destroy(ft, group) < 0)
+				ret = -1;
+		}
+	}
 	return ret;
 }
 
@@ -42907,6 +43011,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_lookup_longest_match_root);
 	RUN_TEST(test_lookup_relational);
 	RUN_TEST(test_lookup_first_last);
+	RUN_TEST(test_lookup_last_all_ff_key);
 
 	/* 4. Iteration */
 	diag("Iteration tests");
