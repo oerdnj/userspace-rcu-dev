@@ -22295,7 +22295,7 @@ int ft_bulk_node_reserve_fill(struct cds_ft *ft, struct cds_ft_alloc_reserve *r)
 	/* Compressed-node arena (speculative groups; else compressed == NODE). */
 	if (ft->group->speculative) {
 		unsigned int order;
-		unsigned int cmax = ft_compressed_order(FT_SKIP_LEN_MAX);
+		unsigned int cmax = ft_compressed_order(FT_CN_LEN_MAX);
 
 		if (cmax > FT_ALLOC_ORDER_MAX)
 			cmax = FT_ALLOC_ORDER_MAX;

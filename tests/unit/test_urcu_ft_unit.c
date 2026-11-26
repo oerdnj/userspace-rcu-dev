@@ -69,7 +69,7 @@
 #endif
 
 /*
- * 368 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
+ * 369 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  *
  * ☠ BUMP BOTH ARMS.  A new unconditional test belongs to the fault-inject
@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (421 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (422 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (368 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (369 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -21345,6 +21345,83 @@ static int test_graft_self_error(void)
 
 	cds_ft_destroy(ft);
 	cds_ft_group_destroy(group);
+	return 0;
+}
+
+/*
+ * One leg of test_bulk_long_dst_key: move the key "abc" of an exclusive source
+ * under a @len byte key of an empty destination, with cds_ft_graft or with
+ * cds_ft_merge_at.
+ */
+static int bulk_long_dst_key(unsigned int len, bool merge)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	struct ft_test_node *n;
+	struct cds_ft_node *found = NULL;
+	uint8_t key[FT_TEST_OVL_MAX];
+	enum cds_ft_status s;
+	int ret = -1;
+
+	dst = create_varlen_ft(&group);
+	if (cds_ft_create(group, NULL, &src) < 0)
+		abort();
+	n = node_alloc(0);
+	if (cds_ft_insert(src, (const uint8_t *) "abc", 3, &n->node)
+			!= CDS_FT_STATUS_OK) {
+		node_free(n);
+		goto out;
+	}
+	cds_ft_make_exclusive(src);
+	memset(key, 'y', len);
+	memcpy(key + len, "abc", 3);
+	rcu_read_lock();
+	if (merge)
+		s = cds_ft_merge_at(dst, key, len, src, NULL, 0);
+	else
+		s = cds_ft_graft(dst, key, len, src);
+	if (s != CDS_FT_STATUS_OK ||
+			cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK ||
+			cds_ft_eager_lookup_key(dst, key, len + 3, 0, &found)
+				!= CDS_FT_STATUS_OK ||
+			found != &n->node || cds_ft_count_keys(dst) != 1 ||
+			!cds_ft_empty(src)) {
+		fprintf(stderr, "bulk_long_dst_key: %s at a %u byte key "
+			"failed (%s)\n", merge ? "merge_at" : "graft", len,
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * A bulk attach under a long destination key spells that key with one
+ * compressed node, which can be 255 bytes long.  The node reserve of the bulk
+ * operations was filled up to the size class of a 127 byte node.  From 246
+ * bytes on, the node is in the next size class: the reserve underflowed, which
+ * is an assertion failure.
+ */
+static int test_bulk_long_dst_key(void)
+{
+	static const unsigned int lens[] = { 245, 246, 250, 253 };
+	unsigned int i;
+
+	for (i = 0; i < CAA_ARRAY_SIZE(lens); i++) {
+		if (bulk_long_dst_key(lens[i], false))
+			return -1;
+		if (cds_ft_merge_enabled() && bulk_long_dst_key(lens[i], true))
+			return -1;
+	}
 	return 0;
 }
 
@@ -42731,6 +42808,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_graft_different_group_error);
 	RUN_TEST(test_graft_self_error);
 	RUN_TEST(test_graft_overflow_error);
+	RUN_TEST(test_bulk_long_dst_key);
 	RUN_TEST(test_graft_swap_basic);
 	RUN_TEST(test_graft_swap_into_empty);
 	RUN_TEST(test_graft_swap_extract_empty_compressed_parent);
