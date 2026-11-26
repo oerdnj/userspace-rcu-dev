@@ -1491,9 +1491,11 @@ retry:
 				cds_find_prev_bit(bitmap->bitmap,
 					FT_ENTRY_PER_NODE, i - 1);
 
+			/* Only a hint, but a writer stores this slot concurrently. */
 			if (adj >= 0)
-				ft_maybe_prefetch_nta(((struct cds_ft_inode_flag **)
-					node->data)[adj]);
+				ft_maybe_prefetch_nta(uatomic_load(
+					&((struct cds_ft_inode_flag **)
+						node->data)[adj], CMM_RELAXED));
 		}
 		dbg_printf("ft_pigeon_node_get child_node_flag %p\n", child_node_flag);
 		*result_key = (uint8_t) i;
