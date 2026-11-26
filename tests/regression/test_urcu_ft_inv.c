@@ -92,7 +92,8 @@
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
 /* +1 inv_graft_swap_whole_seam_points */
-#define NR_TESTS	(149 + NR_TESTS_REKEY_DLM)	/* +1: inv_compact_vs_graft; +1: inv_compact_vs_rekey; +1: inv_detach_orphan_shape; +1: inv_owned_long_runs; +1: inv_owned_prefix_dense_remove_all; +1: inv_ir_prefix_roundtrip; +1: inv_owned_prefix_dense_replace; +1: inv_owned_prefix_dense; +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension; +1: inv_prefix_shape_zoo */
+/* +1 inv_nil_key_insert_vs_remove_all */
+#define NR_TESTS	(150 + NR_TESTS_REKEY_DLM)	/* +1: inv_compact_vs_graft; +1: inv_compact_vs_rekey; +1: inv_detach_orphan_shape; +1: inv_owned_long_runs; +1: inv_owned_prefix_dense_remove_all; +1: inv_ir_prefix_roundtrip; +1: inv_owned_prefix_dense_replace; +1: inv_owned_prefix_dense; +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension; +1: inv_prefix_shape_zoo */
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -30756,6 +30757,148 @@ static int inv_rekey_shape_concurrent(void)
 	return 0;
 }
 
+/* ================================================================== */
+/*                                                                    */
+/*   The zero-length key: cds_ft_insert vs cds_ft_remove_all          */
+/*                                                                    */
+/*   The zero-length key is stored in the root's external_nodes       */
+/*   word.  One thread inserts duplicates of it while another         */
+/*   removes the whole chain, under the default writer strategy.      */
+/*   Each inserted node must be handed back by exactly one            */
+/*   remove_all, or still be in the trie at the end.                  */
+/*                                                                    */
+/* ================================================================== */
+
+struct nilra_ctx {
+	struct cds_ft *ft;
+	unsigned long inserted;		/* inserter only */
+	unsigned long returned;		/* remover only */
+	unsigned long bad_status;
+};
+
+static void *nilra_inserter(void *arg)
+{
+	struct nilra_ctx *c = (struct nilra_ctx *) arg;
+
+	rcu_register_thread();
+	while (!test_go_load())
+		caa_cpu_relax();
+	while (!test_stop_load()) {
+		struct ft_test_node *n = node_alloc(0);
+		enum cds_ft_status s;
+
+		rcu_read_lock();
+		s = cds_ft_insert(c->ft, (const uint8_t *) "", 0, &n->node);
+		rcu_read_unlock();
+		if (s == CDS_FT_STATUS_OK) {
+			c->inserted++;
+		} else {
+			uatomic_inc(&c->bad_status);
+			node_free(n);
+		}
+		rcu_quiescent_state();
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *nilra_remover(void *arg)
+{
+	struct nilra_ctx *c = (struct nilra_ctx *) arg;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(c->ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	while (!test_go_load())
+		caa_cpu_relax();
+	while (!test_stop_load()) {
+		struct cds_ft_node *head = NULL, *next;
+		enum cds_ft_status s;
+
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, (const uint8_t *) "", 0);
+		s = cds_ft_remove_all(c->ft, iter, &head);
+		if (s == CDS_FT_STATUS_OK) {
+			for (; head; head = next) {
+				next = cds_ft_node_next_rcu(head);
+				c->returned++;
+				node_free_rcu(to_test_node(head));
+			}
+		} else if (s != CDS_FT_STATUS_NOT_FOUND) {
+			uatomic_inc(&c->bad_status);
+		}
+		rcu_read_unlock();
+		rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int nilra_run(bool list_on)
+{
+	struct nilra_ctx c;
+	struct cds_ft_group *group;
+	struct cds_ft_iter *iter;
+	struct cds_ft_node *head, *next;
+	pthread_t ins, rm;
+	struct timespec t0;
+	unsigned long left = 0;
+	int ret = 0;
+
+	memset(&c, 0, sizeof(c));
+	c.ft = list_on ? create_varlen_ord_ft(&group) :
+		create_varlen_nolist_ft(&group);
+	test_go_set(0);
+	test_stop_set(0);
+	pthread_create(&ins, NULL, nilra_inserter, &c);
+	pthread_create(&rm, NULL, nilra_remover, &c);
+	test_go_set(1);
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+	test_stop_set(1);
+	pthread_join(ins, NULL);
+	pthread_join(rm, NULL);
+	rcu_thread_online();
+
+	if (cds_ft_iter_create(c.ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_lock();
+	if (cds_ft_verify(c.ft, stderr) != CDS_FT_STATUS_OK)
+		ret = -1;
+	cds_ft_iter_set_key(iter, (const uint8_t *) "", 0);
+	head = NULL;
+	if (cds_ft_remove_all(c.ft, iter, &head) == CDS_FT_STATUS_OK) {
+		for (; head; head = next) {
+			next = cds_ft_node_next_rcu(head);
+			left++;
+			node_free_rcu(to_test_node(head));
+		}
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	if (c.inserted != c.returned + left || c.bad_status) {
+		fprintf(stderr, "inv_nil_key_insert_vs_remove_all (list %s): "
+			"inserted %lu, handed back %lu, left in the trie %lu, "
+			"unexpected statuses %lu\n", list_on ? "on" : "off",
+			c.inserted, c.returned, left, c.bad_status);
+		ret = -1;
+	}
+	if (drain_and_destroy(c.ft, group))
+		ret = -1;
+	return ret;
+}
+
+static int inv_nil_key_insert_vs_remove_all(void)
+{
+	if (nilra_run(true))
+		return -1;
+	return nilra_run(false);
+}
+
 int main(int argc, char **argv)
 {
 	const char *filter = (argc >= 2) ? argv[1] : NULL;
@@ -31034,6 +31177,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_concurrent_remove_all_prefix_coarse);
 	RUN_TEST(inv_concurrent_insert_replace_nolist);
 	RUN_TEST(inv_concurrent_insert_replace_coarse);
+	RUN_TEST(inv_nil_key_insert_vs_remove_all);
 
 	rcu_barrier();
 	rcu_unregister_thread();

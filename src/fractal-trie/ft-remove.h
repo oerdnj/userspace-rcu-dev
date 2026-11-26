@@ -10840,7 +10840,12 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 
 		root_nf = ft_resolve_flip_proxy(rcu_dereference(ft->root));
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(root_nf));
-		external_nodes = metadata->external_nodes;
+		/*
+		 * Resolve: a peer insert of the NIL key parks a flip proxy in
+		 * this word (ft_insert_park_external_nodes).  Read raw, the
+		 * proxy would be walked as the chain head below.
+		 */
+		external_nodes = ft_dereference_external(metadata->external_nodes);
 		if (!external_nodes) {
 			*result_node = NULL;
 #if defined(FT_ENABLE_TRACING) || defined(FT_DEBUG_RM_SITE)
@@ -10907,7 +10912,9 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			}
 			if (ft_resolve_flip_proxy(rcu_dereference(ft->root)) !=
 						root_nf ||
-					metadata->external_nodes != external_nodes ||
+					ft_dereference_external(
+						metadata->external_nodes) !=
+						external_nodes ||
 					ft_hlist_chain_len(external_nodes) !=
 						nr_frozen) {
 				ft_flip_txn_destroy(root_txn);
