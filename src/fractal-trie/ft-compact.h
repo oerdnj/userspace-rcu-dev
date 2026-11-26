@@ -1310,6 +1310,7 @@ void cds_ft_compact_end(struct cds_ft_compact_state *st)
 
 enum cds_ft_compact_status cds_ft_compact(struct cds_ft *ft)
 {
+	const struct rcu_flavor_struct *flavor = ft->group->flavor;
 	struct cds_ft_compact_state *st;
 	enum cds_ft_compact_status s;
 
@@ -1328,6 +1329,23 @@ enum cds_ft_compact_status cds_ft_compact(struct cds_ft *ft)
 	 */
 	do {
 		s = cds_ft_compact_step(st, 0);
+		/*
+		 * Let grace periods complete between two steps under EVERY
+		 * flavor.  A step ends its own read-side section, but under a
+		 * quiescent-state flavor (QSBR) the calling thread remains a
+		 * reader until it reports a quiescent state.  Without one, no
+		 * grace period completes before the pass returns.  Every
+		 * relocation retires its transaction descriptor after a grace
+		 * period, and the descriptor slab never gives memory back: a
+		 * pass over 200000 keys then left 350 MB of it resident for
+		 * good.
+		 *
+		 * The step has bound its iterator, so the pass holds no
+		 * reference here.  The caller holds none either, by contract.
+		 * A no-op under the other flavors.
+		 */
+		if (flavor->read_ongoing())
+			flavor->read_quiescent_state();
 	} while (s == CDS_FT_COMPACT_MORE);
 	cds_ft_compact_end(st);
 	return s;	/* DONE, or OOM / BUSY if a step stopped the pass */

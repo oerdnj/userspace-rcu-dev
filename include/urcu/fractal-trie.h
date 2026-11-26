@@ -4240,6 +4240,13 @@ enum cds_ft_compact_status {
  * elapsed.  A caller that needs to observe the lower RSS (e.g. before
  * measuring) must wait for a grace period itself, for example rcu_barrier().
  *
+ * Grace periods must be able to complete DURING the call as well: each
+ * relocation retires memory after one, and a pass which holds them all up
+ * keeps every retired item until it returns.  So do not call this inside a
+ * read-side critical section, and do not hold an RCU-protected reference
+ * across it.  Under a quiescent-state flavor (QSBR) the calling thread
+ * reports quiescent states between the steps of the pass.
+ *
  * To defragment a whole group, call this on each trie the group contains.
  */
 enum cds_ft_compact_status cds_ft_compact(struct cds_ft *ft);
@@ -4253,7 +4260,10 @@ enum cds_ft_compact_status cds_ft_compact(struct cds_ft *ft);
  * steps.  The library provides no such lock under CDS_FT_WRITER_LOCK_FINE:
  * use an application mutex that the point writers of @ft also take.  Bulk
  * ops need no such exclusion.  Other writers then get a window between
- * steps, and so do the grace periods that drain reclaimed ranges.  Each
+ * steps, and so do the grace periods that drain reclaimed ranges.  Under a
+ * quiescent-state flavor (QSBR) that window only opens when the calling
+ * thread reports a quiescent state or goes offline between two steps: the
+ * library does not do it here.  Each
  * step tolerates the structure changing between steps (a writer may mutate
  * the trie while the lock is dropped).
  *
