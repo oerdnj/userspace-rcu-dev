@@ -69,7 +69,7 @@
 #endif
 
 /*
- * 365 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
+ * 367 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  *
  * ☠ BUMP BOTH ARMS.  A new unconditional test belongs to the fault-inject
@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (419 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (420 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (366 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (367 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -18019,6 +18019,57 @@ static int test_rekey_known_nonterminating(void)
 	 */
 	return rekey_exclusive_keeps_keys("hang/exclusive-cross-parent", x1,
 			"bz", "ax");
+}
+
+/*
+ * A destination which sorts right after the zero-length key.  With the ordered
+ * list on, that key's cell is then the list predecessor of the moved keys.  Its
+ * key rebuilds to a length of 0, which the splice-position check took for an
+ * unreadable walk: the rekey retried without end.  Like the legs above, a
+ * regression here hangs the suite.
+ */
+static int test_rekey_dst_after_nil_key(void)
+{
+	static const char *k1[] = { "", "bccc", NULL };
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_dst_after_nil_key: skipped, merge compiled "
+			"out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (rekey_keeps_keys("nil-pred/merge", k1, "a", "b"))
+		return -1;
+	if (rekey_rankstats_keeps_keys("nil-pred/merge-rankstats", k1, "a", "b"))
+		return -1;
+
+	ft = create_varlen_ft(&group);
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *) "", 0, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "bccc", 4, &node_alloc(2)->node);
+	s = cds_ft_rekey_graft(ft, (const uint8_t *) "a", 1,
+			(const uint8_t *) "b", 1);
+	if (s != CDS_FT_STATUS_OK ||
+			cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+			!ft_test_has_key(ft, "") || !ft_test_has_key(ft, "accc") ||
+			ft_test_has_key(ft, "bccc") ||
+			cds_ft_count_keys(ft) != 2) {
+		fprintf(stderr, "nil-pred/graft: rekey_graft a<-b next to the "
+			"zero-length key failed (%s)\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
 }
 
 /*
@@ -42538,6 +42589,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_cut_run_dst_split_keeps_keys);
 	RUN_TEST(test_rekey_graft_publish_survives_detach);
 	RUN_TEST(test_rekey_known_nonterminating);
+	RUN_TEST(test_rekey_dst_after_nil_key);
 	RUN_TEST(test_rekey_exclusive_drain_after_loss);
 	RUN_TEST(test_rekey_fixed_len_atomic_or_refused);
 	RUN_TEST(test_rekey_varlen_ordered_splice);
