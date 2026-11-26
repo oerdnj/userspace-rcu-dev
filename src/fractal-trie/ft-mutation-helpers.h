@@ -24103,9 +24103,9 @@ void ft_glue_record_back_edge_slot(struct ft_flip_txn *txn,
 		ft_node_skip_compressed(parent_nf);
 #endif
 	if (!parent_compressed)
-		meta->incoming_byte = FT_DT_IB_STORE(meta, ft_slot_to_byte(
-			&ft_types[ft_node_type(parent_nf)],
-			ft_node_ptr(parent_nf), slot));
+		ft_meta_incoming_byte_set(meta, FT_DT_IB_STORE(meta,
+			ft_slot_to_byte(&ft_types[ft_node_type(parent_nf)],
+			ft_node_ptr(parent_nf), slot)));
 }
 
 /*
@@ -24356,9 +24356,9 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 				&& !ft_node_skip_compressed(parent_nf)
 #endif
 		   )
-			meta->incoming_byte = FT_DT_IB_STORE(meta, ft_slot_to_byte(
-				&ft_types[ft_node_type(parent_nf)],
-				ft_node_ptr(parent_nf), slot));
+			ft_meta_incoming_byte_set(meta, FT_DT_IB_STORE(meta,
+				ft_slot_to_byte(&ft_types[ft_node_type(parent_nf)],
+				ft_node_ptr(parent_nf), slot)));
 	}
 	/*
 	 * @parent_nf stays the parent NODE above, because the offset and

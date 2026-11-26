@@ -1604,26 +1604,23 @@ struct ft_pub_rec {
  *     RAW producers beside them (ft_set_parent's external arm).  That is one
  *     whole-class step, not six small ones.
  * (6) The one family whose design-MW is ARGUED rather than asserted.
- * (7) ☑ THESE TWO SHARE ONE WORD, AND THAT IS THE CLASSIFICATION.  Neither is
- *     transacted, so neither took a KIND and neither was listed here.  But
- *     @incoming_byte IS written on a PLACED node: ft_set_parent_slot, from
- *     ft_set_parent AND ft_publish_to_parent, i.e. every publish path.  And
- *     it is a BITFIELD: each write is a read-modify-write of the whole tail
- *     word, @alloc_index included.  A register that lists only transacted
- *     words hides that.  That is why @alloc_index is named here and not left
- *     out.
+ * (7) ☑ THESE TWO SHARE ONE WORD.  Neither is transacted, so neither took a
+ *     KIND and neither was listed here.  But @incoming_byte IS written on a
+ *     PLACED node: ft_set_parent_slot, from ft_set_parent AND
+ *     ft_publish_to_parent, i.e. every publish path.  The up-walk reads it
+ *     at the same time.
  *
- *     The struct's own note rests the sharing on "no two writers ever race
- *     here".  The load-bearing half is narrower and checkable: @alloc_index
- *     is IMMUTABLE while the node is reachable.  The allocator writes it
- *     once (fractal-trie-alloc.c, at alloc) and never again.  It is saved
- *     and restored around the free-list memset, where the item is
- *     unreachable.  So a racing @incoming_byte RMW writes the SAME
- *     @alloc_index back and cannot lose it, whatever the byte does.
- *     ☠ A new field packed into this word would have to inherit that, and a
- *     mutable one could NOT.  It would need @incoming_byte's writers to
- *     exclude each other, which nothing here does.  A value that must be
- *     coherent with a structural flip belongs in @state.
+ *     It used to be a BITFIELD of the tail word: each write was a
+ *     read-modify-write of the whole word, @alloc_index included, racing
+ *     with that read.  It is now a byte member of its own, the last byte of
+ *     the word, stored and loaded with relaxed atomic accesses
+ *     (ft_meta_incoming_byte{,_set}).  @alloc_index keeps the other three
+ *     bytes.  It is IMMUTABLE while the node is reachable: the allocator
+ *     writes it once (fractal-trie-alloc.c, at alloc) and never again.  It
+ *     is saved and restored around the free-list memset, where the item is
+ *     unreachable.
+ *     ☠ A value that must be coherent with a structural flip still belongs
+ *     in @state.
  * (8) ☑ Written RAW, twice.  Both sites are legal by the last rule in this
  *     block (a node no reader can reach):
  *       - ft_ord_cell_alloc;
@@ -1935,13 +1932,18 @@ struct cds_ft_metadata {
 	 * store legal.  Its only ordering is the release of the parent pointer
 	 * that follows it.  So a reader's up-walk must acquire @parent_word
 	 * BEFORE reading the byte.
-	 * ☠ IT IS A BITFIELD: every write is a read-modify-write of the whole
-	 * word.  These two fields can share it only because no two writers ever
-	 * race here.  A new field packed in inherits that obligation.  A value
-	 * that must be coherent with a structural flip belongs in @state.
+	 * ☞ @incoming_byte IS A BYTE OF ITS OWN, not a bitfield of this word.
+	 * A bitfield store is a read-modify-write of the whole word, done
+	 * while the up-walk reads the byte: a data race, which ThreadSanitizer
+	 * reports.  As a member it is a separate memory location.  It is
+	 * stored and loaded with relaxed atomic accesses wherever a reader
+	 * can reach the item (ft_meta_incoming_byte{,_set}).  It still fills
+	 * the last byte of the tail word, so the struct keeps its size.  A
+	 * value that must be coherent with a structural flip belongs in
+	 * @state.
 	 */
 	uint32_t alloc_index:24;
-	uint32_t incoming_byte:8;
+	uint8_t incoming_byte;
 #else
 	/*
 	 * Near metadata: alloc_index is packed into this word, sized with
@@ -2182,6 +2184,23 @@ static unsigned int ft_dt_ib_store_probe(const struct cds_ft_metadata *meta,
 #else
 # define FT_DT_IB_STORE(meta, byte)	(byte)
 #endif
+
+/*
+ * @incoming_byte of an item which readers can reach.  The up-walk loads it
+ * while a placement stores it, so both are relaxed atomic accesses.  Its only
+ * ordering is the release of the parent word which follows the store.
+ */
+static inline
+uint8_t ft_meta_incoming_byte(const struct cds_ft_metadata *meta)
+{
+	return uatomic_load(&meta->incoming_byte, CMM_RELAXED);
+}
+
+static inline
+void ft_meta_incoming_byte_set(struct cds_ft_metadata *meta, uint8_t byte)
+{
+	uatomic_store(&meta->incoming_byte, byte, CMM_RELAXED);
+}
 
 static inline
 void ft_meta_parent_slot_offset_set(struct cds_ft_metadata *meta, unsigned int off)

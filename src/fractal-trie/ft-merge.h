@@ -4129,7 +4129,8 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 				src_key, src_key_len);
 		/* A refused merge leaves the key where it was: so does this. */
 		if (st__ != CDS_FT_STATUS_OK && end_cell)
-			cds_ft_item_to_metadata(end_cell)->incoming_byte = end_old;
+			ft_meta_incoming_byte_set(
+				cds_ft_item_to_metadata(end_cell), end_old);
 		return st__;
 	}
 #else

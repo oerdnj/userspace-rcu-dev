@@ -363,7 +363,7 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 
 		if (pos == 0)
 			return 0;
-		out[--pos] = (uint8_t) hmeta->incoming_byte;
+		out[--pos] = ft_meta_incoming_byte(hmeta);
 	} else if (!ft_node_compressed(ft_resolve_skip_compressed(ft, nf))) {
 		/*
 		 * Parent is an internal (slot-array) node.  Write the head's edge
@@ -418,7 +418,7 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 
 			if (pos == 0)
 				return 0;
-			out[--pos] = (uint8_t) hmeta->incoming_byte;
+			out[--pos] = ft_meta_incoming_byte(hmeta);
 		}
 	}
 	/* else parent compressed: the head byte is covered by its key_bytes. */
@@ -500,7 +500,7 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 					ft_resolve_skip_compressed(ft, parent))) {
 				if (pos == 0)
 					return 0;
-				out[--pos] = (uint8_t) meta->incoming_byte;
+				out[--pos] = ft_meta_incoming_byte(meta);
 			}
 			from = nf;	/* whose parent_word produced the next @nf */
 			nf = parent;

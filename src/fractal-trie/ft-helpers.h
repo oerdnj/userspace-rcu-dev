@@ -2920,8 +2920,8 @@ void ft_set_parent_slot(struct cds_ft_metadata *meta,
 	parent_compressed = parent_compressed || ft_node_skip_compressed(p);
 #endif
 	if (!parent_compressed)
-		meta->incoming_byte = FT_DT_IB_STORE(meta, ft_slot_to_byte(
-			&ft_types[ft_node_type(p)], ft_node_ptr(p), slot));
+		ft_meta_incoming_byte_set(meta, FT_DT_IB_STORE(meta,
+			ft_slot_to_byte(&ft_types[ft_node_type(p)], ft_node_ptr(p), slot)));
 }
 
 /*
@@ -4724,7 +4724,8 @@ void ft_head_stamp_incoming_byte(const struct cds_ft *ft,
 	 */
 	if (!prev || !((uintptr_t) prev & FT_ORD_CELL_TAG))
 		return;
-	cds_ft_item_to_metadata(ft_ord_cell_ptr(prev))->incoming_byte = byte;
+	ft_meta_incoming_byte_set(cds_ft_item_to_metadata(ft_ord_cell_ptr(prev)),
+		byte);
 }
 
 /*
@@ -4756,8 +4757,8 @@ struct ft_ord_cell *ft_head_set_key_end_byte(const struct cds_ft *ft,
 		return NULL;
 	cmeta = cds_ft_item_to_metadata(ft_ord_cell_ptr(prev));
 	if (old)
-		*old = (uint8_t) cmeta->incoming_byte;
-	cmeta->incoming_byte = byte;
+		*old = ft_meta_incoming_byte(cmeta);
+	ft_meta_incoming_byte_set(cmeta, byte);
 	return ft_ord_cell_ptr(prev);
 }
 
@@ -4907,9 +4908,9 @@ void ft_set_parent_at(const char *fn, int line, struct cds_ft *ft,
 				&& !ft_node_skip_compressed(parent_nf)
 #endif
 		   )
-			meta->incoming_byte = FT_DT_IB_STORE(meta, ft_slot_to_byte(
-				&ft_types[ft_node_type(parent_nf)],
-				ft_node_ptr(parent_nf), slot));
+			ft_meta_incoming_byte_set(meta, FT_DT_IB_STORE(meta,
+				ft_slot_to_byte(&ft_types[ft_node_type(parent_nf)],
+				ft_node_ptr(parent_nf), slot)));
 		ft_ch_audit_parent_at(fn, line, ft, meta, parent_nf, excl);
 		rcu_assign_pointer(meta->parent_word, stored_parent);
 		ft_set_parent_slot(meta, parent_nf, slot);
