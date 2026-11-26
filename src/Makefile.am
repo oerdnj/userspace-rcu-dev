@@ -24,6 +24,7 @@ FRACTAL_TRIE = fractal-trie/fractal-trie.c fractal-trie/fractal-trie-alloc.c \
 	fractal-trie/ft-inequality.h fractal-trie/ft-insert.h \
 	fractal-trie/ft-remove.h fractal-trie/ft-graft.h \
 	fractal-trie/ft-detach.h fractal-trie/ft-merge.h \
+	fractal-trie/ft-rekey.h \
 	fractal-trie/ft-lifecycle.h fractal-trie/ft-verify.h \
 	fractal-trie/ft-compact.h fractal-trie/ft-key.h \
 	fractal-trie/ft-lookup-helpers.h fractal-trie/ft-iter.h fractal-trie/ft-delay.h fractal-trie/ft-tables.h \

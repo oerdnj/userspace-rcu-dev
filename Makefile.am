@@ -12,6 +12,7 @@ dist_doc_DATA = \
 
 EXTRA_DIST = \
 	CodingStyle.md \
+	ft-lookup-layout.ld \
 	lgpl-relicensing.md \
 	LICENSES/Autoconf-exception-2.0.txt \
 	LICENSES/BSD-2-Clause.txt \
