@@ -69,7 +69,7 @@
 #endif
 
 /*
- * 367 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
+ * 368 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  *
  * ☠ BUMP BOTH ARMS.  A new unconditional test belongs to the fault-inject
@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (420 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (421 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (367 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (368 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -31626,6 +31626,110 @@ out_dst:
 }
 
 /*
+ * One leg of test_merge_lone_key_at_root.  @dkey is the only key of dst and
+ * @skey the only key of src.  cds_ft_merge_at moves the src key onto the dst
+ * key: the result is one chain of two nodes at @dkey, and an empty src.
+ */
+static int merge_lone_keys(const char *what, bool ordered_list,
+		const char *dkey, const char *skey)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	struct cds_ft_node *found = NULL, *p;
+	struct ft_test_node *n;
+	unsigned int count = 0;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &dst) < 0 ||
+			cds_ft_create(group, NULL, &src) < 0)
+		abort();
+
+	n = node_alloc(1);
+	if (cds_ft_insert(dst, (const uint8_t *) dkey, strlen(dkey),
+			&n->node) != CDS_FT_STATUS_OK) {
+		node_free(n);
+		goto out;
+	}
+	n = node_alloc(2);
+	if (cds_ft_insert(src, (const uint8_t *) skey, strlen(skey),
+			&n->node) != CDS_FT_STATUS_OK) {
+		node_free(n);
+		goto out;
+	}
+	cds_ft_make_exclusive(src);
+	s = cds_ft_merge_at(dst, (const uint8_t *) dkey, strlen(dkey),
+			src, (const uint8_t *) skey, strlen(skey));
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_lone_keys(%s, list %s): %s\n", what,
+			ordered_list ? "on" : "off", cds_ft_status_to_string(s));
+		goto out;
+	}
+	rcu_read_lock();
+	if (cds_ft_eager_lookup_key(dst, (const uint8_t *) dkey, strlen(dkey),
+			0, &found) == CDS_FT_STATUS_OK)
+		for (p = found; p; p = cds_ft_node_next_rcu(p))
+			count++;
+	if (count != 2 || cds_ft_count_keys(dst) != 1 || !cds_ft_empty(src) ||
+			cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK ||
+			cds_ft_verify(src, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_lone_keys(%s, list %s): %u nodes at the "
+			"dst key (expected 2), %lu dst keys (expected 1), src "
+			"%s\n", what, ordered_list ? "on" : "off", count,
+			cds_ft_count_keys(dst),
+			cds_ft_empty(src) ? "empty" : "NOT empty");
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * A trie which holds only its zero-length key has a childless root.  A merge
+ * with such a root on one side, and no child on the other side either, has no
+ * child to add to the merged node.  The merged node was allocated when the
+ * first child was added: without one, the merged key chain was stored through
+ * a NULL node.
+ */
+static int test_merge_lone_key_at_root(void)
+{
+	int list;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_lone_key_at_root: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	for (list = 0; list < 2; list++) {
+		if (merge_lone_keys("leaf onto childless root", list, "", "abc"))
+			return -1;
+		if (merge_lone_keys("childless root onto childless root", list,
+				"", ""))
+			return -1;
+		if (merge_lone_keys("childless root onto leaf", list, "abc", ""))
+			return -1;
+	}
+	return 0;
+}
+
+/*
  * Argument validation: NULL, dst == src, mismatched groups,
  * out-of-range key_len all return INVALID_ARGUMENT_ERROR.
  *
@@ -42785,6 +42889,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_empty_source);
 	RUN_TEST(test_merge_at_root_empty_dst);
 	RUN_TEST(test_merge_duplicate_chains);
+	RUN_TEST(test_merge_lone_key_at_root);
 	RUN_TEST(test_merge_invalid_arguments);
 	RUN_TEST(test_merge_concurrent_source);
 	RUN_TEST(test_merge_prefix_subtree);
